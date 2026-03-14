@@ -1,0 +1,957 @@
+#include "Utils.h"
+#include "ChatBox.h"
+#include "ChatUIGlobals.h"
+#include "Comm.h"
+#include "Globals.h"
+#include <fstream>
+#include <iomanip>
+#include <kenshi/Character.h>
+#include <kenshi/Enums.h>
+#include <kenshi/GameWorld.h>
+#include <kenshi/RootObject.h>
+#include <kenshi/util/hand.h>
+#include <sstream>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <set>
+#include <windows.h>
+
+
+using namespace Stobe::UI;
+
+namespace {
+std::string GetExecutableDir() {
+  char path[MAX_PATH];
+  GetModuleFileNameA(NULL, path, MAX_PATH);
+  std::string dir = path;
+  size_t lastBackslash = dir.find_last_of("\\/");
+  if (lastBackslash != std::string::npos) {
+    dir = dir.substr(0, lastBackslash);
+  }
+  return dir;
+}
+
+std::string GetStobeConfigDir(bool ensureModDir) {
+  std::string exeDir = GetExecutableDir();
+  std::string modsDir = exeDir + "\\mods";
+  std::string stobeDir = modsDir + "\\Stobe";
+  if (ensureModDir) {
+    CreateDirectoryA(modsDir.c_str(), NULL);
+    CreateDirectoryA(stobeDir.c_str(), NULL);
+  }
+  return stobeDir;
+}
+
+std::string GetStobeIniPath(bool ensureModDir) {
+  std::string stobeDir = GetStobeConfigDir(ensureModDir);
+  return stobeDir + "\\Stobe.ini";
+}
+
+std::string GetStobeCustomIniPath(bool ensureModDir) {
+  std::string stobeDir = GetStobeConfigDir(ensureModDir);
+  return stobeDir + "\\StobeCustom.ini";
+}
+
+std::string GetStobeLogPath(bool ensureModDir) {
+  std::string stobeDir = GetStobeConfigDir(ensureModDir);
+  return stobeDir + "\\stobe.log";
+}
+
+bool FileExists(const std::string &path) {
+  DWORD attrs = GetFileAttributesA(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+void EnsureCustomIniSeeded(const std::string &baseIniPath,
+                           const std::string &customIniPath) {
+  if (FileExists(customIniPath)) {
+    return;
+  }
+
+  if (FileExists(baseIniPath)) {
+    if (CopyFileA(baseIniPath.c_str(), customIniPath.c_str(), TRUE)) {
+      Log("CONFIG: Seeded StobeCustom.ini from Stobe.ini.");
+      return;
+    }
+    Log("CONFIG_WARN: Failed to seed StobeCustom.ini from Stobe.ini.");
+  }
+
+  std::ofstream out(customIniPath.c_str(), std::ios::out | std::ios::trunc);
+  if (out.is_open()) {
+    out << "[Settings]" << std::endl;
+    out.close();
+    Log("CONFIG: Created empty StobeCustom.ini.");
+  } else {
+    Log("CONFIG_WARN: Unable to create StobeCustom.ini.");
+  }
+}
+
+std::string ReadLayeredIniString(const std::string &baseIniPath,
+                                 const std::string &customIniPath,
+                                 const char *section, const char *key,
+                                 const char *defaultValue) {
+  char baseBuf[512];
+  char customBuf[512];
+  GetPrivateProfileStringA(section, key, defaultValue, baseBuf,
+                           sizeof(baseBuf), baseIniPath.c_str());
+  GetPrivateProfileStringA(section, key, baseBuf, customBuf, sizeof(customBuf),
+                           customIniPath.c_str());
+  return std::string(customBuf);
+}
+
+int ReadLayeredIniInt(const std::string &baseIniPath,
+                      const std::string &customIniPath, const char *section,
+                      const char *key, int defaultValue) {
+  int baseValue =
+      GetPrivateProfileIntA(section, key, defaultValue, baseIniPath.c_str());
+  return GetPrivateProfileIntA(section, key, baseValue, customIniPath.c_str());
+}
+
+std::string NormalizeIniChatMode(const std::string &rawMode) {
+  std::string mode = rawMode;
+  std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+  if (mode == "whisper")
+    return "whisper";
+  if (mode == "shout")
+    return "shout";
+  if (mode == "cheat")
+    return "cheat";
+  if (mode == "chat" || mode == "talk")
+    return "chat";
+  return "chat";
+}
+} // namespace
+
+std::wstring WideFromUtf8(const std::string &str) {
+  if (str.empty())
+    return L"";
+  int size_needed =
+      MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+  std::wstring wstrTo(size_needed, 0);
+  MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0],
+                      size_needed);
+  return wstrTo;
+}
+
+void Log(const std::string &msg) {
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  char timestamp[64];
+  sprintf_s(timestamp, "%04d-%02d-%02d %02d:%02d:%02d.%03d", st.wYear,
+            st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            st.wMilliseconds);
+  std::string line = "[" + std::string(timestamp) + "] [Stobe] " + msg;
+
+  EnterCriticalSection(&g_LogMutex);
+  std::ofstream legacyLogFile("Stobe_SDK.log", std::ios::app);
+  if (legacyLogFile.is_open())
+    legacyLogFile << line << std::endl;
+
+  std::string rootStobeLogPath = GetExecutableDir() + "\\stobe.log";
+  std::ofstream rootStobeLogFile(rootStobeLogPath.c_str(), std::ios::app);
+  if (rootStobeLogFile.is_open())
+    rootStobeLogFile << line << std::endl;
+
+  std::string modStobeLogPath = GetStobeLogPath(true);
+  std::ofstream modStobeLogFile(modStobeLogPath.c_str(), std::ios::app);
+  if (modStobeLogFile.is_open())
+    modStobeLogFile << line << std::endl;
+
+  LeaveCriticalSection(&g_LogMutex);
+  OutputDebugStringA((line + "\n").c_str());
+}
+
+void ResetRuntimeLogsForSession() {
+  // Clear logs once at game startup so each run has a fresh trace.
+  std::ofstream legacyLogFile("Stobe_SDK.log", std::ios::trunc);
+  legacyLogFile.close();
+
+  std::string rootStobeLogPath = GetExecutableDir() + "\\stobe.log";
+  std::ofstream rootStobeLogFile(rootStobeLogPath.c_str(), std::ios::trunc);
+  rootStobeLogFile.close();
+
+  std::string modStobeLogPath = GetStobeLogPath(true);
+  std::ofstream modStobeLogFile(modStobeLogPath.c_str(), std::ios::trunc);
+  modStobeLogFile.close();
+}
+
+template <typename T> std::string ToStringT(T val) {
+  std::ostringstream ss;
+  ss << val;
+  return ss.str();
+}
+
+std::string ToString(int val) { return ToStringT(val); }
+std::string ToString(unsigned int val) { return ToStringT(val); }
+std::string ToString(float val) { return ToStringT(val); }
+
+std::string EscapeJSON(const std::string &s) {
+  std::string res = "";
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '\"')
+      res += "\\\"";
+    else if (c == '\\')
+      res += "\\\\";
+    else if (c == '\n')
+      res += "\\n";
+    else if (c == '\r')
+      res += "\\r";
+    else
+      res += c;
+  }
+  return res;
+}
+
+std::string UnescapeJSON(const std::string &s) {
+  std::string res = "";
+  for (size_t i = 0; i < s.length(); ++i) {
+    if (s[i] == '\\' && i + 1 < s.length()) {
+      if (s[i + 1] == 'n') {
+        res += '\n';
+        i++;
+      } else if (s[i + 1] == 'r') {
+        res += '\r';
+        i++;
+      } else if (s[i + 1] == '\"') {
+        res += '\"';
+        i++;
+      } else if (s[i + 1] == '\\') {
+        res += '\\';
+        i++;
+      } else if (s[i + 1] == 'u' && i + 5 < s.length()) {
+        // Handle \uXXXX hex sequence
+        unsigned int cp = 0;
+        bool valid = true;
+        for (int j = 0; j < 4; ++j) {
+          char c = s[i + 2 + j];
+          cp <<= 4;
+          if (c >= '0' && c <= '9')
+            cp += (c - '0');
+          else if (c >= 'a' && c <= 'f')
+            cp += (10 + c - 'a');
+          else if (c >= 'A' && c <= 'F')
+            cp += (10 + c - 'A');
+          else {
+            valid = false;
+            break;
+          }
+        }
+
+        if (valid) {
+          // Convert Unicode codepoint to UTF-8
+          if (cp <= 0x7F) {
+            res += (char)cp;
+          } else if (cp <= 0x7FF) {
+            res += (char)(0xC0 | ((cp >> 6) & 0x1F));
+            res += (char)(0x80 | (cp & 0x3F));
+          } else {
+            res += (char)(0xE0 | ((cp >> 12) & 0x0F));
+            res += (char)(0x80 | ((cp >> 6) & 0x3F));
+            res += (char)(0x80 | (cp & 0x3F));
+          }
+          i += 5; // skip uXXXX
+        } else {
+          res += s[i]; // Not a valid hex sequence, just append the backslash
+        }
+      } else {
+        res += s[i];
+      }
+    } else {
+      res += s[i];
+    }
+  }
+  return res;
+}
+
+std::string JsonReadField(const std::string &json, const std::string &key) {
+  std::string keyQuery = "\"" + key + "\":";
+  size_t pos = json.find(keyQuery);
+  if (pos == std::string::npos) {
+    // try without quotes in case it's non-standard but that's unlikely
+    return "";
+  }
+
+  size_t valStart = json.find_first_not_of(" \t\r\n", pos + keyQuery.length());
+  if (valStart == std::string::npos)
+    return "";
+
+  if (json[valStart] == '\"') {
+    // String value
+    valStart++;
+    std::string res = "";
+    for (size_t i = valStart; i < json.length(); ++i) {
+      if (json[i] == '\\' && i + 1 < json.length()) {
+        res += json[i];
+        res += json[i + 1];
+        i++;
+      } else if (json[i] == '\"') {
+        return UnescapeJSON(res);
+      } else {
+        res += json[i];
+      }
+    }
+  } else if (json[valStart] == '[' || json[valStart] == '{') {
+    char open = json[valStart];
+    char close = (open == '[') ? ']' : '}';
+    int bracketCount = 0;
+    bool inString = false;
+    size_t i = valStart;
+    for (; i < json.length(); i++) {
+      if (json[i] == '"' && (i == 0 || json[i - 1] != '\\')) {
+        inString = !inString;
+      } else if (!inString) {
+        if (json[i] == open)
+          bracketCount++;
+        else if (json[i] == close) {
+          bracketCount--;
+          if (bracketCount == 0)
+            break;
+        }
+      }
+    }
+    if (i < json.length() && json[i] == close) {
+      return json.substr(valStart, i - valStart + 1);
+    }
+  } else {
+    // Number or bool
+    size_t end = json.find_first_of(",}", valStart);
+    if (end != std::string::npos) {
+      return json.substr(valStart, end - valStart);
+    }
+  }
+  return "";
+}
+
+void SetHotkeyFromString(const std::string &keyStr) {
+  std::string normalized = keyStr;
+  if (!normalized.empty()) {
+    if (normalized[0] >= 'a' && normalized[0] <= 'z') {
+      normalized[0] = (char)(normalized[0] - ('a' - 'A'));
+    }
+  }
+  g_chatHotkeyStr = normalized;
+  if (normalized == "/")
+    g_chatHotkey = VK_OEM_2;
+  else if (normalized == "-")
+    g_chatHotkey = VK_OEM_MINUS;
+  else if (normalized == ".")
+    g_chatHotkey = VK_OEM_PERIOD;
+  else if (normalized == "\\")
+    g_chatHotkey = VK_OEM_5;
+  else if (normalized == "[")
+    g_chatHotkey = VK_OEM_4;
+  else if (normalized == "]")
+    g_chatHotkey = VK_OEM_6;
+  else if (normalized == "O")
+    g_chatHotkey = 'O';
+  else if (normalized == "P")
+    g_chatHotkey = 'P';
+  else if (normalized == "J")
+    g_chatHotkey = 'J';
+  else if (normalized == "U")
+    g_chatHotkey = 'U';
+  else if (normalized == "K")
+    g_chatHotkey = 'K';
+  else {
+    g_chatHotkey = VK_OEM_2;
+    g_chatHotkeyStr = "/";
+  }
+}
+
+void LoadStobeRuntimeConfig() {
+  std::string baseIniPath = GetStobeIniPath(false);
+  std::string customIniPath = GetStobeCustomIniPath(true);
+  EnsureCustomIniSeeded(baseIniPath, customIniPath);
+
+  SetHotkeyFromString(ReadLayeredIniString(baseIniPath, customIniPath,
+                                           "Settings", "ChatHotkey", "/"));
+  g_chatMode = NormalizeIniChatMode(ReadLayeredIniString(
+      baseIniPath, customIniPath, "Settings", "ChatMode", "chat"));
+  g_autoChatEnabled =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "AutoChat", 0) !=
+      0;
+  g_enableAnimalTalks =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "AnimalTalks", 0) !=
+      0;
+  g_useNearestPlayerSpeaker =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "UseNearestPlayerSpeaker", 1) != 0;
+  if (g_chatMode == "whisper")
+    g_lastChatModeIndex = 1;
+  else if (g_chatMode == "shout")
+    g_lastChatModeIndex = 2;
+  else if (g_chatMode == "cheat")
+    g_lastChatModeIndex = 3;
+  else
+    g_lastChatModeIndex = 0;
+
+  g_boredEventRange = (float)ReadLayeredIniInt(baseIniPath, customIniPath,
+                                                "Settings", "BoredEventRange", 200);
+  g_proximityRadius = (float)ReadLayeredIniInt(baseIniPath, customIniPath,
+                                               "Settings", "TalkRadius", 80);
+  g_shoutRadius = (float)ReadLayeredIniInt(baseIniPath, customIniPath,
+                                           "Settings", "ShoutRadius", 200);
+  g_ttsVolumePercent =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "TTSVolume", 100);
+  if (g_ttsVolumePercent < 0) {
+    g_ttsVolumePercent = 0;
+  } else if (g_ttsVolumePercent > 100) {
+    g_ttsVolumePercent = 100;
+  }
+  g_ttsEnabled =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "TtsEnabled", 1) !=
+      0;
+  g_boredEventIntervalSeconds = ReadLayeredIniInt(
+      baseIniPath, customIniPath, "Settings", "BoardEventIntervalSeconds", 240);
+  g_dynamicProfileIntervalMinutes =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "DynamicProfileIntervalMinutes", 20);
+  if (g_dynamicProfileIntervalMinutes < 1) {
+    g_dynamicProfileIntervalMinutes = 1;
+  } else if (g_dynamicProfileIntervalMinutes > 720) {
+    g_dynamicProfileIntervalMinutes = 720;
+  }
+
+  g_enableBoredEvents =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableBoredEventConversations", 1) != 0;
+
+  int enableWelcomeFallback = ReadLayeredIniInt(
+      baseIniPath, customIniPath, "Settings", "EnableWelcomePopup", 1);
+  g_enableWelcome = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                                      "EnableMOTD", enableWelcomeFallback) != 0;
+
+  Log("CONFIG: Loaded ProximityRadius=" + ToString(g_proximityRadius) +
+      ", BoredEventRange=" + ToString(g_boredEventRange) +
+      ", TTSVolume=" + ToString(g_ttsVolumePercent) +
+      ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+      ", BoredEventInterval=" + ToString(g_boredEventIntervalSeconds) + "s" +
+      ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalMinutes) +
+      "m" +
+      ", AnimalTalks=" + (g_enableAnimalTalks ? "true" : "false") +
+      ", NearestSpeaker=" +
+      (g_useNearestPlayerSpeaker ? "true" : "false") +
+      ", EnableBoredEvents=" + (g_enableBoredEvents ? "true" : "false") +
+      ", EnableWelcome=" + (g_enableWelcome ? "true" : "false"));
+
+  // Ensure StobeCustom.ini exists with all current keys while preserving
+  // baseline defaults in Stobe.ini.
+  SaveStobeRuntimeConfig();
+}
+
+void SaveStobeRuntimeConfig() {
+  std::string iniPath = GetStobeCustomIniPath(true);
+
+  WritePrivateProfileStringA("Settings", "ChatHotkey", g_chatHotkeyStr.c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "ChatMode", g_chatMode.c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "AutoChat",
+                             g_autoChatEnabled ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "AnimalTalks",
+                             g_enableAnimalTalks ? "1" : "0",
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "UseNearestPlayerSpeaker",
+                             g_useNearestPlayerSpeaker ? "1" : "0",
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "BoredEventRange",
+                             ToString((int)g_boredEventRange).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "TalkRadius",
+                             ToString((int)g_proximityRadius).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "ShoutRadius",
+                             ToString((int)g_shoutRadius).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "TTSVolume",
+                             ToString(g_ttsVolumePercent).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "TtsEnabled",
+                             g_ttsEnabled ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "BoardEventIntervalSeconds",
+                             ToString(g_boredEventIntervalSeconds).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "DynamicProfileIntervalMinutes",
+                             ToString(g_dynamicProfileIntervalMinutes).c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableBoredEventConversations",
+                             g_enableBoredEvents ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableMOTD",
+                             g_enableWelcome ? "1" : "0", iniPath.c_str());
+
+  // Remove deprecated/renamed keys from legacy configs.
+  WritePrivateProfileStringA("Settings", "EnableWelcomePopup", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "GlobalEventsCount", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "DialogueSpeedSeconds", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "DialogueSpeed", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "Language", NULL, iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "WhisperRadius", NULL,
+                             iniPath.c_str());
+
+  Log("CONFIG: Saved full settings state to StobeCustom.ini.");
+}
+
+static int ResolveCurrentGameTsForEvent() {
+  GameWorld *world = GetWorldSafe();
+  if (!world || reinterpret_cast<uintptr_t>(world) < 0x1000) {
+    return 0;
+  }
+  int gameTs = 0;
+  try {
+    TimeOfDay tod = world->getTimeStamp_inGameHours();
+    gameTs = static_cast<int>(tod.getTotalSeconds());
+  } catch (...) {
+    gameTs = 0;
+  }
+  if (gameTs < 0) {
+    gameTs = 0;
+  }
+  return gameTs;
+}
+
+static std::string NormalizeEventName(const std::string &value) {
+  std::string out = value;
+  out.erase(0, out.find_first_not_of(" \t\r\n"));
+  size_t last = out.find_last_not_of(" \t\r\n");
+  if (last == std::string::npos) {
+    return "";
+  }
+  out.erase(last + 1);
+  if (out == "None" || out == "Unknown" || out == "null") {
+    return "";
+  }
+  return out;
+}
+
+static bool EqualsIgnoreCaseToken(const std::string &a, const std::string &b) {
+  if (a.length() != b.length()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.length(); ++i) {
+    unsigned char ac = static_cast<unsigned char>(a[i]);
+    unsigned char bc = static_cast<unsigned char>(b[i]);
+    if (tolower(ac) != tolower(bc)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::string BuildEventPeopleJsonArray(
+    const std::vector<std::string> &people) {
+  std::string json = "[";
+  for (size_t i = 0; i < people.size(); ++i) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += "\"" + EscapeJSON(people[i]) + "\"";
+  }
+  json += "]";
+  return json;
+}
+
+static bool IsValidIndoorsHandleForEvent(const hand &indoorsHandle) {
+  return indoorsHandle.isValid() && !indoorsHandle.isNull();
+}
+
+static bool TryGetEventSpatialState(Character *character, bool &hasBuilding,
+                                    unsigned int &buildingSerial,
+                                    int &floorValue) {
+  hasBuilding = false;
+  buildingSerial = 0;
+  floorValue = 0;
+  if (!character || reinterpret_cast<uintptr_t>(character) <= 0x1000) {
+    return false;
+  }
+#if defined(_MSC_VER)
+  __try {
+#endif
+    const hand &indoorsHandle = character->isIndoors();
+    hasBuilding = IsValidIndoorsHandleForEvent(indoorsHandle);
+    buildingSerial = hasBuilding ? indoorsHandle.serial : 0;
+    floorValue = character->getFloor();
+    return true;
+#if defined(_MSC_VER)
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+#endif
+}
+
+static bool IsEventAreaCompatible(Character *anchor, Character *candidate) {
+  if (!anchor || !candidate || reinterpret_cast<uintptr_t>(anchor) <= 0x1000 ||
+      reinterpret_cast<uintptr_t>(candidate) <= 0x1000) {
+    return false;
+  }
+
+  bool anchorHasBuilding = false;
+  bool candidateHasBuilding = false;
+  unsigned int anchorBuildingSerial = 0;
+  unsigned int candidateBuildingSerial = 0;
+  int anchorFloor = 0;
+  int candidateFloor = 0;
+  if (!TryGetEventSpatialState(anchor, anchorHasBuilding, anchorBuildingSerial,
+                               anchorFloor)) {
+    return false;
+  }
+  if (!TryGetEventSpatialState(candidate, candidateHasBuilding,
+                               candidateBuildingSerial, candidateFloor)) {
+    return false;
+  }
+
+  if (anchorHasBuilding) {
+    if (!candidateHasBuilding) {
+      return false;
+    }
+    if (anchorBuildingSerial == 0 || candidateBuildingSerial == 0 ||
+        anchorBuildingSerial != candidateBuildingSerial) {
+      return false;
+    }
+    int floorDelta = anchorFloor - candidateFloor;
+    if (floorDelta < 0) {
+      floorDelta = -floorDelta;
+    }
+    return floorDelta <= 1;
+  }
+
+  if (candidateHasBuilding) {
+    return false;
+  }
+  if (candidateFloor > anchorFloor + 1) {
+    return false;
+  }
+  return true;
+}
+
+static unsigned int ResolveCharacterSerialSafe(Character *npc) {
+  if (!npc || reinterpret_cast<uintptr_t>(npc) <= 0x1000) {
+    return 0;
+  }
+  unsigned int serial = 0;
+  try {
+    serial = npc->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  return serial;
+}
+
+static std::string ResolveCharacterNameForEvent(Character *npc) {
+  if (!npc || reinterpret_cast<uintptr_t>(npc) <= 0x1000) {
+    return "";
+  }
+  std::string name = "";
+  try {
+    name = npc->getName();
+  } catch (...) {
+    name = "";
+  }
+  return NormalizeEventName(name);
+}
+
+static Character *FindCharacterBySerialForEvent(GameWorld *world,
+                                                unsigned int serial) {
+  if (!world || serial == 0) {
+    return nullptr;
+  }
+  const ogre_unordered_set<Character *>::type &chars =
+      world->getCharacterUpdateList();
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    Character *candidate = *it;
+    if (!candidate || reinterpret_cast<uintptr_t>(candidate) <= 0x1000) {
+      continue;
+    }
+    if (ResolveCharacterSerialSafe(candidate) == serial) {
+      return candidate;
+    }
+  }
+  return nullptr;
+}
+
+static Character *FindCharacterByNameForEvent(GameWorld *world,
+                                              const std::string &name) {
+  if (!world) {
+    return nullptr;
+  }
+  std::string wanted = NormalizeEventName(name);
+  if (wanted.empty()) {
+    return nullptr;
+  }
+  const ogre_unordered_set<Character *>::type &chars =
+      world->getCharacterUpdateList();
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    Character *candidate = *it;
+    if (!candidate || reinterpret_cast<uintptr_t>(candidate) <= 0x1000) {
+      continue;
+    }
+    std::string candidateName = ResolveCharacterNameForEvent(candidate);
+    if (!candidateName.empty() && EqualsIgnoreCaseToken(candidateName, wanted)) {
+      return candidate;
+    }
+  }
+  return nullptr;
+}
+
+static bool TryAppendEventPersonBySerial(std::vector<std::string> &people,
+                                         std::set<unsigned int> &seenSerials,
+                                         unsigned int serial,
+                                         const std::string &name,
+                                         size_t totalCap,
+                                         int &droppedByCapOut) {
+  if (serial == 0 || name.empty()) {
+    return false;
+  }
+  if (seenSerials.count(serial) != 0) {
+    return false;
+  }
+  if (people.size() >= totalCap) {
+    ++droppedByCapOut;
+    return false;
+  }
+  seenSerials.insert(serial);
+  people.push_back(name + "|" + ToString((int)serial));
+  return true;
+}
+
+static void CollectEventPeopleFromAnchor(
+    GameWorld *world, Character *anchor, float searchRadius, size_t perAnchorCap,
+    size_t totalCap, std::vector<std::string> &people,
+    std::set<unsigned int> &seenSerials, int &addedCountOut,
+    int &droppedByCapOut) {
+  addedCountOut = 0;
+  if (!world || !anchor || reinterpret_cast<uintptr_t>(anchor) <= 0x1000) {
+    return;
+  }
+
+  lektor<RootObject *> nearbyResults;
+  try {
+    world->getCharactersWithinSphere(nearbyResults, anchor->getPosition(),
+                                     searchRadius, 0.0f, 0.0f, 0x10, 0,
+                                     anchor);
+  } catch (...) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < nearbyResults.size(); ++i) {
+    if ((size_t)addedCountOut >= perAnchorCap) {
+      break;
+    }
+    if (people.size() >= totalCap) {
+      ++droppedByCapOut;
+      break;
+    }
+    Character *other = reinterpret_cast<Character *>(nearbyResults.stuff[i]);
+    if (!other || reinterpret_cast<uintptr_t>(other) <= 0x1000) {
+      continue;
+    }
+    if (!IsEventAreaCompatible(anchor, other)) {
+      continue;
+    }
+    float dist = 0.0f;
+    try {
+      dist = anchor->getPosition().distance(other->getPosition());
+    } catch (...) {
+      continue;
+    }
+    if (dist > searchRadius) {
+      continue;
+    }
+
+    unsigned int otherSerial = ResolveCharacterSerialSafe(other);
+    std::string otherName = ResolveCharacterNameForEvent(other);
+    if (TryAppendEventPersonBySerial(people, seenSerials, otherSerial, otherName,
+                                     totalCap, droppedByCapOut)) {
+      ++addedCountOut;
+    }
+  }
+}
+
+static std::string BuildEventPeopleJson(GameWorld *world,
+                                        const std::string &actor,
+                                        const std::string &target,
+                                        unsigned int actorSerial,
+                                        unsigned int targetSerial,
+                                        int &peopleCountOut,
+                                        int &anchorACountOut,
+                                        int &anchorBCountOut,
+                                        int &droppedByCapOut,
+                                        bool &usedSecondAnchorOut) {
+  std::vector<std::string> people;
+  std::set<unsigned int> seenSerials;
+  peopleCountOut = 0;
+  anchorACountOut = 0;
+  anchorBCountOut = 0;
+  droppedByCapOut = 0;
+  usedSecondAnchorOut = false;
+
+  Character *actorNpc = FindCharacterBySerialForEvent(world, actorSerial);
+  Character *targetNpc = FindCharacterBySerialForEvent(world, targetSerial);
+  if (!actorNpc && !NormalizeEventName(actor).empty()) {
+    actorNpc = FindCharacterByNameForEvent(world, actor);
+  }
+  if (!targetNpc && !NormalizeEventName(target).empty()) {
+    targetNpc = FindCharacterByNameForEvent(world, target);
+  }
+
+  std::string actorName = NormalizeEventName(actor);
+  std::string targetName = NormalizeEventName(target);
+  if (actorNpc) {
+    actorName = ResolveCharacterNameForEvent(actorNpc);
+  }
+  if (targetNpc) {
+    targetName = ResolveCharacterNameForEvent(targetNpc);
+  }
+
+  const size_t kPerAnchorCap = 12;
+  const size_t kTotalPeopleCap = 24;
+  unsigned int resolvedActorSerial =
+      actorNpc ? ResolveCharacterSerialSafe(actorNpc) : actorSerial;
+  unsigned int resolvedTargetSerial =
+      targetNpc ? ResolveCharacterSerialSafe(targetNpc) : targetSerial;
+  TryAppendEventPersonBySerial(people, seenSerials, resolvedActorSerial, actorName,
+                               kTotalPeopleCap, droppedByCapOut);
+  TryAppendEventPersonBySerial(people, seenSerials, resolvedTargetSerial,
+                               targetName, kTotalPeopleCap, droppedByCapOut);
+
+  Character *anchorA = targetNpc ? targetNpc : actorNpc;
+  Character *anchorB = nullptr;
+  if (targetNpc && actorNpc) {
+    anchorB = (anchorA == targetNpc) ? actorNpc : targetNpc;
+    unsigned int anchorASerial = ResolveCharacterSerialSafe(anchorA);
+    unsigned int anchorBSerial = ResolveCharacterSerialSafe(anchorB);
+    if (anchorASerial == 0 || anchorBSerial == 0 || anchorASerial == anchorBSerial) {
+      anchorB = nullptr;
+    }
+  }
+  usedSecondAnchorOut = (anchorB != nullptr);
+
+  if (world && anchorA && reinterpret_cast<uintptr_t>(anchorA) > 0x1000) {
+    float searchRadius = g_shoutRadius;
+    if (searchRadius < g_proximityRadius) {
+      searchRadius = g_proximityRadius;
+    }
+    if (searchRadius < 30.0f) {
+      searchRadius = 30.0f;
+    } else if (searchRadius > 600.0f) {
+      searchRadius = 600.0f;
+    }
+    CollectEventPeopleFromAnchor(world, anchorA, searchRadius, kPerAnchorCap,
+                                 kTotalPeopleCap, people, seenSerials,
+                                 anchorACountOut, droppedByCapOut);
+    if (anchorB && people.size() < kTotalPeopleCap) {
+      CollectEventPeopleFromAnchor(world, anchorB, searchRadius, kPerAnchorCap,
+                                   kTotalPeopleCap, people, seenSerials,
+                                   anchorBCountOut, droppedByCapOut);
+    }
+  }
+
+  peopleCountOut = static_cast<int>(people.size());
+  return BuildEventPeopleJsonArray(people);
+}
+
+static std::string BuildEventStreamData(const std::string &type,
+                                        const std::string &actor,
+                                        const std::string &target,
+                                        const std::string &message) {
+  std::string speaker = NormalizeEventName(actor);
+  std::string listener = NormalizeEventName(target);
+  if (speaker.empty()) {
+    speaker = listener;
+    listener.clear();
+  }
+  if (speaker.empty()) {
+    speaker = "Unknown";
+  }
+
+  std::string body = message;
+  if (body.empty()) {
+    body = type;
+  }
+
+  std::string line = speaker + ": " + body;
+  if (!listener.empty() && listener != speaker) {
+    line += " (talking to: " + listener + ")";
+  }
+  return line;
+}
+
+void LogGameEvent(const std::string &type, const std::string &actor,
+                  const std::string &actorFaction, const std::string &target,
+                  const std::string &targetFaction,
+                  const std::string &message, unsigned int actorSerial,
+                  unsigned int targetSerial) {
+  EnterCriticalSection(&g_eventMutex);
+  GameEvent ev;
+  ev.type = type;
+  ev.actor = actor;
+  ev.actorFaction = actorFaction;
+  ev.target = target;
+  ev.targetFaction = targetFaction;
+  ev.message = message;
+  ev.timestamp = GetTickCount();
+  g_gameEvents.push_back(ev);
+  if (g_gameEvents.size() > 100) {
+    g_gameEvents.pop_front();
+  }
+  LeaveCriticalSection(&g_eventMutex);
+
+  std::string logMsg = "[EVENT] " + type + ": " + actor;
+  if (!actorFaction.empty() && actorFaction != "None")
+    logMsg += " (" + actorFaction + ")";
+  logMsg += " -> " + target;
+  if (!targetFaction.empty() && targetFaction != "None")
+    logMsg += " (" + targetFaction + ")";
+  logMsg += " (" + message + ")";
+  Log(logMsg);
+
+  std::string eventType = NormalizeEventName(type);
+  if (eventType.empty()) {
+    return;
+  }
+  std::string eventData = BuildEventStreamData(eventType, actor, target, message);
+  int peopleCount = 0;
+  int anchorACount = 0;
+  int anchorBCount = 0;
+  int droppedByCap = 0;
+  bool usedSecondAnchor = false;
+  std::string peopleJson =
+      BuildEventPeopleJson(GetWorldSafe(), actor, target, actorSerial,
+                           targetSerial, peopleCount, anchorACount, anchorBCount,
+                           droppedByCap, usedSecondAnchor);
+  int gameTs = ResolveCurrentGameTsForEvent();
+  std::wstring endpoint = L"/StobeServer/stream.php?DATA=" +
+                          ToWide(BuildStreamQueryData(eventType, eventData, gameTs));
+  endpoint += L"&people=" + ToWide(UrlEncode(peopleJson));
+  AsyncPostToStobeSerial(endpoint, "");
+  Log("EVENT_STREAM: queued type=" + eventType +
+      " gamets=" + ToString(gameTs) +
+      " people_count=" + ToString(peopleCount) +
+      " anchor_a_count=" + ToString(anchorACount) +
+      " anchor_b_enabled=" + std::string(usedSecondAnchor ? "1" : "0") +
+      " anchor_b_count=" + ToString(anchorBCount) +
+      " dropped_by_cap=" + ToString(droppedByCap) +
+      " actor_serial=" + ToString((int)actorSerial) +
+      " target_serial=" + ToString((int)targetSerial) +
+      " data=" + eventData);
+}
+void SleepIfPaused(DWORD ms) {
+  DWORD start = GetTickCount();
+  while (GetTickCount() - start < ms) {
+    GameWorld *world = GetWorldSafe();
+    if (world && world->isPaused()) {
+      Sleep(100);
+      start +=
+          100; // Shift start so the actual message delay remains consistent
+      continue;
+    }
+    Sleep(100);
+  }
+}
