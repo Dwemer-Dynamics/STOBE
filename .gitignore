@@ -1,6 +1,7 @@
 build/
 build-map/
 *.dll
+!mod/Stobe.dll
 *.lib
 *.exp
 *.obj
@@ -10,7 +11,7 @@ build-map/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-mod/Stobe.mod
+!mod/Stobe.mod
 
 # Visual Studio / local IDE
 .vs/
