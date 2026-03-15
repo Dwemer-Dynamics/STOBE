@@ -95,6 +95,68 @@ std::string TrimCopy(const std::string &value) {
   return value.substr(first, last - first + 1);
 }
 
+int ClampIntRange(int value, int minValue, int maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+std::string ResolveArmourQualityLabelFromLevel(int level) {
+  if (level >= 95) {
+    return "Masterwork";
+  }
+  if (level >= 80) {
+    return "Specialist";
+  }
+  if (level >= 60) {
+    return "High";
+  }
+  if (level >= 40) {
+    return "Standard";
+  }
+  if (level >= 20) {
+    return "Shoddy";
+  }
+  return "Prototype";
+}
+
+bool TryExtractArmourQuality(Item *item, int &levelOut, std::string &labelOut) {
+  levelOut = -1;
+  labelOut.clear();
+  if (!item || (uintptr_t)item <= 0x1000) {
+    return false;
+  }
+
+  bool isArmour = false;
+  try {
+    isArmour = (item->isArmour() != NULL) || (item->isLockedArmour() != NULL);
+  } catch (...) {
+    isArmour = false;
+  }
+  if (!isArmour) {
+    return false;
+  }
+
+  int level = -1;
+  try {
+    level = item->getLevel();
+  } catch (...) {
+    level = -1;
+  }
+  if (level < 0) {
+    return false;
+  }
+
+  level = ClampIntRange(level, 0, 100);
+  levelOut = level;
+  labelOut = ResolveArmourQualityLabelFromLevel(level);
+  return !labelOut.empty();
+}
+
 bool IsUnknownToken(const std::string &value) {
   std::string normalized = TrimCopy(value);
   if (normalized.empty()) {
@@ -116,6 +178,8 @@ struct TraderInventoryCacheEntry {
 struct SimpleTraderInventoryItem {
   std::string name;
   std::string itemId;
+  std::string quality;
+  int qualityLevel;
   int count;
   int valueEach;
 };
@@ -1392,6 +1456,8 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     std::string name;
     std::string itemId;
     std::string description;
+    std::string quality;
+    int qualityLevel;
     int count;
     int valueEach;
   };
@@ -1406,6 +1472,8 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     std::string itemName = "";
     std::string itemId = "";
     std::string itemDescription = "";
+    std::string itemQuality = "";
+    int itemQualityLevel = -1;
     int itemCount = 1;
     int itemValueEach = 0;
     try {
@@ -1417,6 +1485,7 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       if (item->data && (uintptr_t)item->data > 0x1000) {
         itemDescription = ResolveItemDescription(item->data);
       }
+      TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
       itemCount = item->quantity;
       itemValueEach = item->getValueSingle(false);
     } catch (...) {
@@ -1437,6 +1506,14 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     for (size_t ci = 0; ci < key.length(); ++ci) {
       key[ci] = static_cast<char>(tolower((unsigned char)key[ci]));
     }
+    std::string qualityKey =
+        itemQualityLevel >= 0
+            ? ToString(itemQualityLevel)
+            : (itemQuality.empty() ? std::string("none") : itemQuality);
+    for (size_t qi = 0; qi < qualityKey.length(); ++qi) {
+      qualityKey[qi] = static_cast<char>(tolower((unsigned char)qualityKey[qi]));
+    }
+    key += "|q:" + qualityKey;
 
     auto it = aggregated.find(key);
     if (it == aggregated.end()) {
@@ -1444,6 +1521,8 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       entry.name = itemName;
       entry.itemId = itemId;
       entry.description = itemDescription;
+      entry.quality = itemQuality;
+      entry.qualityLevel = itemQualityLevel;
       entry.count = itemCount;
       entry.valueEach = itemValueEach;
       aggregated[key] = entry;
@@ -1457,6 +1536,12 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       }
       if (it->second.valueEach <= 0 && itemValueEach > 0) {
         it->second.valueEach = itemValueEach;
+      }
+      if (it->second.quality.empty() && !itemQuality.empty()) {
+        it->second.quality = itemQuality;
+      }
+      if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
+        it->second.qualityLevel = itemQualityLevel;
       }
     }
   }
@@ -1483,6 +1568,12 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     }
     if (entry.valueEach > 0) {
       json += ",\"value_each\":" + ToString(entry.valueEach);
+    }
+    if (entry.qualityLevel >= 0) {
+      json += ",\"quality_level\":" + ToString(entry.qualityLevel);
+    }
+    if (!entry.quality.empty()) {
+      json += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
     }
     json += "}";
 
@@ -1511,6 +1602,8 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     std::string name;
     std::string itemId;
     std::string description;
+    std::string quality;
+    int qualityLevel;
     std::string model;
     std::string manufacturer;
     std::string manufacturerId;
@@ -1536,6 +1629,8 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     std::string itemName = "";
     std::string itemId = "";
     std::string itemDescription = "";
+    std::string itemQuality = "";
+    int itemQualityLevel = -1;
     std::string itemModel = "";
     std::string itemManufacturer = "";
     std::string itemManufacturerId = "";
@@ -1551,6 +1646,7 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       if (item->data && (uintptr_t)item->data > 0x1000) {
         itemDescription = ResolveItemDescription(item->data);
       }
+      TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
       itemCount = item->quantity;
       itemEquipped = item->isEquipped;
       itemValueEach = item->getValueSingle(false);
@@ -1681,6 +1777,14 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     for (size_t ci = 0; ci < key.length(); ++ci) {
       key[ci] = static_cast<char>(tolower((unsigned char)key[ci]));
     }
+    std::string qualityKey =
+        itemQualityLevel >= 0
+            ? ToString(itemQualityLevel)
+            : (itemQuality.empty() ? std::string("none") : itemQuality);
+    for (size_t qi = 0; qi < qualityKey.length(); ++qi) {
+      qualityKey[qi] = static_cast<char>(tolower((unsigned char)qualityKey[qi]));
+    }
+    key += "|q:" + qualityKey;
     // Model/manufacturer tracking is disabled for now.
     itemModel.clear();
     itemManufacturer.clear();
@@ -1693,6 +1797,8 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       entry.name = itemName;
       entry.itemId = itemId;
       entry.description = itemDescription;
+      entry.quality = itemQuality;
+      entry.qualityLevel = itemQualityLevel;
       entry.model = "";
       entry.manufacturer = "";
       entry.manufacturerId = "";
@@ -1710,6 +1816,12 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       }
       if (it->second.valueEach <= 0 && itemValueEach > 0) {
         it->second.valueEach = itemValueEach;
+      }
+      if (it->second.quality.empty() && !itemQuality.empty()) {
+        it->second.quality = itemQuality;
+      }
+      if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
+        it->second.qualityLevel = itemQualityLevel;
       }
     }
   }
@@ -1739,11 +1851,18 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     if (entry.valueEach > 0) {
       json += ",\"value_each\":" + ToString(entry.valueEach);
     }
+    if (entry.qualityLevel >= 0) {
+      json += ",\"quality_level\":" + ToString(entry.qualityLevel);
+    }
+    if (!entry.quality.empty()) {
+      json += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
+    }
     json += "}";
 
     hash += EscapeJSON(entry.itemId.empty() ? entry.name : entry.itemId) + "^" +
             ToString(entry.count) + "^" + std::string(entry.equipped ? "1" : "0") + "^" +
-            ToString(entry.valueEach) + "^" + EscapeJSON(entry.description);
+            ToString(entry.valueEach) + "^" + EscapeJSON(entry.description) +
+            "^" + ToString(entry.qualityLevel) + "^" + EscapeJSON(entry.quality);
     ++outputCount;
     if (outputCount >= 200) {
       break;
@@ -1822,6 +1941,8 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
 
       std::string itemName = "";
       std::string itemId = "";
+      std::string itemQuality = "";
+      int itemQualityLevel = -1;
       int itemCount = 1;
       int itemValueEach = 0;
       try {
@@ -1830,6 +1951,7 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
             !item->data->stringID.empty()) {
           itemId = TrimCopy(item->data->stringID);
         }
+        TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
         itemCount = item->quantity;
         itemValueEach = item->getValueSingle(false);
       } catch (...) {
@@ -1847,11 +1969,18 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
 
       std::string key = itemId.empty() ? itemName : itemId;
       key = lowerAscii(key);
+      std::string qualityKey =
+          itemQualityLevel >= 0
+              ? ToString(itemQualityLevel)
+              : (itemQuality.empty() ? std::string("none") : itemQuality);
+      key += "|q:" + lowerAscii(qualityKey);
       auto it = aggregated.find(key);
       if (it == aggregated.end()) {
         SimpleTraderInventoryItem entry;
         entry.name = itemName;
         entry.itemId = itemId;
+        entry.quality = itemQuality;
+        entry.qualityLevel = itemQualityLevel;
         entry.count = itemCount;
         entry.valueEach = itemValueEach;
         aggregated[key] = entry;
@@ -1862,6 +1991,12 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
         }
         if (it->second.valueEach <= 0 && itemValueEach > 0) {
           it->second.valueEach = itemValueEach;
+        }
+        if (it->second.quality.empty() && !itemQuality.empty()) {
+          it->second.quality = itemQuality;
+        }
+        if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
+          it->second.qualityLevel = itemQualityLevel;
         }
       }
       if (aggregated.size() >= 320) {
@@ -1991,6 +2126,12 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
     if (entry.valueEach > 0) {
       inventoryJson += ",\"value_each\":" + ToString(entry.valueEach);
     }
+    if (entry.qualityLevel >= 0) {
+      inventoryJson += ",\"quality_level\":" + ToString(entry.qualityLevel);
+    }
+    if (!entry.quality.empty()) {
+      inventoryJson += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
+    }
     inventoryJson += "}";
     inventoryCount += 1;
     if (inventoryCount >= 260) {
@@ -2094,25 +2235,44 @@ static std::string GetVisibleEquipment(Character *npc) {
   if (!inv || (uintptr_t)inv < 0x1000)
     return "";
 
+  auto appendEquipmentName = [](std::string &buffer, Item *item) {
+    if (!item || (uintptr_t)item <= 0x1000) {
+      return;
+    }
+    std::string itemName = "";
+    try {
+      itemName = TrimCopy(item->getName());
+    } catch (...) {
+      itemName = "";
+    }
+    if (itemName.empty()) {
+      return;
+    }
+
+    int qualityLevel = -1;
+    std::string qualityLabel;
+    if (TryExtractArmourQuality(item, qualityLevel, qualityLabel) &&
+        !qualityLabel.empty()) {
+      itemName += " [" + qualityLabel + "]";
+    }
+
+    if (!buffer.empty()) {
+      buffer += ", ";
+    }
+    buffer += itemName;
+  };
+
   std::string eq = "";
   lektor<Item *> armor;
   inv->getEquippedArmour(armor);
   for (uint32_t i = 0; i < armor.size(); ++i) {
-    if (armor.stuff[i] && (uintptr_t)armor.stuff[i] > 0x1000) {
-      if (!eq.empty())
-        eq += ", ";
-      eq += armor.stuff[i]->getName();
-    }
+    appendEquipmentName(eq, armor.stuff[i]);
   }
 
   lektor<Item *> weapons;
   inv->getEquippedWeapons(weapons);
   for (uint32_t i = 0; i < weapons.size(); ++i) {
-    if (weapons.stuff[i] && (uintptr_t)weapons.stuff[i] > 0x1000) {
-      if (!eq.empty())
-        eq += ", ";
-      eq += weapons.stuff[i]->getName();
-    }
+    appendEquipmentName(eq, weapons.stuff[i]);
   }
   return eq;
 }
