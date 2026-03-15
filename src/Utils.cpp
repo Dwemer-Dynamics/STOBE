@@ -22,6 +22,65 @@
 using namespace Stobe::UI;
 
 namespace {
+std::string TrimCopy(const std::string &value) {
+  if (value.empty()) {
+    return "";
+  }
+  size_t start = value.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) {
+    return "";
+  }
+  size_t end = value.find_last_not_of(" \t\r\n");
+  return value.substr(start, end - start + 1);
+}
+
+std::string ToLowerAsciiCopy(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+bool ShouldFilterChatEventLine(const std::string &type,
+                               const std::string &message) {
+  if (ToLowerAsciiCopy(TrimCopy(type)) != "chat") {
+    return false;
+  }
+
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(message));
+  while (!normalized.empty()) {
+    char tail = normalized[normalized.size() - 1];
+    if (tail == '.' || tail == '!' || tail == '?' || tail == ',' ||
+        tail == ';' || tail == ':') {
+      normalized.pop_back();
+      continue;
+    }
+    break;
+  }
+  normalized = TrimCopy(normalized);
+
+  if (normalized == "i can't afford that" || normalized == "i cant afford that") {
+    return true;
+  }
+
+  if (normalized.size() > 18) {
+    const std::string suffixA = ": i can't afford that";
+    const std::string suffixB = ": i cant afford that";
+    if (normalized.size() >= suffixA.size() &&
+        normalized.compare(normalized.size() - suffixA.size(), suffixA.size(),
+                           suffixA) == 0) {
+      return true;
+    }
+    if (normalized.size() >= suffixB.size() &&
+        normalized.compare(normalized.size() - suffixB.size(), suffixB.size(),
+                           suffixB) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 std::string GetExecutableDir() {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -888,6 +947,12 @@ void LogGameEvent(const std::string &type, const std::string &actor,
                   const std::string &targetFaction,
                   const std::string &message, unsigned int actorSerial,
                   unsigned int targetSerial) {
+  if (ShouldFilterChatEventLine(type, message)) {
+    Log("EVENT_STREAM: dropped filtered chat line actor=" + actor +
+        " message=" + message);
+    return;
+  }
+
   EnterCriticalSection(&g_eventMutex);
   GameEvent ev;
   ev.type = type;
