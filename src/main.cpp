@@ -561,6 +561,13 @@ static std::string SanitizeCapturedDialogueLine(std::string value) {
     return "";
   }
 
+  // Drop embedded NUL tails if engine-provided text contains binary remnants.
+  size_t nulPos = value.find('\0');
+  if (nulPos != std::string::npos) {
+    value = value.substr(0, nulPos);
+    value = TrimCopy(value);
+  }
+
   // Strip trailing " ??" corruption while preserving intentional single '?' usage.
   size_t suffixStart = value.find_last_not_of('?');
   if (suffixStart != std::string::npos && suffixStart + 1 < value.size()) {
@@ -571,6 +578,50 @@ static std::string SanitizeCapturedDialogueLine(std::string value) {
           std::isspace(static_cast<unsigned char>(prefix[prefix.size() - 1]))) {
         value = TrimCopy(prefix);
       }
+    }
+  }
+
+  // Strip garbage suffixes such as "...night6??х??????Ѽ?..."
+  // Keep this conservative: only trim when a trailing suspect run is long.
+  if (!value.empty()) {
+    size_t scan = value.size();
+    size_t suffixRun = 0;
+    size_t hardSuspectCount = 0;
+    bool seenSuspect = false;
+
+    while (scan > 0) {
+      const unsigned char ch = static_cast<unsigned char>(value[scan - 1]);
+      const bool isControl = (ch < 0x20 && ch != '\t' && ch != '\r' && ch != '\n');
+      const bool isNonAscii = (ch >= 0x80);
+      const bool isQuestion = (ch == '?');
+      const bool isSoftJoiner =
+          std::isspace(ch) || std::isdigit(ch) || ch == '=' || ch == '+' ||
+          ch == '-' || ch == '_' || ch == '.' || ch == ',' || ch == ':' ||
+          ch == ';' || ch == '!' || ch == ')' || ch == ']' || ch == '(' ||
+          ch == '[' || ch == '|' || ch == '\\' || ch == '/';
+
+      if (isControl || isNonAscii || isQuestion) {
+        seenSuspect = true;
+        ++suffixRun;
+        if (isControl || isNonAscii) {
+          ++hardSuspectCount;
+        }
+        --scan;
+        continue;
+      }
+
+      if (seenSuspect && isSoftJoiner) {
+        ++suffixRun;
+        --scan;
+        continue;
+      }
+
+      break;
+    }
+
+    if (seenSuspect && suffixRun >= 6 && hardSuspectCount >= 1 &&
+        scan < value.size()) {
+      value = TrimCopy(value.substr(0, scan));
     }
   }
 
