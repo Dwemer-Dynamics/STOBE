@@ -384,7 +384,8 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
         std::string pathUtf8 = ToUtf8(request.path);
         bool isImportRoute =
             PathContains(request.path, L"/StobeServer/npc_snapshot.php") ||
-            PathContains(request.path, L"/StobeServer/gamedata.php");
+            PathContains(request.path, L"/StobeServer/gamedata.php") ||
+            PathContains(request.path, L"/StobeServer/world_state.php");
         if (isImportRoute) {
           Log("NETWORK_TRACE: " + ToUtf8(request.method) + " " + pathUtf8 +
               " status=" + ToString((int)statusCode) +
@@ -554,6 +555,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
 
   if (endpoint == L"/gamedata") {
     request.path = L"/StobeServer/gamedata.php";
+    return request;
+  }
+
+  if (endpoint == L"/world_state") {
+    request.path = L"/StobeServer/world_state.php";
     return request;
   }
 

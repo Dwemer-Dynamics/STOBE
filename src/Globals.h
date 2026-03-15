@@ -141,6 +141,7 @@ extern CRITICAL_SECTION g_nameCheckMutex;
 extern std::set<unsigned int> g_renamedSerials;
 extern std::set<unsigned int> g_activatedAnimalSerials;
 extern DWORD g_lastContextPushTick;
+extern DWORD g_lastWorldStatePushTick;
 
 void MarkAnimalActivated(unsigned int serial);
 bool IsAnimalActivated(unsigned int serial);

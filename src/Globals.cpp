@@ -69,6 +69,7 @@ CRITICAL_SECTION g_nameCheckMutex;
 std::set<unsigned int> g_renamedSerials;
 std::set<unsigned int> g_activatedAnimalSerials;
 DWORD g_lastContextPushTick = 0;
+DWORD g_lastWorldStatePushTick = 0;
 
 GameWorld *GetWorldSafe() {
   if (!ppWorld) {
