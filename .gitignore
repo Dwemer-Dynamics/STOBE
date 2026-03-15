@@ -2,6 +2,8 @@ build/
 build-map/
 *.dll
 !mod/Stobe.dll
+!mod/Stobe.ini
+!mod/RE_Kenshi.json
 *.lib
 *.exp
 *.obj
@@ -12,6 +14,8 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 !mod/Stobe.mod
+!STOBE/Stobe.ini
+!STOBE/RE_Kenshi.json
 
 # Visual Studio / local IDE
 .vs/
