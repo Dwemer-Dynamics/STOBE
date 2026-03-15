@@ -107,6 +107,22 @@ bool IsUnknownToken(const std::string &value) {
          normalized == "null" || normalized == "n/a";
 }
 
+struct TraderInventoryCacheEntry {
+  std::string inventoryJson;
+  int itemCount;
+  DWORD capturedTick;
+};
+
+struct SimpleTraderInventoryItem {
+  std::string name;
+  std::string itemId;
+  int count;
+  int valueEach;
+};
+
+static std::map<unsigned int, TraderInventoryCacheEntry>
+    s_traderInventoryCacheBySerial;
+
 std::string UseObjectClassLabel(BuildingClassType classType) {
   switch (classType) {
   case BCTYPE_USABLE:
@@ -1319,11 +1335,9 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   return json;
 }
 
-void GetAllCharacterItems(Character *npc, std::vector<Item *> &outItems) {
-  if (!npc)
-    return;
-  Inventory *inv = npc->getInventory();
-  if (!inv)
+void GetAllInventoryItemsFromInventory(Inventory *inv,
+                                       std::vector<Item *> &outItems) {
+  if (!inv || (uintptr_t)inv <= 0x1000)
     return;
 
   lektor<InventorySection *> &sections = inv->sectionsInSearchOrder;
@@ -1338,23 +1352,150 @@ void GetAllCharacterItems(Character *npc, std::vector<Item *> &outItems) {
       }
     }
   }
+}
+
+void GetAllCharacterItems(Character *npc, std::vector<Item *> &outItems) {
+  if (!npc)
+    return;
+  Inventory *inv = npc->getInventory();
+  if (!inv)
+    return;
+
+  GetAllInventoryItemsFromInventory(inv, outItems);
 
   ContainerItem *backpack = npc->hasABackpackOn();
   if (backpack && backpack->inventory) {
-    lektor<InventorySection *> &bpSections =
-        backpack->inventory->sectionsInSearchOrder;
-    for (uint32_t s = 0; s < bpSections.size(); ++s) {
-      InventorySection *sect = bpSections[s];
-      if (sect) {
-        const Ogre::vector<InventorySection::SectionItem>::type &items =
-            sect->getItems();
-        for (uint32_t i = 0; i < items.size(); ++i) {
-          if (items[i].item)
-            outItems.push_back(items[i].item);
-        }
+    GetAllInventoryItemsFromInventory(backpack->inventory, outItems);
+  }
+}
+
+bool BuildInventorySnapshotFromInventory(Inventory *inv,
+                                         std::string &inventoryJsonOut,
+                                         int &itemCountOut) {
+  inventoryJsonOut = "[]";
+  itemCountOut = 0;
+  if (!inv || (uintptr_t)inv <= 0x1000) {
+    return false;
+  }
+
+  std::vector<Item *> rawItems;
+  try {
+    GetAllInventoryItemsFromInventory(inv, rawItems);
+  } catch (...) {
+    return false;
+  }
+  if (rawItems.size() > 600) {
+    rawItems.resize(600);
+  }
+
+  struct AggregatedInventoryItem {
+    std::string name;
+    std::string itemId;
+    std::string description;
+    int count;
+    int valueEach;
+  };
+
+  std::map<std::string, AggregatedInventoryItem> aggregated;
+  for (uint32_t i = 0; i < rawItems.size(); ++i) {
+    Item *item = rawItems[i];
+    if (!item || (uintptr_t)item <= 0x1000) {
+      continue;
+    }
+
+    std::string itemName = "";
+    std::string itemId = "";
+    std::string itemDescription = "";
+    int itemCount = 1;
+    int itemValueEach = 0;
+    try {
+      itemName = TrimCopy(item->getName());
+      if (item->data && (uintptr_t)item->data > 0x1000 &&
+          !item->data->stringID.empty()) {
+        itemId = TrimCopy(item->data->stringID);
+      }
+      if (item->data && (uintptr_t)item->data > 0x1000) {
+        itemDescription = ResolveItemDescription(item->data);
+      }
+      itemCount = item->quantity;
+      itemValueEach = item->getValueSingle(false);
+    } catch (...) {
+      continue;
+    }
+
+    if (itemName.empty()) {
+      continue;
+    }
+    if (itemCount <= 0) {
+      itemCount = 1;
+    }
+    if (itemValueEach < 0) {
+      itemValueEach = 0;
+    }
+
+    std::string key = itemId.empty() ? itemName : itemId;
+    for (size_t ci = 0; ci < key.length(); ++ci) {
+      key[ci] = static_cast<char>(tolower((unsigned char)key[ci]));
+    }
+
+    auto it = aggregated.find(key);
+    if (it == aggregated.end()) {
+      AggregatedInventoryItem entry;
+      entry.name = itemName;
+      entry.itemId = itemId;
+      entry.description = itemDescription;
+      entry.count = itemCount;
+      entry.valueEach = itemValueEach;
+      aggregated[key] = entry;
+    } else {
+      it->second.count += itemCount;
+      if (it->second.itemId.empty() && !itemId.empty()) {
+        it->second.itemId = itemId;
+      }
+      if (it->second.description.empty() && !itemDescription.empty()) {
+        it->second.description = itemDescription;
+      }
+      if (it->second.valueEach <= 0 && itemValueEach > 0) {
+        it->second.valueEach = itemValueEach;
       }
     }
   }
+
+  if (aggregated.empty()) {
+    return true;
+  }
+
+  std::string json = "[";
+  int outputCount = 0;
+  for (auto it = aggregated.begin(); it != aggregated.end(); ++it) {
+    const AggregatedInventoryItem &entry = it->second;
+    if (outputCount > 0) {
+      json += ",";
+    }
+    json += "{\"name\":\"" + EscapeJSON(entry.name) + "\",";
+    json += "\"count\":" + ToString(entry.count) + ",";
+    json += "\"equipped\":false";
+    if (!entry.itemId.empty()) {
+      json += ",\"item_id\":\"" + EscapeJSON(entry.itemId) + "\"";
+    }
+    if (!entry.description.empty()) {
+      json += ",\"description\":\"" + EscapeJSON(entry.description) + "\"";
+    }
+    if (entry.valueEach > 0) {
+      json += ",\"value_each\":" + ToString(entry.valueEach);
+    }
+    json += "}";
+
+    ++outputCount;
+    if (outputCount >= 120) {
+      break;
+    }
+  }
+  json += "]";
+
+  inventoryJsonOut = json;
+  itemCountOut = outputCount;
+  return true;
 }
 
 bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
@@ -1614,6 +1755,298 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
   inventoryHashOut = hash;
   itemCountOut = outputCount;
   return true;
+}
+
+bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world <= 0x1000) {
+    return false;
+  }
+
+  bool worldLoadingFromSave = true;
+  try {
+    worldLoadingFromSave = world->isLoadingFromASaveGame();
+  } catch (...) {
+    worldLoadingFromSave = true;
+  }
+  if (worldLoadingFromSave) {
+    return false;
+  }
+
+  unsigned int npcSerial = 0;
+  try {
+    npcSerial = npc->getHandle().serial;
+  } catch (...) {
+    npcSerial = 0;
+  }
+  if (npcSerial == 0) {
+    return false;
+  }
+
+  const hand &npcIndoorsHandle = npc->isIndoors();
+  bool npcIsIndoors = IsIndoorsHandleValid(npcIndoorsHandle);
+  unsigned int npcBuildingSerial = npcIsIndoors ? npcIndoorsHandle.serial : 0;
+
+  std::map<std::string, SimpleTraderInventoryItem> aggregated;
+
+  auto lowerAscii = [](const std::string &value) -> std::string {
+    std::string lowered = value;
+    for (size_t i = 0; i < lowered.length(); ++i) {
+      lowered[i] = static_cast<char>(std::tolower((unsigned char)lowered[i]));
+    }
+    return lowered;
+  };
+
+  auto mergeInventory = [&](Inventory *inventory) {
+    if (!inventory || (uintptr_t)inventory <= 0x1000) {
+      return;
+    }
+    std::vector<Item *> rawItems;
+    try {
+      GetAllInventoryItemsFromInventory(inventory, rawItems);
+    } catch (...) {
+      rawItems.clear();
+    }
+    if (rawItems.size() > 600) {
+      rawItems.resize(600);
+    }
+    for (uint32_t i = 0; i < rawItems.size(); ++i) {
+      Item *item = rawItems[i];
+      if (!item || (uintptr_t)item <= 0x1000) {
+        continue;
+      }
+
+      std::string itemName = "";
+      std::string itemId = "";
+      int itemCount = 1;
+      int itemValueEach = 0;
+      try {
+        itemName = TrimCopy(item->getName());
+        if (item->data && (uintptr_t)item->data > 0x1000 &&
+            !item->data->stringID.empty()) {
+          itemId = TrimCopy(item->data->stringID);
+        }
+        itemCount = item->quantity;
+        itemValueEach = item->getValueSingle(false);
+      } catch (...) {
+        continue;
+      }
+      if (itemName.empty()) {
+        continue;
+      }
+      if (itemCount <= 0) {
+        itemCount = 1;
+      }
+      if (itemValueEach < 0) {
+        itemValueEach = 0;
+      }
+
+      std::string key = itemId.empty() ? itemName : itemId;
+      key = lowerAscii(key);
+      auto it = aggregated.find(key);
+      if (it == aggregated.end()) {
+        SimpleTraderInventoryItem entry;
+        entry.name = itemName;
+        entry.itemId = itemId;
+        entry.count = itemCount;
+        entry.valueEach = itemValueEach;
+        aggregated[key] = entry;
+      } else {
+        it->second.count += itemCount;
+        if (it->second.itemId.empty() && !itemId.empty()) {
+          it->second.itemId = itemId;
+        }
+        if (it->second.valueEach <= 0 && itemValueEach > 0) {
+          it->second.valueEach = itemValueEach;
+        }
+      }
+      if (aggregated.size() >= 320) {
+        break;
+      }
+    }
+  };
+
+  lektor<RootObject *> nearbyBuildings;
+  try {
+    world->getObjectsWithinSphere(nearbyBuildings, npc->getPosition(), 120.0f,
+                                  BUILDING, 96, (RootObject *)npc);
+  } catch (...) {
+    nearbyBuildings.clear();
+  }
+
+  std::map<unsigned int, bool> seenBuildingSerials;
+  for (uint32_t i = 0; i < nearbyBuildings.size(); ++i) {
+    Building *building = (Building *)nearbyBuildings.stuff[i];
+    if (!building || (uintptr_t)building <= 0x1000) {
+      continue;
+    }
+
+    unsigned int buildingSerial = 0;
+    try {
+      buildingSerial = building->getHandle().serial;
+    } catch (...) {
+      buildingSerial = 0;
+    }
+    if (buildingSerial == 0) {
+      continue;
+    }
+    if (seenBuildingSerials.count(buildingSerial) > 0) {
+      continue;
+    }
+    seenBuildingSerials[buildingSerial] = true;
+
+    bool sameIndoorShell = true;
+    if (npcIsIndoors) {
+      sameIndoorShell = (buildingSerial == npcBuildingSerial);
+      try {
+        const hand &buildingIndoors = building->isIndoors();
+        if (!sameIndoorShell && IsIndoorsHandleValid(buildingIndoors) &&
+            buildingIndoors.serial == npcBuildingSerial) {
+          sameIndoorShell = true;
+        }
+      } catch (...) {
+      }
+      if (!sameIndoorShell) {
+        continue;
+      }
+    }
+
+    BuildingFunction functionType = BF_ANY;
+    BuildingClassType classType = BCTYPE_FLUFF;
+    try {
+      functionType = building->_NV_getSpecialFunction();
+    } catch (...) {
+      functionType = BF_ANY;
+    }
+    try {
+      classType = building->_NV_getBuildingClass();
+    } catch (...) {
+      classType = BCTYPE_FLUFF;
+    }
+    std::string buildingName = "";
+    try {
+      buildingName = TrimCopy(building->getName());
+    } catch (...) {
+      buildingName = "";
+    }
+    std::string buildingNameLower = lowerAscii(buildingName);
+    bool likelyStorageByName =
+        buildingNameLower.find("shop") != std::string::npos ||
+        buildingNameLower.find("counter") != std::string::npos ||
+        buildingNameLower.find("barrel") != std::string::npos ||
+        buildingNameLower.find("chest") != std::string::npos ||
+        buildingNameLower.find("storage") != std::string::npos ||
+        buildingNameLower.find("cabinet") != std::string::npos ||
+        buildingNameLower.find("shelf") != std::string::npos ||
+        buildingNameLower.find("basket") != std::string::npos;
+    bool likelyStorage =
+        functionType == BF_SHOP ||
+        functionType == BF_GENERAL_STORAGE ||
+        functionType == BF_RESOURCE_STORAGE || classType == BCTYPE_STORAGE ||
+        classType == BCTYPE_PRODUCTION || classType == BCTYPE_CRAFTING ||
+        classType == BCTYPE_USABLE || likelyStorageByName;
+    if (!likelyStorage) {
+      continue;
+    }
+
+    Inventory *buildingInventory = nullptr;
+    try {
+      buildingInventory = building->getInventory();
+    } catch (...) {
+      buildingInventory = nullptr;
+    }
+    mergeInventory(buildingInventory);
+    if (aggregated.size() >= 320) {
+      break;
+    }
+  }
+
+  if (aggregated.empty()) {
+    try {
+      mergeInventory(npc->getInventory());
+      ContainerItem *backpack = npc->hasABackpackOn();
+      if (backpack && backpack->inventory) {
+        mergeInventory(backpack->inventory);
+      }
+    } catch (...) {
+    }
+  }
+
+  std::string inventoryJson = "[";
+  int inventoryCount = 0;
+  for (auto it = aggregated.begin(); it != aggregated.end(); ++it) {
+    const SimpleTraderInventoryItem &entry = it->second;
+    if (inventoryCount > 0) {
+      inventoryJson += ",";
+    }
+    inventoryJson += "{\"name\":\"" + EscapeJSON(entry.name) + "\",";
+    inventoryJson += "\"count\":" + ToString(entry.count);
+    if (!entry.itemId.empty()) {
+      inventoryJson += ",\"item_id\":\"" + EscapeJSON(entry.itemId) + "\"";
+    }
+    if (entry.valueEach > 0) {
+      inventoryJson += ",\"value_each\":" + ToString(entry.valueEach);
+    }
+    inventoryJson += "}";
+    inventoryCount += 1;
+    if (inventoryCount >= 260) {
+      break;
+    }
+  }
+  inventoryJson += "]";
+
+  EnterCriticalSection(&g_stateMutex);
+  TraderInventoryCacheEntry &cache = s_traderInventoryCacheBySerial[npcSerial];
+  cache.inventoryJson = inventoryJson;
+  cache.itemCount = inventoryCount;
+  cache.capturedTick = GetTickCount();
+  LeaveCriticalSection(&g_stateMutex);
+
+  Log("TRADER_INVENTORY_CAPTURE: npc=" + npc->getName() +
+      " serial=" + ToString((int)npcSerial) +
+      " items=" + ToString(inventoryCount) + " reason=" + reason);
+  return inventoryCount > 0;
+}
+
+bool GetCachedTraderInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
+                                      int &itemCountOut, int *ageSecondsOut) {
+  inventoryJsonOut = "[]";
+  itemCountOut = 0;
+  if (ageSecondsOut) {
+    *ageSecondsOut = -1;
+  }
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  unsigned int npcSerial = 0;
+  try {
+    npcSerial = npc->getHandle().serial;
+  } catch (...) {
+    npcSerial = 0;
+  }
+  if (npcSerial == 0) {
+    return false;
+  }
+
+  EnterCriticalSection(&g_stateMutex);
+  auto it = s_traderInventoryCacheBySerial.find(npcSerial);
+  if (it != s_traderInventoryCacheBySerial.end()) {
+    inventoryJsonOut = it->second.inventoryJson;
+    itemCountOut = it->second.itemCount;
+    if (ageSecondsOut) {
+      DWORD nowTick = GetTickCount();
+      *ageSecondsOut = (int)((nowTick - it->second.capturedTick) / 1000);
+    }
+    LeaveCriticalSection(&g_stateMutex);
+    return itemCountOut > 0;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return false;
 }
 
 static std::string GetHealthStatus(Character *npc) {
@@ -2062,6 +2495,20 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   if (town) {
     townName = ((RootObjectBase *)town)->getName();
     zoneName = ResolveTownZoneName(town);
+  }
+
+  std::string cachedTraderInventoryJson = "[]";
+  int cachedTraderInventoryCount = 0;
+  int cachedTraderInventoryAgeSeconds = -1;
+  if (GetCachedTraderInventorySnapshot(npc, cachedTraderInventoryJson,
+                                       cachedTraderInventoryCount,
+                                       &cachedTraderInventoryAgeSeconds) &&
+      cachedTraderInventoryCount > 0) {
+    json += "\"trader_inventory_items\":" + cachedTraderInventoryJson + ",";
+    json += "\"trader_inventory_item_count\":" +
+            ToString(cachedTraderInventoryCount) + ",";
+    json += "\"trader_inventory_age_seconds\":" +
+            ToString(cachedTraderInventoryAgeSeconds) + ",";
   }
 
   if (world) {

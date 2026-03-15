@@ -118,6 +118,31 @@ static bool ContainsAsciiInsensitive(const std::string &value,
          std::string::npos;
 }
 
+static bool IsLikelyTradeDialogueReply(const std::string &line) {
+  std::string trimmed = line;
+  size_t first = trimmed.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return false;
+  }
+  size_t last = trimmed.find_last_not_of(" \t\r\n");
+  trimmed = trimmed.substr(first, last - first + 1);
+  std::string lowered = ToLowerAsciiCopy(trimmed);
+  if (lowered.empty()) {
+    return false;
+  }
+  if (lowered.find("trade") != std::string::npos ||
+      lowered.find("shop") != std::string::npos ||
+      lowered.find("buy") != std::string::npos ||
+      lowered.find("sell") != std::string::npos ||
+      lowered.find("wares") != std::string::npos ||
+      lowered.find("goods") != std::string::npos ||
+      lowered.find("show me what you have") != std::string::npos ||
+      lowered.find("show me your goods") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
 static bool DirectoryExists(const std::string &path) {
   DWORD attrs = GetFileAttributesA(path.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -1380,6 +1405,42 @@ static bool SyncInventoryForCharacter(Character *npc, bool force,
       " hash=" + ShortInventoryHashForLog(inventoryHash) +
       " items=" + ToString(inventoryItemCount));
   return true;
+}
+
+static void PushImmediateContextSnapshot(Character *npc,
+                                         const std::string &reason,
+                                         bool synchronous) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return;
+  }
+
+  std::string contextType = "npc";
+  std::string npcName = "Unknown";
+  try {
+    if (npc->isPlayerCharacter()) {
+      contextType = "player";
+    }
+    npcName = npc->getName();
+  } catch (...) {
+  }
+
+  std::string contextJson = BuildNpcContextEnvelope(npc, contextType);
+  if (contextJson.empty() || contextJson.front() != '{' ||
+      contextJson.back() != '}') {
+    Log("CONTEXT_PUSH: skipped invalid immediate snapshot reason=" + reason +
+        " name=" + npcName);
+    return;
+  }
+
+  if (synchronous) {
+    PostToStobe(L"/context", contextJson);
+  } else {
+    AsyncPostToStobe(L"/context", contextJson);
+  }
+  Log("CONTEXT_PUSH: sent immediate snapshot reason=" + reason +
+      " name=" + npcName + " type=" + contextType +
+      " len=" + ToString((int)contextJson.length()) +
+      " sync=" + std::string(synchronous ? "1" : "0"));
 }
 
 static void PruneInventorySyncState() {
@@ -4089,6 +4150,11 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 ToString(catsAmount) + " target='" + catsTargetToken +
                 "' target_serial=" + ToString((unsigned int)catsTarget.serial));
           } else if (actionCommand == "GIVE_CATS") {
+            if (!actionActorIsPlayerFaction) {
+              Log("HOOK_MSG_PROC: GIVE_CATS ignored; non-player-faction actor '" +
+                  actionActorName + "' serial=" + ToString(actionActorSerial));
+              continue;
+            }
             std::string catsTargetToken = "";
             int catsAmount = 0;
             if (!parseCatsPayload(actionArgument, catsTargetToken, catsAmount)) {
@@ -4789,6 +4855,41 @@ static void CapturePlayerDialogueReplyFromUi(Dialogue *dialogue,
     listenerName = ResolveCharacterNameSafe(listener);
     listenerFaction = SafeFaction(listener);
     listenerSerial = ResolveCharacterSerialForEvent(listener);
+  }
+
+  bool listenerIsPlayerCharacter = false;
+  if (listener && (uintptr_t)listener > 0x1000) {
+    try {
+      listenerIsPlayerCharacter = listener->isPlayerCharacter();
+    } catch (...) {
+      listenerIsPlayerCharacter = false;
+    }
+  }
+
+  bool listenerIsTrader = false;
+  if (listener && (uintptr_t)listener > 0x1000 && !listenerIsPlayerCharacter) {
+    try {
+      listenerIsTrader = listener->isATrader();
+    } catch (...) {
+      listenerIsTrader = false;
+    }
+  }
+
+  bool likelyTradeReply = IsLikelyTradeDialogueReply(line);
+  if (listener && (uintptr_t)listener > 0x1000 && !listenerIsPlayerCharacter &&
+      (likelyTradeReply || listenerIsTrader)) {
+    bool capturedTraderInventory =
+        CaptureTraderInventorySnapshot(listener, "dialogue_reply_trade");
+    Log("TRADER_INVENTORY_CAPTURE: reply-triggered listener=" +
+        ResolveCharacterNameSafe(listener) + " serial=" +
+        ToString(listenerSerial) +
+        " success=" + std::string(capturedTraderInventory ? "1" : "0") +
+        " reason=" +
+        std::string(likelyTradeReply ? "trade_reply" : "listener_is_trader"));
+    if (capturedTraderInventory) {
+      PushImmediateContextSnapshot(listener, "dialogue_reply_trade_capture",
+                                   true);
+    }
   }
 
   LogGameEvent("chat", ResolveCharacterNameSafe(speaker), SafeFaction(speaker),

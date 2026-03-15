@@ -37,6 +37,7 @@
 std::string TrimCopySimple(const std::string &value);
 void ApplyDrunkKnockoutPulse(Character *npc);
 int ResolveCurrentGameTimestampSeconds(GameWorld *world);
+std::string SafeBuildingName(Building *building);
 
 const int kDrunkLevelDurationSeconds = 5 * 60 * 60;
 const int kDrunkPassoutDurationSeconds = 2 * 60 * 60;
@@ -987,6 +988,216 @@ std::string NormalizeInventoryMatchToken(const std::string &value) {
     out.pop_back();
   }
   return out;
+}
+
+bool IsLikelyTraderStorageBuilding(Building *building) {
+  if (!building || (uintptr_t)building <= 0x1000) {
+    return false;
+  }
+
+  BuildingFunction functionType = BF_ANY;
+  BuildingClassType classType = BCTYPE_FLUFF;
+  try {
+    functionType = building->_NV_getSpecialFunction();
+  } catch (...) {
+    functionType = BF_ANY;
+  }
+  try {
+    classType = building->_NV_getBuildingClass();
+  } catch (...) {
+    classType = BCTYPE_FLUFF;
+  }
+
+  std::string buildingNameLower = ToLowerCopy(SafeBuildingName(building));
+  bool likelyStorageByName =
+      buildingNameLower.find("shop") != std::string::npos ||
+      buildingNameLower.find("counter") != std::string::npos ||
+      buildingNameLower.find("barrel") != std::string::npos ||
+      buildingNameLower.find("chest") != std::string::npos ||
+      buildingNameLower.find("storage") != std::string::npos ||
+      buildingNameLower.find("cabinet") != std::string::npos ||
+      buildingNameLower.find("shelf") != std::string::npos ||
+      buildingNameLower.find("basket") != std::string::npos;
+
+  return functionType == BF_SHOP || functionType == BF_GENERAL_STORAGE ||
+         functionType == BF_RESOURCE_STORAGE || classType == BCTYPE_STORAGE ||
+         classType == BCTYPE_PRODUCTION || classType == BCTYPE_CRAFTING ||
+         classType == BCTYPE_USABLE || likelyStorageByName;
+}
+
+bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
+                                         Character *recipient,
+                                         const std::string &queryToken,
+                                         std::string &itemNameOut) {
+  itemNameOut.clear();
+  if (!sourceInventory || (uintptr_t)sourceInventory <= 0x1000 || !recipient ||
+      (uintptr_t)recipient <= 0x1000 || queryToken.empty()) {
+    return false;
+  }
+
+  std::vector<Item *> items;
+  try {
+    GetAllInventoryItemsFromInventory(sourceInventory, items);
+  } catch (...) {
+    items.clear();
+  }
+  if (items.size() > 600) {
+    items.resize(600);
+  }
+
+  for (size_t i = 0; i < items.size(); ++i) {
+    Item *item = items[i];
+    if (!item || (uintptr_t)item <= 0x1000) {
+      continue;
+    }
+
+    std::string itemName = "";
+    try {
+      itemName = item->getName();
+    } catch (...) {
+      itemName = "";
+    }
+    if (itemName.empty()) {
+      continue;
+    }
+
+    std::string itemToken = NormalizeInventoryMatchToken(itemName);
+    if (itemToken.empty()) {
+      continue;
+    }
+    bool queryMatches = itemToken.find(queryToken) != std::string::npos ||
+                        queryToken.find(itemToken) != std::string::npos;
+    if (!queryMatches) {
+      continue;
+    }
+
+    Inventory *itemInventory = nullptr;
+    try {
+      itemInventory = item->getInventory();
+    } catch (...) {
+      itemInventory = nullptr;
+    }
+    if (!itemInventory) {
+      itemInventory = sourceInventory;
+    }
+
+    Item *detached = nullptr;
+    try {
+      detached = itemInventory ? itemInventory->removeItemDontDestroy_returnsItem(
+                                    item, item->quantity, false)
+                              : nullptr;
+    } catch (...) {
+      detached = nullptr;
+    }
+
+    try {
+      recipient->giveItem(detached ? detached : item, true, false);
+    } catch (...) {
+      return false;
+    }
+
+    itemNameOut = itemName;
+    return true;
+  }
+
+  return false;
+}
+
+bool TryTransferItemFromNearbyTraderStorage(Character *npc, Character *recipient,
+                                            const std::string &rawQuery,
+                                            std::string &itemNameOut,
+                                            std::string &sourceNameOut) {
+  itemNameOut.clear();
+  sourceNameOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000 || !recipient ||
+      (uintptr_t)recipient <= 0x1000) {
+    return false;
+  }
+
+  std::string queryToken = NormalizeInventoryMatchToken(rawQuery);
+  if (queryToken.empty()) {
+    return false;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world <= 0x1000) {
+    return false;
+  }
+
+  bool npcIsIndoors = false;
+  unsigned int npcIndoorSerial = 0;
+  try {
+    const hand &indoorsHandle = npc->isIndoors();
+    npcIsIndoors = indoorsHandle.isValid();
+    npcIndoorSerial = npcIsIndoors ? indoorsHandle.serial : 0;
+  } catch (...) {
+    npcIsIndoors = false;
+    npcIndoorSerial = 0;
+  }
+
+  lektor<RootObject *> nearbyBuildings;
+  try {
+    world->getObjectsWithinSphere(nearbyBuildings, npc->getPosition(), 120.0f,
+                                  BUILDING, 96, (RootObject *)npc);
+  } catch (...) {
+    nearbyBuildings.clear();
+  }
+
+  std::map<unsigned int, bool> seenSerials;
+  for (uint32_t i = 0; i < nearbyBuildings.size(); ++i) {
+    Building *building = (Building *)nearbyBuildings.stuff[i];
+    if (!building || (uintptr_t)building <= 0x1000) {
+      continue;
+    }
+
+    unsigned int buildingSerial = 0;
+    try {
+      buildingSerial = building->getHandle().serial;
+    } catch (...) {
+      buildingSerial = 0;
+    }
+    if (buildingSerial == 0 || seenSerials.count(buildingSerial) > 0) {
+      continue;
+    }
+    seenSerials[buildingSerial] = true;
+
+    if (npcIsIndoors) {
+      bool sameIndoorShell = (buildingSerial == npcIndoorSerial);
+      try {
+        const hand &buildingIndoors = building->isIndoors();
+        if (!sameIndoorShell && buildingIndoors.isValid() &&
+            buildingIndoors.serial == npcIndoorSerial) {
+          sameIndoorShell = true;
+        }
+      } catch (...) {
+      }
+      if (!sameIndoorShell) {
+        continue;
+      }
+    }
+
+    if (!IsLikelyTraderStorageBuilding(building)) {
+      continue;
+    }
+
+    Inventory *buildingInventory = nullptr;
+    try {
+      buildingInventory = building->getInventory();
+    } catch (...) {
+      buildingInventory = nullptr;
+    }
+    if (!buildingInventory || (uintptr_t)buildingInventory <= 0x1000) {
+      continue;
+    }
+
+    if (TryTransferItemFromInventoryByQuery(buildingInventory, recipient, queryToken,
+                                            itemNameOut)) {
+      sourceNameOut = SafeBuildingName(building);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 std::string CanonicalDrinkLabelFromToken(const std::string &token) {
@@ -3521,6 +3732,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           }
           std::transform(itemQuery.begin(), itemQuery.end(), itemQuery.begin(),
                          ::tolower);
+          const std::string itemQueryToken =
+              NormalizeInventoryMatchToken(itemQuery);
 
           Character *primaryPlayer =
               (thisptr->player && thisptr->player->playerCharacters.size() > 0)
@@ -3536,7 +3749,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           } else if (recipient == npc) {
             Log("ACTION_EXEC: GIVE_ITEM blocked actor=" + SafeCharacterName(npc) +
                 " reason=self_transfer");
-          } else if (itemQuery.empty()) {
+          } else if (itemQuery.empty() || itemQueryToken.empty()) {
             thisptr->showPlayerAMessage_withLog(
                 SafeCharacterName(npc) + " could not parse an item to give.",
                 true);
@@ -3546,9 +3759,14 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             bool itemTransferred = false;
             for (uint32_t i = 0; i < items.size(); ++i) {
               std::string itemName = items[i]->getName();
-              std::transform(itemName.begin(), itemName.end(), itemName.begin(),
-                             ::tolower);
-              if (itemName.find(itemQuery) != std::string::npos) {
+              std::string itemToken = NormalizeInventoryMatchToken(itemName);
+              if (itemToken.empty()) {
+                continue;
+              }
+              bool queryMatches =
+                  itemToken.find(itemQueryToken) != std::string::npos ||
+                  itemQueryToken.find(itemToken) != std::string::npos;
+              if (queryMatches) {
                 Log("ACTION_EXEC: Giving item: " + items[i]->getName());
                 if (items[i]->isEquipped)
                   npc->unequipItem(items[i]->inventorySection, items[i]);
@@ -3573,6 +3791,52 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 inventoryTimer = 999;
                 itemTransferred = true;
                 break;
+              }
+            }
+            if (!itemTransferred) {
+              bool actorIsTrader = false;
+              try {
+                actorIsTrader = npc->isATrader();
+              } catch (...) {
+                actorIsTrader = false;
+              }
+              std::string cachedTraderInventoryJson = "";
+              int cachedTraderInventoryCount = 0;
+              int cachedTraderInventoryAgeSeconds = -1;
+              bool hasCachedTraderInventory = GetCachedTraderInventorySnapshot(
+                  npc, cachedTraderInventoryJson, cachedTraderInventoryCount,
+                  &cachedTraderInventoryAgeSeconds);
+              if (actorIsTrader || hasCachedTraderInventory) {
+                std::string storageItemName = "";
+                std::string storageSourceName = "";
+                bool storageTransferred = TryTransferItemFromNearbyTraderStorage(
+                    npc, recipient, itemQueryToken, storageItemName,
+                    storageSourceName);
+                if (storageTransferred) {
+                  const std::string givenItemName =
+                      storageItemName.empty() ? act.message : storageItemName;
+                  const std::string sourceLabel = storageSourceName.empty()
+                                                      ? "shop storage"
+                                                      : storageSourceName;
+                  thisptr->showPlayerAMessage_withLog(
+                      SafeCharacterName(npc) + " gave " + givenItemName +
+                          " from " + sourceLabel + ".",
+                      true);
+                  Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
+                      " recipient=" + SafeCharacterName(recipient) +
+                      " source=" + sourceLabel + " item='" + givenItemName +
+                      "' path=trader_storage");
+                  npc->reThinkCurrentAIAction();
+                  inventoryTimer = 999;
+                  itemTransferred = true;
+                } else {
+                  Log("ACTION_EXEC: GIVE_ITEM trader storage miss actor=" +
+                      SafeCharacterName(npc) + " query='" + act.message +
+                      "' is_trader=" + (actorIsTrader ? "1" : "0") +
+                      " cached_items=" + ToString(cachedTraderInventoryCount) +
+                      " cache_age_s=" +
+                      ToString(cachedTraderInventoryAgeSeconds));
+                }
               }
             }
             if (!itemTransferred) {
