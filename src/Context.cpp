@@ -1868,10 +1868,21 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   std::string drunkStatus = "sober";
   GetCharacterDrunkPromptState(npc, drunkLevel, isDrunk, drunkStatus,
                                drunkSecondsRemaining);
+  bool isHigh = false;
+  int highSecondsRemaining = 0;
+  float highHungerRateMultiplier = 1.0f;
+  std::string highStatus = "sober";
+  GetCharacterDrugPromptState(npc, isHigh, highStatus, highSecondsRemaining,
+                              highHungerRateMultiplier);
   json += "\"drunk_level\": " + ToString(drunkLevel) + ",";
   json += "\"is_drunk\": " + std::string(isDrunk ? "true" : "false") + ",";
   json += "\"drunk_status\": \"" + EscapeJSON(drunkStatus) + "\",";
   json += "\"drunk_seconds_remaining\": " + ToString(drunkSecondsRemaining) + ",";
+  json += "\"is_high\": " + std::string(isHigh ? "true" : "false") + ",";
+  json += "\"high_status\": \"" + EscapeJSON(highStatus) + "\",";
+  json += "\"high_seconds_remaining\": " + ToString(highSecondsRemaining) + ",";
+  json += "\"high_hunger_rate_multiplier\": " +
+          ToString(highHungerRateMultiplier) + ",";
 
   ActivitySnapshot activity;
   CaptureActivitySnapshot(npc, charState, activity);
@@ -2200,6 +2211,13 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         std::string oDrunkStatus = "sober";
         GetCharacterDrunkPromptState(other, oDrunkLevel, oIsDrunk, oDrunkStatus,
                                      oDrunkSecondsRemaining);
+        bool oIsHigh = false;
+        int oHighSecondsRemaining = 0;
+        float oHighHungerRateMultiplier = 1.0f;
+        std::string oHighStatus = "sober";
+        GetCharacterDrugPromptState(other, oIsHigh, oHighStatus,
+                                    oHighSecondsRemaining,
+                                    oHighHungerRateMultiplier);
 
         json += "{\"name\":\"" + EscapeJSON(o_name) + "\",";
         json += "\"race\":\"" + EscapeJSON(o_rn) + "\",";
@@ -2241,6 +2259,12 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         json += "\"drunk_status\": \"" + EscapeJSON(oDrunkStatus) + "\",";
         json += "\"drunk_seconds_remaining\": " +
                 ToString(oDrunkSecondsRemaining) + ",";
+        json += "\"is_high\": " + std::string(oIsHigh ? "true" : "false") + ",";
+        json += "\"high_status\": \"" + EscapeJSON(oHighStatus) + "\",";
+        json += "\"high_seconds_remaining\": " +
+                ToString(oHighSecondsRemaining) + ",";
+        json += "\"high_hunger_rate_multiplier\": " +
+                ToString(oHighHungerRateMultiplier) + ",";
         json += "\"storage_id\":\"" + EscapeJSON(o_sid) + "\",";
         json += "\"indoors\": " +
                 std::string(otherIsIndoors ? "true" : "false") + ",";

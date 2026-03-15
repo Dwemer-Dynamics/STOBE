@@ -58,7 +58,8 @@ enum ManualChatActionType {
   MANUAL_CHAT_ACTION_GIVE_CATS = 2,
   MANUAL_CHAT_ACTION_GIVE_ITEM = 3,
   MANUAL_CHAT_ACTION_ROLEPLAY_ACTION = 4,
-  MANUAL_CHAT_ACTION_DRINK_ITEM = 5
+  MANUAL_CHAT_ACTION_DRINK_ITEM = 5,
+  MANUAL_CHAT_ACTION_USE_DRUGS = 6
 };
 
 struct ManualChatActionChoice {
@@ -75,6 +76,7 @@ const ManualChatActionChoice kManualChatActionChoices[] = {
     {MANUAL_CHAT_ACTION_GIVE_ITEM, "give item", "", "", false},
     {MANUAL_CHAT_ACTION_ROLEPLAY_ACTION, "roleplay action", "", "", false},
     {MANUAL_CHAT_ACTION_DRINK_ITEM, "drink item", "", "", false},
+    {MANUAL_CHAT_ACTION_USE_DRUGS, "use drugs", "", "", false},
     {MANUAL_CHAT_ACTION_REMOVE_LIMB, "remove left arm (hacksaw)",
      "remove_limb_left_arm", "LEFT_ARM", false},
     {MANUAL_CHAT_ACTION_REMOVE_LIMB, "remove right arm (hacksaw)",
@@ -183,6 +185,14 @@ std::string BuildManualDrinkItemActionToken(const std::string &itemName) {
     return "";
   }
   return "DRINK_ITEM@" + normalizedItem;
+}
+
+std::string BuildManualUseDrugsActionToken(const std::string &itemName) {
+  std::string normalizedItem = TrimManualActionArg(itemName);
+  if (normalizedItem.empty()) {
+    return "";
+  }
+  return "USE_DRUGS@" + normalizedItem;
 }
 
 bool TryParseActionAmount(const std::string &rawValue, int &amountOut) {
@@ -1417,6 +1427,7 @@ void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
       "RELEASE_PRISONER",
       "GIVE_CATS",        "TAKE_CATS",     "TAKE_ITEM",        "GIVE_ITEM",
       "DROP_ITEM",        "DRINK_ITEM",    "DRINKITEM",        "DRINK-ITEM",
+      "USE_DRUGS",        "USEDRUGS",      "USE-DRUGS",
       "ROLEPLAY_ACTION",  "ROLEPLAYACTION","ROLEPLAY-ACTION",
       "NOTIFY",           "FACTION_RELATIONS","TRAVEL_LOCATION",
       "TRAVELLOCATION",   "USE_OBJECT",    "USEOBJECT",
@@ -2104,6 +2115,47 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       manualActionCommand = BuildManualDrinkItemActionToken(matchedDrinkItemName);
       if (manualActionCommand.empty()) {
         manualActionPromptSkipReason = "invalid_action_token";
+      }
+    } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_USE_DRUGS) {
+      if (manualActionTextArg.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Provide a drug item name.", true);
+        }
+        Log("CHAT_GATE: blocked manual use drugs missing item name");
+        return;
+      }
+      if (IsCharacterSkeletonRace(player)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Skeleton race cannot use drugs.", true);
+        }
+        Log("CHAT_GATE: blocked manual use drugs reason=skeleton_race actor='" +
+            playerName + "'");
+        return;
+      }
+      std::string matchedDrugItemName = "";
+      if (!ResolveCharacterDrugItemMatch(player, manualActionTextArg,
+                                         matchedDrugItemName)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Drug item must be Hashish in speaker "
+              "inventory/equipment.",
+              true);
+        }
+        Log("CHAT_GATE: blocked manual use drugs no_inventory_match query='" +
+            manualActionTextArg + "' actor='" + playerName + "'");
+        return;
+      }
+      manualActionCommand = BuildManualUseDrugsActionToken(matchedDrugItemName);
+      if (manualActionCommand.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not build use-drugs action.", true);
+        }
+        Log("CHAT_GATE: blocked manual use drugs invalid_action_token actor='" +
+            playerName + "'");
+        return;
       }
     } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_ROLEPLAY_ACTION) {
       if (manualActionTextArg.empty()) {

@@ -3395,6 +3395,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } else if (actionCommand == "DRINKITEM" ||
                      actionCommand == "DRINK-ITEM") {
             actionCommand = "DRINK_ITEM";
+          } else if (actionCommand == "USEDRUGS" ||
+                     actionCommand == "USE-DRUGS") {
+            actionCommand = "USE_DRUGS";
           } else if (actionCommand == "REMOVELIMB") {
             actionCommand = "REMOVE_LIMB";
           } else if (actionCommand == "TRAVELLOCATION" ||
@@ -3972,6 +3975,25 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             Log("HOOK_MSG_PROC: DRINK_ITEM queued actor_serial=" +
                 ToString((unsigned int)targetHand.serial) + " item='" +
                 drinkItemName + "'");
+          } else if (actionCommand == "USE_DRUGS") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string drugItemName = TrimCopy(actionArgument);
+            if (drugItemName.empty()) {
+              Log("HOOK_MSG_PROC: USE_DRUGS ignored; empty item payload");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_USE_DRUGS;
+            act.actor = targetHand;
+            act.message = drugItemName;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: USE_DRUGS queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " item='" +
+                drugItemName + "'");
           } else if (actionCommand == "ROLEPLAY_ACTION") {
             std::string notice = TrimCopy(actionArgument);
             if (notice.empty()) {

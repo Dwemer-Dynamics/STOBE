@@ -41,6 +41,9 @@ int ResolveCurrentGameTimestampSeconds(GameWorld *world);
 const int kDrunkLevelDurationSeconds = 5 * 60 * 60;
 const int kDrunkPassoutDurationSeconds = 2 * 60 * 60;
 const DWORD kDrunkKnockoutPulseMs = 1000;
+const int kDrugHighDurationSeconds = 5 * 60 * 60;
+const float kDrugHungerMultiplier = 1.5f;
+const float kDrugExtraHungerMultiplier = kDrugHungerMultiplier - 1.0f;
 
 struct NpcDrunkState {
   int level;
@@ -53,7 +56,19 @@ struct NpcDrunkState {
         nextKnockoutPulseTick(0) {}
 };
 
+struct NpcDrugState {
+  int highUntilGameTs;
+  int lastObservedGameTs;
+  float lastObservedHunger;
+  bool hasHungerSnapshot;
+
+  NpcDrugState()
+      : highUntilGameTs(0), lastObservedGameTs(0), lastObservedHunger(0.0f),
+        hasHungerSnapshot(false) {}
+};
+
 static std::map<unsigned int, NpcDrunkState> g_npcDrunkStates;
+static std::map<unsigned int, NpcDrugState> g_npcDrugStates;
 
 void PerformLeaveSquad(Character *npc, GameWorld *world,
                        const std::string &originFaction) {
@@ -419,6 +434,119 @@ void UpdateNpcDrunkStates(GameWorld *world) {
       continue;
     }
     ApplyDrunkKnockoutPulse(target);
+  }
+}
+
+void UpdateNpcDrugStates(GameWorld *world) {
+  if (!world) {
+    return;
+  }
+
+  int gameTs = ResolveCurrentGameTimestampSeconds(world);
+  std::vector<unsigned int> activeSerials;
+
+  EnterCriticalSection(&g_stateMutex);
+  for (auto it = g_npcDrugStates.begin(); it != g_npcDrugStates.end();) {
+    NpcDrugState &state = it->second;
+    if (state.highUntilGameTs > 0 && gameTs >= state.highUntilGameTs) {
+      state.highUntilGameTs = 0;
+      state.lastObservedGameTs = 0;
+      state.lastObservedHunger = 0.0f;
+      state.hasHungerSnapshot = false;
+    }
+
+    if (state.highUntilGameTs <= 0) {
+      it = g_npcDrugStates.erase(it);
+      continue;
+    }
+
+    activeSerials.push_back(it->first);
+    ++it;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+
+  for (size_t i = 0; i < activeSerials.size(); ++i) {
+    unsigned int serial = activeSerials[i];
+    Character *target = ResolveLiveCharacterBySerial(world, serial);
+    if (!target || (uintptr_t)target <= 0x1000) {
+      continue;
+    }
+
+    bool dead = false;
+    try {
+      dead = target->isDead();
+    } catch (...) {
+      dead = false;
+    }
+    if (dead) {
+      continue;
+    }
+
+    MedicalSystem *medical = nullptr;
+    try {
+      medical = target->getMedical();
+    } catch (...) {
+      medical = nullptr;
+    }
+    if (!medical || (uintptr_t)medical <= 0x1000) {
+      continue;
+    }
+
+    float currentHunger = 0.0f;
+    try {
+      currentHunger = medical->hunger;
+    } catch (...) {
+      currentHunger = 0.0f;
+    }
+    if (currentHunger < 0.0f) {
+      currentHunger = 0.0f;
+    }
+
+    float extraHungerToApply = 0.0f;
+    EnterCriticalSection(&g_stateMutex);
+    auto stateIt = g_npcDrugStates.find(serial);
+    if (stateIt != g_npcDrugStates.end()) {
+      NpcDrugState &state = stateIt->second;
+      if (state.highUntilGameTs > gameTs) {
+        if (!state.hasHungerSnapshot) {
+          state.hasHungerSnapshot = true;
+          state.lastObservedGameTs = gameTs;
+          state.lastObservedHunger = currentHunger;
+        } else {
+          int gameDelta = gameTs - state.lastObservedGameTs;
+          if (gameDelta > 0) {
+            float naturalHungerDelta = currentHunger - state.lastObservedHunger;
+            state.lastObservedGameTs = gameTs;
+            state.lastObservedHunger = currentHunger;
+            if (naturalHungerDelta > 0.001f) {
+              extraHungerToApply = naturalHungerDelta * kDrugExtraHungerMultiplier;
+            }
+          } else {
+            state.lastObservedHunger = currentHunger;
+          }
+        }
+      }
+    }
+    LeaveCriticalSection(&g_stateMutex);
+
+    if (extraHungerToApply > 0.001f) {
+      float postHunger = currentHunger;
+      try {
+        medical->hunger = currentHunger + extraHungerToApply;
+        medical->validateHealthValues();
+        postHunger = medical->hunger;
+      } catch (...) {
+        postHunger = currentHunger;
+      }
+      EnterCriticalSection(&g_stateMutex);
+      auto updateIt = g_npcDrugStates.find(serial);
+      if (updateIt != g_npcDrugStates.end()) {
+        updateIt->second.lastObservedHunger = postHunger;
+        updateIt->second.lastObservedGameTs = gameTs;
+        updateIt->second.hasHungerSnapshot = true;
+      }
+      LeaveCriticalSection(&g_stateMutex);
+    }
   }
 }
 
@@ -890,6 +1018,88 @@ bool IsAllowedDrinkItemName(const std::string &itemName,
   return !canonicalLabelOut.empty();
 }
 
+std::string CanonicalDrugLabelFromToken(const std::string &token) {
+  std::string key = token;
+  key.erase(std::remove(key.begin(), key.end(), ' '), key.end());
+  if (key == "hashish") {
+    return "Hashish";
+  }
+  return "";
+}
+
+bool IsAllowedDrugItemName(const std::string &itemName,
+                           std::string &canonicalLabelOut) {
+  canonicalLabelOut.clear();
+  std::string token = NormalizeInventoryMatchToken(itemName);
+  if (token.empty()) {
+    return false;
+  }
+  canonicalLabelOut = CanonicalDrugLabelFromToken(token);
+  return !canonicalLabelOut.empty();
+}
+
+bool TryResolveDrugItemForActor(Character *npc, const std::string &rawQuery,
+                                Item *&itemOut, std::string &itemNameOut,
+                                std::string &canonicalLabelOut) {
+  itemOut = nullptr;
+  itemNameOut.clear();
+  canonicalLabelOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return false;
+  }
+
+  std::string queryToken = NormalizeInventoryMatchToken(rawQuery);
+  if (queryToken.empty()) {
+    return false;
+  }
+
+  std::vector<Item *> items;
+  try {
+    GetAllCharacterItems(npc, items);
+  } catch (...) {
+    items.clear();
+  }
+
+  for (size_t i = 0; i < items.size(); ++i) {
+    Item *item = items[i];
+    if (!item || (uintptr_t)item <= 0x1000) {
+      continue;
+    }
+    std::string itemName = "";
+    try {
+      itemName = item->getName();
+    } catch (...) {
+      itemName = "";
+    }
+    if (itemName.empty()) {
+      continue;
+    }
+
+    std::string canonicalLabel = "";
+    if (!IsAllowedDrugItemName(itemName, canonicalLabel)) {
+      continue;
+    }
+
+    std::string itemToken = NormalizeInventoryMatchToken(itemName);
+    std::string canonicalToken = NormalizeInventoryMatchToken(canonicalLabel);
+    bool queryMatches =
+        itemToken.find(queryToken) != std::string::npos ||
+        canonicalToken.find(queryToken) != std::string::npos ||
+        queryToken.find(itemToken) != std::string::npos ||
+        queryToken.find(canonicalToken) != std::string::npos;
+    if (!queryMatches) {
+      continue;
+    }
+
+    itemOut = item;
+    itemNameOut = itemName;
+    canonicalLabelOut = canonicalLabel;
+    return true;
+  }
+
+  return false;
+}
+
 bool TryResolveDrinkItemForActor(Character *npc, const std::string &rawQuery,
                                  Item *&itemOut, std::string &itemNameOut,
                                  std::string &canonicalLabelOut) {
@@ -1038,6 +1248,55 @@ void BuildDrunkPromptStateFromSnapshot(const NpcDrunkState &state,
   }
 }
 
+void BuildDrugPromptStateFromSnapshot(const NpcDrugState &state, int gameTs,
+                                      bool &isHighOut, std::string &statusOut,
+                                      int &secondsRemainingOut,
+                                      float &hungerRateMultiplierOut) {
+  isHighOut = false;
+  statusOut = "sober";
+  secondsRemainingOut = 0;
+  hungerRateMultiplierOut = 1.0f;
+  if (state.highUntilGameTs > gameTs) {
+    isHighOut = true;
+    statusOut = "high";
+    secondsRemainingOut = state.highUntilGameTs - gameTs;
+    if (secondsRemainingOut < 0) {
+      secondsRemainingOut = 0;
+    }
+    hungerRateMultiplierOut = kDrugHungerMultiplier;
+  }
+}
+
+bool ActivateNpcDrugHighState(GameWorld *world, Character *npc,
+                              int &secondsRemainingOut) {
+  secondsRemainingOut = 0;
+  if (!world || !npc || (uintptr_t)npc <= 0x1000) {
+    return false;
+  }
+
+  unsigned int serial = 0;
+  try {
+    serial = npc->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return false;
+  }
+
+  int gameTs = ResolveCurrentGameTimestampSeconds(world);
+  EnterCriticalSection(&g_stateMutex);
+  NpcDrugState &state = g_npcDrugStates[serial];
+  state.highUntilGameTs = gameTs + kDrugHighDurationSeconds;
+  state.lastObservedGameTs = 0;
+  state.lastObservedHunger = 0.0f;
+  state.hasHungerSnapshot = false;
+  LeaveCriticalSection(&g_stateMutex);
+
+  secondsRemainingOut = kDrugHighDurationSeconds;
+  return true;
+}
+
 void ApplyDrunkKnockoutPulse(Character *npc) {
   if (!npc || (uintptr_t)npc <= 0x1000) {
     return;
@@ -1175,6 +1434,19 @@ bool ResolveCharacterDrinkItemMatch(Character *npc, const std::string &rawQuery,
   return !matchedNameOut.empty();
 }
 
+bool ResolveCharacterDrugItemMatch(Character *npc, const std::string &rawQuery,
+                                   std::string &matchedNameOut) {
+  matchedNameOut.clear();
+  Item *item = nullptr;
+  std::string itemName = "";
+  std::string canonicalLabel = "";
+  if (!TryResolveDrugItemForActor(npc, rawQuery, item, itemName, canonicalLabel)) {
+    return false;
+  }
+  matchedNameOut = canonicalLabel.empty() ? itemName : canonicalLabel;
+  return !matchedNameOut.empty();
+}
+
 bool GetCharacterDrunkPromptState(Character *npc, int &levelOut,
                                   bool &isDrunkOut, std::string &statusOut,
                                   int &secondsRemainingOut) {
@@ -1207,6 +1479,41 @@ bool GetCharacterDrunkPromptState(Character *npc, int &levelOut,
   }
   LeaveCriticalSection(&g_stateMutex);
   return isDrunkOut;
+}
+
+bool GetCharacterDrugPromptState(Character *npc, bool &isHighOut,
+                                 std::string &statusOut,
+                                 int &secondsRemainingOut,
+                                 float &hungerRateMultiplierOut) {
+  isHighOut = false;
+  statusOut = "sober";
+  secondsRemainingOut = 0;
+  hungerRateMultiplierOut = 1.0f;
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return false;
+  }
+
+  unsigned int serial = 0;
+  try {
+    serial = npc->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return false;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  int gameTs = ResolveCurrentGameTimestampSeconds(world);
+  EnterCriticalSection(&g_stateMutex);
+  auto it = g_npcDrugStates.find(serial);
+  if (it != g_npcDrugStates.end()) {
+    BuildDrugPromptStateFromSnapshot(it->second, gameTs, isHighOut, statusOut,
+                                     secondsRemainingOut,
+                                     hungerRateMultiplierOut);
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return isHighOut;
 }
 
 bool CharacterHasHacksaw(Character *npc) {
@@ -2345,6 +2652,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static DWORD holdPlaybackLogTick = 0;
 
   UpdateNpcDrunkStates(thisptr);
+  UpdateNpcDrugStates(thisptr);
 
   if (TryEnterCriticalSection(&g_uiMutex)) {
     if (holdForTtsPlayback) {
@@ -3354,6 +3662,71 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                       ToString(newLevel) + " expires_in_seconds=" +
                       ToString(secondsRemaining));
                 }
+                inventoryTimer = 999;
+                try {
+                  npc->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+              }
+            }
+          }
+        } else if (act.type == ACT_USE_DRUGS) {
+          const std::string actorName = SafeCharacterName(npc);
+          std::string requestedDrug = TrimCopySimple(act.message);
+          if (requestedDrug.empty()) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not parse a drug item.", true);
+            Log("ACTION_EXEC: USE_DRUGS blocked actor=" + actorName +
+                " reason=empty_item_query");
+          } else if (IsCharacterSkeletonRace(npc)) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot use drugs (skeleton race).", true);
+            Log("ACTION_EXEC: USE_DRUGS blocked actor=" + actorName +
+                " reason=skeleton_race");
+          } else {
+            Item *drugItem = nullptr;
+            std::string drugItemName = "";
+            std::string drugCanonicalLabel = "";
+            bool hasDrug = TryResolveDrugItemForActor(
+                npc, requestedDrug, drugItem, drugItemName, drugCanonicalLabel);
+            if (!hasDrug || !drugItem) {
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " could not find that drug (Hashish).", true);
+              Log("ACTION_EXEC: USE_DRUGS blocked actor=" + actorName +
+                  " reason=item_not_found query='" + requestedDrug + "'");
+            } else if (!ConsumeSingleItemFromActor(npc, drugItem)) {
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " failed to consume " +
+                      (drugCanonicalLabel.empty() ? drugItemName
+                                                  : drugCanonicalLabel) +
+                      ".",
+                  true);
+              Log("ACTION_EXEC: USE_DRUGS blocked actor=" + actorName +
+                  " reason=consume_failed item='" +
+                  (drugCanonicalLabel.empty() ? drugItemName
+                                              : drugCanonicalLabel) +
+                  "'");
+            } else {
+              int secondsRemaining = 0;
+              if (!ActivateNpcDrugHighState(thisptr, npc, secondsRemaining)) {
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " failed to enter a high state.", true);
+                Log("ACTION_EXEC: USE_DRUGS blocked actor=" + actorName +
+                    " reason=state_activation_failed");
+              } else {
+                std::string drugDisplay = drugCanonicalLabel.empty()
+                                              ? drugItemName
+                                              : drugCanonicalLabel;
+                if (drugDisplay.empty()) {
+                  drugDisplay = requestedDrug;
+                }
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " used " + drugDisplay +
+                        " and is now high (hunger x1.5).",
+                    true);
+                Log("ACTION_EXEC: USE_DRUGS actor=" + actorName + " item='" +
+                    drugDisplay + "' high_seconds=" +
+                    ToString(secondsRemaining) + " hunger_mult=1.5");
                 inventoryTimer = 999;
                 try {
                   npc->reThinkCurrentAIAction();
