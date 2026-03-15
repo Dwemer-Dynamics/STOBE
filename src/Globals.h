@@ -85,7 +85,8 @@ enum ActionType {
   ACT_DRINK_ITEM,
   ACT_USE_DRUGS,
   ACT_REMOVE_LIMB,
-  ACT_USE_OBJECT
+  ACT_USE_OBJECT,
+  ACT_KILL
 };
 
 struct GameEvent {

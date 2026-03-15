@@ -4213,6 +4213,118 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               }
             }
           }
+        } else if (act.type == ACT_KILL) {
+          const std::string actorName = SafeCharacterName(npc);
+          std::string targetName =
+              target ? SafeCharacterName(target) : TrimCopySimple(act.message);
+          if (targetName.empty()) {
+            targetName = "target";
+          }
+          if (!target || (uintptr_t)target <= 0x1000) {
+            Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                " reason=target_not_found target_token='" + act.message + "'");
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid execution target.", true);
+          } else if (target == npc) {
+            Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                " reason=self_target");
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot use KILL on themselves.", true);
+          } else {
+            std::string invalidReason = "";
+            if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+              if (invalidReason.empty()) {
+                invalidReason = "target is not in a valid state";
+              }
+              Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                  " target=" + targetName + " reason=" + invalidReason);
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " cannot kill " + targetName + ": " +
+                      invalidReason + ".",
+                  true);
+            } else {
+              ClearCharacterSpeechBubble(target);
+
+              MedicalSystem *medical = nullptr;
+              try {
+                medical = target->getMedical();
+              } catch (...) {
+                medical = nullptr;
+              }
+              bool bloodForced = false;
+              bool validatedHealth = false;
+              if (medical && (uintptr_t)medical > 0x1000) {
+                try {
+                  medical->blood = 0.0f;
+                  bloodForced = true;
+                } catch (...) {
+                  bloodForced = false;
+                }
+                try {
+                  medical->validateHealthValues();
+                  validatedHealth = true;
+                } catch (...) {
+                  validatedHealth = false;
+                }
+              }
+
+              bool alreadyDead = false;
+              try {
+                alreadyDead = target->isDead();
+              } catch (...) {
+                alreadyDead = false;
+              }
+
+              bool declaredDead = false;
+              if (!alreadyDead) {
+                try {
+                  target->declareDead();
+                  declaredDead = true;
+                } catch (...) {
+                  declaredDead = false;
+                }
+              }
+
+              bool nowDead = alreadyDead || declaredDead;
+              if (!nowDead) {
+                try {
+                  nowDead = target->isDead();
+                } catch (...) {
+                  nowDead = false;
+                }
+              }
+
+              try {
+                target->reThinkCurrentAIAction();
+              } catch (...) {
+              }
+              try {
+                npc->reThinkCurrentAIAction();
+              } catch (...) {
+              }
+
+              if (nowDead) {
+                Log("ACTION_EXEC: KILL success actor=" + actorName +
+                    " target=" + targetName +
+                    " blood_forced=" + std::string(bloodForced ? "1" : "0") +
+                    " medical_validated=" +
+                    std::string(validatedHealth ? "1" : "0") +
+                    " already_dead=" + std::string(alreadyDead ? "1" : "0") +
+                    " declared_dead=" +
+                    std::string(declaredDead ? "1" : "0"));
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " killed " + targetName + ".", true);
+              } else {
+                Log("ACTION_EXEC: KILL failed actor=" + actorName +
+                    " target=" + targetName +
+                    " blood_forced=" + std::string(bloodForced ? "1" : "0") +
+                    " medical_validated=" +
+                    std::string(validatedHealth ? "1" : "0"));
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " failed to kill " + targetName + ".", true);
+              }
+            }
+          }
         } else if (act.type == ACT_USE_OBJECT) {
           const std::string actorName = SafeCharacterName(npc);
           std::string objectTokenRaw = TrimCopySimple(act.message);

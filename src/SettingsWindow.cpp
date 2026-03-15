@@ -447,7 +447,7 @@ void CreateSettingsUI() {
 
   MyGUI::TextBox *rangeHint = CreateLabel(
       client, labelX, y, 0.90f, rangeHintH,
-      "Range units: ~1 unit = ~1 meter. Whisper is fixed at 20 units.",
+      "Range units: ~10 unit = ~1 meter. Whisper is fixed at 20 units.",
       "Stobe_Plugin_RangeUnitsHint");
   rangeHint->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.35f));
   y += rangeHintGap;

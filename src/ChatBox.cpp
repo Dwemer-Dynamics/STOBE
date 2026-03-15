@@ -59,7 +59,8 @@ enum ManualChatActionType {
   MANUAL_CHAT_ACTION_GIVE_ITEM = 3,
   MANUAL_CHAT_ACTION_ROLEPLAY_ACTION = 4,
   MANUAL_CHAT_ACTION_DRINK_ITEM = 5,
-  MANUAL_CHAT_ACTION_USE_DRUGS = 6
+  MANUAL_CHAT_ACTION_USE_DRUGS = 6,
+  MANUAL_CHAT_ACTION_KILL = 7
 };
 
 struct ManualChatActionChoice {
@@ -85,6 +86,7 @@ const ManualChatActionChoice kManualChatActionChoices[] = {
      "remove_limb_left_leg", "LEFT_LEG", false},
     {MANUAL_CHAT_ACTION_REMOVE_LIMB, "remove right leg (hacksaw)",
      "remove_limb_right_leg", "RIGHT_LEG", false},
+    {MANUAL_CHAT_ACTION_KILL, "kill", "kill", "", false},
 };
 
 size_t ManualChatActionChoiceCount() {
@@ -193,6 +195,19 @@ std::string BuildManualUseDrugsActionToken(const std::string &itemName) {
     return "";
   }
   return "USE_DRUGS@" + normalizedItem;
+}
+
+std::string BuildManualKillActionToken(const std::string &targetName,
+                                       const std::string &targetHandle) {
+  std::string normalizedTargetName = TrimManualActionArg(targetName);
+  if (normalizedTargetName.empty()) {
+    return "";
+  }
+  std::string targetToken = normalizedTargetName;
+  if (!targetHandle.empty()) {
+    targetToken += "|" + targetHandle;
+  }
+  return "KILL@" + targetToken;
 }
 
 bool TryParseActionAmount(const std::string &rawValue, int &amountOut) {
@@ -1431,7 +1446,8 @@ void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
       "ROLEPLAY_ACTION",  "ROLEPLAYACTION","ROLEPLAY-ACTION",
       "NOTIFY",           "FACTION_RELATIONS","TRAVEL_LOCATION",
       "TRAVELLOCATION",   "USE_OBJECT",    "USEOBJECT",
-      "USE-OBJECT",       "SPAWN_ITEM",
+      "USE-OBJECT",       "KILL",          "KILLTARGET",
+      "SPAWN_ITEM",
       "TASK",             "SET_BLOCK",     "SET_HOLD",         "SET_PASSIVE",
       "SET_JOBS",         "SET_RANGED",    "SET_TAUNT",        "SET_SNEAK",
       "SET_RESOURCE",     "SET_MEDIC",     0};
@@ -2012,6 +2028,33 @@ void OnChatSendClick(MyGUI::Widget *sender) {
               "Chat blocked: " + invalidReason + ".", true);
         }
         Log("CHAT_GATE: blocked manual remove limb reason='" + invalidReason +
+            "' actor='" + playerName + "' target='" + targetName + "'");
+        return;
+      }
+      manualActionPromptEligible = true;
+    } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_KILL) {
+      manualActionCommand =
+          BuildManualKillActionToken(targetName, resolvedTargetHandle);
+      if (manualActionCommand.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not build kill action.", true);
+        }
+        Log("CHAT_GATE: blocked manual kill invalid_action_token target='" +
+            targetName + "' handle='" + resolvedTargetHandle + "'");
+        return;
+      }
+      std::string invalidReason = "";
+      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+        if (invalidReason.empty()) {
+          invalidReason =
+              "target must be knocked out, unconscious, imprisoned, or carried";
+        }
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: " + invalidReason + ".", true);
+        }
+        Log("CHAT_GATE: blocked manual kill reason='" + invalidReason +
             "' actor='" + playerName + "' target='" + targetName + "'");
         return;
       }

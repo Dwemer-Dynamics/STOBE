@@ -3512,6 +3512,10 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             actionCommand = "USE_DRUGS";
           } else if (actionCommand == "REMOVELIMB") {
             actionCommand = "REMOVE_LIMB";
+          } else if (actionCommand == "KILLTARGET" ||
+                     actionCommand == "EXECUTE" ||
+                     actionCommand == "MURDER") {
+            actionCommand = "KILL";
           } else if (actionCommand == "TRAVELLOCATION" ||
                      actionCommand == "TRAVEL-LOCATION") {
             actionCommand = "TRAVEL_LOCATION";
@@ -4265,6 +4269,33 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 targetToken + "' target_serial=" +
                 ToString((unsigned int)limbTarget.serial) + " limb_code=" +
                 ToString(limbCode));
+          } else if (actionCommand == "KILL") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string targetToken = TrimCopy(actionArgument);
+            if (targetToken.empty()) {
+              Log("HOOK_MSG_PROC: KILL ignored; empty target payload");
+              continue;
+            }
+            hand killTarget = resolveActionTargetHand(targetToken, targetHand);
+            if (!killTarget.isValid()) {
+              Log("HOOK_MSG_PROC: KILL ignored; target unresolved '" +
+                  targetToken + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_KILL;
+            act.actor = targetHand;
+            act.target = killTarget;
+            act.message = targetToken;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: KILL queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)killTarget.serial));
           } else if (actionCommand == "SPAWN_ITEM") {
             Log("HOOK_MSG_PROC: SPAWN_ITEM ignored; action currently disabled. arg='" +
                 actionArgument + "'");
