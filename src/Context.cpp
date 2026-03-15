@@ -180,6 +180,7 @@ struct SimpleTraderInventoryItem {
   std::string itemId;
   std::string quality;
   int qualityLevel;
+  std::string weaponModel;
   int count;
   int valueEach;
 };
@@ -475,6 +476,100 @@ std::string ResolveGameDataIdentity(GameData *data) {
     return sid;
   }
   return "";
+}
+
+std::string NormalizeWeaponModelLabel(const std::string &value) {
+  std::string normalized = TrimCopy(value);
+  if (normalized.empty()) {
+    return "";
+  }
+  std::string collapsed;
+  collapsed.reserve(normalized.size());
+  bool inWhitespace = false;
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    unsigned char ch = (unsigned char)normalized[i];
+    if (std::isspace(ch)) {
+      if (!inWhitespace && !collapsed.empty()) {
+        collapsed.push_back(' ');
+      }
+      inWhitespace = true;
+    } else {
+      collapsed.push_back((char)ch);
+      inWhitespace = false;
+    }
+  }
+  normalized = TrimCopy(collapsed);
+  if (normalized.length() >= 2 && normalized.front() == '[' &&
+      normalized.back() == ']') {
+    normalized = TrimCopy(normalized.substr(1, normalized.length() - 2));
+  }
+  if (normalized.empty() || IsUnknownToken(normalized) ||
+      LooksLikeDataStringId(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+
+bool TryExtractWeaponModel(Item *item, std::string &modelOut) {
+  modelOut.clear();
+  if (!item || (uintptr_t)item <= 0x1000) {
+    return false;
+  }
+
+  bool isWeaponLike = false;
+  try {
+    isWeaponLike = (item->isWeapon() != NULL) || (item->isCrossbow() != NULL);
+  } catch (...) {
+    isWeaponLike = false;
+  }
+  if (!isWeaponLike) {
+    return false;
+  }
+
+  auto assignModel = [&](const std::string &candidate) -> bool {
+    std::string normalized = NormalizeWeaponModelLabel(candidate);
+    if (normalized.empty()) {
+      return false;
+    }
+    modelOut = normalized;
+    return true;
+  };
+
+  try {
+    if (item->manufacturerData && (uintptr_t)item->manufacturerData > 0x1000) {
+      if (assignModel(ResolveGameDataIdentity(item->manufacturerData))) {
+        return true;
+      }
+      if (assignModel(TrimCopy(item->manufacturerData->stringID))) {
+        return true;
+      }
+    }
+  } catch (...) {
+  }
+
+  if (item->data && (uintptr_t)item->data > 0x1000) {
+    const char *refKeys[] = {"manufacturer", "weapon_manufacturer",
+                             "manufacturerData", "model", "weapon_model"};
+    for (size_t i = 0; i < sizeof(refKeys) / sizeof(refKeys[0]); ++i) {
+      if (assignModel(ResolveGameDataRefName(item->data, refKeys[i]))) {
+        return true;
+      }
+      if (assignModel(ResolveGameDataRefSid(item->data, refKeys[i]))) {
+        return true;
+      }
+    }
+
+    const char *stringKeys[] = {"weapon_model",      "weaponModel",
+                                "manufacturer_name", "manufacturer",
+                                "model_name",        "model"};
+    for (size_t i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); ++i) {
+      if (assignModel(ResolveGameDataString(item->data, stringKeys[i]))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 std::string CollapseWhitespace(const std::string &value) {
@@ -1458,6 +1553,7 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     std::string description;
     std::string quality;
     int qualityLevel;
+    std::string weaponModel;
     int count;
     int valueEach;
   };
@@ -1474,6 +1570,7 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     std::string itemDescription = "";
     std::string itemQuality = "";
     int itemQualityLevel = -1;
+    std::string itemWeaponModel = "";
     int itemCount = 1;
     int itemValueEach = 0;
     try {
@@ -1486,6 +1583,7 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
         itemDescription = ResolveItemDescription(item->data);
       }
       TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
+      TryExtractWeaponModel(item, itemWeaponModel);
       itemCount = item->quantity;
       itemValueEach = item->getValueSingle(false);
     } catch (...) {
@@ -1514,6 +1612,14 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       qualityKey[qi] = static_cast<char>(tolower((unsigned char)qualityKey[qi]));
     }
     key += "|q:" + qualityKey;
+    if (!itemWeaponModel.empty()) {
+      std::string weaponModelKey = itemWeaponModel;
+      for (size_t wi = 0; wi < weaponModelKey.length(); ++wi) {
+        weaponModelKey[wi] =
+            static_cast<char>(tolower((unsigned char)weaponModelKey[wi]));
+      }
+      key += "|wm:" + weaponModelKey;
+    }
 
     auto it = aggregated.find(key);
     if (it == aggregated.end()) {
@@ -1523,6 +1629,7 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       entry.description = itemDescription;
       entry.quality = itemQuality;
       entry.qualityLevel = itemQualityLevel;
+      entry.weaponModel = itemWeaponModel;
       entry.count = itemCount;
       entry.valueEach = itemValueEach;
       aggregated[key] = entry;
@@ -1542,6 +1649,9 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
       }
       if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
         it->second.qualityLevel = itemQualityLevel;
+      }
+      if (it->second.weaponModel.empty() && !itemWeaponModel.empty()) {
+        it->second.weaponModel = itemWeaponModel;
       }
     }
   }
@@ -1575,6 +1685,9 @@ bool BuildInventorySnapshotFromInventory(Inventory *inv,
     if (!entry.quality.empty()) {
       json += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
     }
+    if (!entry.weaponModel.empty()) {
+      json += ",\"weapon_model\":\"" + EscapeJSON(entry.weaponModel) + "\"";
+    }
     json += "}";
 
     ++outputCount;
@@ -1604,9 +1717,7 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     std::string description;
     std::string quality;
     int qualityLevel;
-    std::string model;
-    std::string manufacturer;
-    std::string manufacturerId;
+    std::string weaponModel;
     int count;
     bool equipped;
     int valueEach;
@@ -1631,9 +1742,7 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     std::string itemDescription = "";
     std::string itemQuality = "";
     int itemQualityLevel = -1;
-    std::string itemModel = "";
-    std::string itemManufacturer = "";
-    std::string itemManufacturerId = "";
+    std::string itemWeaponModel = "";
     int itemCount = 1;
     bool itemEquipped = false;
     int itemValueEach = 0;
@@ -1647,118 +1756,10 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
         itemDescription = ResolveItemDescription(item->data);
       }
       TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
+      TryExtractWeaponModel(item, itemWeaponModel);
       itemCount = item->quantity;
       itemEquipped = item->isEquipped;
       itemValueEach = item->getValueSingle(false);
-
-      bool isWeaponLike = false;
-      try {
-        isWeaponLike = (item->isWeapon() != NULL) || (item->isCrossbow() != NULL);
-      } catch (...) {
-        isWeaponLike = false;
-      }
-
-      // Primary source: live manufacturer/material pointers from game data.
-      // This yields readable values like "Cross" and "Meitou" when present.
-      if (item->manufacturerData && (uintptr_t)item->manufacturerData > 0x1000) {
-        itemManufacturer = ResolveGameDataIdentity(item->manufacturerData);
-        itemManufacturerId = TrimCopy(item->manufacturerData->stringID);
-      }
-      if (item->materialData && (uintptr_t)item->materialData > 0x1000) {
-        itemModel = ResolveGameDataIdentity(item->materialData);
-      }
-
-      // Fallback to item template references only when no readable runtime
-      // identity exists and prefer weapon-style rows for manufacturer.
-      if (item->data && (uintptr_t)item->data > 0x1000) {
-        if (itemModel.empty()) {
-          itemModel = ResolveGameDataString(item->data, "model");
-        }
-        if (itemModel.empty()) {
-          itemModel = ResolveGameDataString(item->data, "model_name");
-        }
-        if (itemModel.empty()) {
-          itemModel = ResolveGameDataString(item->data, "modelName");
-        }
-
-        // Manufacturer refs exist on many non-weapon templates; keep readable
-        // display value when possible and always keep SID as fallback id.
-        std::string manufacturerRefDisplay =
-            ResolveGameDataRefName(item->data, "manufacturer");
-        if (manufacturerRefDisplay.empty()) {
-          manufacturerRefDisplay =
-              ResolveGameDataRefName(item->data, "weapon_manufacturer");
-        }
-        if (manufacturerRefDisplay.empty()) {
-          manufacturerRefDisplay =
-              ResolveGameDataRefName(item->data, "manufacturerData");
-        }
-        if (manufacturerRefDisplay.empty()) {
-          manufacturerRefDisplay = ResolveGameDataRefName(item->data, "company");
-        }
-        if (manufacturerRefDisplay.empty()) {
-          manufacturerRefDisplay = ResolveGameDataRefName(item->data, "maker");
-        }
-        if (!manufacturerRefDisplay.empty() &&
-            (itemManufacturer.empty() ||
-             LooksLikeDataStringId(itemManufacturer)) &&
-            !LooksLikeDataStringId(manufacturerRefDisplay)) {
-          itemManufacturer = manufacturerRefDisplay;
-        }
-
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataRefSid(item->data, "manufacturer");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId =
-              ResolveGameDataRefSid(item->data, "weapon_manufacturer");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId =
-              ResolveGameDataRefSid(item->data, "manufacturerData");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataRefSid(item->data, "company");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataRefSid(item->data, "maker");
-        }
-
-        if (itemManufacturer.empty() && isWeaponLike) {
-          itemManufacturer = ResolveGameDataString(item->data, "manufacturer");
-        }
-        if (itemManufacturer.empty() && isWeaponLike) {
-          itemManufacturer = ResolveGameDataString(item->data, "manufacturer_name");
-        }
-        if (itemManufacturer.empty() && isWeaponLike) {
-          itemManufacturer = ResolveGameDataRefName(item->data, "manufacturer");
-        }
-        if (itemManufacturer.empty() && isWeaponLike) {
-          itemManufacturer =
-              ResolveGameDataRefName(item->data, "weapon_manufacturer");
-        }
-
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataString(item->data, "manufacturer_id");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataString(item->data, "manufacturer_sid");
-        }
-        if (itemManufacturerId.empty()) {
-          itemManufacturerId = ResolveGameDataString(item->data, "manufacturerID");
-        }
-      }
-
-      // Avoid surfacing internal SID-looking identifiers as display text.
-      if (!itemModel.empty() && LooksLikeDataStringId(itemModel)) {
-        itemModel = "";
-      }
-      if (!itemManufacturer.empty() && LooksLikeDataStringId(itemManufacturer)) {
-        itemManufacturer = "";
-      }
-      if (itemManufacturer.empty() && !itemManufacturerId.empty()) {
-        itemManufacturer = itemManufacturerId;
-      }
     } catch (...) {
       continue;
     }
@@ -1785,10 +1786,14 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       qualityKey[qi] = static_cast<char>(tolower((unsigned char)qualityKey[qi]));
     }
     key += "|q:" + qualityKey;
-    // Model/manufacturer tracking is disabled for now.
-    itemModel.clear();
-    itemManufacturer.clear();
-    itemManufacturerId.clear();
+    if (!itemWeaponModel.empty()) {
+      std::string weaponModelKey = itemWeaponModel;
+      for (size_t wi = 0; wi < weaponModelKey.length(); ++wi) {
+        weaponModelKey[wi] =
+            static_cast<char>(tolower((unsigned char)weaponModelKey[wi]));
+      }
+      key += "|wm:" + weaponModelKey;
+    }
     key += "|" + std::string(itemEquipped ? "1" : "0");
 
     auto it = aggregated.find(key);
@@ -1799,9 +1804,7 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       entry.description = itemDescription;
       entry.quality = itemQuality;
       entry.qualityLevel = itemQualityLevel;
-      entry.model = "";
-      entry.manufacturer = "";
-      entry.manufacturerId = "";
+      entry.weaponModel = itemWeaponModel;
       entry.count = itemCount;
       entry.equipped = itemEquipped;
       entry.valueEach = itemValueEach;
@@ -1822,6 +1825,9 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
       }
       if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
         it->second.qualityLevel = itemQualityLevel;
+      }
+      if (it->second.weaponModel.empty() && !itemWeaponModel.empty()) {
+        it->second.weaponModel = itemWeaponModel;
       }
     }
   }
@@ -1857,12 +1863,16 @@ bool BuildInventorySnapshot(Character *npc, std::string &inventoryJsonOut,
     if (!entry.quality.empty()) {
       json += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
     }
+    if (!entry.weaponModel.empty()) {
+      json += ",\"weapon_model\":\"" + EscapeJSON(entry.weaponModel) + "\"";
+    }
     json += "}";
 
     hash += EscapeJSON(entry.itemId.empty() ? entry.name : entry.itemId) + "^" +
             ToString(entry.count) + "^" + std::string(entry.equipped ? "1" : "0") + "^" +
             ToString(entry.valueEach) + "^" + EscapeJSON(entry.description) +
-            "^" + ToString(entry.qualityLevel) + "^" + EscapeJSON(entry.quality);
+            "^" + ToString(entry.qualityLevel) + "^" + EscapeJSON(entry.quality) +
+            "^" + EscapeJSON(entry.weaponModel);
     ++outputCount;
     if (outputCount >= 200) {
       break;
@@ -1943,6 +1953,7 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
       std::string itemId = "";
       std::string itemQuality = "";
       int itemQualityLevel = -1;
+      std::string itemWeaponModel = "";
       int itemCount = 1;
       int itemValueEach = 0;
       try {
@@ -1952,6 +1963,7 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
           itemId = TrimCopy(item->data->stringID);
         }
         TryExtractArmourQuality(item, itemQualityLevel, itemQuality);
+        TryExtractWeaponModel(item, itemWeaponModel);
         itemCount = item->quantity;
         itemValueEach = item->getValueSingle(false);
       } catch (...) {
@@ -1974,6 +1986,9 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
               ? ToString(itemQualityLevel)
               : (itemQuality.empty() ? std::string("none") : itemQuality);
       key += "|q:" + lowerAscii(qualityKey);
+      if (!itemWeaponModel.empty()) {
+        key += "|wm:" + lowerAscii(itemWeaponModel);
+      }
       auto it = aggregated.find(key);
       if (it == aggregated.end()) {
         SimpleTraderInventoryItem entry;
@@ -1981,6 +1996,7 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
         entry.itemId = itemId;
         entry.quality = itemQuality;
         entry.qualityLevel = itemQualityLevel;
+        entry.weaponModel = itemWeaponModel;
         entry.count = itemCount;
         entry.valueEach = itemValueEach;
         aggregated[key] = entry;
@@ -1997,6 +2013,9 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
         }
         if (it->second.qualityLevel < 0 && itemQualityLevel >= 0) {
           it->second.qualityLevel = itemQualityLevel;
+        }
+        if (it->second.weaponModel.empty() && !itemWeaponModel.empty()) {
+          it->second.weaponModel = itemWeaponModel;
         }
       }
       if (aggregated.size() >= 320) {
@@ -2132,6 +2151,10 @@ bool CaptureTraderInventorySnapshot(Character *npc, const std::string &reason) {
     if (!entry.quality.empty()) {
       inventoryJson += ",\"quality\":\"" + EscapeJSON(entry.quality) + "\"";
     }
+    if (!entry.weaponModel.empty()) {
+      inventoryJson += ",\"weapon_model\":\"" + EscapeJSON(entry.weaponModel) +
+                       "\"";
+    }
     inventoryJson += "}";
     inventoryCount += 1;
     if (inventoryCount >= 260) {
@@ -2254,6 +2277,10 @@ static std::string GetVisibleEquipment(Character *npc) {
     if (TryExtractArmourQuality(item, qualityLevel, qualityLabel) &&
         !qualityLabel.empty()) {
       itemName += " [" + qualityLabel + "]";
+    }
+    std::string weaponModel;
+    if (TryExtractWeaponModel(item, weaponModel) && !weaponModel.empty()) {
+      itemName += " [" + weaponModel + "]";
     }
 
     if (!buffer.empty()) {
