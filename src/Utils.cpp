@@ -41,6 +41,55 @@ std::string ToLowerAsciiCopy(std::string value) {
   return value;
 }
 
+std::string SanitizeDialogueForEventStreamImpl(std::string value) {
+  value = TrimCopy(value);
+  if (value.empty()) {
+    return "";
+  }
+
+  // Drop embedded NUL tails if engine-provided text contains binary remnants.
+  size_t nulPos = value.find('\0');
+  if (nulPos != std::string::npos) {
+    value = TrimCopy(value.substr(0, nulPos));
+  }
+
+  // Strip trailing "??" corruption while keeping intentional single '?'.
+  size_t end = value.size();
+  size_t questionCount = 0;
+  while (end > 0 && value[end - 1] == '?') {
+    --end;
+    ++questionCount;
+  }
+  if (questionCount >= 2) {
+    while (end > 0 &&
+           std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+      --end;
+    }
+    value = TrimCopy(value.substr(0, end));
+  }
+
+  // Strip the common leaked trailing token pattern: "... 7".
+  if (value.length() >= 2 && value[value.length() - 1] == '7' &&
+      std::isspace(static_cast<unsigned char>(value[value.length() - 2])) != 0) {
+    size_t prefixEnd = value.length() - 2;
+    while (prefixEnd > 0 &&
+           std::isspace(static_cast<unsigned char>(value[prefixEnd - 1])) != 0) {
+      --prefixEnd;
+    }
+    if (prefixEnd > 0) {
+      value = TrimCopy(value.substr(0, prefixEnd));
+    }
+  }
+
+  return TrimCopy(value);
+}
+
+bool IsDialogueLikeEventType(const std::string &type) {
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(type));
+  return normalized == "chat" || normalized == "rechat" ||
+         normalized == "inputtext" || normalized == "bored";
+}
+
 bool ShouldFilterChatEventLine(const std::string &type,
                                const std::string &message) {
   if (ToLowerAsciiCopy(TrimCopy(type)) != "chat") {
@@ -183,6 +232,10 @@ std::string NormalizeIniChatMode(const std::string &rawMode) {
   return "chat";
 }
 } // namespace
+
+std::string SanitizeDialogueForEventStream(const std::string &value) {
+  return SanitizeDialogueForEventStreamImpl(value);
+}
 
 std::wstring WideFromUtf8(const std::string &str) {
   if (str.empty())
@@ -931,6 +984,9 @@ static std::string BuildEventStreamData(const std::string &type,
   }
 
   std::string body = message;
+  if (IsDialogueLikeEventType(type)) {
+    body = SanitizeDialogueForEventStreamImpl(body);
+  }
   if (body.empty()) {
     body = type;
   }

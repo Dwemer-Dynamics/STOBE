@@ -1954,7 +1954,7 @@ static Character *ResolveDialogueListenerForSpeech(Character *speaker,
 }
 
 static Character *ResolveNearestPlayerSpeakerForTarget(GameWorld *world,
-                                                        Character *target) {
+                                                       Character *target) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return nullptr;
   }
@@ -1973,13 +1973,34 @@ static Character *ResolveNearestPlayerSpeakerForTarget(GameWorld *world,
     if (!candidate || (uintptr_t)candidate < 0x1000) {
       continue;
     }
+    // If the target is a squadmate, pick another squadmate as the speaker.
+    if (candidate == target) {
+      continue;
+    }
     float dist = candidate->getPosition().distance(target->getPosition());
     if (!best || dist < bestDist) {
       best = candidate;
       bestDist = dist;
     }
   }
-  return best ? best : fallback;
+  if (best) {
+    return best;
+  }
+  if (fallback && (uintptr_t)fallback >= 0x1000 && fallback != target) {
+    return fallback;
+  }
+
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *candidate = world->player->playerCharacters[i];
+    if (!candidate || (uintptr_t)candidate < 0x1000 || candidate == target) {
+      continue;
+    }
+    return candidate;
+  }
+  if (fallback && (uintptr_t)fallback >= 0x1000) {
+    return fallback;
+  }
+  return nullptr;
 }
 
 static Character *ResolveNearestSquadmateTargetForSelection(GameWorld *world,

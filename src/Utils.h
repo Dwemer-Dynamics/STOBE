@@ -17,3 +17,4 @@ void SaveStobeRuntimeConfig();
 void SetHotkeyFromString(const std::string &keyStr);
 void SleepIfPaused(DWORD ms);
 void ResetRuntimeLogsForSession();
+std::string SanitizeDialogueForEventStream(const std::string &value);

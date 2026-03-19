@@ -1173,6 +1173,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
     speakerHandle = TrimChatLine(currentTask.handleStr);
   }
   std::string subtitle = TrimChatLine(lastSubtitle);
+  subtitle = SanitizeDialogueForEventStream(subtitle);
   if (speaker.empty() || subtitle.empty()) {
     return;
   }
@@ -1873,6 +1874,14 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   std::string playerName = g_chatPlayerNameStr;
   if (playerName.empty()) {
     playerName = "Player";
+  }
+
+  std::string sanitizedText = SanitizeDialogueForEventStream(text);
+  if (!sanitizedText.empty() && sanitizedText != text) {
+    Log("CHAT_SANITIZE: stripped trailing noise from player text old_len=" +
+        ToString((int)text.length()) +
+        " new_len=" + ToString((int)sanitizedText.length()));
+    text = sanitizedText;
   }
 
   std::string selectedMode = NormalizeChatMode(g_chatMode);
