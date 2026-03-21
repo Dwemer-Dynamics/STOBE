@@ -564,6 +564,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/item_image_upload") {
+    request.path = L"/StobeServer/item_image_upload.php";
+    return request;
+  }
+
   if (endpoint == L"/world_state") {
     request.path = L"/StobeServer/world_state.php";
     return request;

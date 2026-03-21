@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <set>
@@ -35,6 +36,7 @@
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Platoon.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/gui/InventoryGUI.h>
 #include <kenshi/gui/PortraitManager.h>
 #include <kenshi/util/hand.h>
 #include <kenshi/Damages.h>
@@ -1258,6 +1260,24 @@ struct PortraitSyncState {
       : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
 };
 
+struct ItemImageSyncState {
+  std::string lastHash;
+  DWORD lastSentTick;
+  DWORD lastSeenTick;
+  bool hasSent;
+
+  ItemImageSyncState()
+      : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
+};
+
+struct PendingItemImageSyncRequest {
+  hand npcHand;
+  std::string reason;
+  DWORD queuedTick;
+
+  PendingItemImageSyncRequest() : npcHand(), reason(""), queuedTick(0) {}
+};
+
 struct InventoryEventSnapshot {
   std::map<std::string, int> countsByKey;
   std::map<std::string, int> stolenByKey;
@@ -1299,11 +1319,26 @@ struct NpcWorldEventState {
 static std::map<unsigned int, InventorySyncState> g_inventorySyncStateBySerial;
 static std::map<std::string, PortraitSyncState> g_portraitSyncStateByStorageId;
 static std::map<unsigned int, DWORD> g_portraitSpeechTriggerBySerial;
+static std::map<std::string, ItemImageSyncState> g_itemImageSyncStateByItemId;
+static std::deque<PendingItemImageSyncRequest> g_itemImageSyncRequestQueue;
 static DWORD g_lastInventorySweepTick = 0;
-static const DWORD kInventorySweepIntervalMs = 1500;
+static const DWORD kInventorySweepIntervalMs = 6000;
 static const DWORD kInventoryMinResendMs = 1200;
-static const size_t kInventorySweepCandidateLimit = 24;
+static const size_t kInventorySweepCandidateLimit = 8;
 static const DWORD kInventoryStateRetentionMs = 15 * 60 * 1000;
+static const size_t kItemImageBatchLimit = 5;
+static const DWORD kItemImageMinResendMs = 30 * 60 * 1000;
+static const DWORD kItemImageStateRetentionMs = 60 * 60 * 1000;
+static const DWORD kItemImageRunCooldownMs = 10 * 1000;
+static const DWORD kItemImageStartupDelayMs = 20 * 1000;
+static const size_t kItemImageRequestQueueMax = 64;
+static DWORD g_itemImageLastRunTick = 0;
+static DWORD g_worldStableSinceTick = 0;
+static volatile LONG g_portraitSehCount = 0;
+static DWORD g_portraitLastSehTick = 0;
+static DWORD g_portraitLastSehCode = 0;
+static bool g_portraitSyncDisabledForSession = false;
+static bool g_portraitDisableLogged = false;
 static DWORD g_lastPortraitSweepTick = 0;
 static const DWORD kPortraitSweepIntervalMs = 15000;
 static const DWORD kPortraitMinResendMs = 30 * 60 * 1000;
@@ -1312,8 +1347,8 @@ static const DWORD kPortraitStateRetentionMs = 30 * 60 * 1000;
 static const DWORD kPortraitSpeechTriggerCooldownMs = 2 * 60 * 1000;
 static std::map<unsigned int, NpcWorldEventState> g_npcWorldEventStateBySerial;
 static DWORD g_lastNpcWorldEventSweepTick = 0;
-static const DWORD kNpcWorldEventSweepIntervalMs = 900;
-static const size_t kNpcWorldEventCandidateLimit = 96;
+static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
+static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
 static DWORD g_lastInfoNpcTelemetryCheckTick = 0;
 static DWORD g_lastInfoNpcTelemetrySentTick = 0;
@@ -1333,6 +1368,9 @@ static const char *kStobePluginVersion = "0.6.5";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
+static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
+static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
+static const DWORD kMotdAutoOpenMinStableMs = 180 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
 static int g_dynamicProfileIntervalSyncLastValue = 0;
@@ -1541,10 +1579,34 @@ static bool ResolvePortraitImageRegion(PortraitManager *portraitManager,
   return true;
 }
 
-static bool TryCapturePortraitBmp(Character *npc, std::string &bmpDataOut,
-                                  int &widthOut, int &heightOut,
-                                  std::string &imageHashOut,
-                                  std::string *diagReasonOut = nullptr) {
+static int PortraitSehFilter(unsigned int code) {
+  g_portraitLastSehCode = code;
+  g_portraitLastSehTick = GetTickCount();
+  InterlockedIncrement(&g_portraitSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void MaybeDisablePortraitSyncAfterSeh() {
+  if (g_portraitSyncDisabledForSession) {
+    return;
+  }
+  LONG sehCount = InterlockedCompareExchange(&g_portraitSehCount, 0, 0);
+  if (sehCount >= 3) {
+    g_portraitSyncDisabledForSession = true;
+    if (!g_portraitDisableLogged) {
+      g_portraitDisableLogged = true;
+      Log("PORTRAIT_SYNC: disabled for this session after repeated engine SEH faults code=" +
+          ToString((int)g_portraitLastSehCode) + " count=" +
+          ToString((int)sehCount) + " last_tick=" +
+          ToString((int)g_portraitLastSehTick));
+    }
+  }
+}
+
+static bool TryCapturePortraitBmpUnsafe(Character *npc, std::string &bmpDataOut,
+                                        int &widthOut, int &heightOut,
+                                        std::string &imageHashOut,
+                                        std::string *diagReasonOut = nullptr) {
   auto fail = [&](const std::string &reason) -> bool {
     if (diagReasonOut) {
       *diagReasonOut = reason;
@@ -1691,6 +1753,29 @@ static bool TryCapturePortraitBmp(Character *npc, std::string &bmpDataOut,
   return true;
 }
 
+static bool TryCapturePortraitBmp(Character *npc, std::string &bmpDataOut,
+                                  int &widthOut, int &heightOut,
+                                  std::string &imageHashOut,
+                                  std::string *diagReasonOut = nullptr) {
+  if (g_portraitSyncDisabledForSession) {
+    if (diagReasonOut) {
+      *diagReasonOut = "portrait_sync_disabled_for_session";
+    }
+    return false;
+  }
+
+  __try {
+    return TryCapturePortraitBmpUnsafe(npc, bmpDataOut, widthOut, heightOut,
+                                       imageHashOut, diagReasonOut);
+  } __except (PortraitSehFilter(GetExceptionCode())) {
+    if (diagReasonOut) {
+      *diagReasonOut = "portrait_capture_seh";
+    }
+    MaybeDisablePortraitSyncAfterSeh();
+    return false;
+  }
+}
+
 static bool ShouldSendPortraitSync(const std::string &storageId,
                                    const std::string &imageHash, DWORD nowTick,
                                    bool force, DWORD &sinceLastSentOut,
@@ -1719,8 +1804,8 @@ static bool ShouldSendPortraitSync(const std::string &storageId,
   return shouldSend;
 }
 
-static bool SyncPortraitForCharacter(Character *npc, bool force,
-                                     const std::string &reason) {
+static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
+                                           const std::string &reason) {
   if (!npc || (uintptr_t)npc < 0x1000) {
     return false;
   }
@@ -1825,6 +1910,20 @@ static bool SyncPortraitForCharacter(Character *npc, bool force,
   return true;
 }
 
+static bool SyncPortraitForCharacter(Character *npc, bool force,
+                                     const std::string &reason) {
+  if (g_portraitSyncDisabledForSession) {
+    return false;
+  }
+
+  __try {
+    return SyncPortraitForCharacterUnsafe(npc, force, reason);
+  } __except (PortraitSehFilter(GetExceptionCode())) {
+    MaybeDisablePortraitSyncAfterSeh();
+    return false;
+  }
+}
+
 static bool ShouldTriggerSpeechPortraitSync(unsigned int serial, DWORD nowTick) {
   if (serial == 0) {
     return false;
@@ -1922,8 +2021,10 @@ static void PrunePortraitSyncState() {
   }
 }
 
+static bool IsWorldStableForUI(GameWorld *world);
+
 static void RunPlayerFactionPortraitSweep(GameWorld *world) {
-  if (!world || !world->player || world->player->playerCharacters.size() == 0) {
+  if (!IsWorldStableForUI(world)) {
     static DWORD lastNoRosterLogTick = 0;
     DWORD nowTick = GetTickCount();
     if (nowTick - lastNoRosterLogTick >= 30000) {
@@ -2297,6 +2398,1078 @@ static void RefreshInventoryContextCache(Character *npc,
   LeaveCriticalSection(&g_stateMutex);
 }
 
+static volatile LONG g_inventorySyncSehCount = 0;
+static DWORD g_inventoryLastSehTick = 0;
+static DWORD g_inventoryLastSehCode = 0;
+
+static int InventorySyncSehFilter(unsigned int code) {
+  g_inventoryLastSehCode = code;
+  g_inventoryLastSehTick = GetTickCount();
+  InterlockedIncrement(&g_inventorySyncSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static volatile LONG g_itemImageSehCount = 0;
+static DWORD g_itemImageLastSehTick = 0;
+static DWORD g_itemImageLastSehCode = 0;
+static bool g_itemImageSyncDisabledForSession = false;
+static bool g_itemImageDisableLogged = false;
+
+static int ItemImageSehFilter(unsigned int code) {
+  g_itemImageLastSehCode = code;
+  g_itemImageLastSehTick = GetTickCount();
+  InterlockedIncrement(&g_itemImageSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void MaybeDisableItemImageSyncAfterSeh() {
+  if (g_itemImageSyncDisabledForSession) {
+    return;
+  }
+  LONG sehCount = InterlockedCompareExchange(&g_itemImageSehCount, 0, 0);
+  if (sehCount >= 3) {
+    g_itemImageSyncDisabledForSession = true;
+    if (!g_itemImageDisableLogged) {
+      g_itemImageDisableLogged = true;
+      Log("ITEM_IMAGE_SYNC: disabled for this session after repeated engine SEH faults code=" +
+          ToString((int)g_itemImageLastSehCode) + " count=" +
+          ToString((int)sehCount) + " last_tick=" +
+          ToString((int)g_itemImageLastSehTick));
+    }
+  }
+}
+
+static std::string NormalizeItemImageStateKey(const std::string &itemId) {
+  std::string key = TrimCopy(itemId);
+  for (size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<char>(tolower((unsigned char)key[i]));
+  }
+  return key;
+}
+
+static std::string BuildSyntheticItemStringIdFromName(const std::string &itemName) {
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(itemName));
+  if (normalized.empty()) {
+    return "";
+  }
+
+  std::string slug = "";
+  slug.reserve(normalized.size());
+  bool lastWasUnderscore = false;
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    unsigned char ch = (unsigned char)normalized[i];
+    bool isAlphaNum = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+    if (isAlphaNum) {
+      slug.push_back((char)ch);
+      lastWasUnderscore = false;
+      continue;
+    }
+    if (!slug.empty() && !lastWasUnderscore) {
+      slug.push_back('_');
+      lastWasUnderscore = true;
+    }
+  }
+  while (!slug.empty() && slug.back() == '_') {
+    slug.pop_back();
+  }
+  if (slug.empty()) {
+    return "";
+  }
+  if (slug.length() > 110) {
+    slug = slug.substr(0, 110);
+    while (!slug.empty() && slug.back() == '_') {
+      slug.pop_back();
+    }
+  }
+  if (slug.empty()) {
+    return "";
+  }
+  return "name_" + slug;
+}
+
+static bool IsNpcInventoryWindowVisible(Character *npc) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  Inventory *inventory = nullptr;
+  try {
+    inventory = npc->getInventory();
+  } catch (...) {
+    inventory = nullptr;
+  }
+  if (!inventory || (uintptr_t)inventory < 0x1000) {
+    return false;
+  }
+
+  InventoryGUI *inventoryGui = nullptr;
+  try {
+    inventoryGui = inventory->getInventoryGUI();
+  } catch (...) {
+    inventoryGui = nullptr;
+  }
+  if (!inventoryGui || (uintptr_t)inventoryGui < 0x1000) {
+    return false;
+  }
+  try {
+    return inventoryGui->isVisible();
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool IsItemImageSyncReasonAllowed(const std::string &reason) {
+  std::string key = ToLowerAsciiCopy(TrimCopy(reason));
+  if (key.empty()) {
+    return false;
+  }
+  if (key == "periodic") {
+    return false;
+  }
+  if (key == "selection_change" || key == "chat_open" ||
+      key == "dialogue_npc" || key == "dialogue_player") {
+    return true;
+  }
+  if (key.find("dialogue") != std::string::npos ||
+      key.find("description") != std::string::npos ||
+      key.find("chat") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
+static bool ShouldRunItemImageSyncNow(const std::string &reason, bool force) {
+  (void)force;
+  if (g_itemImageSyncDisabledForSession) {
+    return false;
+  }
+  std::string reasonKey = ToLowerAsciiCopy(TrimCopy(reason));
+  if (!IsItemImageSyncReasonAllowed(reasonKey)) {
+    return false;
+  }
+
+  DWORD nowTick = GetTickCount();
+  bool allow = false;
+  EnterCriticalSection(&g_stateMutex);
+  DWORD stableTick = g_worldStableSinceTick;
+  DWORD sinceLastRun =
+      g_itemImageLastRunTick == 0 ? 0 : (nowTick - g_itemImageLastRunTick);
+  bool startupDelayPassed =
+      stableTick != 0 && (nowTick - stableTick) >= kItemImageStartupDelayMs;
+  bool cooldownPassed =
+      g_itemImageLastRunTick == 0 || sinceLastRun >= kItemImageRunCooldownMs;
+  if (startupDelayPassed && cooldownPassed) {
+    allow = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return allow;
+}
+
+static bool ShouldSendItemImageSync(const std::string &itemId,
+                                    const std::string &imageHash, DWORD nowTick,
+                                    bool force, DWORD &sinceLastSentOut,
+                                    bool &changedOut, bool &firstOut) {
+  sinceLastSentOut = 0;
+  changedOut = false;
+  firstOut = false;
+  if (itemId.empty() || imageHash.empty()) {
+    return false;
+  }
+
+  std::string stateKey = NormalizeItemImageStateKey(itemId);
+  if (stateKey.empty()) {
+    return false;
+  }
+
+  bool shouldSend = false;
+  EnterCriticalSection(&g_stateMutex);
+  ItemImageSyncState &state = g_itemImageSyncStateByItemId[stateKey];
+  state.lastSeenTick = nowTick;
+  changedOut = (state.lastHash != imageHash);
+  firstOut = !state.hasSent;
+  sinceLastSentOut = state.hasSent ? (nowTick - state.lastSentTick) : 0;
+  if (force || firstOut || changedOut || sinceLastSentOut >= kItemImageMinResendMs) {
+    shouldSend = true;
+    state.lastHash = imageHash;
+    state.lastSentTick = nowTick;
+    state.hasSent = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return shouldSend;
+}
+
+static void QueueItemImageSyncRequest(Character *npc, const std::string &reason) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return;
+  }
+
+  hand npcHand;
+  unsigned int serial = 0;
+  try {
+    npcHand = npc->getHandle();
+    serial = npcHand.serial;
+  } catch (...) {
+    return;
+  }
+  if (serial == 0 || !npcHand.isValid()) {
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  EnterCriticalSection(&g_stateMutex);
+  for (size_t i = 0; i < g_itemImageSyncRequestQueue.size(); ++i) {
+    if (g_itemImageSyncRequestQueue[i].npcHand.serial == serial) {
+      g_itemImageSyncRequestQueue[i].reason = reason;
+      g_itemImageSyncRequestQueue[i].queuedTick = nowTick;
+      LeaveCriticalSection(&g_stateMutex);
+      return;
+    }
+  }
+
+  PendingItemImageSyncRequest req;
+  req.npcHand = npcHand;
+  req.reason = reason;
+  req.queuedTick = nowTick;
+  g_itemImageSyncRequestQueue.push_back(req);
+  while (g_itemImageSyncRequestQueue.size() > kItemImageRequestQueueMax) {
+    g_itemImageSyncRequestQueue.pop_front();
+  }
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static std::string TruncateItemImageDiagValue(const std::string &value,
+                                              size_t maxLen = 72) {
+  if (value.length() <= maxLen) {
+    return value;
+  }
+  if (maxLen <= 3) {
+    return value.substr(0, maxLen);
+  }
+  return value.substr(0, maxLen - 3) + "...";
+}
+
+static bool HasKnownImageExtension(const std::string &name) {
+  return EndsWithAsciiInsensitive(name, ".dds") ||
+         EndsWithAsciiInsensitive(name, ".png") ||
+         EndsWithAsciiInsensitive(name, ".tga") ||
+         EndsWithAsciiInsensitive(name, ".bmp") ||
+         EndsWithAsciiInsensitive(name, ".jpg") ||
+         EndsWithAsciiInsensitive(name, ".jpeg") ||
+         EndsWithAsciiInsensitive(name, ".webp");
+}
+
+static void AppendUniqueIconResourceCandidate(std::vector<std::string> &out,
+                                              const std::string &candidate) {
+  std::string trimmed = TrimCopy(candidate);
+  if (trimmed.empty()) {
+    return;
+  }
+  std::string lowered = ToLowerAsciiCopy(trimmed);
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (ToLowerAsciiCopy(out[i]) == lowered) {
+      return;
+    }
+  }
+  out.push_back(trimmed);
+}
+
+static std::vector<Ogre::String>
+BuildItemIconResourceCandidates(const std::string &iconImageName) {
+  std::vector<std::string> nativeCandidates;
+  std::string trimmed = TrimCopy(iconImageName);
+  AppendUniqueIconResourceCandidate(nativeCandidates, trimmed);
+
+  std::string normalizedSlashes = trimmed;
+  for (size_t i = 0; i < normalizedSlashes.size(); ++i) {
+    if (normalizedSlashes[i] == '\\') {
+      normalizedSlashes[i] = '/';
+    }
+  }
+  AppendUniqueIconResourceCandidate(nativeCandidates, normalizedSlashes);
+
+  if (!HasKnownImageExtension(trimmed)) {
+    const char *exts[] = {".dds", ".png", ".tga", ".bmp", ".jpg", ".jpeg"};
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); ++i) {
+      AppendUniqueIconResourceCandidate(nativeCandidates, trimmed + exts[i]);
+      AppendUniqueIconResourceCandidate(nativeCandidates,
+                                        normalizedSlashes + exts[i]);
+    }
+  }
+
+  std::vector<Ogre::String> ogreCandidates;
+  ogreCandidates.reserve(nativeCandidates.size());
+  for (size_t i = 0; i < nativeCandidates.size(); ++i) {
+    ogreCandidates.push_back(Ogre::String(nativeCandidates[i].c_str()));
+  }
+  return ogreCandidates;
+}
+
+static bool TryLoadItemIconImage(const std::string &iconImageName,
+                                 Ogre::Image &iconImage,
+                                 std::string &resolvedNameOut,
+                                 std::string &resolvedGroupOut,
+                                 std::string *diagReasonOut = nullptr) {
+  resolvedNameOut.clear();
+  resolvedGroupOut.clear();
+  if (diagReasonOut) {
+    diagReasonOut->clear();
+  }
+
+  std::vector<Ogre::String> candidates =
+      BuildItemIconResourceCandidates(iconImageName);
+  if (candidates.empty()) {
+    if (diagReasonOut) {
+      *diagReasonOut = "icon_candidates_empty";
+    }
+    return false;
+  }
+
+  const char *groupCandidates[] = {"General", "GUI", "Characters", "Materials",
+                                   ""};
+
+  for (size_t c = 0; c < candidates.size(); ++c) {
+    const Ogre::String &candidate = candidates[c];
+    for (size_t g = 0; g < sizeof(groupCandidates) / sizeof(groupCandidates[0]);
+         ++g) {
+      try {
+        iconImage.load(candidate, Ogre::String(groupCandidates[g]));
+        resolvedNameOut = candidate.c_str();
+        resolvedGroupOut = groupCandidates[g];
+        return true;
+      } catch (...) {
+      }
+    }
+  }
+
+  if (diagReasonOut) {
+    *diagReasonOut =
+        "icon_load_failed:" + TruncateItemImageDiagValue(iconImageName);
+  }
+  return false;
+}
+
+static bool ExtractIconRectToRgba(const Ogre::PixelBox &pixelBox, size_t elemBytes,
+                                  int srcLeft, int srcTop, int width, int height,
+                                  std::vector<unsigned char> &rgbaOut) {
+  rgbaOut.clear();
+  if (width <= 0 || height <= 0 || srcLeft < 0 || srcTop < 0) {
+    return false;
+  }
+  const int imageWidth = static_cast<int>(pixelBox.getWidth());
+  const int imageHeight = static_cast<int>(pixelBox.getHeight());
+  if (srcLeft + width > imageWidth || srcTop + height > imageHeight) {
+    return false;
+  }
+  const unsigned char *base = static_cast<const unsigned char *>(pixelBox.data);
+  if (!base) {
+    return false;
+  }
+
+  try {
+    rgbaOut.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U,
+                   0U);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const size_t srcOffset =
+            (static_cast<size_t>(srcTop + y) *
+                 static_cast<size_t>(pixelBox.rowPitch) +
+             static_cast<size_t>(srcLeft + x)) *
+            elemBytes;
+        const unsigned char *srcPixel = base + srcOffset;
+        unsigned char *dstPixel =
+            &rgbaOut[(static_cast<size_t>(y) * static_cast<size_t>(width) +
+                      static_cast<size_t>(x)) *
+                     4U];
+        Ogre::PixelUtil::unpackColour(&dstPixel[0], &dstPixel[1], &dstPixel[2],
+                                      &dstPixel[3], pixelBox.format, srcPixel);
+      }
+    }
+  } catch (...) {
+    rgbaOut.clear();
+    return false;
+  }
+
+  return !rgbaOut.empty();
+}
+
+static bool ComputeOpaqueIconBounds(const Ogre::PixelBox &pixelBox, size_t elemBytes,
+                                    int alphaThreshold, int &leftOut, int &topOut,
+                                    int &widthOut, int &heightOut) {
+  leftOut = 0;
+  topOut = 0;
+  widthOut = 0;
+  heightOut = 0;
+
+  const unsigned char *base = static_cast<const unsigned char *>(pixelBox.data);
+  if (!base) {
+    return false;
+  }
+
+  const int imageWidth = static_cast<int>(pixelBox.getWidth());
+  const int imageHeight = static_cast<int>(pixelBox.getHeight());
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return false;
+  }
+
+  int minX = imageWidth;
+  int minY = imageHeight;
+  int maxX = -1;
+  int maxY = -1;
+  try {
+    for (int y = 0; y < imageHeight; ++y) {
+      for (int x = 0; x < imageWidth; ++x) {
+        const size_t srcOffset =
+            (static_cast<size_t>(y) * static_cast<size_t>(pixelBox.rowPitch) +
+             static_cast<size_t>(x)) *
+            elemBytes;
+        const unsigned char *srcPixel = base + srcOffset;
+        unsigned char r = 0;
+        unsigned char g = 0;
+        unsigned char b = 0;
+        unsigned char a = 0;
+        Ogre::PixelUtil::unpackColour(&r, &g, &b, &a, pixelBox.format, srcPixel);
+        if (a > alphaThreshold && (r > 6 || g > 6 || b > 6)) {
+          if (x < minX) {
+            minX = x;
+          }
+          if (y < minY) {
+            minY = y;
+          }
+          if (x > maxX) {
+            maxX = x;
+          }
+          if (y > maxY) {
+            maxY = y;
+          }
+        }
+      }
+    }
+  } catch (...) {
+    return false;
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return false;
+  }
+
+  leftOut = minX;
+  topOut = minY;
+  widthOut = maxX - minX + 1;
+  heightOut = maxY - minY + 1;
+  return widthOut > 0 && heightOut > 0;
+}
+
+static size_t CountOpaquePixelsRgba(const std::vector<unsigned char> &rgba,
+                                    unsigned char alphaThreshold) {
+  size_t count = 0;
+  for (size_t i = 3; i < rgba.size(); i += 4) {
+    if (rgba[i] > alphaThreshold) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+typedef void (*InventoryIconCreateIconImageExportFn)(Item *, std::string &,
+                                                      iVector2 &);
+
+static InventoryIconCreateIconImageExportFn ResolveInventoryIconCreateIconImageExport() {
+  static InventoryIconCreateIconImageExportFn fn = nullptr;
+  static bool resolved = false;
+  if (resolved) {
+    return fn;
+  }
+  resolved = true;
+
+  HMODULE kenshiLib = GetModuleHandleA("KenshiLib.dll");
+  if (!kenshiLib) {
+    return nullptr;
+  }
+
+  FARPROC exported = GetProcAddress(
+      kenshiLib,
+      "?createIconImage@InventoryIcon@@SAXPEAVItem@@AEAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@AEAViVector2@@@Z");
+  if (exported) {
+    fn = reinterpret_cast<InventoryIconCreateIconImageExportFn>(exported);
+  }
+  return fn;
+}
+
+static bool TryCreateIconImageSehSafe(Item *item, std::string &iconImageNameOut,
+                                      iVector2 &iconSizeOut,
+                                      std::string *diagReasonOut = nullptr) {
+  if (diagReasonOut) {
+    diagReasonOut->clear();
+  }
+  iconImageNameOut.clear();
+  iconSizeOut.x = 0;
+  iconSizeOut.y = 0;
+  if (!item || (uintptr_t)item < 0x1000) {
+    if (diagReasonOut) {
+      *diagReasonOut = "invalid_item";
+    }
+    return false;
+  }
+
+  InventoryIconCreateIconImageExportFn exportFn =
+      ResolveInventoryIconCreateIconImageExport();
+  if (exportFn) {
+    __try {
+      exportFn(item, iconImageNameOut, iconSizeOut);
+      return true;
+    } __except (ItemImageSehFilter(GetExceptionCode())) {
+      if (diagReasonOut) {
+        *diagReasonOut = "create_icon_image_export_seh";
+      }
+      MaybeDisableItemImageSyncAfterSeh();
+      return false;
+    }
+  }
+
+  __try {
+    InventoryIcon::createIconImage(item, iconImageNameOut, iconSizeOut);
+    return true;
+  } __except (ItemImageSehFilter(GetExceptionCode())) {
+    if (diagReasonOut) {
+      *diagReasonOut = "create_icon_image_seh";
+    }
+    MaybeDisableItemImageSyncAfterSeh();
+    return false;
+  }
+}
+
+static bool TryCaptureItemIconBmpUnsafe(Item *item, std::string &bmpDataOut,
+                                        int &widthOut, int &heightOut,
+                                        std::string &imageHashOut,
+                                        std::string *diagReasonOut = nullptr) {
+  auto fail = [&](const std::string &reason) -> bool {
+    if (diagReasonOut) {
+      *diagReasonOut = reason;
+    }
+    return false;
+  };
+
+  bmpDataOut.clear();
+  imageHashOut.clear();
+  widthOut = 0;
+  heightOut = 0;
+  if (diagReasonOut) {
+    diagReasonOut->clear();
+  }
+
+  if (!item || (uintptr_t)item < 0x1000) {
+    return fail("invalid_item");
+  }
+
+  std::string iconImageName = "";
+  iVector2 iconSize;
+  if (!TryCreateIconImageSehSafe(item, iconImageName, iconSize, diagReasonOut)) {
+    if (diagReasonOut && !diagReasonOut->empty()) {
+      return false;
+    }
+    return fail("create_icon_image_failed");
+  }
+  iconImageName = TrimCopy(iconImageName);
+  if (iconImageName.empty()) {
+    return fail("icon_name_empty");
+  }
+
+  Ogre::Image iconImage;
+  std::string resolvedName = "";
+  std::string resolvedGroup = "";
+  if (!TryLoadItemIconImage(iconImageName, iconImage, resolvedName, resolvedGroup,
+                            diagReasonOut)) {
+    if (diagReasonOut && !diagReasonOut->empty()) {
+      return false;
+    }
+    return fail("icon_load_failed");
+  }
+
+  Ogre::PixelBox pixelBox;
+  try {
+    pixelBox = iconImage.getPixelBox(0, 0);
+  } catch (...) {
+    return fail("icon_pixel_box_exception");
+  }
+  if (!pixelBox.data) {
+    return fail("icon_pixel_box_no_data");
+  }
+  if (!Ogre::PixelUtil::isAccessible(pixelBox.format)) {
+    return fail("icon_pixel_format_inaccessible");
+  }
+  const size_t elemBytes = Ogre::PixelUtil::getNumElemBytes(pixelBox.format);
+  if (elemBytes == 0) {
+    return fail("icon_elem_bytes_zero");
+  }
+
+  const int imageWidth = static_cast<int>(pixelBox.getWidth());
+  const int imageHeight = static_cast<int>(pixelBox.getHeight());
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return fail("icon_dimensions_invalid");
+  }
+  if (imageWidth < 8 || imageHeight < 8) {
+    return fail("icon_dimensions_too_small");
+  }
+
+  bool hasIconSizeHint =
+      iconSize.x > 0 && iconSize.y > 0 && iconSize.x <= imageWidth &&
+      iconSize.y <= imageHeight;
+
+  int opaqueLeft = 0;
+  int opaqueTop = 0;
+  int opaqueWidth = 0;
+  int opaqueHeight = 0;
+  // Avoid expensive per-pixel alpha scans on large source textures to prevent
+  // frame hangs on the main thread.
+  bool canRunOpaqueScan = imageWidth <= 512 && imageHeight <= 512;
+  bool hasOpaqueBounds = false;
+  if (canRunOpaqueScan) {
+    hasOpaqueBounds = ComputeOpaqueIconBounds(pixelBox, elemBytes, 10, opaqueLeft,
+                                              opaqueTop, opaqueWidth,
+                                              opaqueHeight);
+  }
+  if (hasOpaqueBounds) {
+    const int kOpaquePad = 1;
+    int left = opaqueLeft - kOpaquePad;
+    int top = opaqueTop - kOpaquePad;
+    int right = opaqueLeft + opaqueWidth - 1 + kOpaquePad;
+    int bottom = opaqueTop + opaqueHeight - 1 + kOpaquePad;
+    if (left < 0) {
+      left = 0;
+    }
+    if (top < 0) {
+      top = 0;
+    }
+    if (right >= imageWidth) {
+      right = imageWidth - 1;
+    }
+    if (bottom >= imageHeight) {
+      bottom = imageHeight - 1;
+    }
+    if (right >= left && bottom >= top) {
+      opaqueLeft = left;
+      opaqueTop = top;
+      opaqueWidth = right - left + 1;
+      opaqueHeight = bottom - top + 1;
+    }
+  }
+
+  int captureLeft = 0;
+  int captureTop = 0;
+  int captureWidth = imageWidth;
+  int captureHeight = imageHeight;
+  if (hasIconSizeHint) {
+    captureWidth = iconSize.x;
+    captureHeight = iconSize.y;
+    captureLeft = (imageWidth - captureWidth) / 2;
+    captureTop = (imageHeight - captureHeight) / 2;
+  } else if (imageWidth > 512 || imageHeight > 512) {
+    // No reliable size hint; take a bounded center crop instead of scanning or
+    // processing a full atlas-sized source.
+    int bounded = std::min(imageWidth, imageHeight);
+    if (bounded > 256) {
+      bounded = 256;
+    }
+    if (bounded < 8) {
+      return fail("icon_dimensions_too_small");
+    }
+    captureWidth = bounded;
+    captureHeight = bounded;
+    captureLeft = (imageWidth - captureWidth) / 2;
+    captureTop = (imageHeight - captureHeight) / 2;
+  }
+  if (hasOpaqueBounds && opaqueWidth >= 8 && opaqueHeight >= 8) {
+    long long opaqueArea =
+        static_cast<long long>(opaqueWidth) * static_cast<long long>(opaqueHeight);
+    long long fullArea =
+        static_cast<long long>(imageWidth) * static_cast<long long>(imageHeight);
+    bool opaqueLooksSpecific = fullArea > 0 && opaqueArea * 100LL <= fullArea * 95LL;
+    if (!hasIconSizeHint || opaqueLooksSpecific) {
+      captureLeft = opaqueLeft;
+      captureTop = opaqueTop;
+      captureWidth = opaqueWidth;
+      captureHeight = opaqueHeight;
+    }
+  }
+  if (captureWidth < 8 || captureHeight < 8) {
+    return fail("icon_dimensions_too_small");
+  }
+
+  const int kMaxCaptureDimension = 512;
+  if (captureWidth > kMaxCaptureDimension || captureHeight > kMaxCaptureDimension) {
+    bool reduced = false;
+    if (hasIconSizeHint && iconSize.x <= kMaxCaptureDimension &&
+        iconSize.y <= kMaxCaptureDimension) {
+      captureWidth = iconSize.x;
+      captureHeight = iconSize.y;
+      captureLeft = (imageWidth - captureWidth) / 2;
+      captureTop = (imageHeight - captureHeight) / 2;
+      reduced = true;
+    }
+    if (!reduced && hasOpaqueBounds && opaqueWidth >= 8 && opaqueHeight >= 8 &&
+        opaqueWidth <= kMaxCaptureDimension &&
+        opaqueHeight <= kMaxCaptureDimension) {
+      captureLeft = opaqueLeft;
+      captureTop = opaqueTop;
+      captureWidth = opaqueWidth;
+      captureHeight = opaqueHeight;
+      reduced = true;
+    }
+    if (!reduced) {
+      return fail("icon_dimensions_too_large");
+    }
+  }
+
+  std::vector<unsigned char> rgba;
+  if (!ExtractIconRectToRgba(pixelBox, elemBytes, captureLeft, captureTop,
+                             captureWidth, captureHeight, rgba)) {
+    return fail("icon_readback_exception");
+  }
+
+  if (hasIconSizeHint &&
+      (captureWidth != imageWidth || captureHeight != imageHeight)) {
+    size_t totalPixels =
+        static_cast<size_t>(captureWidth) * static_cast<size_t>(captureHeight);
+    size_t opaquePixels = CountOpaquePixelsRgba(rgba, 8);
+    bool mostlyTransparent =
+        totalPixels == 0 || opaquePixels == 0 || (opaquePixels * 200U) < totalPixels;
+    if (mostlyTransparent) {
+      bool replaced = false;
+      if (hasOpaqueBounds && opaqueWidth >= 8 && opaqueHeight >= 8 &&
+          (opaqueLeft != captureLeft || opaqueTop != captureTop ||
+           opaqueWidth != captureWidth || opaqueHeight != captureHeight) &&
+          ExtractIconRectToRgba(pixelBox, elemBytes, opaqueLeft, opaqueTop,
+                                opaqueWidth, opaqueHeight, rgba)) {
+        captureLeft = opaqueLeft;
+        captureTop = opaqueTop;
+        captureWidth = opaqueWidth;
+        captureHeight = opaqueHeight;
+        replaced = true;
+      }
+      if (!replaced &&
+          ExtractIconRectToRgba(pixelBox, elemBytes, 0, 0, imageWidth, imageHeight,
+                                rgba)) {
+        captureLeft = 0;
+        captureTop = 0;
+        captureWidth = imageWidth;
+        captureHeight = imageHeight;
+      }
+    }
+  }
+
+  if (!EncodeBmp24(rgba, captureWidth, captureHeight, bmpDataOut) ||
+      bmpDataOut.empty()) {
+    return fail("icon_encode_bmp_failed");
+  }
+
+  if (diagReasonOut) {
+    *diagReasonOut = "ok:" + TruncateItemImageDiagValue(resolvedName) + "@" +
+                     TruncateItemImageDiagValue(resolvedGroup) + ":" +
+                     ToString(captureWidth) + "x" + ToString(captureHeight);
+  }
+
+  imageHashOut = HexFromU64(HashFnv1a64(
+      reinterpret_cast<const unsigned char *>(bmpDataOut.data()),
+      bmpDataOut.size()));
+  widthOut = captureWidth;
+  heightOut = captureHeight;
+  return true;
+}
+
+static bool TryCaptureItemIconBmp(Item *item, std::string &bmpDataOut,
+                                  int &widthOut, int &heightOut,
+                                  std::string &imageHashOut,
+                                  std::string *diagReasonOut = nullptr) {
+  if (g_itemImageSyncDisabledForSession) {
+    if (diagReasonOut) {
+      *diagReasonOut = "item_image_sync_disabled_for_session";
+    }
+    return false;
+  }
+
+  __try {
+    return TryCaptureItemIconBmpUnsafe(item, bmpDataOut, widthOut, heightOut,
+                                       imageHashOut, diagReasonOut);
+  } __except (ItemImageSehFilter(GetExceptionCode())) {
+    if (diagReasonOut) {
+      *diagReasonOut = "item_icon_capture_seh";
+    }
+    MaybeDisableItemImageSyncAfterSeh();
+    return false;
+  }
+}
+
+static void PruneItemImageSyncState() {
+  DWORD nowTick = GetTickCount();
+  int pruned = 0;
+  EnterCriticalSection(&g_stateMutex);
+  for (std::map<std::string, ItemImageSyncState>::iterator it =
+           g_itemImageSyncStateByItemId.begin();
+       it != g_itemImageSyncStateByItemId.end();) {
+    DWORD age = nowTick - it->second.lastSeenTick;
+    if (it->second.lastSeenTick == 0 || age > kItemImageStateRetentionMs) {
+      it = g_itemImageSyncStateByItemId.erase(it);
+      ++pruned;
+    } else {
+      ++it;
+    }
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  if (pruned > 0) {
+    Log("ITEM_IMAGE_SYNC: pruned stale state entries=" + ToString(pruned));
+  }
+}
+
+static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
+                                               const std::string &reason) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return 0;
+  }
+  if (g_itemImageSyncDisabledForSession) {
+    return 0;
+  }
+
+  DWORD nowTick = GetTickCount();
+  EnterCriticalSection(&g_stateMutex);
+  g_itemImageLastRunTick = nowTick;
+  LeaveCriticalSection(&g_stateMutex);
+
+  std::vector<Item *> rawItems;
+  try {
+    GetAllCharacterItems(npc, rawItems);
+  } catch (...) {
+    return 0;
+  }
+  if (rawItems.empty()) {
+    return 0;
+  }
+
+  std::map<std::string, Item *> uniqueByIdKey;
+  std::map<std::string, std::string> sourceItemIdByKey;
+  for (uint32_t i = 0; i < rawItems.size(); ++i) {
+    Item *item = rawItems[i];
+    if (!item || (uintptr_t)item < 0x1000) {
+      continue;
+    }
+    std::string itemId = "";
+    std::string itemName = "";
+    try {
+      itemName = TrimCopy(item->getName());
+      if (item->data && (uintptr_t)item->data > 0x1000) {
+        itemId = TrimCopy(item->data->stringID);
+      }
+    } catch (...) {
+      itemId = "";
+      itemName = "";
+    }
+    if (itemId.empty()) {
+      itemId = BuildSyntheticItemStringIdFromName(itemName);
+    }
+    if (itemId.empty()) {
+      continue;
+    }
+    std::string key = NormalizeItemImageStateKey(itemId);
+    if (key.empty()) {
+      continue;
+    }
+    if (uniqueByIdKey.find(key) == uniqueByIdKey.end()) {
+      uniqueByIdKey[key] = item;
+      sourceItemIdByKey[key] = itemId;
+    }
+  }
+
+  if (uniqueByIdKey.empty()) {
+    return 0;
+  }
+
+  size_t queued = 0;
+  size_t captureFailed = 0;
+  size_t considered = 0;
+  std::string firstCaptureReason = "";
+  std::string entriesJson = "[";
+  for (std::map<std::string, Item *>::iterator it = uniqueByIdKey.begin();
+       it != uniqueByIdKey.end(); ++it) {
+    if (queued >= kItemImageBatchLimit) {
+      break;
+    }
+    if (considered >= kItemImageBatchLimit * 6) {
+      break;
+    }
+    ++considered;
+
+    const std::string itemId = sourceItemIdByKey[it->first];
+    Item *item = it->second;
+    if (!item || (uintptr_t)item < 0x1000 || itemId.empty()) {
+      continue;
+    }
+
+    std::string bmpData = "";
+    std::string imageHash = "";
+    std::string captureReason = "";
+    int width = 0;
+    int height = 0;
+    if (!TryCaptureItemIconBmp(item, bmpData, width, height, imageHash,
+                               &captureReason)) {
+      ++captureFailed;
+      if (firstCaptureReason.empty() && !captureReason.empty()) {
+        firstCaptureReason = captureReason;
+      }
+      continue;
+    }
+    if (bmpData.empty() || imageHash.empty() || width <= 0 || height <= 0) {
+      ++captureFailed;
+      if (firstCaptureReason.empty()) {
+        firstCaptureReason = "invalid_captured_icon";
+      }
+      continue;
+    }
+
+    DWORD sinceLastSent = 0;
+    bool changed = false;
+    bool firstSync = false;
+    if (!ShouldSendItemImageSync(itemId, imageHash, nowTick, force,
+                                 sinceLastSent, changed, firstSync)) {
+      continue;
+    }
+
+    std::string base64Image = Base64EncodeBinary(bmpData);
+    if (base64Image.empty()) {
+      continue;
+    }
+
+    std::string itemName = "";
+    try {
+      itemName = item->getName();
+    } catch (...) {
+      itemName = "";
+    }
+
+    if (queued > 0) {
+      entriesJson += ",";
+    }
+    entriesJson += "{";
+    entriesJson += "\"stringid\":\"" + EscapeJSON(itemId) + "\",";
+    entriesJson += "\"name\":\"" + EscapeJSON(itemName) + "\",";
+    entriesJson += "\"image_hash\":\"" + EscapeJSON(imageHash) + "\",";
+    entriesJson += "\"format\":\"bmp\",";
+    entriesJson += "\"width\":" + ToString(width) + ",";
+    entriesJson += "\"height\":" + ToString(height) + ",";
+    entriesJson += "\"image_base64\":\"" + EscapeJSON(base64Image) + "\"";
+    entriesJson += "}";
+    ++queued;
+  }
+  entriesJson += "]";
+
+  if (queued == 0) {
+    static DWORD lastNoSendLogTick = 0;
+    if (considered > 0 && nowTick - lastNoSendLogTick >= 5000) {
+      lastNoSendLogTick = nowTick;
+      Log("ITEM_IMAGE_SYNC: no-send considered=" + ToString((int)considered) +
+          " capture_failed=" + ToString((int)captureFailed) +
+          " reason=" + reason +
+          (firstCaptureReason.empty()
+               ? std::string("")
+               : std::string(" capture_reason=" + firstCaptureReason)));
+    }
+    return 0;
+  }
+
+  int gameTs = 0;
+  try {
+    GameWorld *world = GetWorldSafe();
+    if (world) {
+      TimeOfDay tod = world->getTimeStamp_inGameHours();
+      gameTs = static_cast<int>(tod.getTotalSeconds());
+    }
+  } catch (...) {
+    gameTs = 0;
+  }
+
+  std::string payload = "{";
+  payload += "\"source\":\"inventory_live_sync\",";
+  payload += "\"sync_reason\":\"" + EscapeJSON(reason) + "\",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload += "\"entries\":" + entriesJson;
+  payload += "}";
+  AsyncPostToStobe(L"/item_image_upload", payload);
+
+  static DWORD lastPruneTick = 0;
+  if (nowTick - lastPruneTick >= 60000) {
+    lastPruneTick = nowTick;
+    PruneItemImageSyncState();
+  }
+
+  Log("ITEM_IMAGE_SYNC: sent entries=" + ToString((int)queued) +
+      " considered=" + ToString((int)considered) +
+      " capture_failed=" + ToString((int)captureFailed) + " reason=" + reason);
+  return queued;
+}
+
+static size_t SyncItemImagesForCharacter(Character *npc, bool force,
+                                         const std::string &reason) {
+  if (g_itemImageSyncDisabledForSession) {
+    return 0;
+  }
+
+  __try {
+    return SyncItemImagesForCharacterUnsafe(npc, force, reason);
+  } __except (ItemImageSehFilter(GetExceptionCode())) {
+    MaybeDisableItemImageSyncAfterSeh();
+    return 0;
+  }
+}
+
+static Character *ResolveCharacterFromHandSehSafe(const hand &characterHand) {
+  Character *npc = nullptr;
+  __try {
+    npc = characterHand.getCharacter();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    npc = nullptr;
+  }
+  return npc;
+}
+
+static void RunQueuedItemImageSync() {
+  if (g_itemImageSyncDisabledForSession) {
+    return;
+  }
+
+  PendingItemImageSyncRequest req;
+  bool hasRequest = false;
+  DWORD nowTick = GetTickCount();
+  EnterCriticalSection(&g_stateMutex);
+  DWORD stableTick = g_worldStableSinceTick;
+  DWORD sinceLastRun =
+      g_itemImageLastRunTick == 0 ? 0 : (nowTick - g_itemImageLastRunTick);
+  bool startupDelayPassed =
+      stableTick != 0 && (nowTick - stableTick) >= kItemImageStartupDelayMs;
+  bool cooldownPassed =
+      g_itemImageLastRunTick == 0 || sinceLastRun >= kItemImageRunCooldownMs;
+
+  if (startupDelayPassed && cooldownPassed && !g_itemImageSyncRequestQueue.empty()) {
+    req = g_itemImageSyncRequestQueue.front();
+    g_itemImageSyncRequestQueue.pop_front();
+    g_itemImageLastRunTick = nowTick;
+    hasRequest = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (!hasRequest) {
+    return;
+  }
+
+  Character *npc = ResolveCharacterFromHandSehSafe(req.npcHand);
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return;
+  }
+
+  std::string reason = TrimCopy(req.reason);
+  if (reason.empty()) {
+    reason = "queued_inventory_sync";
+  }
+  SyncItemImagesForCharacter(npc, false, reason);
+}
+
 static std::string BuildInventorySyncPayload(Character *npc,
                                              const std::string &inventoryJson,
                                              int inventoryItemCount,
@@ -2330,8 +3503,8 @@ static std::string BuildInventorySyncPayload(Character *npc,
   return payload;
 }
 
-static bool SyncInventoryForCharacter(Character *npc, bool force,
-                                      const std::string &reason) {
+static bool SyncInventoryForCharacterUnsafe(Character *npc, bool force,
+                                            const std::string &reason) {
   if (!npc || (uintptr_t)npc < 0x1000) {
     return false;
   }
@@ -2396,6 +3569,10 @@ static bool SyncInventoryForCharacter(Character *npc, bool force,
     return false;
   }
 
+  if (IsItemImageSyncReasonAllowed(reason)) {
+    QueueItemImageSyncRequest(npc, reason);
+  }
+
   std::string payload =
       BuildInventorySyncPayload(npc, inventoryJson, inventoryItemCount, reason);
   AsyncPostToStobe(L"/context", payload);
@@ -2405,6 +3582,15 @@ static bool SyncInventoryForCharacter(Character *npc, bool force,
       " hash=" + ShortInventoryHashForLog(inventoryHash) +
       " items=" + ToString(inventoryItemCount));
   return true;
+}
+
+static bool SyncInventoryForCharacter(Character *npc, bool force,
+                                      const std::string &reason) {
+  __try {
+    return SyncInventoryForCharacterUnsafe(npc, force, reason);
+  } __except (InventorySyncSehFilter(GetExceptionCode())) {
+    return false;
+  }
 }
 
 static void PushImmediateContextSnapshot(Character *npc,
@@ -6206,6 +7392,65 @@ static bool IsWorldStableForUI(GameWorld *world) {
   return true;
 }
 
+static bool TryGetPrimaryPlayerCharacterSafe(GameWorld *world,
+                                             Character *&playerOut) {
+  playerOut = nullptr;
+  if (!IsWorldStableForUI(world)) {
+    return false;
+  }
+
+  __try {
+    if (!world || !world->player ||
+        world->player->playerCharacters.size() == 0) {
+      return false;
+    }
+    Character *player = world->player->playerCharacters[0];
+    if (!player || reinterpret_cast<uintptr_t>(player) < 0x1000) {
+      return false;
+    }
+    playerOut = player;
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    playerOut = nullptr;
+    return false;
+  }
+}
+
+static bool TryGetCharacterHandleSafe(Character *character, hand &handleOut) {
+  handleOut = hand();
+  if (!character || reinterpret_cast<uintptr_t>(character) < 0x1000) {
+    return false;
+  }
+  __try {
+    handleOut = character->getHandle();
+    return handleOut.isValid() && handleOut.serial != 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    handleOut = hand();
+    return false;
+  }
+}
+
+static Character *ResolveSelectedCharacterSehSafe(PlayerInterface *thisptr) {
+  if (!thisptr || reinterpret_cast<uintptr_t>(thisptr) < 0x10000) {
+    return nullptr;
+  }
+
+  Character *selected = nullptr;
+  __try {
+    selected = thisptr->selectedObject.getCharacter();
+    if (!selected || reinterpret_cast<uintptr_t>(selected) < 0x1000) {
+      selected = thisptr->selectedCharacter.getCharacter();
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    selected = nullptr;
+  }
+
+  if (selected && reinterpret_cast<uintptr_t>(selected) >= 0x1000) {
+    return selected;
+  }
+  return nullptr;
+}
+
 static bool IsSpeechSystemBusyForMOTD() {
   if (IsTtsPlaybackActive()) {
     return true;
@@ -6244,6 +7489,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *worldUi = GetWorldSafe();
   static bool worldWasStable = false;
   static DWORD worldBecameStableTick = 0;
+  static bool heavySweepPrimed = false;
+  static DWORD lastHeavySyncGuardLogTick = 0;
   static bool motdAutoOpenQueued = false;
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
@@ -6266,6 +7513,10 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       Log("HOOK: world transition detected; pausing UI hook logic.");
       EnterCriticalSection(&g_stateMutex);
       g_inventorySyncStateBySerial.clear();
+      g_itemImageSyncStateByItemId.clear();
+      g_itemImageSyncRequestQueue.clear();
+      g_itemImageLastRunTick = 0;
+      g_worldStableSinceTick = 0;
       g_activeInventoryJson = "[]";
       g_playerInventoryJson = "[]";
       g_lastInventoryHand = hand();
@@ -6284,6 +7535,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerCatsSyncState();
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
+      heavySweepPrimed = false;
+      lastHeavySyncGuardLogTick = 0;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
@@ -6305,6 +7558,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!worldWasStable) {
     worldWasStable = true;
     worldBecameStableTick = GetTickCount();
+    EnterCriticalSection(&g_stateMutex);
+    g_worldStableSinceTick = worldBecameStableTick;
+    LeaveCriticalSection(&g_stateMutex);
+    heavySweepPrimed = false;
+    lastHeavySyncGuardLogTick = 0;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
@@ -6312,8 +7570,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     return;
   }
 
-  // Save loads can expose unstable pointers briefly right after world appears.
-  if (GetTickCount() - worldBecameStableTick < 3000) {
+  // Save loads can expose unstable pointers for several seconds after world appears.
+  if (GetTickCount() - worldBecameStableTick < 10000) {
     return;
   }
 
@@ -6328,7 +7586,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
-  } else if (!g_welcomeShown) {
+  } else if (!g_welcomeShown &&
+             (GetTickCount() - worldBecameStableTick) >=
+                 kMotdAutoOpenMinStableMs) {
     if (!motdAutoOpenQueued) {
       motdAutoOpenQueued = true;
       motdAutoOpenTick = worldBecameStableTick + 5500;
@@ -6392,22 +7652,24 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
   }
   if (logThisFrame) Log("HOOK_FRAME: selection tracking.");
-  Character *sel = nullptr;
-  try {
-    sel = thisptr->selectedObject.getCharacter();
-    if (!sel)
-      sel = thisptr->selectedCharacter.getCharacter();
-  } catch (...) {
-  }
+  Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
   if (logThisFrame) Log("HOOK_FRAME: selection done.");
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
   bool selectionChanged = false;
-  if (sel && (uintptr_t)sel > 0x1000) {
-    if (sel->getHandle() != g_lastSelectionHand) {
-      g_activeCharName = sel->getName();
-      g_lastSelectionHand = sel->getHandle();
+  hand currentSelectionHand;
+  bool hasSelectionHandle = TryGetCharacterHandleSafe(sel, currentSelectionHand);
+  if (hasSelectionHandle) {
+    if (currentSelectionHand != g_lastSelectionHand) {
+      std::string selectedName = "";
+      try {
+        selectedName = sel->getName();
+      } catch (...) {
+        selectedName = "";
+      }
+      g_activeCharName = selectedName;
+      g_lastSelectionHand = currentSelectionHand;
       selectionChanged = true;
     }
   } else if (g_lastSelectionHand.isValid()) {
@@ -6418,13 +7680,17 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   LeaveCriticalSection(&g_stateMutex);
   if (logThisFrame) Log("HOOK_FRAME: selection change check done.");
 
-  if (selectionChanged && sel && (uintptr_t)sel > 0x1000) {
+  if (selectionChanged && hasSelectionHandle && sel &&
+      (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
       SyncInventoryForCharacter(sel, true, "selection_change");
       SyncPortraitForCharacter(sel, true, "selection_change");
       static DWORD lastSelectionContextPushTick = 0;
+      static DWORD lastSelectionContextDelayLogTick = 0;
       DWORD nowSel = GetTickCount();
-      if (nowSel - lastSelectionContextPushTick > 1000) {
+      bool selectionContextReady =
+          (nowSel - worldBecameStableTick) >= kSelectionContextStartupDelayMs;
+      if (selectionContextReady && nowSel - lastSelectionContextPushTick > 1000) {
         std::string contextType = "npc";
         std::string selectedName = "Unknown";
         try {
@@ -6442,6 +7708,10 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         AsyncPostToStobe(L"/gamedata", selectedGameData);
         lastSelectionContextPushTick = nowSel;
         Log("CONTEXT_PUSH: sent selected character snapshot.");
+      } else if (!selectionContextReady &&
+                 nowSel - lastSelectionContextDelayLogTick >= 10000) {
+        lastSelectionContextDelayLogTick = nowSel;
+        Log("CONTEXT_PUSH: delayed selected character snapshot until startup window passes.");
       }
     } else {
       Log("ANIMAL_TALKS: ignoring selection context sync for inactive animal.");
@@ -6450,19 +7720,39 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 2. Message queue + queued actions
   GameWorld *world = GetWorldSafe();
-  if (world) {
+  bool worldFrameStable = IsWorldStableForUI(world);
+  if (world && worldFrameStable) {
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
-    RunInventorySyncSweep(world, sel);
-    RunPlayerFactionPortraitSweep(world);
-    RunNpcWorldEventSweep(world, sel);
-    RunInfoTelemetrySweep(world, sel);
+    RunQueuedItemImageSync();
+
+    DWORD nowTick = GetTickCount();
+    if (!heavySweepPrimed) {
+      g_lastInventorySweepTick = nowTick;
+      g_lastPortraitSweepTick = nowTick;
+      g_lastNpcWorldEventSweepTick = nowTick;
+      g_lastInfoNpcTelemetryCheckTick = nowTick;
+      g_lastInfoLocTelemetryCheckTick = nowTick;
+      heavySweepPrimed = true;
+      Log("SYNC_GUARD: primed heavy periodic sweep timers.");
+    }
+
+    bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
+    if (heavySyncReady) {
+      RunInventorySyncSweep(world, sel);
+      RunPlayerFactionPortraitSweep(world);
+      RunNpcWorldEventSweep(world, sel);
+      RunInfoTelemetrySweep(world, sel);
+    } else if (nowTick - lastHeavySyncGuardLogTick >= 10000) {
+      lastHeavySyncGuardLogTick = nowTick;
+      Log("SYNC_GUARD: heavy periodic sweeps delayed until world warmup completes.");
+    }
   }
 
-  if (world && g_enableBoredEvents) {
+  if (world && worldFrameStable && g_enableBoredEvents) {
     bool forceTrigger = false;
     EnterCriticalSection(&g_stateMutex);
     if (g_triggerBoredEvent) {
@@ -6721,62 +8011,14 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
   bool nameThreadStarted = false;
   while (true) {
     if (!nameThreadStarted) {
-      GameWorld *worldReady = GetWorldSafe();
-      if (worldReady) {
-        CreateThread(NULL, 0, RenameWorker, NULL, 0, NULL);
-        nameThreadStarted = true;
-      }
+      CreateThread(NULL, 0, RenameWorker, NULL, 0, NULL);
+      nameThreadStarted = true;
     }
 
-    DWORD now = GetTickCount();
-    GameWorld *world = GetWorldSafe();
-    if (world && world->player && world->player->playerCharacters.size() > 0) {
-      Character *player = world->player->playerCharacters[0];
-      if (player && (uintptr_t)player > 0x1000) {
-        SyncPlayerCatsValue(player, false, "main_loop");
-        SyncPlayerSquadsToConfOpts(world, false, "main_loop");
-      }
-    }
+    // Keep main thread lightweight and avoid direct world/player reads.
+    // Runtime game-state sync now runs from the hooked PlayerInterface update path.
     SyncDynamicProfileIntervalToConfOpts(false, "main_loop");
     SyncPluginVersionToConfOpts(false, "main_loop");
-
-    if (now - g_lastContextPushTick > 5000) {
-      if (world && world->player && world->player->playerCharacters.size() > 0) {
-        Character *player = world->player->playerCharacters[0];
-        if (player && (uintptr_t)player > 0x1000) {
-          std::string playerContext = BuildNpcContextEnvelope(player, "player");
-          AsyncPostToStobe(L"/context", playerContext);
-          std::string playerName = player->getName();
-          std::string playerGameData =
-              "{\"type\":\"player\",\"name\":\"" + EscapeJSON(playerName) +
-              "\",\"data\":" + playerContext + "}";
-          AsyncPostToStobe(L"/gamedata", playerGameData);
-          g_lastContextPushTick = now;
-        }
-      }
-    }
-
-    if (world && now - g_lastWorldStatePushTick > 30000) {
-      WorldStateSerializeStats worldStateStats;
-      std::string worldStatePayload =
-          BuildWorldStateSnapshotJson(world, worldStateStats);
-      if (!worldStatePayload.empty() && worldStatePayload.front() == '{' &&
-          worldStatePayload.back() == '}') {
-        AsyncPostToStobe(L"/world_state", worldStatePayload);
-        g_lastWorldStatePushTick = now;
-        Log("WORLD_STATE_SYNC: dispatched query_count=" +
-            ToString(worldStateStats.queryCount) +
-            " npc_rules=" + ToString(worldStateStats.npcAreCount +
-                                     worldStateStats.npcAreNotCount) +
-            " town_rules=" + ToString(worldStateStats.townCount) +
-            " faction_rules=" +
-            ToString(worldStateStats.allyCount + worldStateStats.enemyCount) +
-            " truncated=" +
-            std::string(worldStateStats.truncated ? "1" : "0"));
-      } else {
-        Log("WORLD_STATE_SYNC: skipped invalid payload");
-      }
-    }
     Sleep(2000);
   }
   return 0;
@@ -6831,119 +8073,124 @@ __declspec(dllexport) void startPlugin() {
       " orig=" + ToString((unsigned int)(uintptr_t)playerUpdate_orig));
   Log("HOOK: PlayerInterface::update installed (UI-only mode).");
 
-  void *thunkSayALine = (void *)GetProcAddress(
-      hLib, "?sayALine@Character@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z");
-  if (!thunkSayALine) {
-    Log("HOOK_WARN: Character::sayALine symbol not found.");
+  const bool kEnableSpeechCaptureHooks = false;
+  if (!kEnableSpeechCaptureHooks) {
+    Log("HOOK: speech/dialogue capture hooks disabled for stability.");
   } else {
-    __int64 realSayALine = KenshiLib::GetRealAddress(thunkSayALine);
-    if (!realSayALine) {
-      Log("HOOK_WARN: GetRealAddress failed for Character::sayALine.");
+    void *thunkSayALine = (void *)GetProcAddress(
+        hLib, "?sayALine@Character@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z");
+    if (!thunkSayALine) {
+      Log("HOOK_WARN: Character::sayALine symbol not found.");
     } else {
-      KenshiLib::HookStatus sayStatus =
-          KenshiLib::AddHook((void *)realSayALine, (void *)sayALine_hook,
-                             (void **)&sayALine_orig);
-      Log("HOOK_DIAG: Character::sayALine AddHook status=" +
-          ToString((int)sayStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)sayALine_orig));
+      __int64 realSayALine = KenshiLib::GetRealAddress(thunkSayALine);
+      if (!realSayALine) {
+        Log("HOOK_WARN: GetRealAddress failed for Character::sayALine.");
+      } else {
+        KenshiLib::HookStatus sayStatus =
+            KenshiLib::AddHook((void *)realSayALine, (void *)sayALine_hook,
+                               (void **)&sayALine_orig);
+        Log("HOOK_DIAG: Character::sayALine AddHook status=" +
+            ToString((int)sayStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)sayALine_orig));
+      }
     }
-  }
 
-  void *thunkCharacterSay = (void *)GetProcAddress(
-      hLib, "?say@Character@@UEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
-  if (!thunkCharacterSay) {
-    Log("HOOK_WARN: Character::say symbol not found.");
-  } else {
-    __int64 realCharacterSay = KenshiLib::GetRealAddress(thunkCharacterSay);
-    if (!realCharacterSay) {
-      Log("HOOK_WARN: GetRealAddress failed for Character::say.");
+    void *thunkCharacterSay = (void *)GetProcAddress(
+        hLib, "?say@Character@@UEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    if (!thunkCharacterSay) {
+      Log("HOOK_WARN: Character::say symbol not found.");
     } else {
-      KenshiLib::HookStatus sayFallbackStatus =
-          KenshiLib::AddHook((void *)realCharacterSay, (void *)characterSay_hook,
-                             (void **)&characterSay_orig);
-      Log("HOOK_DIAG: Character::say AddHook status=" +
-          ToString((int)sayFallbackStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)characterSay_orig));
+      __int64 realCharacterSay = KenshiLib::GetRealAddress(thunkCharacterSay);
+      if (!realCharacterSay) {
+        Log("HOOK_WARN: GetRealAddress failed for Character::say.");
+      } else {
+        KenshiLib::HookStatus sayFallbackStatus =
+            KenshiLib::AddHook((void *)realCharacterSay, (void *)characterSay_hook,
+                               (void **)&characterSay_orig);
+        Log("HOOK_DIAG: Character::say AddHook status=" +
+            ToString((int)sayFallbackStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)characterSay_orig));
+      }
     }
-  }
 
-  void *thunkDialogueSayLine =
-      (void *)GetProcAddress(hLib, "?sayLine@Dialogue@@QEAA_NPEAVDialogLineData@@@Z");
-  if (!thunkDialogueSayLine) {
-    Log("HOOK_WARN: Dialogue::sayLine symbol not found.");
-  } else {
-    __int64 realDialogueSayLine = KenshiLib::GetRealAddress(thunkDialogueSayLine);
-    if (!realDialogueSayLine) {
-      Log("HOOK_WARN: GetRealAddress failed for Dialogue::sayLine.");
+    void *thunkDialogueSayLine =
+        (void *)GetProcAddress(hLib, "?sayLine@Dialogue@@QEAA_NPEAVDialogLineData@@@Z");
+    if (!thunkDialogueSayLine) {
+      Log("HOOK_WARN: Dialogue::sayLine symbol not found.");
     } else {
-      KenshiLib::HookStatus dialogueSayLineStatus =
-          KenshiLib::AddHook((void *)realDialogueSayLine,
-                             (void *)dialogueSayLine_hook,
-                             (void **)&dialogueSayLine_orig);
-      Log("HOOK_DIAG: Dialogue::sayLine AddHook status=" +
-          ToString((int)dialogueSayLineStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)dialogueSayLine_orig));
+      __int64 realDialogueSayLine = KenshiLib::GetRealAddress(thunkDialogueSayLine);
+      if (!realDialogueSayLine) {
+        Log("HOOK_WARN: GetRealAddress failed for Dialogue::sayLine.");
+      } else {
+        KenshiLib::HookStatus dialogueSayLineStatus =
+            KenshiLib::AddHook((void *)realDialogueSayLine,
+                               (void *)dialogueSayLine_hook,
+                               (void **)&dialogueSayLine_orig);
+        Log("HOOK_DIAG: Dialogue::sayLine AddHook status=" +
+            ToString((int)dialogueSayLineStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)dialogueSayLine_orig));
+      }
     }
-  }
 
-  void *thunkDialogueSayText = (void *)GetProcAddress(
-      hLib,
-      "?say@Dialogue@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@PEAVDialogLineData@@@Z");
-  if (!thunkDialogueSayText) {
-    Log("HOOK_WARN: Dialogue::say(text, line) symbol not found.");
-  } else {
-    __int64 realDialogueSayText = KenshiLib::GetRealAddress(thunkDialogueSayText);
-    if (!realDialogueSayText) {
-      Log("HOOK_WARN: GetRealAddress failed for Dialogue::say(text, line).");
+    void *thunkDialogueSayText = (void *)GetProcAddress(
+        hLib,
+        "?say@Dialogue@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@PEAVDialogLineData@@@Z");
+    if (!thunkDialogueSayText) {
+      Log("HOOK_WARN: Dialogue::say(text, line) symbol not found.");
     } else {
-      KenshiLib::HookStatus dialogueSayTextStatus =
-          KenshiLib::AddHook((void *)realDialogueSayText,
-                             (void *)dialogueSayText_hook,
-                             (void **)&dialogueSayText_orig);
-      Log("HOOK_DIAG: Dialogue::say(text, line) AddHook status=" +
-          ToString((int)dialogueSayTextStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)dialogueSayText_orig));
+      __int64 realDialogueSayText = KenshiLib::GetRealAddress(thunkDialogueSayText);
+      if (!realDialogueSayText) {
+        Log("HOOK_WARN: GetRealAddress failed for Dialogue::say(text, line).");
+      } else {
+        KenshiLib::HookStatus dialogueSayTextStatus =
+            KenshiLib::AddHook((void *)realDialogueSayText,
+                               (void *)dialogueSayText_hook,
+                               (void **)&dialogueSayText_orig);
+        Log("HOOK_DIAG: Dialogue::say(text, line) AddHook status=" +
+            ToString((int)dialogueSayTextStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)dialogueSayText_orig));
+      }
     }
-  }
 
-  void *thunkDialogueReplyClickedInt =
-      (void *)GetProcAddress(hLib, "?replyClicked@Dialogue@@QEAAXH@Z");
-  if (!thunkDialogueReplyClickedInt) {
-    Log("HOOK_WARN: Dialogue::replyClicked(int) symbol not found.");
-  } else {
-    __int64 realDialogueReplyClickedInt =
-        KenshiLib::GetRealAddress(thunkDialogueReplyClickedInt);
-    if (!realDialogueReplyClickedInt) {
-      Log("HOOK_WARN: GetRealAddress failed for Dialogue::replyClicked(int).");
+    void *thunkDialogueReplyClickedInt =
+        (void *)GetProcAddress(hLib, "?replyClicked@Dialogue@@QEAAXH@Z");
+    if (!thunkDialogueReplyClickedInt) {
+      Log("HOOK_WARN: Dialogue::replyClicked(int) symbol not found.");
     } else {
-      KenshiLib::HookStatus dialogueReplyClickedIntStatus =
-          KenshiLib::AddHook((void *)realDialogueReplyClickedInt,
-                             (void *)dialogueReplyClickedInt_hook,
-                             (void **)&dialogueReplyClickedInt_orig);
-      Log("HOOK_DIAG: Dialogue::replyClicked(int) AddHook status=" +
-          ToString((int)dialogueReplyClickedIntStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)dialogueReplyClickedInt_orig));
+      __int64 realDialogueReplyClickedInt =
+          KenshiLib::GetRealAddress(thunkDialogueReplyClickedInt);
+      if (!realDialogueReplyClickedInt) {
+        Log("HOOK_WARN: GetRealAddress failed for Dialogue::replyClicked(int).");
+      } else {
+        KenshiLib::HookStatus dialogueReplyClickedIntStatus =
+            KenshiLib::AddHook((void *)realDialogueReplyClickedInt,
+                               (void *)dialogueReplyClickedInt_hook,
+                               (void **)&dialogueReplyClickedInt_orig);
+        Log("HOOK_DIAG: Dialogue::replyClicked(int) AddHook status=" +
+            ToString((int)dialogueReplyClickedIntStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)dialogueReplyClickedInt_orig));
+      }
     }
-  }
 
-  void *thunkDialogueReplyClickedString = (void *)GetProcAddress(
-      hLib,
-      "?replyClicked@Dialogue@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
-  if (!thunkDialogueReplyClickedString) {
-    Log("HOOK_WARN: Dialogue::replyClicked(string) symbol not found.");
-  } else {
-    __int64 realDialogueReplyClickedString =
-        KenshiLib::GetRealAddress(thunkDialogueReplyClickedString);
-    if (!realDialogueReplyClickedString) {
-      Log("HOOK_WARN: GetRealAddress failed for Dialogue::replyClicked(string).");
+    void *thunkDialogueReplyClickedString = (void *)GetProcAddress(
+        hLib,
+        "?replyClicked@Dialogue@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    if (!thunkDialogueReplyClickedString) {
+      Log("HOOK_WARN: Dialogue::replyClicked(string) symbol not found.");
     } else {
-      KenshiLib::HookStatus dialogueReplyClickedStringStatus =
-          KenshiLib::AddHook((void *)realDialogueReplyClickedString,
-                             (void *)dialogueReplyClickedString_hook,
-                             (void **)&dialogueReplyClickedString_orig);
-      Log("HOOK_DIAG: Dialogue::replyClicked(string) AddHook status=" +
-          ToString((int)dialogueReplyClickedStringStatus) + " orig=" +
-          ToString((unsigned int)(uintptr_t)dialogueReplyClickedString_orig));
+      __int64 realDialogueReplyClickedString =
+          KenshiLib::GetRealAddress(thunkDialogueReplyClickedString);
+      if (!realDialogueReplyClickedString) {
+        Log("HOOK_WARN: GetRealAddress failed for Dialogue::replyClicked(string).");
+      } else {
+        KenshiLib::HookStatus dialogueReplyClickedStringStatus =
+            KenshiLib::AddHook((void *)realDialogueReplyClickedString,
+                               (void *)dialogueReplyClickedString_hook,
+                               (void **)&dialogueReplyClickedString_orig);
+        Log("HOOK_DIAG: Dialogue::replyClicked(string) AddHook status=" +
+            ToString((int)dialogueReplyClickedStringStatus) + " orig=" +
+            ToString((unsigned int)(uintptr_t)dialogueReplyClickedString_orig));
+      }
     }
   }
 

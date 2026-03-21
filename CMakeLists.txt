@@ -75,6 +75,7 @@ add_library(Stobe SHARED
   src/Globals.cpp
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
+  src/KenshiRvaCompat.cpp
   src/main.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
