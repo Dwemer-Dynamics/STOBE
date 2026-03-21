@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -34,8 +35,10 @@
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Platoon.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/gui/PortraitManager.h>
 #include <kenshi/util/hand.h>
 #include <kenshi/Damages.h>
+#include <ogre/OgreImage.h>
 
 #include <kenshi/RaceData.h>
 #include <kenshi/RootObject.h>
@@ -1245,6 +1248,16 @@ struct InventorySyncState {
       : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
 };
 
+struct PortraitSyncState {
+  std::string lastHash;
+  DWORD lastSentTick;
+  DWORD lastSeenTick;
+  bool hasSent;
+
+  PortraitSyncState()
+      : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
+};
+
 struct InventoryEventSnapshot {
   std::map<std::string, int> countsByKey;
   std::map<std::string, int> stolenByKey;
@@ -1284,11 +1297,19 @@ struct NpcWorldEventState {
 };
 
 static std::map<unsigned int, InventorySyncState> g_inventorySyncStateBySerial;
+static std::map<std::string, PortraitSyncState> g_portraitSyncStateByStorageId;
+static std::map<unsigned int, DWORD> g_portraitSpeechTriggerBySerial;
 static DWORD g_lastInventorySweepTick = 0;
 static const DWORD kInventorySweepIntervalMs = 1500;
 static const DWORD kInventoryMinResendMs = 1200;
 static const size_t kInventorySweepCandidateLimit = 24;
 static const DWORD kInventoryStateRetentionMs = 15 * 60 * 1000;
+static DWORD g_lastPortraitSweepTick = 0;
+static const DWORD kPortraitSweepIntervalMs = 15000;
+static const DWORD kPortraitMinResendMs = 30 * 60 * 1000;
+static const size_t kPortraitSweepCandidateLimit = 48;
+static const DWORD kPortraitStateRetentionMs = 30 * 60 * 1000;
+static const DWORD kPortraitSpeechTriggerCooldownMs = 2 * 60 * 1000;
 static std::map<unsigned int, NpcWorldEventState> g_npcWorldEventStateBySerial;
 static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 900;
@@ -1328,6 +1349,629 @@ static std::string ShortInventoryHashForLog(const std::string &hash) {
     return hash;
   }
   return hash.substr(0, 12);
+}
+
+static uint64_t HashFnv1a64(const unsigned char *data, size_t length) {
+  const uint64_t kOffset = 1469598103934665603ULL;
+  const uint64_t kPrime = 1099511628211ULL;
+  uint64_t hash = kOffset;
+  if (!data || length == 0) {
+    return hash;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= static_cast<uint64_t>(data[i]);
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+static std::string HexFromU64(uint64_t value) {
+  const char *digits = "0123456789abcdef";
+  std::string out(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    out[i] = digits[static_cast<int>(value & 0xFULL)];
+    value >>= 4;
+  }
+  return out;
+}
+
+static std::string Base64EncodeBinary(const std::string &input) {
+  static const char *kChars =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string output;
+  output.reserve(((input.size() + 2) / 3) * 4);
+
+  size_t i = 0;
+  while (i + 2 < input.size()) {
+    const unsigned int a = static_cast<unsigned char>(input[i++]);
+    const unsigned int b = static_cast<unsigned char>(input[i++]);
+    const unsigned int c = static_cast<unsigned char>(input[i++]);
+    const unsigned int triple = (a << 16) | (b << 8) | c;
+    output.push_back(kChars[(triple >> 18) & 0x3F]);
+    output.push_back(kChars[(triple >> 12) & 0x3F]);
+    output.push_back(kChars[(triple >> 6) & 0x3F]);
+    output.push_back(kChars[triple & 0x3F]);
+  }
+
+  if (i < input.size()) {
+    const size_t remaining = input.size() - i;
+    const unsigned int a = static_cast<unsigned char>(input[i++]);
+    const unsigned int b =
+        (remaining > 1) ? static_cast<unsigned char>(input[i++]) : 0;
+    const unsigned int triple = (a << 16) | (b << 8);
+    if (remaining == 1) {
+      output.push_back(kChars[(triple >> 18) & 0x3F]);
+      output.push_back(kChars[(triple >> 12) & 0x3F]);
+      output.push_back('=');
+      output.push_back('=');
+    } else {
+      output.push_back(kChars[(triple >> 18) & 0x3F]);
+      output.push_back(kChars[(triple >> 12) & 0x3F]);
+      output.push_back(kChars[(triple >> 6) & 0x3F]);
+      output.push_back('=');
+    }
+  }
+
+  return output;
+}
+
+static void WriteUInt32LE(std::string &buffer, size_t offset, uint32_t value) {
+  if (offset + 4 > buffer.size()) {
+    return;
+  }
+  buffer[offset + 0] = static_cast<char>(value & 0xFF);
+  buffer[offset + 1] = static_cast<char>((value >> 8) & 0xFF);
+  buffer[offset + 2] = static_cast<char>((value >> 16) & 0xFF);
+  buffer[offset + 3] = static_cast<char>((value >> 24) & 0xFF);
+}
+
+static bool EncodeBmp24(const std::vector<unsigned char> &rgba, int width,
+                        int height, std::string &bmpDataOut) {
+  bmpDataOut.clear();
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  const size_t expectedBytes =
+      static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+  if (rgba.size() < expectedBytes) {
+    return false;
+  }
+
+  const uint32_t rowStride = static_cast<uint32_t>(width) * 3U;
+  const uint32_t paddedRowStride = (rowStride + 3U) & ~3U;
+  const uint32_t imageSize =
+      paddedRowStride * static_cast<uint32_t>(height);
+  const uint32_t fileSize = 54U + imageSize;
+
+  bmpDataOut.assign(fileSize, '\0');
+  bmpDataOut[0] = 'B';
+  bmpDataOut[1] = 'M';
+  WriteUInt32LE(bmpDataOut, 2, fileSize);
+  WriteUInt32LE(bmpDataOut, 10, 54U);
+  WriteUInt32LE(bmpDataOut, 14, 40U);
+  WriteUInt32LE(bmpDataOut, 18, static_cast<uint32_t>(width));
+  WriteUInt32LE(bmpDataOut, 22, static_cast<uint32_t>(height));
+  bmpDataOut[26] = 1;   // planes
+  bmpDataOut[28] = 24;  // bits per pixel
+  WriteUInt32LE(bmpDataOut, 34, imageSize);
+
+  unsigned char *dst = reinterpret_cast<unsigned char *>(&bmpDataOut[0]) + 54;
+  for (int y = 0; y < height; ++y) {
+    const int srcY = height - 1 - y;
+    const unsigned char *srcRow =
+        &rgba[static_cast<size_t>(srcY) * static_cast<size_t>(width) * 4U];
+    unsigned char *dstRow =
+        dst + static_cast<size_t>(y) * static_cast<size_t>(paddedRowStride);
+    for (int x = 0; x < width; ++x) {
+      const unsigned char *srcPx = srcRow + static_cast<size_t>(x) * 4U;
+      unsigned char *dstPx = dstRow + static_cast<size_t>(x) * 3U;
+      // BMP stores BGR order.
+      dstPx[0] = srcPx[2];
+      dstPx[1] = srcPx[1];
+      dstPx[2] = srcPx[0];
+    }
+  }
+  return true;
+}
+
+static bool ResolvePortraitImageRegion(PortraitManager *portraitManager,
+                                       PortraitImage *portraitImage,
+                                       int &leftOut, int &topOut,
+                                       int &widthOut, int &heightOut) {
+  leftOut = 0;
+  topOut = 0;
+  widthOut = 0;
+  heightOut = 0;
+  if (!portraitManager || (uintptr_t)portraitManager <= 0x1000 ||
+      !portraitImage || (uintptr_t)portraitImage <= 0x1000) {
+    return false;
+  }
+
+  leftOut = portraitImage->coords.left;
+  topOut = portraitImage->coords.top;
+  widthOut = portraitImage->coords.width;
+  heightOut = portraitImage->coords.height;
+
+  if (widthOut <= 0 || heightOut <= 0) {
+    widthOut = portraitManager->texturePortraitSize.x;
+    heightOut = portraitManager->texturePortraitSize.y;
+  }
+
+  Ogre::Texture *texture = portraitManager->texture.getPointer();
+  if (!texture || (uintptr_t)texture <= 0x1000) {
+    return false;
+  }
+  const int texWidth = static_cast<int>(texture->getWidth());
+  const int texHeight = static_cast<int>(texture->getHeight());
+  if (texWidth <= 0 || texHeight <= 0) {
+    return false;
+  }
+
+  if (leftOut < 0 || topOut < 0 || leftOut >= texWidth || topOut >= texHeight) {
+    leftOut = static_cast<int>(portraitImage->textureRect.left * texWidth);
+    topOut = static_cast<int>(portraitImage->textureRect.top * texHeight);
+  }
+  if (widthOut <= 0 || heightOut <= 0) {
+    widthOut = static_cast<int>((portraitImage->textureRect.right -
+                                 portraitImage->textureRect.left) *
+                                texWidth);
+    heightOut = static_cast<int>((portraitImage->textureRect.bottom -
+                                  portraitImage->textureRect.top) *
+                                 texHeight);
+  }
+
+  if (leftOut < 0) {
+    leftOut = 0;
+  }
+  if (topOut < 0) {
+    topOut = 0;
+  }
+  if (widthOut <= 0 || heightOut <= 0) {
+    return false;
+  }
+  if (leftOut + widthOut > texWidth) {
+    widthOut = texWidth - leftOut;
+  }
+  if (topOut + heightOut > texHeight) {
+    heightOut = texHeight - topOut;
+  }
+  if (widthOut <= 0 || heightOut <= 0) {
+    return false;
+  }
+  return true;
+}
+
+static bool TryCapturePortraitBmp(Character *npc, std::string &bmpDataOut,
+                                  int &widthOut, int &heightOut,
+                                  std::string &imageHashOut,
+                                  std::string *diagReasonOut = nullptr) {
+  auto fail = [&](const std::string &reason) -> bool {
+    if (diagReasonOut) {
+      *diagReasonOut = reason;
+    }
+    return false;
+  };
+  bmpDataOut.clear();
+  imageHashOut.clear();
+  widthOut = 0;
+  heightOut = 0;
+  if (diagReasonOut) {
+    diagReasonOut->clear();
+  }
+
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return fail("invalid_npc");
+  }
+
+  hand characterHandle;
+  try {
+    characterHandle = npc->getHandle();
+  } catch (...) {
+    return fail("get_handle_exception");
+  }
+  if (!characterHandle.isValid()) {
+    return fail("invalid_handle");
+  }
+
+  PortraitManager *portraitManager = nullptr;
+  try {
+    portraitManager = PortraitManager::getInstance();
+  } catch (...) {
+    portraitManager = nullptr;
+  }
+  if (!portraitManager || (uintptr_t)portraitManager <= 0x1000) {
+    return fail("portrait_manager_unavailable");
+  }
+
+  try {
+    portraitManager->getPortrait(characterHandle);
+  } catch (...) {
+  }
+
+  bool updateOk = false;
+  try {
+    updateOk = portraitManager->updatePortraitImage(characterHandle);
+  } catch (...) {
+    updateOk = false;
+  }
+  if (!updateOk) {
+    try {
+      portraitManager->getPortrait(characterHandle);
+      updateOk = portraitManager->updatePortraitImage(characterHandle);
+    } catch (...) {
+      updateOk = false;
+    }
+  }
+  if (!updateOk) {
+    return fail("update_portrait_image_failed");
+  }
+
+  PortraitImage *portraitImage = nullptr;
+  try {
+    auto it = portraitManager->characterPortraits.find(characterHandle);
+    if (it == portraitManager->characterPortraits.end()) {
+      return fail("portrait_map_missing");
+    }
+    portraitImage = it->second.second;
+  } catch (...) {
+    return fail("portrait_map_exception");
+  }
+  if (!portraitImage || (uintptr_t)portraitImage <= 0x1000) {
+    return fail("portrait_image_invalid");
+  }
+
+  int srcLeft = 0;
+  int srcTop = 0;
+  int srcWidth = 0;
+  int srcHeight = 0;
+  if (!ResolvePortraitImageRegion(portraitManager, portraitImage, srcLeft, srcTop,
+                                  srcWidth, srcHeight)) {
+    return fail("resolve_region_failed");
+  }
+
+  Ogre::Texture *texture = portraitManager->texture.getPointer();
+  if (!texture || (uintptr_t)texture <= 0x1000) {
+    return fail("texture_unavailable");
+  }
+  std::vector<unsigned char> rgba;
+  try {
+    Ogre::Image textureImage;
+    texture->convertToImage(textureImage, false);
+    Ogre::PixelBox pixelBox = textureImage.getPixelBox(0, 0);
+    if (!pixelBox.data) {
+      return fail("image_pixel_box_no_data");
+    }
+    if (!Ogre::PixelUtil::isAccessible(pixelBox.format)) {
+      return fail("image_pixel_format_inaccessible");
+    }
+
+    const size_t elemBytes = Ogre::PixelUtil::getNumElemBytes(pixelBox.format);
+    if (elemBytes == 0) {
+      return fail("image_pixel_elem_bytes_zero");
+    }
+
+    const int imageWidth = static_cast<int>(pixelBox.getWidth());
+    const int imageHeight = static_cast<int>(pixelBox.getHeight());
+    if (srcLeft < 0 || srcTop < 0 || srcWidth <= 0 || srcHeight <= 0 ||
+        srcLeft + srcWidth > imageWidth || srcTop + srcHeight > imageHeight) {
+      return fail("image_crop_out_of_bounds");
+    }
+
+    rgba.assign(static_cast<size_t>(srcWidth) * static_cast<size_t>(srcHeight) * 4U,
+                0U);
+    const unsigned char *base = static_cast<const unsigned char *>(pixelBox.data);
+    for (int y = 0; y < srcHeight; ++y) {
+      for (int x = 0; x < srcWidth; ++x) {
+        const size_t srcOffset =
+            (static_cast<size_t>(srcTop + y) * static_cast<size_t>(pixelBox.rowPitch) +
+             static_cast<size_t>(srcLeft + x)) *
+            elemBytes;
+        const unsigned char *srcPixel = base + srcOffset;
+        unsigned char *dstPixel =
+            &rgba[(static_cast<size_t>(y) * static_cast<size_t>(srcWidth) +
+                   static_cast<size_t>(x)) *
+                  4U];
+        Ogre::PixelUtil::unpackColour(&dstPixel[0], &dstPixel[1], &dstPixel[2],
+                                      &dstPixel[3], pixelBox.format, srcPixel);
+      }
+    }
+  } catch (...) {
+    return fail("image_readback_exception");
+  }
+
+  if (!EncodeBmp24(rgba, srcWidth, srcHeight, bmpDataOut) || bmpDataOut.empty()) {
+    return fail("encode_bmp_failed");
+  }
+
+  imageHashOut = HexFromU64(HashFnv1a64(
+      reinterpret_cast<const unsigned char *>(bmpDataOut.data()),
+      bmpDataOut.size()));
+  widthOut = srcWidth;
+  heightOut = srcHeight;
+  return true;
+}
+
+static bool ShouldSendPortraitSync(const std::string &storageId,
+                                   const std::string &imageHash, DWORD nowTick,
+                                   bool force, DWORD &sinceLastSentOut,
+                                   bool &changedOut, bool &firstOut) {
+  sinceLastSentOut = 0;
+  changedOut = false;
+  firstOut = false;
+  if (storageId.empty() || imageHash.empty()) {
+    return false;
+  }
+
+  bool shouldSend = false;
+  EnterCriticalSection(&g_stateMutex);
+  PortraitSyncState &state = g_portraitSyncStateByStorageId[storageId];
+  state.lastSeenTick = nowTick;
+  changedOut = (state.lastHash != imageHash);
+  firstOut = !state.hasSent;
+  sinceLastSentOut = state.hasSent ? (nowTick - state.lastSentTick) : 0;
+  if (force || firstOut || changedOut || sinceLastSentOut >= kPortraitMinResendMs) {
+    shouldSend = true;
+    state.lastHash = imageHash;
+    state.lastSentTick = nowTick;
+    state.hasSent = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return shouldSend;
+}
+
+static bool SyncPortraitForCharacter(Character *npc, bool force,
+                                     const std::string &reason) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  unsigned int serial = 0;
+  std::string npcName = "Unknown";
+  std::string storageId = "";
+  try {
+    serial = npc->getHandle().serial;
+    npcName = npc->getName();
+    storageId = GetStorageIDFor(npc, npcName, GetIdentityFaction(npc));
+  } catch (...) {
+    return false;
+  }
+  if (serial == 0) {
+    return false;
+  }
+  if (storageId.empty()) {
+    storageId = "hand_" + ToString((int)serial);
+  }
+
+  std::string bmpData = "";
+  std::string imageHash = "";
+  std::string captureReason = "";
+  int width = 0;
+  int height = 0;
+  if (!TryCapturePortraitBmp(npc, bmpData, width, height, imageHash,
+                             &captureReason)) {
+    static DWORD lastCaptureFailLogTick = 0;
+    DWORD nowTick = GetTickCount();
+    if (nowTick - lastCaptureFailLogTick >= 5000) {
+      lastCaptureFailLogTick = nowTick;
+      Log("PORTRAIT_SYNC: capture failed name=" + npcName +
+          " storage=" + storageId + " reason=" + captureReason);
+    }
+    return false;
+  }
+  if (bmpData.empty() || imageHash.empty() || width <= 0 || height <= 0) {
+    static DWORD lastInvalidSampleLogTick = 0;
+    DWORD nowTick = GetTickCount();
+    if (nowTick - lastInvalidSampleLogTick >= 5000) {
+      lastInvalidSampleLogTick = nowTick;
+      Log("PORTRAIT_SYNC: invalid sample name=" + npcName +
+          " storage=" + storageId + " width=" + ToString(width) +
+          " height=" + ToString(height) + " hash_len=" +
+          ToString((int)imageHash.length()) + " bytes=" +
+          ToString((int)bmpData.length()));
+    }
+    return false;
+  }
+
+  DWORD nowTick = GetTickCount();
+  DWORD sinceLastSent = 0;
+  bool changed = false;
+  bool firstSync = false;
+  if (!ShouldSendPortraitSync(storageId, imageHash, nowTick, force, sinceLastSent,
+                              changed, firstSync)) {
+    return false;
+  }
+
+  std::string base64Image = Base64EncodeBinary(bmpData);
+  if (base64Image.empty()) {
+    static DWORD lastBase64FailLogTick = 0;
+    DWORD nowTick = GetTickCount();
+    if (nowTick - lastBase64FailLogTick >= 5000) {
+      lastBase64FailLogTick = nowTick;
+      Log("PORTRAIT_SYNC: base64 encode failed name=" + npcName +
+          " storage=" + storageId + " bytes=" + ToString((int)bmpData.length()));
+    }
+    return false;
+  }
+
+  int gameTs = 0;
+  try {
+    GameWorld *world = GetWorldSafe();
+    if (world) {
+      TimeOfDay tod = world->getTimeStamp_inGameHours();
+      gameTs = static_cast<int>(tod.getTotalSeconds());
+    }
+  } catch (...) {
+    gameTs = 0;
+  }
+
+  std::string payload = "{";
+  payload += "\"name\":\"" + EscapeJSON(npcName) + "\",";
+  payload += "\"storage_id\":\"" + EscapeJSON(storageId) + "\",";
+  payload += "\"source\":\"player_faction_portrait_sync\",";
+  payload += "\"sync_reason\":\"" + EscapeJSON(reason) + "\",";
+  payload += "\"image_hash\":\"" + EscapeJSON(imageHash) + "\",";
+  payload += "\"format\":\"bmp\",";
+  payload += "\"width\":" + ToString(width) + ",";
+  payload += "\"height\":" + ToString(height) + ",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload += "\"image_base64\":\"" + EscapeJSON(base64Image) + "\"";
+  payload += "}";
+
+  AsyncPostToStobe(L"/portrait_upload", payload);
+  Log("PORTRAIT_SYNC: sent name=" + npcName + " storage=" + storageId +
+      " hash=" + imageHash + " size=" + ToString(width) + "x" +
+      ToString(height) + " changed=" + std::string(changed ? "1" : "0") +
+      " first=" + std::string(firstSync ? "1" : "0") + " reason=" + reason);
+  return true;
+}
+
+static bool ShouldTriggerSpeechPortraitSync(unsigned int serial, DWORD nowTick) {
+  if (serial == 0) {
+    return false;
+  }
+
+  bool shouldTrigger = false;
+  EnterCriticalSection(&g_stateMutex);
+  std::map<unsigned int, DWORD>::iterator it =
+      g_portraitSpeechTriggerBySerial.find(serial);
+  if (it == g_portraitSpeechTriggerBySerial.end() || it->second == 0 ||
+      nowTick - it->second >= kPortraitSpeechTriggerCooldownMs) {
+    g_portraitSpeechTriggerBySerial[serial] = nowTick;
+    shouldTrigger = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return shouldTrigger;
+}
+
+static void TrySpeechTriggeredPortraitSync(Character *npc,
+                                           const std::string &reason) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return;
+  }
+
+  bool isPlayerCharacter = false;
+  try {
+    isPlayerCharacter = npc->isPlayerCharacter();
+  } catch (...) {
+    isPlayerCharacter = false;
+  }
+  if (isPlayerCharacter) {
+    return;
+  }
+
+  unsigned int serial = 0;
+  try {
+    serial = npc->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return;
+  }
+  DWORD nowTick = GetTickCount();
+  if (!ShouldTriggerSpeechPortraitSync(serial, nowTick)) {
+    return;
+  }
+
+  SyncPortraitForCharacter(npc, true, reason);
+}
+
+static void TrySpeechTriggeredPortraitSyncForPair(Character *speaker,
+                                                  Character *listener,
+                                                  const char *sourceTag) {
+  std::string reasonBase = "speech_trigger";
+  if (sourceTag && sourceTag[0] != '\0') {
+    reasonBase = reasonBase + "_" + std::string(sourceTag);
+  }
+
+  TrySpeechTriggeredPortraitSync(speaker, reasonBase + "_speaker");
+  if (listener && listener != speaker) {
+    TrySpeechTriggeredPortraitSync(listener, reasonBase + "_listener");
+  }
+}
+
+static void PrunePortraitSyncState() {
+  DWORD nowTick = GetTickCount();
+  int pruned = 0;
+  EnterCriticalSection(&g_stateMutex);
+  for (std::map<std::string, PortraitSyncState>::iterator it =
+           g_portraitSyncStateByStorageId.begin();
+       it != g_portraitSyncStateByStorageId.end();) {
+    DWORD age = nowTick - it->second.lastSeenTick;
+    if (it->second.lastSeenTick == 0 || age > kPortraitStateRetentionMs) {
+      it = g_portraitSyncStateByStorageId.erase(it);
+      ++pruned;
+    } else {
+      ++it;
+    }
+  }
+
+  for (std::map<unsigned int, DWORD>::iterator it =
+           g_portraitSpeechTriggerBySerial.begin();
+       it != g_portraitSpeechTriggerBySerial.end();) {
+    DWORD age = nowTick - it->second;
+    if (it->second == 0 || age > kPortraitStateRetentionMs) {
+      it = g_portraitSpeechTriggerBySerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  if (pruned > 0) {
+    Log("PORTRAIT_SYNC: pruned stale state entries=" + ToString(pruned));
+  }
+}
+
+static void RunPlayerFactionPortraitSweep(GameWorld *world) {
+  if (!world || !world->player || world->player->playerCharacters.size() == 0) {
+    static DWORD lastNoRosterLogTick = 0;
+    DWORD nowTick = GetTickCount();
+    if (nowTick - lastNoRosterLogTick >= 30000) {
+      lastNoRosterLogTick = nowTick;
+      Log("PORTRAIT_SYNC: skipped sweep (no player roster)");
+    }
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  if (nowTick - g_lastPortraitSweepTick < kPortraitSweepIntervalMs) {
+    return;
+  }
+  g_lastPortraitSweepTick = nowTick;
+
+  size_t candidates = 0;
+  size_t sent = 0;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    if (!member || (uintptr_t)member < 0x1000) {
+      continue;
+    }
+    ++candidates;
+    if (SyncPortraitForCharacter(member, false, "player_faction_sweep")) {
+      ++sent;
+    }
+    if (candidates >= kPortraitSweepCandidateLimit) {
+      break;
+    }
+  }
+
+  static DWORD lastPruneTick = 0;
+  if (nowTick - lastPruneTick >= 60000) {
+    lastPruneTick = nowTick;
+    PrunePortraitSyncState();
+  }
+
+  if (sent > 0) {
+    Log("PORTRAIT_SYNC: sweep complete candidates=" + ToString((int)candidates) +
+        " sent=" + ToString((int)sent));
+  } else {
+    static DWORD lastNoSendLogTick = 0;
+    if (nowTick - lastNoSendLogTick >= 60000) {
+      lastNoSendLogTick = nowTick;
+      Log("PORTRAIT_SYNC: sweep no-send candidates=" +
+          ToString((int)candidates));
+    }
+  }
 }
 
 static void ResetPlayerCatsSyncState() {
@@ -5265,6 +5909,8 @@ static void CapturePlayerDialogueReplyFromUi(Dialogue *dialogue,
     listenerSerial = ResolveCharacterSerialForEvent(listener);
   }
 
+  TrySpeechTriggeredPortraitSyncForPair(speaker, listener, sourceTag);
+
   bool listenerIsPlayerCharacter = false;
   if (listener && (uintptr_t)listener > 0x1000) {
     try {
@@ -5394,6 +6040,8 @@ static void TryCaptureAmbientSpeechFromNative(Character *speaker,
     listenerFaction = SafeFaction(listener);
     listenerSerial = ResolveCharacterSerialForEvent(listener);
   }
+
+  TrySpeechTriggeredPortraitSyncForPair(speaker, listener, sourceTag);
 
   LogGameEvent("chat", ResolveCharacterNameSafe(speaker), SafeFaction(speaker),
                listenerName, listenerFaction, line, speakerSerial, listenerSerial);
@@ -5773,6 +6421,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (selectionChanged && sel && (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
       SyncInventoryForCharacter(sel, true, "selection_change");
+      SyncPortraitForCharacter(sel, true, "selection_change");
       static DWORD lastSelectionContextPushTick = 0;
       DWORD nowSel = GetTickCount();
       if (nowSel - lastSelectionContextPushTick > 1000) {
@@ -5808,6 +6457,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
     RunInventorySyncSweep(world, sel);
+    RunPlayerFactionPortraitSweep(world);
     RunNpcWorldEventSweep(world, sel);
     RunInfoTelemetrySweep(world, sel);
   }
