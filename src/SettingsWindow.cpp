@@ -76,6 +76,8 @@ std::string NormalizeChatModeValue(const std::string &modeRaw) {
     return "shout";
   if (mode == "cheat")
     return "cheat";
+  if (mode == "narrator")
+    return "narrator";
   return "chat";
 }
 
@@ -132,6 +134,7 @@ void PopulateChatModeCombo() {
   g_pluginChatModeCombo->addItem(WideFromUtf8("whisper").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("cheat").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("narrator").c_str());
 
   std::string currentMode = NormalizeChatModeValue(g_chatMode);
   size_t selected = 0;
@@ -141,6 +144,8 @@ void PopulateChatModeCombo() {
     selected = 2;
   else if (currentMode == "cheat")
     selected = 3;
+  else if (currentMode == "narrator")
+    selected = 4;
   g_pluginChatModeCombo->setIndexSelected(selected);
 }
 
@@ -161,6 +166,8 @@ void OnPluginModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
     g_lastChatModeIndex = 2;
   else if (g_chatMode == "cheat")
     g_lastChatModeIndex = 3;
+  else if (g_chatMode == "narrator")
+    g_lastChatModeIndex = 4;
   else
     g_lastChatModeIndex = 0;
 }
@@ -238,6 +245,8 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
     g_lastChatModeIndex = 2;
   else if (g_chatMode == "cheat")
     g_lastChatModeIndex = 3;
+  else if (g_chatMode == "narrator")
+    g_lastChatModeIndex = 4;
   else
     g_lastChatModeIndex = 0;
 

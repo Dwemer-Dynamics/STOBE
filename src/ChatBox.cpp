@@ -51,6 +51,7 @@ size_t g_lastChatModeIndex = 1;
 bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 const float kWhisperRangeUnits = 20.0f;
+const char *kNarratorName = "The Narrator";
 
 enum ManualChatActionType {
   MANUAL_CHAT_ACTION_NONE = 0,
@@ -317,6 +318,8 @@ size_t ChatModeToIndex(const std::string &mode) {
     return 2;
   if (mode == "cheat")
     return 3;
+  if (mode == "narrator")
+    return 4;
   return 0; // chat
 }
 
@@ -330,6 +333,8 @@ std::string NormalizeChatMode(const std::string &mode) {
     return "shout";
   if (normalized == "cheat")
     return "cheat";
+  if (normalized == "narrator")
+    return "narrator";
   if (normalized == "talk" || normalized == "chat")
     return "chat";
   return "chat";
@@ -347,6 +352,10 @@ bool EqualsIgnoreCase(const std::string &lhs, const std::string &rhs) {
     }
   }
   return true;
+}
+
+bool IsNarratorName(const std::string &name) {
+  return EqualsIgnoreCase(name, kNarratorName);
 }
 
 bool IsAnimalCharacterSafe(Character *character, unsigned int *serialOut) {
@@ -490,6 +499,7 @@ std::string BuildPeopleJson(GameWorld *world, const std::string &playerName,
                             const std::string &mode,
                             Character *speakerOverride = nullptr) {
   std::vector<std::string> people;
+  const bool narratorMode = (mode == "narrator");
   Character *player = nullptr;
   std::string playerHandle = "";
 
@@ -511,13 +521,17 @@ std::string BuildPeopleJson(GameWorld *world, const std::string &playerName,
   }
 
   if (!targetName.empty()) {
-    if (!targetHandle.empty())
+    if (!targetHandle.empty() && !narratorMode)
       AppendUniquePerson(people, targetName + "|" + targetHandle);
     else
       AppendUniquePerson(people, targetName);
   }
 
-  if (player && mode != "whisper") {
+  if (narratorMode) {
+    AppendUniquePerson(people, kNarratorName);
+  }
+
+  if (player && mode != "whisper" && mode != "narrator") {
     float searchRadius = GetSearchRadiusForMode(mode);
     const hand &playerIndoorsHandle = player->isIndoors();
     bool playerIsIndoors = IsIndoorsHandleValid(playerIndoorsHandle);
@@ -636,6 +650,17 @@ Character *ResolveChatTargetCharacter(GameWorld *world,
   }
 
   return nullptr;
+}
+
+Character *ResolveSelectedChatSpeaker(GameWorld *world) {
+  if (!world || !world->player) {
+    return nullptr;
+  }
+  const hand &selectedHandle = world->player->selectedCharacter;
+  if (!selectedHandle.isValid() || selectedHandle.serial == 0) {
+    return nullptr;
+  }
+  return ResolveChatTargetCharacter(world, "", ToString(selectedHandle.serial));
 }
 
 Character *ResolveNearestPlayerSpeaker(GameWorld *world, Character *target) {
@@ -1162,8 +1187,9 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   if (!IsChatInterruptGenerationCurrent(currentTask.generation)) {
     return;
   }
-  if (currentTask.requestMode == "whisper") {
-    Log("RECHAT: skipped (whisper mode)");
+  if (currentTask.requestMode == "whisper" ||
+      currentTask.requestMode == "narrator") {
+    Log("RECHAT: skipped (" + currentTask.requestMode + " mode)");
     return;
   }
 
@@ -1171,6 +1197,10 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   std::string speakerHandle = TrimChatLine(lastSpeakerHandle);
   if (speakerHandle.empty() && EqualsIgnoreCase(speaker, currentTask.npcName)) {
     speakerHandle = TrimChatLine(currentTask.handleStr);
+  }
+  if (IsNarratorName(speaker)) {
+    Log("RECHAT: skipped (narrator speaker)");
+    return;
   }
   std::string subtitle = TrimChatLine(lastSubtitle);
   subtitle = SanitizeDialogueForEventStream(subtitle);
@@ -1615,38 +1645,52 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   }
 
   std::string speakerHeader = actor;
+  bool narratorSpeaker = IsNarratorName(actor);
   if (!state->task->handleStr.empty() && actor == state->task->npcName) {
     speakerHeader = actor + "|" + state->task->handleStr;
   }
   if ((EqualsIgnoreCase(actionKind, "ActionQueue") ||
        EqualsIgnoreCase(actionKind, "Action")) &&
       !subtitle.empty()) {
+    if (narratorSpeaker) {
+      Log("CHAT_TIMING: narrator action ignored actor=" + actor +
+          " action=" + subtitle + " gen=" + ToString((int)state->generation));
+      return true;
+    }
     QueueStreamActionIfNew(state, actor, speakerHeader, subtitle);
     return true;
   }
 
   std::vector<std::string> extractedActions;
-  ExtractActionTags(subtitle, extractedActions);
-  for (size_t i = 0; i < extractedActions.size(); ++i) {
-    QueueStreamActionIfNew(state, actor, speakerHeader, extractedActions[i]);
+  if (!narratorSpeaker) {
+    ExtractActionTags(subtitle, extractedActions);
+    for (size_t i = 0; i < extractedActions.size(); ++i) {
+      QueueStreamActionIfNew(state, actor, speakerHeader, extractedActions[i]);
+    }
   }
 
   if (!subtitle.empty()) {
     if (!IsChatInterruptGenerationCurrent(state->generation)) {
       return false;
     }
-    std::string queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
-    if (speakerHeader == actor) {
-      GameWorld *worldForSpeaker = GetWorldSafe();
-      if (worldForSpeaker && worldForSpeaker->player &&
-          worldForSpeaker->player->playerCharacters.size() > 0) {
-        Character *playerSpeaker = worldForSpeaker->player->playerCharacters[0];
-        if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000 &&
-            EqualsIgnoreCase(playerSpeaker->getName(), actor)) {
-          speakerHeader = actor + "|" + ToString(playerSpeaker->getHandle().serial);
-        }
-      }
+    std::string queueLine = "";
+    if (narratorSpeaker) {
+      queueLine = "NOTIFY:" + std::string(kNarratorName) + ": " + subtitle;
+    } else {
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
+      if (speakerHeader == actor) {
+        GameWorld *worldForSpeaker = GetWorldSafe();
+        if (worldForSpeaker && worldForSpeaker->player &&
+            worldForSpeaker->player->playerCharacters.size() > 0) {
+          Character *playerSpeaker = worldForSpeaker->player->playerCharacters[0];
+          if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000 &&
+              EqualsIgnoreCase(playerSpeaker->getName(), actor)) {
+            speakerHeader =
+                actor + "|" + ToString(playerSpeaker->getHandle().serial);
+          }
+        }
+        queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
+      }
     }
     if (g_ttsEnabled && !ttsHash.empty()) {
       queueLine += " [TTSHASH:" + ttsHash + "]";
@@ -1662,11 +1706,13 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         " gen=" + ToString((int)state->generation));
     QueueChatPipeLine(queueLine, state->generation);
     std::string speakerHandle = "";
-    size_t headerPipePos = speakerHeader.find('|');
-    if (headerPipePos != std::string::npos) {
-      speakerHandle = TrimChatLine(speakerHeader.substr(headerPipePos + 1));
-    } else if (EqualsIgnoreCase(actor, state->task->npcName)) {
-      speakerHandle = TrimChatLine(state->task->handleStr);
+    if (!narratorSpeaker) {
+      size_t headerPipePos = speakerHeader.find('|');
+      if (headerPipePos != std::string::npos) {
+        speakerHandle = TrimChatLine(speakerHeader.substr(headerPipePos + 1));
+      } else if (EqualsIgnoreCase(actor, state->task->npcName)) {
+        speakerHandle = TrimChatLine(state->task->handleStr);
+      }
     }
     state->lastSpeaker = actor;
     state->lastSpeakerHandle = speakerHandle;
@@ -1875,6 +1921,11 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   if (playerName.empty()) {
     playerName = "Player";
   }
+  std::string narratorSpeakerName = TrimChatLine(g_chatPlayerNameStr);
+  if (narratorSpeakerName.empty()) {
+    narratorSpeakerName = playerName;
+  }
+  std::string narratorSpeakerHandle = "";
 
   std::string sanitizedText = SanitizeDialogueForEventStream(text);
   if (!sanitizedText.empty() && sanitizedText != text) {
@@ -1885,10 +1936,17 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
 
   std::string selectedMode = NormalizeChatMode(g_chatMode);
+  bool narratorModeSelected = (selectedMode == "narrator");
+  if (narratorModeSelected) {
+    npcName = kNarratorName;
+    handleStr = "";
+  }
   std::string mode = "talk";
   bool cheatModeSelected = (selectedMode == "cheat");
   if (cheatModeSelected) {
     mode = "cheat";
+  } else if (narratorModeSelected) {
+    mode = "narrator";
   } else if (g_autoChatEnabled) {
     mode = "autochat";
   } else if (selectedMode == "whisper") {
@@ -1908,6 +1966,15 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       GetManualChatActionChoice(selectedManualActionIndex);
   bool manualActionSelected =
       (manualActionChoice.type != MANUAL_CHAT_ACTION_NONE);
+  if (narratorModeSelected && manualActionSelected) {
+    if (world) {
+      world->showPlayerAMessage_withLog(
+          "Chat blocked: Manual actions are unavailable in narrator mode.",
+          true);
+    }
+    Log("CHAT_GATE: blocked manual action in narrator mode");
+    return;
+  }
   std::string manualActionArgRaw =
       g_chatActionArgInput ? g_chatActionArgInput->getCaption().asUTF8() : "";
   if (g_chatActionCombo && g_chatActionCombo->getIndexSelected() != 0) {
@@ -1935,12 +2002,37 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     player = world->player->playerCharacters[0];
   }
   Log("CHAT_SEND_STAGE: resolving_target");
-  Character *targetNpc = ResolveChatTargetCharacter(world, npcName, handleStr);
-  Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
-  if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
-    player = bestSpeaker;
-    playerName = bestSpeaker->getName();
-    g_chatPlayerNameStr = playerName;
+  Character *targetNpc = nullptr;
+  Character *narratorSpeakerNpc = nullptr;
+  if (narratorModeSelected) {
+    Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
+    if (selectedSpeakerNpc && (uintptr_t)selectedSpeakerNpc > 0x1000) {
+      narratorSpeakerNpc = selectedSpeakerNpc;
+      narratorSpeakerName = selectedSpeakerNpc->getName();
+      narratorSpeakerHandle = ToString(selectedSpeakerNpc->getHandle().serial);
+    } else {
+      narratorSpeakerNpc =
+          ResolveChatTargetCharacter(world, narratorSpeakerName, narratorSpeakerHandle);
+    }
+  } else {
+    targetNpc = ResolveChatTargetCharacter(world, npcName, handleStr);
+  }
+  if (narratorModeSelected) {
+    if (narratorSpeakerNpc && (uintptr_t)narratorSpeakerNpc > 0x1000) {
+      player = narratorSpeakerNpc;
+      playerName = narratorSpeakerNpc->getName();
+      if (playerName.empty()) {
+        playerName = narratorSpeakerName;
+      }
+      g_chatPlayerNameStr = playerName;
+    }
+  } else {
+    Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+    if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
+      player = bestSpeaker;
+      playerName = bestSpeaker->getName();
+      g_chatPlayerNameStr = playerName;
+    }
   }
   Log("CHAT_SEND_STAGE: resolved_target ptr=" +
       ToString((int)((uintptr_t)targetNpc & 0x7fffffff)) + " has_target=" +
@@ -1953,9 +2045,18 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   Log("CHAT_SEND_STAGE: validate_target");
   std::string sendFailReason;
   bool requireStrictTalkValidation = !manualActionSelected;
-  if (!ValidatePlayerChatSend(world, player, targetNpc, selectedMode,
-                              requireStrictTalkValidation,
-                              sendFailReason)) {
+  bool validationOk = true;
+  if (narratorModeSelected) {
+    validationOk = (narratorSpeakerNpc && (uintptr_t)narratorSpeakerNpc > 0x1000);
+    if (!validationOk) {
+      sendFailReason = "Select a valid speaker before using narrator mode.";
+    }
+  } else {
+    validationOk = ValidatePlayerChatSend(world, player, targetNpc, selectedMode,
+                                          requireStrictTalkValidation,
+                                          sendFailReason);
+  }
+  if (!validationOk) {
     if (world && !sendFailReason.empty()) {
       world->showPlayerAMessage_withLog("Chat blocked: " + sendFailReason, true);
     }
@@ -1981,6 +2082,9 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
 
   std::string targetName = npcName;
+  if (narratorModeSelected) {
+    targetName = kNarratorName;
+  }
   if (targetNpc && (uintptr_t)targetNpc > 0x1000) {
     std::string resolvedTargetName = targetNpc->getName();
     if (!resolvedTargetName.empty()) {
@@ -1992,7 +2096,9 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
 
   std::string resolvedTargetHandle = handleStr;
-  if (targetNpc && (uintptr_t)targetNpc > 0x1000) {
+  if (narratorModeSelected) {
+    resolvedTargetHandle = "";
+  } else if (targetNpc && (uintptr_t)targetNpc > 0x1000) {
     resolvedTargetHandle = ResolveCharacterSerialToken(targetNpc);
   }
 
@@ -2227,7 +2333,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 
   CloseChatUI();
 
-  bool shouldQueueLocalPlayerSpeech = (mode != "autochat" && mode != "cheat");
+  bool shouldQueueLocalPlayerSpeech =
+      (mode != "autochat" && mode != "cheat" && mode != "narrator");
   if (shouldQueueLocalPlayerSpeech) {
     EnterCriticalSection(&g_msgMutex);
     g_messageQueue.push_back("PLAYER_SAY: " + text);
@@ -2413,6 +2520,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
     playerName = bestSpeaker->getName();
   }
   std::string selectedMode = NormalizeChatMode(g_chatMode);
+  if (selectedMode == "narrator") {
+    selectedMode = "chat";
+  }
   std::string peopleJson =
       BuildPeopleJson(world, playerName, targetNpcName, targetHandle, selectedMode,
                       player);
@@ -2659,6 +2769,89 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   return true;
 }
 
+bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
+                                  LONG generationOverride) {
+  if (!world || !world->player || world->player->playerCharacters.size() == 0) {
+    return false;
+  }
+
+  Character *speaker = nullptr;
+  if (preferredSpeaker && (uintptr_t)preferredSpeaker > 0x1000) {
+    bool isPlayerCharacter = false;
+    try {
+      isPlayerCharacter = preferredSpeaker->isPlayerCharacter();
+    } catch (...) {
+      isPlayerCharacter = false;
+    }
+    if (isPlayerCharacter) {
+      speaker = preferredSpeaker;
+    }
+  }
+  if (!speaker) {
+    speaker = world->player->playerCharacters[0];
+  }
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return false;
+  }
+
+  std::string speakerName = TrimChatLine(speaker->getName());
+  if (speakerName.empty()) {
+    speakerName = "Player";
+  }
+  std::string speakerSerial = ResolveCharacterSerialToken(speaker);
+
+  std::vector<std::string> people;
+  if (!speakerSerial.empty()) {
+    AppendUniquePerson(people, speakerName + "|" + speakerSerial);
+  } else {
+    AppendUniquePerson(people, speakerName);
+  }
+  AppendUniquePerson(people, std::string(kNarratorName));
+
+  std::string peopleJson = "[";
+  for (size_t i = 0; i < people.size(); ++i) {
+    if (i > 0) {
+      peopleJson += ",";
+    }
+    peopleJson += "\"" + EscapeJSON(people[i]) + "\"";
+  }
+  peopleJson += "]";
+
+  std::string eventData = speakerName + ": game load detected";
+  std::wstring endpoint =
+      L"/StobeServer/stream.php?DATA=" +
+      ToWide(BuildStreamQueryData("init", eventData, ResolveCurrentGameTs())) +
+      L"&mode=narrator" + L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
+      L"&people=" + ToWide(UrlEncode(peopleJson));
+  AppendGeoQueryFromPlayer(endpoint, speaker);
+
+  StreamChatTask *task = new StreamChatTask();
+  task->endpoint = endpoint;
+  task->npcName = kNarratorName;
+  task->handleStr = "";
+  task->peopleJson = peopleJson;
+  task->previousSpeaker = speakerName;
+  task->previousSpeakerHandle = speakerSerial;
+  task->initiatorSpeaker = speakerName;
+  task->initiatorSpeakerHandle = speakerSerial;
+  task->requestMode = "narrator";
+  task->generation = generationOverride > 0 ? generationOverride
+                                             : GetChatInterruptGeneration();
+  task->rechatDepth = 0;
+
+  HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
+  if (!thread) {
+    delete task;
+    Log("LOAD_SYNC: failed to start narrator welcome stream thread");
+    return false;
+  }
+  CloseHandle(thread);
+
+  Log("LOAD_SYNC: dispatched narrator welcome init speaker=" + speakerName +
+      " serial=" + speakerSerial + " gen=" + ToString((int)task->generation));
+  return true;
+}
+
 void OnChatWindowButtonPressed(MyGUI::Window *sender, const std::string &name) {
   if (name == "close")
     CloseChatUI();
@@ -2754,6 +2947,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatModeCombo->addItem(WideFromUtf8("whisper").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("cheat").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("narrator").c_str());
   g_chatModeCombo->eventComboAccept += MyGUI::newDelegate(OnChatModeChange);
   g_chatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatModeChange);
@@ -2864,6 +3058,25 @@ void RefreshChatModeControls() {
     g_chatAutoChatToggle->setCaption(
         WideFromUtf8(std::string("Auto Chat: ") +
                    (g_autoChatEnabled ? "[ON]" : "[OFF]"))
+            .c_str());
+  }
+
+  if (g_chatLabel) {
+    std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
+    std::string targetLabel = g_chatTargetNameStr.empty() ? "Unknown" : g_chatTargetNameStr;
+    if (g_chatMode == "narrator") {
+      Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(GetWorldSafe());
+      if (selectedSpeakerNpc && (uintptr_t)selectedSpeakerNpc > 0x1000) {
+        std::string selectedSpeakerName = selectedSpeakerNpc->getName();
+        if (!selectedSpeakerName.empty()) {
+          speakerName = selectedSpeakerName;
+          g_chatPlayerNameStr = selectedSpeakerName;
+        }
+      }
+      targetLabel = kNarratorName;
+    }
+    g_chatLabel->setCaption(
+        WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
             .c_str());
   }
 }

@@ -227,6 +227,8 @@ std::string NormalizeIniChatMode(const std::string &rawMode) {
     return "shout";
   if (mode == "cheat")
     return "cheat";
+  if (mode == "narrator")
+    return "narrator";
   if (mode == "chat" || mode == "talk")
     return "chat";
   return "chat";
@@ -498,6 +500,8 @@ void LoadStobeRuntimeConfig() {
     g_lastChatModeIndex = 2;
   else if (g_chatMode == "cheat")
     g_lastChatModeIndex = 3;
+  else if (g_chatMode == "narrator")
+    g_lastChatModeIndex = 4;
   else
     g_lastChatModeIndex = 0;
 

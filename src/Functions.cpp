@@ -2937,27 +2937,53 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
       if (act.type == ACT_NOTIFY) {
         thisptr->showPlayerAMessage_withLog(act.message, true);
+        bool hasTtsClip = g_ttsEnabled && !act.ttsHash.empty();
+        bool playbackQueued = false;
+        if (hasTtsClip) {
+          playbackQueued = QueueTtsPlayback(act.ttsHash);
+        }
+        if (hasTtsClip) {
+          Log("ACTION_TIMING: NOTIFY tts_hash=" + act.ttsHash.substr(0, 8) +
+              " tts_dur_ms=" + ToString(act.taskValue) +
+              " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
+        }
+        if (playbackQueued) {
+          blockSpeechQueue = true;
+          holdForTtsPlayback = true;
+          activeSpeechTarget = hand();
+          activeSpeechTargetSerial = 0;
+          speechDelayMs = 250;
+        } else if (act.taskValue > 0) {
+          blockSpeechQueue = true;
+          speechDelayMs = static_cast<DWORD>(act.taskValue) + 120;
+        }
       } else if (act.type == ACT_SAY && target &&
                  !IsCharacterUnavailableForDialogue(target)) {
         bool isPC = target->isPlayerCharacter();
         float appliedBubbleDuration = 0.0f;
+        bool forcedSayFallback = false;
         Log("ACTION_EXEC: SAY [" + target->getName() + "]: " + act.message +
             (isPC ? " (PC)" : " (NPC)"));
         try {
           // If npc is in vanilla dialogue state, bubbles are often suppressed.
           // Force a reset if they seem stuck.
-          if (target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
+          if (!isPC && target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
             target->dialogue->endDialogue(true);
             target->dialogue->setInDialog(false);
           }
 
           // Primary method: sayALine (supports multiple lines/delays)
-          target->sayALine(act.message, true);
+          target->sayALine(act.message, !isPC);
+          // Force native floating text path as well. This is the most reliable
+          // way to surface overhead speech bubbles across player and NPC actors.
+          target->say(act.message);
+          forcedSayFallback = true;
 
           // ðŸš¨ FIX: Speech bubbles disappear too fast at high game speeds.
           // Scale the timer by game speed to keep real-time duration stable.
           // When TTS metadata is present, sync bubble lifetime to clip length.
           if (target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
+            target->dialogue->npcReplyText = act.message;
             float speed = thisptr->getFrameSpeedMultiplier();
             if (speed < 1.0f)
               speed = 1.0f;
@@ -2975,10 +3001,18 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             target->dialogue->speechTextTimer = duration;
             target->dialogue->speechTextTimer_forced = duration;
             appliedBubbleDuration = duration;
+            bool timerActive = target->dialogue->speechTextTimer > 0.05f ||
+                               target->dialogue->speechTextTimer_forced > 0.05f;
+            bool hasReplyText = !target->dialogue->npcReplyText.empty();
+            if ((!timerActive || !hasReplyText) && !forcedSayFallback) {
+              target->say(act.message);
+              forcedSayFallback = true;
+            }
           } else {
             // Secondary fallback: say (force floating text bubble)
             // ONLY if dialogue system failed to initialize for this character
             target->say(act.message);
+            forcedSayFallback = true;
           }
 
         } catch (...) {
@@ -2997,7 +3031,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             " bubble_ms=" + ToString((int)(appliedBubbleDuration * 1000.0f)) +
             " est_ms=" + ToString((int)EstimateSpeechDurationMs(act.message)) +
             " tts_enabled=" + std::string(g_ttsEnabled ? "1" : "0") +
-            " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
+            " playbackQueued=" + std::string(playbackQueued ? "1" : "0") +
+            " forced_say_fallback=" +
+            std::string(forcedSayFallback ? "1" : "0"));
         blockSpeechQueue = true;
         if (playbackQueued) {
           holdForTtsPlayback = true;
@@ -3005,9 +3041,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           activeSpeechTargetSerial = act.target.serial;
           speechDelayMs = 250;
         } else {
-          if (isPC && !hasTtsClip) {
+          if (isPC && !hasTtsClip && act.taskValue < 0) {
             // PLAYER_TTS arrives asynchronously after PLAYER_SAY; keep queue
             // delay short so playback can start quickly once hash resolves.
+            // Non-player squad speech should use normal pacing.
             speechDelayMs = 250;
           } else {
             speechDelayMs = ResolveSpeechQueueDelayMs(act);

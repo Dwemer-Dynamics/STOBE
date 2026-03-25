@@ -5389,13 +5389,20 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         }
       } else if (isNotify) {
         std::string text = msg.substr(7);
+        int ttsDurationMs = ExtractTrailingTtsDurationMs(text);
+        std::string ttsHash = ExtractTrailingTtsHash(text);
+        if (!g_ttsEnabled) {
+          ttsDurationMs = 0;
+          ttsHash.clear();
+        }
         EnterCriticalSection(&g_uiMutex);
         QueuedAction act;
         act.type = ACT_NOTIFY;
         act.actor = hand();
         act.target = hand();
         act.message = text;
-        act.taskValue = 0;
+        act.ttsHash = ttsHash;
+        act.taskValue = ttsDurationMs;
         g_uiActionQueue.push_back(act);
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {
@@ -6739,6 +6746,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               tc = thisptr->player->playerCharacters[0];
             }
           }
+          if (isNPCSay && tc && (uintptr_t)tc > 0x1000 && tc->isPlayerCharacter()) {
+            Character *talkTarget = ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
+            if (talkTarget && (uintptr_t)talkTarget > 0x1000 &&
+                !talkTarget->isPlayerCharacter()) {
+              Log("CHAT_SPEAKER: NPC_SAY retargeted from player " +
+                  tc->getName() + " to talk target " + talkTarget->getName());
+              tc = talkTarget;
+              targetHand = talkTarget->getHandle();
+            }
+          }
 
           Log("HOOK_MSG_PROC: Queuing SAY for " +
               (tc ? tc->getName() : "Unknown") + ": " + bubbleContent);
@@ -6787,23 +6804,39 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                          listenerSerial);
           }
 
-          if (targetHand.isValid()) {
+          hand sayTargetHand = targetHand;
+          if (tc && (uintptr_t)tc > 0x1000) {
+            sayTargetHand = tc->getHandle();
+            targetHand = sayTargetHand;
+          }
+
+          if (sayTargetHand.isValid()) {
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
             act.type = ACT_SAY;
-            act.actor = targetHand;
-            act.target = targetHand;
+            act.actor = sayTargetHand;
+            act.target = sayTargetHand;
             act.message = bubbleContent;
             act.ttsHash = ttsHash;
-            act.taskValue = ttsDurationMs;
+            int speechTimingMs = ttsDurationMs;
+            if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
+                ttsDurationMs <= 0) {
+              // PLAYER_TTS metadata arrives asynchronously after PLAYER_SAY.
+              // Use a sentinel so only local player speech gets the short wait.
+              speechTimingMs = -1;
+            }
+            act.taskValue = speechTimingMs;
             g_uiActionQueue.push_back(act);
             LeaveCriticalSection(&g_uiMutex);
             Log("TIMING_META: queued ACT_SAY target=" +
                 (tc ? tc->getName() : "Unknown") +
                 " tts_hash=" + (ttsHash.empty() ? "" : ttsHash.substr(0, 8)) +
-                " tts_dur_ms=" + ToString(ttsDurationMs));
+                " tts_dur_ms=" + ToString(ttsDurationMs) +
+                " player_tts_wait_hint=" +
+                std::string(speechTimingMs < 0 ? "1" : "0"));
           } else {
-            Log("HOOK_MSG_PROC: SAY fallback logged without target hand");
+            Log("HOOK_MSG_PROC: SAY fallback logged without target hand actor=" +
+                std::string(tc ? tc->getName() : "Unknown"));
           }
         }
       }
@@ -7494,6 +7527,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static bool motdAutoOpenQueued = false;
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
+  static bool loadInitEventDispatched = false;
   bool worldStable = IsWorldStableForUI(worldUi);
 
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
@@ -7540,6 +7574,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
+      loadInitEventDispatched = false;
       Log("INV_SYNC: state reset on world transition.");
     }
     if (g_settingsWindow)
@@ -7566,6 +7601,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
+    loadInitEventDispatched = false;
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
   }
@@ -7722,6 +7758,35 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    if (!loadInitEventDispatched) {
+      bool dispatchedViaStream =
+          TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));
+      if (!dispatchedViaStream) {
+        Character *initSpeaker = ResolvePlayerSpeakerForCurrentTalk(world);
+        if ((!initSpeaker || (uintptr_t)initSpeaker < 0x1000) && world->player &&
+            world->player->playerCharacters.size() > 0) {
+          initSpeaker = world->player->playerCharacters[0];
+        }
+
+        std::string initActor = ResolveCharacterNameSafe(initSpeaker);
+        if (initActor.empty() || initActor == "Unknown") {
+          initActor = "Player";
+        }
+        std::string initFaction = SafeFaction(initSpeaker);
+        if (initFaction.empty()) {
+          initFaction = "None";
+        }
+        unsigned int initActorSerial = ResolveCharacterSerialForEvent(initSpeaker);
+        std::string initMessage = "game load detected (fallback init event)";
+
+        LogGameEvent("init", initActor, initFaction, "", "None", initMessage,
+                     initActorSerial, 0);
+        Log("LOAD_SYNC: narrator welcome stream unavailable; queued init fallback actor=" +
+            initActor + " serial=" + ToString((int)initActorSerial));
+      }
+      loadInitEventDispatched = true;
+    }
+
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);

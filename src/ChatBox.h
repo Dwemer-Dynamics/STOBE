@@ -43,6 +43,9 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName = "",
                        const std::string &preferredSpeakerSerial = "",
                        LONG generationOverride = 0);
+bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
+                                  Character *preferredSpeaker = nullptr,
+                                  LONG generationOverride = 0);
 void OnChatWindowButtonPressed(MyGUI::Window *sender, const std::string &name);
 
 } // namespace UI
