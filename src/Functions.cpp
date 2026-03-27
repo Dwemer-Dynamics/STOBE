@@ -1096,6 +1096,36 @@ std::string NormalizeInventoryMatchToken(const std::string &value) {
   return out;
 }
 
+std::string CollapseInventoryTokenNoSpace(const std::string &value) {
+  std::string compact;
+  compact.reserve(value.size());
+  for (size_t i = 0; i < value.size(); ++i) {
+    unsigned char ch = (unsigned char)value[i];
+    if (std::isalnum(ch)) {
+      compact.push_back((char)std::tolower(ch));
+    }
+  }
+  return compact;
+}
+
+bool InventoryTokensMatch(const std::string &itemToken,
+                          const std::string &queryToken) {
+  if (itemToken.empty() || queryToken.empty()) {
+    return false;
+  }
+  if (itemToken.find(queryToken) != std::string::npos ||
+      queryToken.find(itemToken) != std::string::npos) {
+    return true;
+  }
+  const std::string itemCompact = CollapseInventoryTokenNoSpace(itemToken);
+  const std::string queryCompact = CollapseInventoryTokenNoSpace(queryToken);
+  if (itemCompact.empty() || queryCompact.empty()) {
+    return false;
+  }
+  return itemCompact.find(queryCompact) != std::string::npos ||
+         queryCompact.find(itemCompact) != std::string::npos;
+}
+
 bool IsLikelyTraderStorageBuilding(Building *building) {
   if (!building || (uintptr_t)building <= 0x1000) {
     return false;
@@ -1175,8 +1205,7 @@ bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
     if (itemToken.empty()) {
       continue;
     }
-    bool queryMatches = itemToken.find(queryToken) != std::string::npos ||
-                        queryToken.find(itemToken) != std::string::npos;
+    bool queryMatches = InventoryTokensMatch(itemToken, queryToken);
     if (!queryMatches) {
       continue;
     }
@@ -4010,9 +4039,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               if (itemToken.empty()) {
                 continue;
               }
-              bool queryMatches =
-                  itemToken.find(itemQueryToken) != std::string::npos ||
-                  itemQueryToken.find(itemToken) != std::string::npos;
+              bool queryMatches = InventoryTokensMatch(itemToken, itemQueryToken);
               if (queryMatches) {
                 int stackQuantity = 1;
                 try {

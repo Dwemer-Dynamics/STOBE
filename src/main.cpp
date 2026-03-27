@@ -5968,12 +5968,56 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               outAmount = parsed;
               return true;
             };
-
             auto parseItemSpec = [&](const std::string &rawSpec,
                                      std::string &itemNameOut,
                                      int &itemAmountOut) -> bool {
-              itemNameOut = TrimCopy(rawSpec);
+              auto stripTrailingNoise = [](std::string value) -> std::string {
+                value = TrimCopy(value);
+                if (value.empty()) {
+                  return value;
+                }
+
+                size_t fencePos = value.find("```");
+                if (fencePos != std::string::npos) {
+                  value = TrimCopy(value.substr(0, fencePos));
+                }
+
+                std::string valueLower = ToLowerAsciiCopy(value);
+                size_t sourcePos = valueLower.find("[source:");
+                if (sourcePos != std::string::npos) {
+                  value = TrimCopy(value.substr(0, sourcePos));
+                  valueLower = ToLowerAsciiCopy(value);
+                }
+                size_t talkingPos = valueLower.find("(talking to:");
+                if (talkingPos != std::string::npos) {
+                  value = TrimCopy(value.substr(0, talkingPos));
+                }
+
+                while (!value.empty()) {
+                  char c = value.back();
+                  if (c == '`' || c == '.' || c == ',' || c == ';' || c == ':' ||
+                      c == '!' || c == '?' || c == ')' || c == ']' || c == '}') {
+                    value.erase(value.size() - 1, 1);
+                    continue;
+                  }
+                  break;
+                }
+                return TrimCopy(value);
+              };
+
+              itemNameOut = stripTrailingNoise(rawSpec);
               itemAmountOut = 1;
+              if (itemNameOut.empty()) {
+                return false;
+              }
+
+              std::string leadingLower = ToLowerAsciiCopy(itemNameOut);
+              if (leadingLower.find("and ") == 0) {
+                itemNameOut = TrimCopy(itemNameOut.substr(4));
+              } else if (leadingLower.find("then ") == 0) {
+                itemNameOut = TrimCopy(itemNameOut.substr(5));
+              }
+              itemNameOut = stripTrailingNoise(itemNameOut);
               if (itemNameOut.empty()) {
                 return false;
               }
@@ -5983,6 +6027,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                    (itemNameOut.front() == '\'' && itemNameOut.back() == '\''))) {
                 itemNameOut =
                     TrimCopy(itemNameOut.substr(1, itemNameOut.size() - 2));
+                itemNameOut = stripTrailingNoise(itemNameOut);
               }
               if (itemNameOut.empty()) {
                 return false;
@@ -6390,14 +6435,85 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 ToString((int)targetHand.serial));
           } else if (actionCommand == "GIVE_ITEM") {
             std::string giveItemTargetToken = "";
-            std::string iName = "";
-            int giveItemAmount = 1;
-            if (!parseGiveItemPayload(actionArgument, giveItemTargetToken, iName,
-                                      giveItemAmount)) {
-              Log("HOOK_MSG_PROC: GIVE_ITEM ignored; invalid payload '" +
-                  actionArgument + "'");
-              continue;
+            std::vector<std::pair<std::string, int>> giveItemRequests;
+
+            std::string trimmedGiveItemArg = TrimCopy(actionArgument);
+            bool listSyntaxRequested =
+                trimmedGiveItemArg.find(',') != std::string::npos ||
+                trimmedGiveItemArg.find(';') != std::string::npos;
+
+            if (listSyntaxRequested) {
+              std::string listPayload = trimmedGiveItemArg;
+              size_t firstAt = listPayload.find('@');
+              if (firstAt != std::string::npos) {
+                std::string targetToken = TrimCopy(listPayload.substr(0, firstAt));
+                std::string itemsToken = TrimCopy(listPayload.substr(firstAt + 1));
+                if (!targetToken.empty() && !itemsToken.empty()) {
+                  giveItemTargetToken = targetToken;
+                  listPayload = itemsToken;
+                }
+              }
+
+              std::vector<std::string> parts;
+              std::string current = "";
+              std::string listPayloadLower = ToLowerAsciiCopy(listPayload);
+              for (size_t i = 0; i < listPayload.size(); ++i) {
+                char ch = listPayload[i];
+                bool shouldSplit = (ch == ',' || ch == ';');
+                size_t splitAdvance = 0;
+                if (!shouldSplit && i + 5 <= listPayloadLower.size() &&
+                    listPayloadLower.substr(i, 5) == " and ") {
+                  shouldSplit = true;
+                  splitAdvance = 4;
+                }
+                if (shouldSplit) {
+                  std::string part = TrimCopy(current);
+                  if (!part.empty()) {
+                    parts.push_back(part);
+                  }
+                  current.clear();
+                  i += splitAdvance;
+                  continue;
+                }
+                current.push_back(ch);
+              }
+              std::string tail = TrimCopy(current);
+              if (!tail.empty()) {
+                parts.push_back(tail);
+              }
+
+              for (size_t i = 0; i < parts.size(); ++i) {
+                std::string parsedTargetToken = "";
+                std::string parsedItemName = "";
+                int parsedAmount = 1;
+                if (!parseGiveItemPayload(parts[i], parsedTargetToken, parsedItemName,
+                                          parsedAmount)) {
+                  Log("HOOK_MSG_PROC: GIVE_ITEM list part parse failed part='" +
+                      parts[i] + "'");
+                  continue;
+                }
+                if (!parsedTargetToken.empty() && giveItemTargetToken.empty()) {
+                  giveItemTargetToken = parsedTargetToken;
+                }
+                if (!parsedItemName.empty() && parsedAmount > 0) {
+                  giveItemRequests.push_back(
+                      std::make_pair(parsedItemName, parsedAmount));
+                }
+              }
             }
+
+            if (giveItemRequests.empty()) {
+              std::string iName = "";
+              int giveItemAmount = 1;
+              if (!parseGiveItemPayload(actionArgument, giveItemTargetToken, iName,
+                                        giveItemAmount)) {
+                Log("HOOK_MSG_PROC: GIVE_ITEM ignored; invalid payload '" +
+                    actionArgument + "'");
+                continue;
+              }
+              giveItemRequests.push_back(std::make_pair(iName, giveItemAmount));
+            }
+
             hand giveItemTarget = hand();
             if (!giveItemTargetToken.empty()) {
               giveItemTarget =
@@ -6434,19 +6550,29 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               }
             }
             EnterCriticalSection(&g_uiMutex);
-            QueuedAction act;
-            act.type = ACT_GIVE_ITEM;
-            act.actor = targetHand;
-            act.target = giveItemTarget;
-            act.message = iName;
-            act.taskValue = giveItemAmount;
-            g_uiActionQueue.push_back(act);
+            for (size_t i = 0; i < giveItemRequests.size(); ++i) {
+              QueuedAction act;
+              act.type = ACT_GIVE_ITEM;
+              act.actor = targetHand;
+              act.target = giveItemTarget;
+              act.message = giveItemRequests[i].first;
+              act.taskValue = giveItemRequests[i].second;
+              g_uiActionQueue.push_back(act);
+            }
             LeaveCriticalSection(&g_uiMutex);
+            std::string giveItemSummary = "";
+            for (size_t i = 0; i < giveItemRequests.size(); ++i) {
+              if (i > 0) {
+                giveItemSummary += ", ";
+              }
+              giveItemSummary += giveItemRequests[i].first + " x" +
+                                 ToString(giveItemRequests[i].second);
+            }
             Log("HOOK_MSG_PROC: GIVE_ITEM queued actor_serial=" +
-                ToString((unsigned int)targetHand.serial) + " item='" + iName +
-                "' qty=" + ToString(giveItemAmount) +
-                "' target='" + giveItemTargetToken + "' target_serial=" +
-                ToString((unsigned int)giveItemTarget.serial));
+                ToString((unsigned int)targetHand.serial) + " count=" +
+                ToString((int)giveItemRequests.size()) + " items=[" +
+                giveItemSummary + "] target='" + giveItemTargetToken +
+                "' target_serial=" + ToString((unsigned int)giveItemTarget.serial));
           } else if (actionCommand == "TAKE_ITEM") {
             std::string iName = actionArgument;
             EnterCriticalSection(&g_uiMutex);
