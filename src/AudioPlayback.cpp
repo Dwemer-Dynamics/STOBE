@@ -17,6 +17,8 @@ namespace {
 struct TtsPlaybackTask {
   std::string hash;
   LONG generation;
+  int volumePercentOverride;
+  unsigned int speakerSerial;
 };
 
 LONG g_ttsPlaybackBusy = 0;
@@ -40,6 +42,16 @@ std::string ShortHashForLog(const std::string &hash) {
     return hash;
   }
   return hash.substr(0, 8);
+}
+
+int ClampVolumePercent(int volumePercent) {
+  if (volumePercent < 0) {
+    return 0;
+  }
+  if (volumePercent > 100) {
+    return 100;
+  }
+  return volumePercent;
 }
 
 int EstimateWavDurationMs(const std::string &wavData) {
@@ -356,6 +368,8 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 
   std::string hash = task->hash;
   LONG generation = task->generation;
+  int volumePercentOverride = task->volumePercentOverride;
+  unsigned int speakerSerial = task->speakerSerial;
   delete task;
   DWORD threadStartTick = GetTickCount();
 
@@ -404,12 +418,9 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   if (durationMs <= 0) {
     durationMs = 5000;
   }
-  int volumePercent = g_ttsVolumePercent;
-  if (volumePercent < 0) {
-    volumePercent = 0;
-  } else if (volumePercent > 100) {
-    volumePercent = 100;
-  }
+  int volumePercent = (volumePercentOverride >= 0)
+                          ? ClampVolumePercent(volumePercentOverride)
+                          : ClampVolumePercent(g_ttsVolumePercent);
   if (volumePercent < 100) {
     ApplyWavVolumeInPlace(wavData, volumePercent);
   }
@@ -430,6 +441,8 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " bytes=" + ToString((int)wavData.size()) +
       " est_ms=" + ToString(durationMs) +
       " volume_pct=" + ToString(volumePercent) +
+      " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
+      " speaker_serial=" + ToString((int)speakerSerial) +
       " download_ms=" + ToString((int)downloadMs));
 
   DWORD playFlags = SND_FILENAME | SND_ASYNC | SND_NODEFAULT;
@@ -473,7 +486,8 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 }
 } // namespace
 
-bool QueueTtsPlayback(const std::string &ttsHash) {
+bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
+                      unsigned int speakerSerial) {
   if (!IsHexHash(ttsHash)) {
     Log("TTS_PLAYBACK: rejected invalid hash");
     return false;
@@ -490,12 +504,16 @@ bool QueueTtsPlayback(const std::string &ttsHash) {
   TtsPlaybackTask *task = new TtsPlaybackTask();
   task->hash = ttsHash;
   task->generation = CurrentTtsPlaybackGeneration();
+  task->volumePercentOverride = volumePercentOverride;
+  task->speakerSerial = speakerSerial;
 
   HANDLE threadHandle = CreateThread(NULL, 0, PlaybackThreadProc, task, 0, NULL);
   if (threadHandle) {
     CloseHandle(threadHandle);
     Log("TTS_PLAYBACK: enqueued hash=" + ShortHashForLog(ttsHash) +
-        " generation=" + ToString((int)task->generation));
+        " generation=" + ToString((int)task->generation) +
+        " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
+        " speaker_serial=" + ToString((int)speakerSerial));
     return true;
   }
 

@@ -271,6 +271,112 @@ DWORD ResolveSpeechQueueDelayMs(const QueuedAction &act) {
   return delayMs;
 }
 
+int ClampTtsVolumePercent(int volumePercent) {
+  if (volumePercent < 0) {
+    return 0;
+  }
+  if (volumePercent > 100) {
+    return 100;
+  }
+  return volumePercent;
+}
+
+bool IsCharacterLoadedForTtsPlayback(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  bool isVisibleNear = false;
+  bool isOnScreen = false;
+  try {
+    isVisibleNear = character->isVisibleAndNear;
+    isOnScreen = character->isOnScreen;
+  } catch (...) {
+    return false;
+  }
+  return isVisibleNear || isOnScreen;
+}
+
+float ResolveCameraDistanceToCharacter(GameWorld *world, Character *character) {
+  if (!world || !character || (uintptr_t)character <= 0x1000) {
+    return -1.0f;
+  }
+  try {
+    const Ogre::Vector3 cameraPos = world->getCameraPos();
+    const Ogre::Vector3 characterPos = character->getPosition();
+    float distance = cameraPos.distance(characterPos);
+    if (distance >= 0.0f) {
+      return distance;
+    }
+  } catch (...) {
+  }
+  return -1.0f;
+}
+
+int ResolveTtsPlaybackVolumePercent(GameWorld *world, Character *speaker,
+                                    float &cameraDistanceOut,
+                                    bool &speakerLoadedOut,
+                                    bool &attenuatedOut) {
+  cameraDistanceOut = -1.0f;
+  speakerLoadedOut = false;
+  attenuatedOut = false;
+
+  int baseVolumePercent = ClampTtsVolumePercent(g_ttsVolumePercent);
+  if (baseVolumePercent <= 0) {
+    return 0;
+  }
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return 0;
+  }
+
+  speakerLoadedOut = IsCharacterLoadedForTtsPlayback(speaker);
+  if (!speakerLoadedOut) {
+    return 0;
+  }
+
+  cameraDistanceOut = ResolveCameraDistanceToCharacter(world, speaker);
+  if (cameraDistanceOut < 0.0f) {
+    return baseVolumePercent;
+  }
+
+  // Fade out by camera distance, and fully mute beyond far range.
+  const float kNearDistanceUnits = 40.0f;
+  float farDistanceUnits = g_shoutRadius;
+  if (farDistanceUnits < 120.0f) {
+    farDistanceUnits = 120.0f;
+  } else if (farDistanceUnits > 1200.0f) {
+    farDistanceUnits = 1200.0f;
+  }
+
+  if (cameraDistanceOut <= kNearDistanceUnits) {
+    return baseVolumePercent;
+  }
+  if (cameraDistanceOut >= farDistanceUnits) {
+    attenuatedOut = true;
+    return 0;
+  }
+
+  float linearGain =
+      (farDistanceUnits - cameraDistanceOut) /
+      (farDistanceUnits - kNearDistanceUnits);
+  if (linearGain < 0.0f) {
+    linearGain = 0.0f;
+  } else if (linearGain > 1.0f) {
+    linearGain = 1.0f;
+  }
+  float gain = linearGain * linearGain;
+  if (gain <= 0.001f) {
+    attenuatedOut = true;
+    return 0;
+  }
+
+  int resolvedVolumePercent = ClampTtsVolumePercent(
+      static_cast<int>(static_cast<float>(baseVolumePercent) * gain + 0.5f));
+  if (resolvedVolumePercent < baseVolumePercent) {
+    attenuatedOut = true;
+  }
+  return resolvedVolumePercent;
+}
+
 static bool ParseTravelLocationPayload(const std::string &rawPayload, float &xOut,
                                        float &yOut, float &zOut,
                                        std::string &labelOut) {
@@ -3021,13 +3127,38 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
         bool hasTtsClip = g_ttsEnabled && !act.ttsHash.empty();
         bool playbackQueued = false;
+        float ttsCameraDistance = -1.0f;
+        bool ttsSpeakerLoaded = false;
+        bool ttsAttenuated = false;
+        int ttsVolumePercent = ClampTtsVolumePercent(g_ttsVolumePercent);
+        std::string ttsSkipReason = "";
         if (hasTtsClip) {
-          playbackQueued = QueueTtsPlayback(act.ttsHash);
+          ttsVolumePercent =
+              ResolveTtsPlaybackVolumePercent(thisptr, target, ttsCameraDistance,
+                                              ttsSpeakerLoaded, ttsAttenuated);
+          if (ttsVolumePercent > 0) {
+            playbackQueued =
+                QueueTtsPlayback(act.ttsHash, ttsVolumePercent, act.target.serial);
+          } else {
+            ttsSkipReason =
+                ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
+            Log("TTS_PLAYBACK: skip queue hash=" + act.ttsHash.substr(0, 8) +
+                " reason=" + ttsSkipReason +
+                " target=" + SafeCharacterName(target) +
+                " target_serial=" + ToString((int)act.target.serial) +
+                " camera_dist=" + ToString(ttsCameraDistance));
+          }
         }
         Log("ACTION_TIMING: SAY target=" + target->getName() +
             " msg_len=" + ToString((int)act.message.length()) +
             " tts_hash=" + (hasTtsClip ? act.ttsHash.substr(0, 8) : "") +
             " tts_dur_ms=" + ToString(act.taskValue) +
+            " tts_vol_pct=" + ToString(ttsVolumePercent) +
+            " tts_cam_dist=" + ToString(ttsCameraDistance) +
+            " tts_speaker_loaded=" +
+            std::string(ttsSpeakerLoaded ? "1" : "0") +
+            " tts_attenuated=" + std::string(ttsAttenuated ? "1" : "0") +
+            " tts_skip_reason=" + ttsSkipReason +
             " bubble_ms=" + ToString((int)(appliedBubbleDuration * 1000.0f)) +
             " est_ms=" + ToString((int)EstimateSpeechDurationMs(act.message)) +
             " tts_enabled=" + std::string(g_ttsEnabled ? "1" : "0") +
@@ -3074,12 +3205,37 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         }
         bool hasTtsClip = g_ttsEnabled && !act.ttsHash.empty();
         bool playbackQueued = false;
+        float ttsCameraDistance = -1.0f;
+        bool ttsSpeakerLoaded = false;
+        bool ttsAttenuated = false;
+        int ttsVolumePercent = ClampTtsVolumePercent(g_ttsVolumePercent);
+        std::string ttsSkipReason = "";
         if (hasTtsClip) {
-          playbackQueued = QueueTtsPlayback(act.ttsHash);
+          ttsVolumePercent =
+              ResolveTtsPlaybackVolumePercent(thisptr, target, ttsCameraDistance,
+                                              ttsSpeakerLoaded, ttsAttenuated);
+          if (ttsVolumePercent > 0) {
+            playbackQueued =
+                QueueTtsPlayback(act.ttsHash, ttsVolumePercent, act.target.serial);
+          } else {
+            ttsSkipReason =
+                ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
+            Log("TTS_PLAYBACK: skip queue hash=" + act.ttsHash.substr(0, 8) +
+                " reason=" + ttsSkipReason +
+                " target=" + SafeCharacterName(target) +
+                " target_serial=" + ToString((int)act.target.serial) +
+                " camera_dist=" + ToString(ttsCameraDistance));
+          }
         }
         Log("ACTION_TIMING: PLAY_TTS target=" + target->getName() +
             " tts_hash=" + (hasTtsClip ? act.ttsHash.substr(0, 8) : "") +
             " tts_dur_ms=" + ToString(act.taskValue) +
+            " tts_vol_pct=" + ToString(ttsVolumePercent) +
+            " tts_cam_dist=" + ToString(ttsCameraDistance) +
+            " tts_speaker_loaded=" +
+            std::string(ttsSpeakerLoaded ? "1" : "0") +
+            " tts_attenuated=" + std::string(ttsAttenuated ? "1" : "0") +
+            " tts_skip_reason=" + ttsSkipReason +
             " bubble_ms=" + ToString((int)(appliedBubbleDuration * 1000.0f)) +
             " est_ms=" + ToString((int)EstimateSpeechDurationMs(act.message)) +
             " tts_enabled=" + std::string(g_ttsEnabled ? "1" : "0") +

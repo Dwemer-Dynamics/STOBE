@@ -1370,7 +1370,6 @@ static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
 static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
-static const DWORD kMotdAutoOpenMinStableMs = 180 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
 static int g_dynamicProfileIntervalSyncLastValue = 0;
@@ -4130,15 +4129,34 @@ static void EmitLimbLossEvent(Character *victim, const std::string &limbLabel) {
                ResolveCharacterSerialForEvent(victim));
 }
 
+static std::string EnsureLeadingArticle(const std::string &rawValue) {
+  std::string value = TrimCopy(rawValue);
+  if (value.empty()) {
+    return "an unknown weapon";
+  }
+  std::string lower = ToLowerAsciiCopy(value);
+  if (lower.rfind("a ", 0) == 0 || lower.rfind("an ", 0) == 0 ||
+      lower.rfind("the ", 0) == 0) {
+    return value;
+  }
+  char first = (char)std::tolower((unsigned char)value[0]);
+  bool vowel =
+      first == 'a' || first == 'e' || first == 'i' || first == 'o' || first == 'u';
+  return std::string(vowel ? "an " : "a ") + value;
+}
+
 static void EmitKnockoutEvent(Character *victim) {
   CombatAttribution attribution = ResolveCombatAttribution(victim);
   std::string victimName = ResolveCharacterNameSafe(victim);
   std::string victimFaction = SafeFaction(victim);
-  std::string message =
-      "knocked out with " + attribution.weaponName;
-  LogGameEvent("knockout", attribution.actorName, attribution.actorFaction,
-               victimName, victimFaction, message, attribution.actorSerial,
-               ResolveCharacterSerialForEvent(victim));
+  std::string attackerName = TrimCopy(attribution.actorName);
+  std::string message = "Knocked out by " + EnsureLeadingArticle(attribution.weaponName);
+  if (!attackerName.empty() && ToLowerAsciiCopy(attackerName) != "unknown" &&
+      ToLowerAsciiCopy(attackerName) != ToLowerAsciiCopy(victimName)) {
+    message += " from " + attackerName;
+  }
+  LogGameEvent("knockout", victimName, victimFaction, "None", "None", message,
+               ResolveCharacterSerialForEvent(victim), 0);
 }
 
 static void EmitRecoveredEvent(Character *victim) {
@@ -7622,9 +7640,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
-  } else if (!g_welcomeShown &&
-             (GetTickCount() - worldBecameStableTick) >=
-                 kMotdAutoOpenMinStableMs) {
+  } else if (!g_welcomeShown) {
     if (!motdAutoOpenQueued) {
       motdAutoOpenQueued = true;
       motdAutoOpenTick = worldBecameStableTick + 5500;
