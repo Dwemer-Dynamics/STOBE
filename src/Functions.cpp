@@ -1134,10 +1134,14 @@ bool IsLikelyTraderStorageBuilding(Building *building) {
 bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
                                          Character *recipient,
                                          const std::string &queryToken,
+                                         int maxQuantity,
+                                         int &quantityTransferredOut,
                                          std::string &itemNameOut) {
+  quantityTransferredOut = 0;
   itemNameOut.clear();
   if (!sourceInventory || (uintptr_t)sourceInventory <= 0x1000 || !recipient ||
-      (uintptr_t)recipient <= 0x1000 || queryToken.empty()) {
+      (uintptr_t)recipient <= 0x1000 || queryToken.empty() ||
+      maxQuantity <= 0) {
     return false;
   }
 
@@ -1177,6 +1181,20 @@ bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
       continue;
     }
 
+    int stackQuantity = 1;
+    try {
+      stackQuantity = item->quantity;
+    } catch (...) {
+      stackQuantity = 1;
+    }
+    if (stackQuantity < 1) {
+      stackQuantity = 1;
+    }
+    int transferQuantity = stackQuantity;
+    if (transferQuantity > maxQuantity) {
+      transferQuantity = maxQuantity;
+    }
+
     Inventory *itemInventory = nullptr;
     try {
       itemInventory = item->getInventory();
@@ -1190,19 +1208,31 @@ bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
     Item *detached = nullptr;
     try {
       detached = itemInventory ? itemInventory->removeItemDontDestroy_returnsItem(
-                                    item, item->quantity, false)
+                                    item, transferQuantity, false)
                               : nullptr;
     } catch (...) {
       detached = nullptr;
     }
+    if (!detached || (uintptr_t)detached <= 0x1000) {
+      continue;
+    }
 
+    int detachedQuantity = transferQuantity;
     try {
-      recipient->giveItem(detached ? detached : item, true, false);
+      if (detached->quantity > 0) {
+        detachedQuantity = detached->quantity;
+      }
+    } catch (...) {
+      detachedQuantity = transferQuantity;
+    }
+    try {
+      recipient->giveItem(detached, true, false);
     } catch (...) {
       return false;
     }
 
     itemNameOut = itemName;
+    quantityTransferredOut = detachedQuantity;
     return true;
   }
 
@@ -1211,12 +1241,15 @@ bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
 
 bool TryTransferItemFromNearbyTraderStorage(Character *npc, Character *recipient,
                                             const std::string &rawQuery,
+                                            int maxQuantity,
+                                            int &quantityTransferredOut,
                                             std::string &itemNameOut,
                                             std::string &sourceNameOut) {
+  quantityTransferredOut = 0;
   itemNameOut.clear();
   sourceNameOut.clear();
   if (!npc || (uintptr_t)npc <= 0x1000 || !recipient ||
-      (uintptr_t)recipient <= 0x1000) {
+      (uintptr_t)recipient <= 0x1000 || maxQuantity <= 0) {
     return false;
   }
 
@@ -1296,8 +1329,9 @@ bool TryTransferItemFromNearbyTraderStorage(Character *npc, Character *recipient
       continue;
     }
 
-    if (TryTransferItemFromInventoryByQuery(buildingInventory, recipient, queryToken,
-                                            itemNameOut)) {
+    if (TryTransferItemFromInventoryByQuery(
+            buildingInventory, recipient, queryToken, maxQuantity,
+            quantityTransferredOut, itemNameOut)) {
       sourceNameOut = SafeBuildingName(building);
       return true;
     }
@@ -3927,11 +3961,16 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                          ::tolower);
           const std::string itemQueryToken =
               NormalizeInventoryMatchToken(itemQuery);
+          int requestedCount = act.taskValue > 0 ? act.taskValue : 1;
+          if (requestedCount > 100) {
+            requestedCount = 100;
+          }
 
-          Character *primaryPlayer =
-              (thisptr->player && thisptr->player->playerCharacters.size() > 0)
-                  ? thisptr->player->playerCharacters[0]
-                  : nullptr;
+          Character *primaryPlayer = GetActivePlayerCharacter(thisptr);
+          if (!primaryPlayer && thisptr->player &&
+              thisptr->player->playerCharacters.size() > 0) {
+            primaryPlayer = thisptr->player->playerCharacters[0];
+          }
           Character *recipient = primaryPlayer;
           if (target && target != npc && (uintptr_t)target > 0x1000) {
             recipient = target;
@@ -3949,9 +3988,24 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             Log("ACTION_EXEC: GIVE_ITEM blocked actor=" + SafeCharacterName(npc) +
                 " reason=empty_item_query raw='" + act.message + "'");
           } else {
-            bool itemTransferred = false;
-            for (uint32_t i = 0; i < items.size(); ++i) {
-              std::string itemName = items[i]->getName();
+            int transferredCount = 0;
+            std::string transferredItemName = "";
+            std::string transferSourceLabel = "";
+
+            for (uint32_t i = 0; i < items.size() && transferredCount < requestedCount;
+                 ++i) {
+              if (!items[i] || (uintptr_t)items[i] <= 0x1000) {
+                continue;
+              }
+              std::string itemName = "";
+              try {
+                itemName = items[i]->getName();
+              } catch (...) {
+                itemName = "";
+              }
+              if (itemName.empty()) {
+                continue;
+              }
               std::string itemToken = NormalizeInventoryMatchToken(itemName);
               if (itemToken.empty()) {
                 continue;
@@ -3960,33 +4014,56 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                   itemToken.find(itemQueryToken) != std::string::npos ||
                   itemQueryToken.find(itemToken) != std::string::npos;
               if (queryMatches) {
-                Log("ACTION_EXEC: Giving item: " + items[i]->getName());
-                if (items[i]->isEquipped)
-                  npc->unequipItem(items[i]->inventorySection, items[i]);
-                Inventory *inv = items[i]->getInventory();
-                if (!inv)
-                  inv = npc->getInventory();
-                Item *detached = inv ? inv->removeItemDontDestroy_returnsItem(
-                                           items[i], items[i]->quantity, false)
-                                     : nullptr;
-                recipient->giveItem(detached ? detached : items[i], true, false);
-                if (recipient == primaryPlayer) {
-                  thisptr->showPlayerAMessage_withLog(
-                      npc->getName() + " gave you " + items[i]->getName(),
-                      true);
-                } else {
-                  thisptr->showPlayerAMessage_withLog(
-                      SafeCharacterName(npc) + " gave " + items[i]->getName() +
-                          " to " + SafeCharacterName(recipient) + ".",
-                      true);
+                int stackQuantity = 1;
+                try {
+                  stackQuantity = items[i]->quantity;
+                } catch (...) {
+                  stackQuantity = 1;
                 }
-                npc->reThinkCurrentAIAction();
+                if (stackQuantity < 1) {
+                  stackQuantity = 1;
+                }
+                int remaining = requestedCount - transferredCount;
+                int transferQuantity =
+                    (stackQuantity > remaining) ? remaining : stackQuantity;
+                if (transferQuantity <= 0) {
+                  continue;
+                }
+
+                Log("ACTION_EXEC: Giving item: " + itemName +
+                    " qty=" + ToString(transferQuantity));
+                if (items[i]->isEquipped) {
+                  npc->unequipItem(items[i]->inventorySection, items[i]);
+                }
+                Inventory *inv = items[i]->getInventory();
+                if (!inv) {
+                  inv = npc->getInventory();
+                }
+                Item *detached = inv ? inv->removeItemDontDestroy_returnsItem(
+                                           items[i], transferQuantity, false)
+                                     : nullptr;
+                if (!detached || (uintptr_t)detached <= 0x1000) {
+                  continue;
+                }
+                int actualTransferred = transferQuantity;
+                try {
+                  if (detached->quantity > 0) {
+                    actualTransferred = detached->quantity;
+                  }
+                } catch (...) {
+                  actualTransferred = transferQuantity;
+                }
+                recipient->giveItem(detached, true, false);
+                transferredCount += actualTransferred;
                 inventoryTimer = 999;
-                itemTransferred = true;
-                break;
+                if (transferredItemName.empty()) {
+                  transferredItemName = itemName;
+                }
+                transferSourceLabel = "inventory";
               }
             }
-            if (!itemTransferred) {
+
+            if (transferredCount < requestedCount) {
               bool actorIsTrader = false;
               try {
                 actorIsTrader = npc->isATrader();
@@ -4000,29 +4077,28 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                   npc, cachedTraderInventoryJson, cachedTraderInventoryCount,
                   &cachedTraderInventoryAgeSeconds);
               if (actorIsTrader || hasCachedTraderInventory) {
-                std::string storageItemName = "";
-                std::string storageSourceName = "";
-                bool storageTransferred = TryTransferItemFromNearbyTraderStorage(
-                    npc, recipient, itemQueryToken, storageItemName,
-                    storageSourceName);
-                if (storageTransferred) {
-                  const std::string givenItemName =
-                      storageItemName.empty() ? act.message : storageItemName;
-                  const std::string sourceLabel = storageSourceName.empty()
-                                                      ? "shop storage"
-                                                      : storageSourceName;
-                  thisptr->showPlayerAMessage_withLog(
-                      SafeCharacterName(npc) + " gave " + givenItemName +
-                          " from " + sourceLabel + ".",
-                      true);
-                  Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
-                      " recipient=" + SafeCharacterName(recipient) +
-                      " source=" + sourceLabel + " item='" + givenItemName +
-                      "' path=trader_storage");
-                  npc->reThinkCurrentAIAction();
+                while (transferredCount < requestedCount) {
+                  int storageTransferredQuantity = 0;
+                  std::string storageItemName = "";
+                  std::string storageSourceName = "";
+                  int remaining = requestedCount - transferredCount;
+                  bool storageTransferred = TryTransferItemFromNearbyTraderStorage(
+                      npc, recipient, itemQueryToken, remaining,
+                      storageTransferredQuantity, storageItemName,
+                      storageSourceName);
+                  if (!storageTransferred || storageTransferredQuantity <= 0) {
+                    break;
+                  }
+                  transferredCount += storageTransferredQuantity;
                   inventoryTimer = 999;
-                  itemTransferred = true;
-                } else {
+                  if (transferredItemName.empty() && !storageItemName.empty()) {
+                    transferredItemName = storageItemName;
+                  }
+                  transferSourceLabel =
+                      storageSourceName.empty() ? "shop storage"
+                                                : storageSourceName;
+                }
+                if (transferredCount < requestedCount) {
                   Log("ACTION_EXEC: GIVE_ITEM trader storage miss actor=" +
                       SafeCharacterName(npc) + " query='" + act.message +
                       "' is_trader=" + (actorIsTrader ? "1" : "0") +
@@ -4032,14 +4108,46 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 }
               }
             }
-            if (!itemTransferred) {
+
+            if (transferredCount > 0) {
+              const std::string givenItemName = transferredItemName.empty()
+                                                    ? act.message
+                                                    : transferredItemName;
+              const std::string quantityPrefix =
+                  (transferredCount > 1) ? (ToString(transferredCount) + "x ")
+                                         : "";
+              const std::string partialSuffix =
+                  (transferredCount < requestedCount)
+                      ? (" (partial " + ToString(transferredCount) + "/" +
+                         ToString(requestedCount) + ")")
+                      : "";
+              if (recipient == primaryPlayer) {
+                thisptr->showPlayerAMessage_withLog(
+                    SafeCharacterName(npc) + " gave you " + quantityPrefix +
+                        givenItemName + partialSuffix + ".",
+                    true);
+              } else {
+                thisptr->showPlayerAMessage_withLog(
+                    SafeCharacterName(npc) + " gave " + quantityPrefix +
+                        givenItemName + " to " + SafeCharacterName(recipient) +
+                        partialSuffix + ".",
+                    true);
+              }
+              Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
+                  " recipient=" + SafeCharacterName(recipient) +
+                  " requested=" + ToString(requestedCount) +
+                  " transferred=" + ToString(transferredCount) +
+                  " item='" + givenItemName + "' source=" + transferSourceLabel);
+              npc->reThinkCurrentAIAction();
+            } else {
               thisptr->showPlayerAMessage_withLog(
                   SafeCharacterName(npc) + " could not find item \"" +
                       act.message + "\" to give.",
                   true);
               Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
                   " recipient=" + SafeCharacterName(recipient) +
-                  " skipped reason=item_not_found query='" + act.message + "'");
+                  " skipped reason=item_not_found query='" + act.message +
+                  "' requested=" + ToString(requestedCount));
             }
           }
         } else if (act.type == ACT_DRINK_ITEM) {

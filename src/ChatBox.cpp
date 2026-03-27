@@ -1539,6 +1539,62 @@ static std::string NormalizeActionForDedupe(const std::string &actorHeader,
   return combined;
 }
 
+static std::string MaybeInjectGiveItemTarget(const StreamChatParseState *state,
+                                             const std::string &actor,
+                                             const std::string &rawAction) {
+  std::string actionLine = TrimChatLine(rawAction);
+  if (!state || !state->task || actionLine.empty()) {
+    return actionLine;
+  }
+
+  size_t atPos = actionLine.find('@');
+  if (atPos == std::string::npos || atPos == 0 || atPos + 1 >= actionLine.size()) {
+    return actionLine;
+  }
+
+  std::string command = actionLine.substr(0, atPos);
+  std::transform(command.begin(), command.end(), command.begin(),
+                 [](unsigned char c) { return (char)std::toupper(c); });
+  if (command != "GIVE_ITEM") {
+    return actionLine;
+  }
+
+  std::string payload = TrimChatLine(actionLine.substr(atPos + 1));
+  if (payload.empty() || payload.find('@') != std::string::npos) {
+    // Already has an explicit target (or malformed multi-token payload).
+    return actionLine;
+  }
+
+  std::string listenerName = TrimChatLine(state->task->previousSpeaker);
+  if (listenerName.empty() || EqualsIgnoreCase(listenerName, actor)) {
+    return actionLine;
+  }
+
+  std::string listenerHandle = TrimChatLine(state->task->previousSpeakerHandle);
+  bool handleIsNumeric = !listenerHandle.empty();
+  for (size_t i = 0; i < listenerHandle.size(); ++i) {
+    unsigned char ch = (unsigned char)listenerHandle[i];
+    if (ch < '0' || ch > '9') {
+      handleIsNumeric = false;
+      break;
+    }
+  }
+  if (!handleIsNumeric) {
+    listenerHandle.clear();
+  }
+
+  std::string listenerToken = listenerName;
+  if (!listenerHandle.empty()) {
+    listenerToken += "|" + listenerHandle;
+  }
+
+  std::string rewritten =
+      "GIVE_ITEM@" + listenerToken + "@" + payload;
+  Log("CHAT_ACTION: injected GIVE_ITEM target actor=" + actor +
+      " listener=" + listenerToken + " payload=" + payload);
+  return rewritten;
+}
+
 static bool QueueStreamActionIfNew(StreamChatParseState *state,
                                    const std::string &actor,
                                    const std::string &speakerHeader,
@@ -1546,7 +1602,8 @@ static bool QueueStreamActionIfNew(StreamChatParseState *state,
   if (!state) {
     return false;
   }
-  std::string actionLine = TrimChatLine(rawAction);
+  std::string actionLine = MaybeInjectGiveItemTarget(state, actor, rawAction);
+  actionLine = TrimChatLine(actionLine);
   if (actionLine.empty()) {
     return false;
   }

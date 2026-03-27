@@ -5940,28 +5940,160 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           };
           auto parseGiveItemPayload =
               [](const std::string &rawPayload, std::string &targetOut,
-                 std::string &itemOut) -> bool {
+                 std::string &itemOut, int &amountOut) -> bool {
             targetOut.clear();
             itemOut.clear();
+            amountOut = 1;
             std::string payload = TrimCopy(rawPayload);
             if (payload.empty()) {
               return false;
             }
 
-            size_t splitPos = payload.find('@');
-            if (splitPos == std::string::npos) {
-              itemOut = payload;
-              return !itemOut.empty();
+            auto parsePositiveAmount = [](const std::string &raw,
+                                          int &outAmount) -> bool {
+              std::string token = TrimCopy(raw);
+              if (token.empty()) {
+                return false;
+              }
+              for (size_t i = 0; i < token.size(); ++i) {
+                unsigned char ch = (unsigned char)token[i];
+                if (ch < '0' || ch > '9') {
+                  return false;
+                }
+              }
+              int parsed = atoi(token.c_str());
+              if (parsed <= 0) {
+                return false;
+              }
+              outAmount = parsed;
+              return true;
+            };
+
+            auto parseItemSpec = [&](const std::string &rawSpec,
+                                     std::string &itemNameOut,
+                                     int &itemAmountOut) -> bool {
+              itemNameOut = TrimCopy(rawSpec);
+              itemAmountOut = 1;
+              if (itemNameOut.empty()) {
+                return false;
+              }
+
+              if (itemNameOut.size() >= 2 &&
+                  ((itemNameOut.front() == '"' && itemNameOut.back() == '"') ||
+                   (itemNameOut.front() == '\'' && itemNameOut.back() == '\''))) {
+                itemNameOut =
+                    TrimCopy(itemNameOut.substr(1, itemNameOut.size() - 2));
+              }
+              if (itemNameOut.empty()) {
+                return false;
+              }
+
+              // "2x Item Name" / "2 Item Name"
+              size_t leadingDigitsEnd = 0;
+              while (leadingDigitsEnd < itemNameOut.size() &&
+                     std::isdigit((unsigned char)itemNameOut[leadingDigitsEnd])) {
+                ++leadingDigitsEnd;
+              }
+              if (leadingDigitsEnd > 0 && leadingDigitsEnd < itemNameOut.size()) {
+                size_t markerPos = leadingDigitsEnd;
+                if (markerPos < itemNameOut.size() &&
+                    (itemNameOut[markerPos] == 'x' ||
+                     itemNameOut[markerPos] == 'X' ||
+                     itemNameOut[markerPos] == '*')) {
+                  ++markerPos;
+                }
+                if (markerPos < itemNameOut.size() &&
+                    std::isspace((unsigned char)itemNameOut[markerPos])) {
+                  std::string amountToken = itemNameOut.substr(0, leadingDigitsEnd);
+                  int parsedLeadingAmount = 0;
+                  if (parsePositiveAmount(amountToken, parsedLeadingAmount)) {
+                    std::string remainder =
+                        TrimCopy(itemNameOut.substr(markerPos + 1));
+                    if (!remainder.empty()) {
+                      itemNameOut = remainder;
+                      itemAmountOut = parsedLeadingAmount;
+                      return true;
+                    }
+                  }
+                }
+              }
+
+              // "Item Name x2" / "Item Name 2" / compact "ItemName2"
+              size_t digitStart = itemNameOut.size();
+              while (digitStart > 0 &&
+                     std::isdigit((unsigned char)itemNameOut[digitStart - 1])) {
+                --digitStart;
+              }
+              if (digitStart < itemNameOut.size() && digitStart > 0) {
+                std::string amountToken = itemNameOut.substr(digitStart);
+                int parsedTrailingAmount = 0;
+                if (parsePositiveAmount(amountToken, parsedTrailingAmount)) {
+                  const char prev = itemNameOut[digitStart - 1];
+                  const bool explicitSeparator =
+                      std::isspace((unsigned char)prev) || prev == 'x' ||
+                      prev == 'X' || prev == '*';
+                  const bool compactSuffix =
+                      std::isalpha((unsigned char)prev) &&
+                      parsedTrailingAmount <= 20;
+                  if (explicitSeparator || compactSuffix) {
+                    size_t baseEnd = digitStart;
+                    if ((prev == 'x' || prev == 'X' || prev == '*') &&
+                        baseEnd > 0) {
+                      --baseEnd;
+                    }
+                    std::string baseName = TrimCopy(itemNameOut.substr(0, baseEnd));
+                    if (!baseName.empty()) {
+                      itemNameOut = baseName;
+                      itemAmountOut = parsedTrailingAmount;
+                      return true;
+                    }
+                  }
+                }
+              }
+
+              return !itemNameOut.empty();
+            };
+
+            size_t firstSplitPos = payload.find('@');
+            if (firstSplitPos == std::string::npos) {
+              return parseItemSpec(payload, itemOut, amountOut);
             }
 
-            std::string left = TrimCopy(payload.substr(0, splitPos));
-            std::string right = TrimCopy(payload.substr(splitPos + 1));
-            if (left.empty() || right.empty()) {
+            size_t lastSplitPos = payload.find_last_of('@');
+            if (firstSplitPos == lastSplitPos) {
+              std::string left = TrimCopy(payload.substr(0, firstSplitPos));
+              std::string right = TrimCopy(payload.substr(firstSplitPos + 1));
+              if (left.empty() || right.empty()) {
+                return false;
+              }
+              targetOut = left;
+              return parseItemSpec(right, itemOut, amountOut);
+            }
+
+            std::string left = TrimCopy(payload.substr(0, firstSplitPos));
+            std::string middle =
+                TrimCopy(payload.substr(firstSplitPos + 1,
+                                        lastSplitPos - firstSplitPos - 1));
+            std::string right = TrimCopy(payload.substr(lastSplitPos + 1));
+            if (left.empty() || middle.empty() || right.empty()) {
               return false;
             }
+
+            int explicitAmount = 0;
+            if (!parsePositiveAmount(right, explicitAmount)) {
+              targetOut = left;
+              std::string mergedItem =
+                  TrimCopy(payload.substr(firstSplitPos + 1));
+              return parseItemSpec(mergedItem, itemOut, amountOut);
+            }
+
             targetOut = left;
-            itemOut = right;
-            return true;
+            int parsedFromSpec = 1;
+            if (!parseItemSpec(middle, itemOut, parsedFromSpec)) {
+              return false;
+            }
+            amountOut = explicitAmount;
+            return amountOut > 0;
           };
           auto parseTravelLocationPayload =
               [](const std::string &rawPayload, float &xOut, float &yOut,
@@ -6259,7 +6391,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } else if (actionCommand == "GIVE_ITEM") {
             std::string giveItemTargetToken = "";
             std::string iName = "";
-            if (!parseGiveItemPayload(actionArgument, giveItemTargetToken, iName)) {
+            int giveItemAmount = 1;
+            if (!parseGiveItemPayload(actionArgument, giveItemTargetToken, iName,
+                                      giveItemAmount)) {
               Log("HOOK_MSG_PROC: GIVE_ITEM ignored; invalid payload '" +
                   actionArgument + "'");
               continue;
@@ -6273,6 +6407,31 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                     giveItemTargetToken + "'");
                 continue;
               }
+            } else if (actionActorResolved && actionActor) {
+              std::string inferredRecipientSource = "";
+              Dialogue *dialogueHint = nullptr;
+              try {
+                dialogueHint = actionActor->dialogue;
+              } catch (...) {
+                dialogueHint = nullptr;
+              }
+              Character *inferredRecipient = ResolveDialogueListenerForSpeech(
+                  actionActor, dialogueHint, inferredRecipientSource);
+              if (inferredRecipient && (uintptr_t)inferredRecipient > 0x1000 &&
+                  inferredRecipient != actionActor) {
+                try {
+                  giveItemTarget = inferredRecipient->getHandle();
+                } catch (...) {
+                  giveItemTarget = hand();
+                }
+                if (giveItemTarget.isValid()) {
+                  giveItemTargetToken = inferredRecipient->getName();
+                  Log("HOOK_MSG_PROC: GIVE_ITEM inferred recipient '" +
+                      giveItemTargetToken + "' source=" +
+                      inferredRecipientSource + " serial=" +
+                      ToString((unsigned int)giveItemTarget.serial));
+                }
+              }
             }
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
@@ -6280,10 +6439,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.actor = targetHand;
             act.target = giveItemTarget;
             act.message = iName;
+            act.taskValue = giveItemAmount;
             g_uiActionQueue.push_back(act);
             LeaveCriticalSection(&g_uiMutex);
             Log("HOOK_MSG_PROC: GIVE_ITEM queued actor_serial=" +
                 ToString((unsigned int)targetHand.serial) + " item='" + iName +
+                "' qty=" + ToString(giveItemAmount) +
                 "' target='" + giveItemTargetToken + "' target_serial=" +
                 ToString((unsigned int)giveItemTarget.serial));
           } else if (actionCommand == "TAKE_ITEM") {
