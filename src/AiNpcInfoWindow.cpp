@@ -104,12 +104,28 @@ void ParsePipeEntryArray(const std::string &dataInput,
     cur = next + 1;
   }
 }
+
+bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
+  if (!widget) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return true;
+  }
+  __try {
+    gui->destroyWidget(widget);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
 } // namespace
 
 void CloseAiNpcInfoUI() {
   if (g_aiNpcInfoWindow) {
-    if (MyGUI::Gui::getInstancePtr()) {
-      MyGUI::Gui::getInstancePtr()->destroyWidget(g_aiNpcInfoWindow);
+    if (!TryDestroyWidgetSafe(g_aiNpcInfoWindow)) {
+      Log("UI_WARN: CloseAiNpcInfoUI destroyWidget failed; clearing stale pointer.");
     }
     g_aiNpcInfoWindow = nullptr;
     g_aiNpcInfoList = nullptr;
@@ -307,8 +323,8 @@ void CreateAiNpcInfoUI() {
 
 void CloseAiDiaryUI() {
   if (g_aiDiaryWindow) {
-    if (MyGUI::Gui::getInstancePtr()) {
-      MyGUI::Gui::getInstancePtr()->destroyWidget(g_aiDiaryWindow);
+    if (!TryDestroyWidgetSafe(g_aiDiaryWindow)) {
+      Log("UI_WARN: CloseAiDiaryUI destroyWidget failed; clearing stale pointer.");
     }
     g_aiDiaryWindow = nullptr;
     g_aiDiaryList = nullptr;

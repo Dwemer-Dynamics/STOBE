@@ -18,11 +18,30 @@ namespace UI {
 
 MyGUI::Window *g_welcomeWindow = nullptr;
 
+namespace {
+bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
+  if (!widget) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return true;
+  }
+  __try {
+    gui->destroyWidget(widget);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+} // namespace
+
 void CloseWelcomeUI() {
   if (g_welcomeWindow) {
     Log("UI: destroying welcome window.");
-    if (MyGUI::Gui::getInstancePtr())
-      MyGUI::Gui::getInstancePtr()->destroyWidget(g_welcomeWindow);
+    if (!TryDestroyWidgetSafe(g_welcomeWindow)) {
+      Log("UI_WARN: CloseWelcomeUI destroyWidget failed; clearing stale pointer.");
+    }
     g_welcomeWindow = nullptr;
     g_welcomeCheckbox = nullptr;
   }

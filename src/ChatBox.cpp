@@ -53,6 +53,54 @@ bool g_chatPausedGame = false;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
 
+bool TryReleaseUserPauseSafe(GameWorld *world) {
+  if (!world) {
+    return true;
+  }
+  __try {
+    world->userPause(false);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool TryRequestUserPauseSafe(GameWorld *world, bool *pausedByUs) {
+  if (pausedByUs) {
+    *pausedByUs = false;
+  }
+  if (!world) {
+    return true;
+  }
+  __try {
+    if (!world->isPaused()) {
+      world->userPause(true);
+      if (pausedByUs) {
+        *pausedByUs = true;
+      }
+    }
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
+  if (!widget) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return true;
+  }
+  __try {
+    gui->destroyWidget(widget);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
 enum ManualChatActionType {
   MANUAL_CHAT_ACTION_NONE = 0,
   MANUAL_CHAT_ACTION_REMOVE_LIMB = 1,
@@ -782,15 +830,16 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
 void CloseChatUI() {
   if (g_chatPausedGame) {
     GameWorld *world = GetWorldSafe();
-    if (world) {
-      world->userPause(false);
+    if (!TryReleaseUserPauseSafe(world)) {
+      Log("UI_WARN: CloseChatUI pause-release failed during world transition.");
     }
     g_chatPausedGame = false;
   }
 
   if (g_chatWindow) {
-    if (MyGUI::Gui::getInstancePtr())
-      MyGUI::Gui::getInstancePtr()->destroyWidget(g_chatWindow);
+    if (!TryDestroyWidgetSafe(g_chatWindow)) {
+      Log("UI_WARN: CloseChatUI destroyWidget failed; clearing stale pointer.");
+    }
     g_chatWindow = nullptr;
     g_chatInput = nullptr;
     g_chatModeCombo = nullptr;
@@ -799,6 +848,10 @@ void CloseChatUI() {
     g_chatAutoChatToggle = nullptr;
     g_chatLabel = nullptr;
   }
+  g_chatTargetHandleStr.clear();
+  g_chatTargetNameStr.clear();
+  g_chatPlayerNameStr.clear();
+  g_chatJustOpened = false;
 }
 
 DWORD WINAPI DialogResponseWorker(LPVOID lpParam) {
@@ -2936,10 +2989,11 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       g_chatPlayerNameStr = bestSpeaker->getName();
     }
   }
-  if (world && !world->isPaused()) {
-    world->userPause(true);
-    g_chatPausedGame = true;
+  bool pausedByUs = false;
+  if (world && !TryRequestUserPauseSafe(world, &pausedByUs)) {
+    Log("UI_WARN: CreateChatUI pause request failed.");
   }
+  g_chatPausedGame = pausedByUs;
   if (g_chatPlayerNameStr.empty()) {
     g_chatPlayerNameStr = playerName.empty() ? "Player" : playerName;
   }

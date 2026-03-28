@@ -7838,6 +7838,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
     g_welcomeWindow = nullptr;
@@ -7892,6 +7893,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       CloseAiNpcInfoUI();
     if (g_aiDiaryWindow)
       CloseAiDiaryUI();
+    if (g_chatWindow)
+      CloseChatUI();
     return;
   }
 

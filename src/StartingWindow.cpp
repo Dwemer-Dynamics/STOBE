@@ -21,19 +21,71 @@ namespace UI {
 MyGUI::Window *g_startingWindow = nullptr;
 bool g_startingPausedGame = false;
 
+namespace {
+bool TryReleaseUserPauseIfNeeded(GameWorld *world) {
+  if (!world) {
+    return true;
+  }
+  __try {
+    if (world->isPaused()) {
+      world->userPause(false);
+    }
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool TryRequestUserPauseIfNeeded(GameWorld *world, bool *pausedByUs) {
+  if (pausedByUs) {
+    *pausedByUs = false;
+  }
+  if (!world) {
+    return true;
+  }
+  __try {
+    if (!world->isPaused()) {
+      world->userPause(true);
+      if (pausedByUs) {
+        *pausedByUs = true;
+      }
+    }
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
+  if (!widget) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return true;
+  }
+  __try {
+    gui->destroyWidget(widget);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+} // namespace
+
 void CloseStartingUI() {
   if (g_startingPausedGame) {
     GameWorld *world = GetWorldSafe();
-    if (world && world->isPaused()) {
-      world->userPause(false);
+    if (!TryReleaseUserPauseIfNeeded(world)) {
+      Log("UI_WARN: CloseStartingUI pause-release failed during world transition.");
     }
     g_startingPausedGame = false;
   }
 
   if (g_startingWindow) {
-    MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
-    if (gui)
-      gui->destroyWidget(g_startingWindow);
+    if (!TryDestroyWidgetSafe(g_startingWindow)) {
+      Log("UI_WARN: CloseStartingUI destroyWidget failed; clearing stale pointer.");
+    }
     g_startingWindow = nullptr;
   }
 }
@@ -62,10 +114,11 @@ void CreateStartingUI() {
   g_startingPausedGame = false;
 
   GameWorld *world = GetWorldSafe();
-  if (world && !world->isPaused()) {
-    world->userPause(true);
-    g_startingPausedGame = true;
+  bool pausedByUs = false;
+  if (world && !TryRequestUserPauseIfNeeded(world, &pausedByUs)) {
+    Log("UI_WARN: CreateStartingUI pause request failed.");
   }
+  g_startingPausedGame = pausedByUs;
 
   g_startingWindow = gui->createWidgetReal<MyGUI::Window>(
       "Kenshi_WindowCX", 0.03f, 0.1f, 0.20f, 0.66f,

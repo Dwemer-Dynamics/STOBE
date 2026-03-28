@@ -81,6 +81,22 @@ std::string NormalizeChatModeValue(const std::string &modeRaw) {
   return "chat";
 }
 
+bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
+  if (!widget) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return true;
+  }
+  __try {
+    gui->destroyWidget(widget);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
 void SetToggleCaption(MyGUI::Button *button, const std::string &label,
                       bool enabled) {
   if (!button)
@@ -368,8 +384,9 @@ MyGUI::TextBox *CreateLabel(MyGUI::Widget *parent, float x, float y, float w,
 
 void CloseSettingsUI() {
   if (g_settingsWindow) {
-    if (MyGUI::Gui::getInstancePtr())
-      MyGUI::Gui::getInstancePtr()->destroyWidget(g_settingsWindow);
+    if (!TryDestroyWidgetSafe(g_settingsWindow)) {
+      Log("UI_WARN: CloseSettingsUI destroyWidget failed; clearing stale pointer.");
+    }
     g_settingsWindow = nullptr;
   }
 
