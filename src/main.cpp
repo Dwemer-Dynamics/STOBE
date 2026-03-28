@@ -1364,7 +1364,7 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.6.5";
+static const char *kStobePluginVersion = "0.7.0";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -8408,6 +8408,7 @@ __declspec(dllexport) void startPlugin() {
   LoadStobeRuntimeConfig();
   Log("STARTUP: initializing UI-only hook mode.");
   Log(std::string("STARTUP: Stobe plugin version ") + kStobePluginVersion);
+  Log(std::string("STARTUP: Stobe plugin release date ") + kStobePluginReleaseDate);
   Log("UI: MOTD auto-popup enabled when EnableMOTD is ON.");
 
   HMODULE hLib = GetModuleHandleA("KenshiLib.dll");
