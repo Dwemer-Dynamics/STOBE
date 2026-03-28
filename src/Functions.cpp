@@ -30,11 +30,15 @@
 #include <kenshi/SensoryData.h>
 #include <kenshi/util/YesNoMaybe.h>
 #include <kenshi/util/hand.h>
+#include <mygui/MyGUI_Colour.h>
+#include <mygui/MyGUI_Gui.h>
+#include <mygui/MyGUI_TextBox.h>
 #include <ogre/OgreColourValue.h>
 #include <map>
 #include <vector>
 
 std::string TrimCopySimple(const std::string &value);
+std::string ToLowerCopy(const std::string &value);
 void ApplyDrunkKnockoutPulse(Character *npc);
 int ResolveCurrentGameTimestampSeconds(GameWorld *world);
 std::string SafeBuildingName(Building *building);
@@ -70,6 +74,37 @@ struct NpcDrugState {
 
 static std::map<unsigned int, NpcDrunkState> g_npcDrunkStates;
 static std::map<unsigned int, NpcDrugState> g_npcDrugStates;
+static MyGUI::TextBox *g_narratorTimedPopupText = nullptr;
+static bool g_narratorTimedPopupVisible = false;
+static DWORD g_narratorTimedPopupShownTick = 0;
+static DWORD g_narratorTimedPopupDurationMs = 0;
+
+static bool TrySetNarratorTimedPopupVisible(bool visible) {
+  if (!g_narratorTimedPopupText) {
+    return false;
+  }
+  try {
+    g_narratorTimedPopupText->setVisible(visible);
+    return true;
+  } catch (...) {
+    g_narratorTimedPopupText = nullptr;
+    return false;
+  }
+}
+
+static bool TryShowNarratorTimedPopupText(const wchar_t *caption) {
+  if (!g_narratorTimedPopupText || !caption) {
+    return false;
+  }
+  try {
+    g_narratorTimedPopupText->setCaption(caption);
+    g_narratorTimedPopupText->setVisible(true);
+    return true;
+  } catch (...) {
+    g_narratorTimedPopupText = nullptr;
+    return false;
+  }
+}
 
 void PerformLeaveSquad(Character *npc, GameWorld *world,
                        const std::string &originFaction) {
@@ -269,6 +304,100 @@ DWORD ResolveSpeechQueueDelayMs(const QueuedAction &act) {
     delayMs = 600000;
   }
   return delayMs;
+}
+
+static bool IsNarratorTimedPopupMessage(const std::string &message) {
+  const std::string trimmed = TrimCopySimple(message);
+  if (trimmed.empty()) {
+    return false;
+  }
+  const std::string lowered = ToLowerCopy(trimmed);
+  return lowered.find("the narrator:") == 0 || lowered.find("narrator:") == 0;
+}
+
+static void HideNarratorTimedPopup() {
+  if (g_narratorTimedPopupVisible) {
+    Log("ACTION_TIMING: narrator popup hidden");
+  }
+  TrySetNarratorTimedPopupVisible(false);
+  g_narratorTimedPopupVisible = false;
+  g_narratorTimedPopupShownTick = 0;
+  g_narratorTimedPopupDurationMs = 0;
+}
+
+static bool EnsureNarratorTimedPopupWidget() {
+  if (g_narratorTimedPopupText) {
+    return true;
+  }
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return false;
+  }
+
+  try {
+    g_narratorTimedPopupText = gui->createWidgetReal<MyGUI::TextBox>(
+        "Kenshi_TextboxStandardText", 0.13f, 0.04f, 0.74f, 0.09f,
+        MyGUI::Align::Top | MyGUI::Align::HCenter, "Popup",
+        "Stobe_NarratorTimedPopupText");
+    if (!g_narratorTimedPopupText) {
+      return false;
+    }
+    g_narratorTimedPopupText->setTextAlign(MyGUI::Align::Center);
+    g_narratorTimedPopupText->setTextColour(MyGUI::Colour(1.0f, 0.91f, 0.56f));
+    g_narratorTimedPopupText->setVisible(false);
+  } catch (...) {
+    g_narratorTimedPopupText = nullptr;
+    return false;
+  }
+
+  return g_narratorTimedPopupText != nullptr;
+}
+
+static void UpdateNarratorTimedPopupLifecycle() {
+  if (!g_narratorTimedPopupVisible) {
+    return;
+  }
+  if (!g_narratorTimedPopupText || !MyGUI::Gui::getInstancePtr()) {
+    g_narratorTimedPopupText = nullptr;
+    g_narratorTimedPopupVisible = false;
+    g_narratorTimedPopupShownTick = 0;
+    g_narratorTimedPopupDurationMs = 0;
+    return;
+  }
+  if ((DWORD)(GetTickCount() - g_narratorTimedPopupShownTick) >=
+      g_narratorTimedPopupDurationMs) {
+    HideNarratorTimedPopup();
+  }
+}
+
+static bool ShowNarratorTimedPopup(const std::string &message, DWORD durationMs) {
+  if (!EnsureNarratorTimedPopupWidget()) {
+    return false;
+  }
+  if (!g_narratorTimedPopupText) {
+    return false;
+  }
+  if (durationMs < 250) {
+    durationMs = 250;
+  } else if (durationMs > 600000) {
+    durationMs = 600000;
+  }
+
+  const std::wstring wideMessage = WideFromUtf8(message);
+  if (!TryShowNarratorTimedPopupText(wideMessage.c_str())) {
+    g_narratorTimedPopupText = nullptr;
+    g_narratorTimedPopupVisible = false;
+    g_narratorTimedPopupShownTick = 0;
+    g_narratorTimedPopupDurationMs = 0;
+    return false;
+  }
+
+  g_narratorTimedPopupVisible = true;
+  g_narratorTimedPopupShownTick = GetTickCount();
+  g_narratorTimedPopupDurationMs = durationMs;
+  Log("ACTION_TIMING: narrator popup shown dur_ms=" + ToString((int)durationMs) +
+      " text_len=" + ToString((int)message.length()));
+  return true;
 }
 
 int ClampTtsVolumePercent(int volumePercent) {
@@ -3031,6 +3160,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static unsigned int activeSpeechTargetSerial = 0;
   static DWORD holdPlaybackLogTick = 0;
 
+  UpdateNarratorTimedPopupLifecycle();
+
   UpdateNpcDrunkStates(thisptr);
   UpdateNpcDrugStates(thisptr);
 
@@ -3105,7 +3236,14 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       }
 
       if (act.type == ACT_NOTIFY) {
-        thisptr->showPlayerAMessage_withLog(act.message, true);
+        bool narratorPopupShown = false;
+        if (IsNarratorTimedPopupMessage(act.message)) {
+          narratorPopupShown =
+              ShowNarratorTimedPopup(act.message, ResolveSpeechQueueDelayMs(act));
+        }
+        if (!narratorPopupShown) {
+          thisptr->showPlayerAMessage_withLog(act.message, true);
+        }
         bool hasTtsClip = g_ttsEnabled && !act.ttsHash.empty();
         bool playbackQueued = false;
         if (hasTtsClip) {
