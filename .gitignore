@@ -14,8 +14,6 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 !mod/Stobe.mod
-!STOBE/Stobe.ini
-!STOBE/RE_Kenshi.json
 
 # Visual Studio / local IDE
 .vs/
