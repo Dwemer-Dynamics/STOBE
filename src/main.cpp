@@ -3879,6 +3879,70 @@ static unsigned int ResolveCharacterSerialForEvent(Character *npc) {
   return serial;
 }
 
+static unsigned int ResolveRootObjectSerialForEvent(RootObjectBase *obj) {
+  if (!obj || (uintptr_t)obj < 0x1000) {
+    return 0;
+  }
+  unsigned int serial = 0;
+  try {
+    serial = obj->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  return serial;
+}
+
+static std::string ResolveRootObjectNameSafe(RootObjectBase *obj) {
+  if (!obj || (uintptr_t)obj < 0x1000) {
+    return "Unknown";
+  }
+  try {
+    std::string name = obj->getName();
+    if (!name.empty()) {
+      return name;
+    }
+  } catch (...) {
+  }
+  return "Unknown";
+}
+
+static bool TryResolveRootObjectMoneySafe(RootObject *obj, int &moneyOut) {
+  moneyOut = 0;
+  if (!obj || (uintptr_t)obj < 0x1000) {
+    return false;
+  }
+
+  int resolved = 0;
+  bool hasValue = false;
+  try {
+    resolved = obj->getMoney();
+    hasValue = true;
+  } catch (...) {
+    hasValue = false;
+  }
+
+  try {
+    Ownerships *ownerships = obj->getOwnerships();
+    if (ownerships && (uintptr_t)ownerships > 0x1000) {
+      int ownershipMoney = ownerships->getMoney();
+      if (!hasValue || ownershipMoney > resolved) {
+        resolved = ownershipMoney;
+        hasValue = true;
+      }
+    }
+  } catch (...) {
+  }
+
+  if (!hasValue) {
+    return false;
+  }
+  if (resolved < 0) {
+    resolved = 0;
+  }
+  moneyOut = resolved;
+  return true;
+}
+
 static std::string ResolvePrimaryWeaponName(Character *npc) {
   if (!npc || (uintptr_t)npc < 0x1000) {
     return "Unknown";
@@ -4263,7 +4327,7 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
   std::string mode = addedStolenCount > 0 ? "theft" : "normal";
   std::string message = "picked up " + ToString(addedCount) + "x " + itemName +
                         " (" + mode + ")";
-  LogGameEvent("item_pickup", actorName, actorFaction, itemName, "Item",
+  LogGameEvent("item_pickup", actorName, actorFaction, "None", "None",
                message, ResolveCharacterSerialForEvent(npc), 0);
 }
 
@@ -7190,16 +7254,89 @@ bool applyFirstAid_hook(MedicalSystem *med, float skill, Item *equipment,
 }
 
 Item *buyItem_hook(Inventory *inv, Item *itemToBuy, RootObject *sendingTo) {
-  if (inv && itemToBuy && sendingTo) {
-    LogGameEvent("trade", ((Character *)sendingTo)->getName(),
-                 SafeFaction((Character *)sendingTo), inv->owner->getName(),
-                 SafeFaction(inv->owner), "Bought " + itemToBuy->getName(),
-                 ResolveCharacterSerialForEvent((Character *)sendingTo),
-                 0);
+  RootObject *buyerObj = nullptr;
+  RootObject *sellerObj = nullptr;
+  if (sendingTo && (uintptr_t)sendingTo > 0x1000) {
+    buyerObj = sendingTo;
   }
-  if (buyItem_orig)
-    return buyItem_orig(inv, itemToBuy, sendingTo);
-  return nullptr;
+  if (inv && (uintptr_t)inv > 0x1000) {
+    try {
+      sellerObj = inv->owner;
+    } catch (...) {
+      sellerObj = nullptr;
+    }
+  }
+
+  int buyerMoneyBefore = 0;
+  int sellerMoneyBefore = 0;
+  bool hasBuyerMoneyBefore =
+      TryResolveRootObjectMoneySafe(buyerObj, buyerMoneyBefore);
+  bool hasSellerMoneyBefore =
+      TryResolveRootObjectMoneySafe(sellerObj, sellerMoneyBefore);
+
+  Item *result = nullptr;
+  if (buyItem_orig) {
+    result = buyItem_orig(inv, itemToBuy, sendingTo);
+  }
+
+  if (buyerObj && result) {
+    int buyerMoneyAfter = 0;
+    int sellerMoneyAfter = 0;
+    bool hasBuyerMoneyAfter =
+        TryResolveRootObjectMoneySafe(buyerObj, buyerMoneyAfter);
+    bool hasSellerMoneyAfter =
+        TryResolveRootObjectMoneySafe(sellerObj, sellerMoneyAfter);
+
+    int buyerSpent = 0;
+    if (hasBuyerMoneyBefore && hasBuyerMoneyAfter &&
+        buyerMoneyBefore > buyerMoneyAfter) {
+      buyerSpent = buyerMoneyBefore - buyerMoneyAfter;
+    }
+    int sellerGained = 0;
+    if (hasSellerMoneyBefore && hasSellerMoneyAfter &&
+        sellerMoneyAfter > sellerMoneyBefore) {
+      sellerGained = sellerMoneyAfter - sellerMoneyBefore;
+    }
+    int catsCost = buyerSpent > 0 ? buyerSpent : sellerGained;
+
+    std::string itemName = "Unknown Item";
+    if (itemToBuy && (uintptr_t)itemToBuy > 0x1000) {
+      try {
+        itemName = itemToBuy->getName();
+      } catch (...) {
+        itemName = "Unknown Item";
+      }
+    }
+    if (itemName == "Unknown Item" && result && (uintptr_t)result > 0x1000) {
+      try {
+        itemName = result->getName();
+      } catch (...) {
+      }
+    }
+
+    std::string buyerName = ResolveRootObjectNameSafe(buyerObj);
+    std::string buyerFaction = SafeFaction(buyerObj);
+    std::string sellerName = ResolveRootObjectNameSafe(sellerObj);
+    std::string sellerFaction = SafeFaction(sellerObj);
+
+    if (!sellerObj || sellerName == buyerName) {
+      sellerName = "None";
+      sellerFaction = "None";
+    }
+
+    std::string message = "bought " + itemName;
+    if (sellerName != "None") {
+      message += " from " + sellerName;
+    }
+    if (catsCost > 0) {
+      message += " for " + ToString(catsCost) + " cats";
+    }
+
+    LogGameEvent("trade", buyerName, buyerFaction, sellerName, sellerFaction,
+                 message, ResolveRootObjectSerialForEvent(buyerObj),
+                 ResolveRootObjectSerialForEvent(sellerObj));
+  }
+  return result;
 }
 
 static bool HasActiveSpeechBubbleSafe(Character *npc) {
@@ -8445,6 +8582,24 @@ __declspec(dllexport) void startPlugin() {
   Log("HOOK_DIAG: AddHook status=" + ToString((int)status) +
       " orig=" + ToString((unsigned int)(uintptr_t)playerUpdate_orig));
   Log("HOOK: PlayerInterface::update installed (UI-only mode).");
+
+  void *thunkInventoryBuyItem = (void *)GetProcAddress(
+      hLib, "?buyItem@Inventory@@QEAAPEAVItem@@PEAV2@PEAVRootObject@@@Z");
+  if (!thunkInventoryBuyItem) {
+    Log("HOOK_WARN: Inventory::buyItem symbol not found.");
+  } else {
+    __int64 realInventoryBuyItem = KenshiLib::GetRealAddress(thunkInventoryBuyItem);
+    if (!realInventoryBuyItem) {
+      Log("HOOK_WARN: GetRealAddress failed for Inventory::buyItem.");
+    } else {
+      KenshiLib::HookStatus buyItemStatus =
+          KenshiLib::AddHook((void *)realInventoryBuyItem, (void *)buyItem_hook,
+                             (void **)&buyItem_orig);
+      Log("HOOK_DIAG: Inventory::buyItem AddHook status=" +
+          ToString((int)buyItemStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)buyItem_orig));
+    }
+  }
 
   const bool kEnableSpeechCaptureHooks = false;
   if (!kEnableSpeechCaptureHooks) {
