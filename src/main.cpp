@@ -4278,9 +4278,16 @@ static void EmitSlaveryEvent(Character *victim, bool enslavedNow) {
   std::string ownerName = owner ? ResolveCharacterNameSafe(owner) : "Unknown";
   std::string ownerFaction = owner ? SafeFaction(owner) : "None";
   std::string message = enslavedNow ? "enslaved as a slave" : "freed from slavery";
-  LogGameEvent("slavery", ownerName, ownerFaction, victimName, victimFaction,
-               message, ResolveCharacterSerialForEvent(owner),
-               ResolveCharacterSerialForEvent(victim));
+  if (enslavedNow && owner) {
+    std::string factionLabel = TrimCopy(ownerFaction);
+    if (factionLabel.empty() || ToLowerAsciiCopy(factionLabel) == "none") {
+      factionLabel = "Unknown Faction";
+    }
+    message += " by " + ownerName + " [" + factionLabel + "]";
+  }
+  LogGameEvent("slavery", victimName, victimFaction, "None", "None", message,
+               ResolveCharacterSerialForEvent(victim),
+               ResolveCharacterSerialForEvent(owner));
 }
 
 static void EmitLockpickedEvent(Character *npc, int previousSkill,

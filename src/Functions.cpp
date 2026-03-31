@@ -470,8 +470,9 @@ int ResolveTtsPlaybackVolumePercent(GameWorld *world, Character *speaker,
   // Fade out by camera distance, and fully mute beyond far range.
   const float kNearDistanceUnits = 40.0f;
   float farDistanceUnits = g_shoutRadius;
-  if (farDistanceUnits < 120.0f) {
-    farDistanceUnits = 120.0f;
+  // Keep TTS audible for squad chatter even when shout radius is configured low.
+  if (farDistanceUnits < 350.0f) {
+    farDistanceUnits = 350.0f;
   } else if (farDistanceUnits > 1200.0f) {
     farDistanceUnits = 1200.0f;
   }
