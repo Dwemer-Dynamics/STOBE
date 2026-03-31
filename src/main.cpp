@@ -25,6 +25,7 @@
 
 #include <kenshi/CharStats.h>
 #include <kenshi/Character.h>
+#include <kenshi/CharBody.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/Dialogue.h>
 #include <kenshi/Faction.h>
@@ -36,6 +37,7 @@
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Platoon.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/Tasker.h>
 #include <kenshi/gui/InventoryGUI.h>
 #include <kenshi/gui/PortraitManager.h>
 #include <kenshi/util/hand.h>
@@ -1301,6 +1303,10 @@ struct NpcWorldEventState {
   int rightArmState;
   int leftLegState;
   int rightLegState;
+  int currentTask;
+  int constructionAction;
+  unsigned int constructionSubjectSerial;
+  std::string constructionSubjectName;
   int lockpickingSkill;
   std::string lastSpeechLine;
   InventoryEventSnapshot inventory;
@@ -1312,6 +1318,8 @@ struct NpcWorldEventState {
         rightLegPresent(true),
         leftArmState((int)LIMB_ORIGINAL), rightArmState((int)LIMB_ORIGINAL),
         leftLegState((int)LIMB_ORIGINAL), rightLegState((int)LIMB_ORIGINAL),
+        currentTask((int)NULL_TASK), constructionAction(0), constructionSubjectSerial(0),
+        constructionSubjectName(""),
         lockpickingSkill(0), lastSpeechLine(""),
         lastSeenTick(0) {}
 };
@@ -4207,6 +4215,132 @@ static int ResolveLockpickingSkillLevel(Character *npc) {
   }
 }
 
+enum ConstructionActionEventType {
+  CONSTRUCTION_ACTION_NONE = 0,
+  CONSTRUCTION_ACTION_BUILD = 1,
+  CONSTRUCTION_ACTION_DISMANTLE = 2,
+};
+
+static TaskType ResolveCurrentNpcTaskSafe(Character *npc, hand &subjectOut) {
+  subjectOut = hand();
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return NULL_TASK;
+  }
+
+  try {
+    CharBody *body = npc->getBody();
+    if (!body || (uintptr_t)body < 0x1000) {
+      return NULL_TASK;
+    }
+
+    Tasker *action = nullptr;
+    try {
+      action = body->getCurrentActionOrMessage();
+    } catch (...) {
+      action = nullptr;
+    }
+    if (!action || (uintptr_t)action < 0x1000) {
+      try {
+        action = body->getCurrentAction();
+      } catch (...) {
+        action = nullptr;
+      }
+    }
+    if (!action || (uintptr_t)action < 0x1000) {
+      return NULL_TASK;
+    }
+
+    try {
+      hand subject = body->getCurrentSubject();
+      if (subject.isValid() && !subject.isNull()) {
+        subjectOut = subject;
+      }
+    } catch (...) {
+      subjectOut = hand();
+    }
+
+    TaskType taskKey = NULL_TASK;
+    try {
+      taskKey = action->key();
+    } catch (...) {
+      taskKey = NULL_TASK;
+    }
+    return taskKey;
+  } catch (...) {
+    return NULL_TASK;
+  }
+}
+
+static ConstructionActionEventType ResolveConstructionActionType(TaskType taskType) {
+  switch (taskType) {
+  case BUILD:
+  case ADD_MATERIALS_TO_BUILDING:
+  case FIND_SOME_BUILDING_MATERIALS:
+  case JOB_BUILDER:
+    return CONSTRUCTION_ACTION_BUILD;
+  case DISMANTLE:
+    return CONSTRUCTION_ACTION_DISMANTLE;
+  default:
+    return CONSTRUCTION_ACTION_NONE;
+  }
+}
+
+static std::string ResolveConstructionSubjectName(const hand &subjectHand) {
+  if (!subjectHand.isValid() || subjectHand.isNull()) {
+    return "";
+  }
+
+  try {
+    RootObject *subject = subjectHand.getRootObject();
+    if (subject && (uintptr_t)subject > 0x1000) {
+      std::string name = TrimCopy(subject->getName());
+      if (!name.empty()) {
+        return name;
+      }
+    }
+  } catch (...) {
+  }
+
+  try {
+    Character *subjectCharacter = subjectHand.getCharacter();
+    if (subjectCharacter && (uintptr_t)subjectCharacter > 0x1000) {
+      std::string name = TrimCopy(subjectCharacter->getName());
+      if (!name.empty()) {
+        return name;
+      }
+    }
+  } catch (...) {
+  }
+
+  return "";
+}
+
+static std::string DescribeConstructionSubject(const std::string &subjectName) {
+  std::string name = TrimCopy(subjectName);
+  if (name.empty()) {
+    return "an object";
+  }
+  return name;
+}
+
+static void EmitBuildEvent(Character *npc, const std::string &subjectName) {
+  std::string actorName = ResolveCharacterNameSafe(npc);
+  std::string actorFaction = SafeFaction(npc);
+  std::string message =
+      "started building " + DescribeConstructionSubject(subjectName);
+  LogGameEvent("build", actorName, actorFaction, "None", "None", message,
+               ResolveCharacterSerialForEvent(npc), 0);
+}
+
+static void EmitDismantleEvent(Character *npc, const std::string &subjectName) {
+  std::string actorName = ResolveCharacterNameSafe(npc);
+  std::string actorFaction = SafeFaction(npc);
+  std::string message =
+      "started dismantling " + DescribeConstructionSubject(subjectName);
+  LogGameEvent("dismantle", actorName, actorFaction, "None", "None", message,
+               ResolveCharacterSerialForEvent(npc), 0);
+}
+
 static void EmitLimbLossEvent(Character *victim, const std::string &limbLabel) {
   CombatAttribution attribution = ResolveCombatAttribution(victim);
   std::string victimName = ResolveCharacterNameSafe(victim);
@@ -4776,6 +4910,16 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     if (normalizedSpeechLine.length() > 240) {
       normalizedSpeechLine = normalizedSpeechLine.substr(0, 240);
     }
+    hand currentTaskSubject;
+    TaskType currentTaskNow = ResolveCurrentNpcTaskSafe(npc, currentTaskSubject);
+    ConstructionActionEventType constructionActionNow =
+        ResolveConstructionActionType(currentTaskNow);
+    unsigned int constructionSubjectSerialNow = 0;
+    std::string constructionSubjectNameNow = "";
+    if (constructionActionNow != CONSTRUCTION_ACTION_NONE) {
+      constructionSubjectSerialNow = currentTaskSubject.serial;
+      constructionSubjectNameNow = ResolveConstructionSubjectName(currentTaskSubject);
+    }
 
     NpcWorldEventState &state = g_npcWorldEventStateBySerial[serial];
     if (!state.initialized) {
@@ -4792,6 +4936,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.rightArmState = rightArmState;
       state.leftLegState = leftLegState;
       state.rightLegState = rightLegState;
+      state.currentTask = (int)currentTaskNow;
+      state.constructionAction = (int)constructionActionNow;
+      state.constructionSubjectSerial = constructionSubjectSerialNow;
+      state.constructionSubjectName = constructionSubjectNameNow;
       state.lockpickingSkill = lockpickingNow;
       state.lastSpeechLine = normalizedSpeechLine;
       state.inventory = inventorySnapshot;
@@ -4875,6 +5023,23 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     if (lockpickingNow > state.lockpickingSkill) {
       EmitLockpickedEvent(npc, state.lockpickingSkill, lockpickingNow);
     }
+    bool constructionChanged =
+        state.constructionAction != (int)constructionActionNow;
+    bool constructionTargetChanged =
+        !constructionChanged &&
+        constructionActionNow != CONSTRUCTION_ACTION_NONE &&
+        ((constructionSubjectSerialNow != 0 &&
+          constructionSubjectSerialNow != state.constructionSubjectSerial) ||
+         ((constructionSubjectSerialNow == 0 || state.constructionSubjectSerial == 0) &&
+          !constructionSubjectNameNow.empty() &&
+          constructionSubjectNameNow != state.constructionSubjectName));
+    if (constructionActionNow == CONSTRUCTION_ACTION_BUILD &&
+        (constructionChanged || constructionTargetChanged)) {
+      EmitBuildEvent(npc, constructionSubjectNameNow);
+    } else if (constructionActionNow == CONSTRUCTION_ACTION_DISMANTLE &&
+               (constructionChanged || constructionTargetChanged)) {
+      EmitDismantleEvent(npc, constructionSubjectNameNow);
+    }
 
     bool hasAmbientSpeech = speechActiveNow && !normalizedSpeechLine.empty();
     bool speechChanged =
@@ -4906,6 +5071,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.rightArmState = rightArmState;
     state.leftLegState = leftLegState;
     state.rightLegState = rightLegState;
+    state.currentTask = (int)currentTaskNow;
+    state.constructionAction = (int)constructionActionNow;
+    state.constructionSubjectSerial = constructionSubjectSerialNow;
+    state.constructionSubjectName = constructionSubjectNameNow;
     state.lockpickingSkill = lockpickingNow;
     state.lastSpeechLine = speechActiveNow ? normalizedSpeechLine : "";
     state.inventory = inventorySnapshot;
