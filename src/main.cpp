@@ -8398,13 +8398,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         }
 
         if (!IsAliveConsciousCharacterForTargeting(chatTarget)) {
-          EnterCriticalSection(&g_msgMutex);
-          g_messageQueue.push_back(
-              "NOTIFY:Chat blocked: target is dead or unconscious.");
-          LeaveCriticalSection(&g_msgMutex);
-          Log("CHAT_OPEN: blocked dead_or_unconscious target='" +
+          Log("CHAT_OPEN: allowing dead_or_unconscious target='" +
               chatTarget->getName() + "'");
-          return;
         }
 
         bool selectedIsAnimal = IsAnimalCharacterSafe(chatTarget);

@@ -49,6 +49,7 @@ const DWORD kDrunkKnockoutPulseMs = 1000;
 const int kDrugHighDurationSeconds = 5 * 60 * 60;
 const float kDrugHungerMultiplier = 1.5f;
 const float kDrugExtraHungerMultiplier = kDrugHungerMultiplier - 1.0f;
+const float kNpcCloseActionRangeUnits = 25.0f;
 
 struct NpcDrunkState {
   int level;
@@ -796,6 +797,106 @@ bool IsCharacterUnavailableForDialogue(Character *character) {
   } catch (...) {
     return true;
   }
+}
+
+static bool IsActionIndoorsHandleValid(const hand &indoorsHandle) {
+  return indoorsHandle.isValid() && !indoorsHandle.isNull();
+}
+
+static bool TryGetActionSpatialState(Character *character, bool &hasBuilding,
+                                     unsigned int &buildingSerial,
+                                     int &floorValue) {
+  hasBuilding = false;
+  buildingSerial = 0;
+  floorValue = 0;
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+#if defined(_MSC_VER)
+  __try {
+#endif
+    const hand &indoorsHandle = character->isIndoors();
+    hasBuilding = IsActionIndoorsHandleValid(indoorsHandle);
+    buildingSerial = hasBuilding ? indoorsHandle.serial : 0;
+    floorValue = character->getFloor();
+    return true;
+#if defined(_MSC_VER)
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+#endif
+}
+
+static bool IsActionAreaCompatible(Character *actor, Character *target) {
+  if (!actor || !target || (uintptr_t)actor <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return false;
+  }
+
+  bool actorHasBuilding = false;
+  bool targetHasBuilding = false;
+  unsigned int actorBuildingSerial = 0;
+  unsigned int targetBuildingSerial = 0;
+  int actorFloor = 0;
+  int targetFloor = 0;
+  if (!TryGetActionSpatialState(actor, actorHasBuilding, actorBuildingSerial,
+                                actorFloor)) {
+    return false;
+  }
+  if (!TryGetActionSpatialState(target, targetHasBuilding, targetBuildingSerial,
+                                targetFloor)) {
+    return false;
+  }
+
+  if (actorHasBuilding) {
+    if (!targetHasBuilding) {
+      return false;
+    }
+    if (actorBuildingSerial == 0 || targetBuildingSerial == 0 ||
+        actorBuildingSerial != targetBuildingSerial) {
+      return false;
+    }
+    int floorDelta = actorFloor - targetFloor;
+    if (floorDelta < 0) {
+      floorDelta = -floorDelta;
+    }
+    return floorDelta <= 1;
+  }
+
+  if (targetHasBuilding) {
+    return false;
+  }
+  if (targetFloor > actorFloor + 1) {
+    return false;
+  }
+  return true;
+}
+
+static bool ValidateNpcCloseActionRange(Character *actor, Character *target,
+                                        float allowedRange, float &distanceOut,
+                                        std::string &reasonOut) {
+  distanceOut = -1.0f;
+  reasonOut = "";
+  if (!actor || !target || (uintptr_t)actor <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    reasonOut = "invalid_handles";
+    return false;
+  }
+  if (!IsActionAreaCompatible(actor, target)) {
+    reasonOut = "area_mismatch";
+    return false;
+  }
+  try {
+    distanceOut = actor->getPosition().distance(target->getPosition());
+  } catch (...) {
+    reasonOut = "distance_failed";
+    return false;
+  }
+  if (distanceOut > allowedRange) {
+    reasonOut = "out_of_range";
+    return false;
+  }
+  return true;
 }
 
 bool IsQueuedActorReferenceValid(Character *npc, const hand &queuedActor,
@@ -4582,6 +4683,24 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             thisptr->showPlayerAMessage_withLog(
                 actorName + " could not find a valid limb-removal target.", true);
           } else {
+            float actionDistance = -1.0f;
+            std::string rangeReason = "";
+            if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
+                                             actionDistance, rangeReason)) {
+              Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
+                  " target=" + targetName + " reason=" + rangeReason +
+                  " dist=" + ToString(actionDistance) + " max_dist=" +
+                  ToString(kNpcCloseActionRangeUnits));
+              std::string userReason = "too far away";
+              if (rangeReason == "area_mismatch") {
+                userReason = "not in the same area";
+              }
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " cannot remove " + targetName +
+                      "'s limb because they are " + userReason + ".",
+                  true);
+              continue;
+            }
             std::string invalidReason = "";
             if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
               if (invalidReason.empty()) {
@@ -4698,6 +4817,24 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             thisptr->showPlayerAMessage_withLog(
                 actorName + " cannot use KILL on themselves.", true);
           } else {
+            float actionDistance = -1.0f;
+            std::string rangeReason = "";
+            if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
+                                             actionDistance, rangeReason)) {
+              Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                  " target=" + targetName + " reason=" + rangeReason +
+                  " dist=" + ToString(actionDistance) + " max_dist=" +
+                  ToString(kNpcCloseActionRangeUnits));
+              std::string userReason = "too far away";
+              if (rangeReason == "area_mismatch") {
+                userReason = "not in the same area";
+              }
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " cannot kill " + targetName +
+                      " because they are " + userReason + ".",
+                  true);
+              continue;
+            }
             std::string invalidReason = "";
             if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
               if (invalidReason.empty()) {

@@ -445,6 +445,40 @@ bool IsCharacterUnavailableForConversation(Character *character) {
   }
 }
 
+std::string ResolveConversationStateSuffix(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return "";
+  }
+  bool isDead = false;
+  bool isUnconscious = false;
+  bool isKnockedOut = false;
+  try {
+    isDead = character->isDead();
+  } catch (...) {
+    isDead = false;
+  }
+  if (isDead) {
+    return " [DEAD]";
+  }
+  try {
+    isUnconscious = character->isUnconcious();
+  } catch (...) {
+    isUnconscious = false;
+  }
+  if (isUnconscious) {
+    return " [UNCONSCIOUS]";
+  }
+  try {
+    isKnockedOut = character->isDown();
+  } catch (...) {
+    isKnockedOut = false;
+  }
+  if (isKnockedOut) {
+    return " [KNOCKED OUT]";
+  }
+  return "";
+}
+
 float GetSearchRadiusForMode(const std::string &mode) {
   if (mode == "whisper")
     return kWhisperRangeUnits;
@@ -700,6 +734,26 @@ Character *ResolveChatTargetCharacter(GameWorld *world,
   return nullptr;
 }
 
+std::string BuildChatTargetLabel(GameWorld *world, const std::string &targetName,
+                                 const std::string &targetHandle) {
+  std::string label = targetName.empty() ? "Unknown" : targetName;
+  if (!world) {
+    return label;
+  }
+  Character *target = ResolveChatTargetCharacter(world, targetName, targetHandle);
+  if (!target || (uintptr_t)target <= 0x1000) {
+    return label;
+  }
+  try {
+    std::string resolvedName = target->getName();
+    if (!resolvedName.empty()) {
+      label = resolvedName;
+    }
+  } catch (...) {
+  }
+  return label + ResolveConversationStateSuffix(target);
+}
+
 Character *ResolveSelectedChatSpeaker(GameWorld *world) {
   if (!world || !world->player) {
     return nullptr;
@@ -776,9 +830,9 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   }
 
   if (IsCharacterUnavailableForConversation(target)) {
-    failReason = "Target is dead or unconscious.";
-    Log("CHAT_VALIDATE: fail target unavailable state");
-    return false;
+    // Allow one-way dialogue attempts to dead/unconscious targets. They will not
+    // respond, but the player can still open/send chat context to them.
+    Log("CHAT_VALIDATE: target dead_or_unconscious; allowing one_way_send");
   }
 
   unsigned int targetAnimalSerial = 0;
@@ -2015,8 +2069,10 @@ void OnChatSendClick(MyGUI::Widget *sender) {
             if (speakerName.empty()) {
               speakerName = "Player";
             }
+            std::string targetLabel =
+                BuildChatTargetLabel(world, newName, handleStr);
             g_chatLabel->setCaption(
-                WideFromUtf8("Speaker: " + speakerName + " -> Target: " + newName)
+                WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
                     .c_str());
           }
 
@@ -3075,6 +3131,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float chatWindowH = 0.18f;
   const float chatWindowX = (1.0f - chatWindowW) * 0.5f;
   const float chatWindowY = (1.0f - chatWindowH) * 0.5f;
+  std::string initialTargetLabel =
+      BuildChatTargetLabel(world, actualNpcName, handleStr);
   g_chatWindow = gui->createWidgetReal<MyGUI::Window>(
       "Kenshi_WindowCX", chatWindowX, chatWindowY, chatWindowW, chatWindowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
@@ -3087,7 +3145,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       "Kenshi_TextboxStandardText", 0.05f, 0.08f, 0.9f, 0.16f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatLabel");
   g_chatLabel->setCaption(
-      WideFromUtf8("Speaker: " + g_chatPlayerNameStr + " -> Target: " + actualNpcName)
+      WideFromUtf8("Speaker: " + g_chatPlayerNameStr + " -> Target: " + initialTargetLabel)
           .c_str());
   g_chatInput = client->createWidgetReal<MyGUI::EditBox>(
       "Kenshi_EditBox", 0.05f, 0.28f, 0.9f, 0.211f,
@@ -3243,10 +3301,12 @@ void RefreshChatModeControls() {
   }
 
   if (g_chatLabel) {
+    GameWorld *world = GetWorldSafe();
     std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
-    std::string targetLabel = g_chatTargetNameStr.empty() ? "Unknown" : g_chatTargetNameStr;
+    std::string targetLabel =
+        BuildChatTargetLabel(world, g_chatTargetNameStr, g_chatTargetHandleStr);
     if (g_chatMode == "narrator") {
-      Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(GetWorldSafe());
+      Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
       if (selectedSpeakerNpc && (uintptr_t)selectedSpeakerNpc > 0x1000) {
         std::string selectedSpeakerName = selectedSpeakerNpc->getName();
         if (!selectedSpeakerName.empty()) {
