@@ -2694,50 +2694,87 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   };
 
   std::vector<CandidateNpc> candidates;
-  const hand &playerIndoorsHandle = player->isIndoors();
-  bool playerIsIndoors = IsIndoorsHandleValid(playerIndoorsHandle);
-  float searchRadius = playerIsIndoors ? g_boredEventRange : g_proximityRadius;
-  if (searchRadius < 10.0f) {
-    searchRadius = 10.0f;
-  }
   std::string preferredName = TrimChatLine(preferredSpeakerName);
   std::string preferredSerial = TrimChatLine(preferredSpeakerSerial);
   bool hasPreferred = !preferredName.empty() || !preferredSerial.empty();
+  Character *preferredCharacter = nullptr;
+  if (hasPreferred) {
+    preferredCharacter =
+        ResolveChatTargetCharacter(world, preferredName, preferredSerial);
+    if (!preferredCharacter || (uintptr_t)preferredCharacter <= 0x1000) {
+      Log("BORED_EVENT: preferred target unresolved name=" + preferredName +
+          " serial=" + preferredSerial);
+    }
+  }
+
+  Character *searchAnchor = player;
+  if (forceDirectorMode && preferredCharacter &&
+      (uintptr_t)preferredCharacter > 0x1000) {
+    searchAnchor = preferredCharacter;
+  }
+
+  const hand &anchorIndoorsHandle = searchAnchor->isIndoors();
+  bool anchorIsIndoors = IsIndoorsHandleValid(anchorIndoorsHandle);
+  float searchRadius = anchorIsIndoors ? g_boredEventRange : g_proximityRadius;
+  if (searchRadius < 10.0f) {
+    searchRadius = 10.0f;
+  }
+
+  bool preferredPresent = false;
 
   const ogre_unordered_set<Character *>::type &chars =
       world->getCharacterUpdateList();
   for (ogre_unordered_set<Character *>::type::const_iterator it = chars.begin();
        it != chars.end(); ++it) {
     Character *other = *it;
-    if (!other || (uintptr_t)other <= 0x1000 || other == player) {
+    if (!other || (uintptr_t)other <= 0x1000) {
+      continue;
+    }
+
+    std::string otherName = "";
+    std::string serial = "";
+    bool preferredMatch = false;
+    try {
+      otherName = other->getName();
+      serial = ToString(other->getHandle().serial);
+      preferredMatch =
+          (!preferredSerial.empty() && serial == preferredSerial) ||
+          (!preferredName.empty() && EqualsIgnoreCase(otherName, preferredName));
+    } catch (...) {
+      continue;
+    }
+
+    if (otherName.empty()) {
+      continue;
+    }
+    if (other == searchAnchor && !preferredMatch) {
       continue;
     }
     if (!ShouldIncludeAnimalForTalk(other)) {
       continue;
     }
+
+    bool isPlayerCharacter = false;
     try {
-      if (other->isPlayerCharacter() || other->isDead() ||
-          other->isUnconcious()) {
+      isPlayerCharacter = other->isPlayerCharacter();
+      if (other->isDead() || other->isUnconcious()) {
         continue;
       }
     } catch (...) {
       continue;
     }
-    std::string otherName = other->getName();
-    if (otherName.empty()) {
+
+    if (isPlayerCharacter && !(forceDirectorMode && preferredMatch)) {
       continue;
     }
+
     const hand &otherIndoorsHandle = other->isIndoors();
     bool otherIsIndoors = IsIndoorsHandleValid(otherIndoorsHandle);
     unsigned int otherBuildingSerial =
         otherIsIndoors ? otherIndoorsHandle.serial : 0;
-    float dist = player->getPosition().distance(other->getPosition());
-    std::string serial = ToString(other->getHandle().serial);
-    bool preferredMatch =
-        (!preferredSerial.empty() && serial == preferredSerial) ||
-        (!preferredName.empty() && EqualsIgnoreCase(otherName, preferredName));
-    bool areaCompatible = IsConversationAreaCompatible(player, other);
-    if (!areaCompatible) {
+    float dist = searchAnchor->getPosition().distance(other->getPosition());
+    bool areaCompatible = IsConversationAreaCompatible(searchAnchor, other);
+    if (!areaCompatible && !(forceDirectorMode && preferredMatch)) {
       continue;
     }
     if (dist > searchRadius && !preferredMatch) {
@@ -2752,10 +2789,43 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     c.buildingSerial = otherBuildingSerial;
     c.floor = other->getFloor();
     candidates.push_back(c);
+    if (preferredMatch) {
+      preferredPresent = true;
+    }
+  }
+
+  if (hasPreferred && !preferredPresent && preferredCharacter &&
+      (uintptr_t)preferredCharacter > 0x1000 &&
+      !IsCharacterUnavailableForConversation(preferredCharacter) &&
+      ShouldIncludeAnimalForTalk(preferredCharacter)) {
+    try {
+      CandidateNpc c;
+      c.name = preferredCharacter->getName();
+      if (!c.name.empty()) {
+        c.serial = ToString(preferredCharacter->getHandle().serial);
+        c.distance =
+            searchAnchor->getPosition().distance(preferredCharacter->getPosition());
+        c.isPreferred = true;
+        const hand &preferredIndoorsHandle = preferredCharacter->isIndoors();
+        c.indoors = IsIndoorsHandleValid(preferredIndoorsHandle);
+        c.buildingSerial = c.indoors ? preferredIndoorsHandle.serial : 0;
+        c.floor = preferredCharacter->getFloor();
+        candidates.push_back(c);
+        preferredPresent = true;
+        Log("BORED_EVENT: preferred speaker injected from target resolver name=" +
+            c.name + " serial=" + c.serial + " director_mode=" +
+            std::string(forceDirectorMode ? "1" : "0"));
+      }
+    } catch (...) {
+      Log("BORED_EVENT: preferred speaker injection failed (exception) name=" +
+          preferredName + " serial=" + preferredSerial);
+    }
   }
 
   if (candidates.empty()) {
-    Log("BORED_EVENT: skipped (no nearby NPC candidates)");
+    Log("BORED_EVENT: skipped (no nearby NPC candidates) preferred_name=" +
+        preferredName + " preferred_serial=" + preferredSerial +
+        " director_mode=" + std::string(forceDirectorMode ? "1" : "0"));
     return false;
   }
 
