@@ -3783,12 +3783,39 @@ static Character *ResolveDialogueListenerForSpeech(Character *speaker,
   return nullptr;
 }
 
+static bool IsAliveConsciousCharacterForTargeting(Character *npc) {
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+  try {
+    if (npc->isDead() || npc->isUnconcious()) {
+      return false;
+    }
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+static Character *ResolveFirstAliveConsciousPlayerCharacter(GameWorld *world) {
+  if (!world || !world->player) {
+    return nullptr;
+  }
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *candidate = world->player->playerCharacters[i];
+    if (IsAliveConsciousCharacterForTargeting(candidate)) {
+      return candidate;
+    }
+  }
+  return nullptr;
+}
+
 static Character *ResolveNearestPlayerSpeakerForTarget(GameWorld *world,
                                                        Character *target) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return nullptr;
   }
-  Character *fallback = world->player->playerCharacters[0];
+  Character *fallback = ResolveFirstAliveConsciousPlayerCharacter(world);
   if (!g_useNearestPlayerSpeaker) {
     return fallback;
   }
@@ -3800,7 +3827,7 @@ static Character *ResolveNearestPlayerSpeakerForTarget(GameWorld *world,
   float bestDist = 1e30f;
   for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
     Character *candidate = world->player->playerCharacters[i];
-    if (!candidate || (uintptr_t)candidate < 0x1000) {
+    if (!IsAliveConsciousCharacterForTargeting(candidate)) {
       continue;
     }
     // If the target is a squadmate, pick another squadmate as the speaker.
@@ -3822,15 +3849,12 @@ static Character *ResolveNearestPlayerSpeakerForTarget(GameWorld *world,
 
   for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
     Character *candidate = world->player->playerCharacters[i];
-    if (!candidate || (uintptr_t)candidate < 0x1000 || candidate == target) {
+    if (!IsAliveConsciousCharacterForTargeting(candidate) || candidate == target) {
       continue;
     }
     return candidate;
   }
-  if (fallback && (uintptr_t)fallback >= 0x1000) {
-    return fallback;
-  }
-  return nullptr;
+  return fallback;
 }
 
 static Character *ResolveNearestSquadmateTargetForSelection(GameWorld *world,
@@ -3846,7 +3870,7 @@ static Character *ResolveNearestSquadmateTargetForSelection(GameWorld *world,
   float bestDist = 1e30f;
   for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
     Character *candidate = world->player->playerCharacters[i];
-    if (!candidate || (uintptr_t)candidate < 0x1000 || candidate == selected) {
+    if (!IsAliveConsciousCharacterForTargeting(candidate) || candidate == selected) {
       continue;
     }
     float dist = candidate->getPosition().distance(selected->getPosition());
@@ -5541,7 +5565,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         if (validHash && thisptr->player && thisptr->player->playerCharacters.size() > 0) {
           Character *playerSpeaker = ResolvePlayerSpeakerForCurrentTalk(thisptr);
           if (!playerSpeaker || (uintptr_t)playerSpeaker < 0x1000) {
-            playerSpeaker = thisptr->player->playerCharacters[0];
+            playerSpeaker = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
           }
           hand playerHand = playerSpeaker ? playerSpeaker->getHandle() : hand();
           if (playerHand.isValid()) {
@@ -5573,7 +5597,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           Character *playerSpeaker = ResolvePlayerSpeakerForCurrentTalk(thisptr);
           if (!playerSpeaker && thisptr->player &&
               thisptr->player->playerCharacters.size() > 0) {
-            playerSpeaker = thisptr->player->playerCharacters[0];
+            playerSpeaker = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
           }
           if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000) {
             targetHand = playerSpeaker->getHandle();
@@ -7113,7 +7137,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           if (!tc && isPlayerSay) {
             tc = ResolvePlayerSpeakerForCurrentTalk(thisptr);
             if (!tc && thisptr->player && thisptr->player->playerCharacters.size() > 0) {
-              tc = thisptr->player->playerCharacters[0];
+              tc = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
             }
           }
           if (isNPCSay && tc && (uintptr_t)tc > 0x1000 && tc->isPlayerCharacter()) {
@@ -7537,7 +7561,7 @@ static void CapturePlayerDialogueReplyFromUi(Dialogue *dialogue,
 
   Character *speaker = ResolveNearestPlayerSpeakerForTarget(world, dialogueOwner);
   if (!speaker && world->player && world->player->playerCharacters.size() > 0) {
-    speaker = world->player->playerCharacters[0];
+    speaker = ResolveFirstAliveConsciousPlayerCharacter(world);
   }
   if (!speaker || (uintptr_t)speaker <= 0x1000) {
     return;
@@ -8209,7 +8233,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         Character *initSpeaker = ResolvePlayerSpeakerForCurrentTalk(world);
         if ((!initSpeaker || (uintptr_t)initSpeaker < 0x1000) && world->player &&
             world->player->playerCharacters.size() > 0) {
-          initSpeaker = world->player->playerCharacters[0];
+          initSpeaker = ResolveFirstAliveConsciousPlayerCharacter(world);
         }
 
         std::string initActor = ResolveCharacterNameSafe(initSpeaker);
@@ -8352,6 +8376,16 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
                 "' has no alternate squadmate target; chat open blocked");
             return;
           }
+        }
+
+        if (!IsAliveConsciousCharacterForTargeting(chatTarget)) {
+          EnterCriticalSection(&g_msgMutex);
+          g_messageQueue.push_back(
+              "NOTIFY:Chat blocked: target is dead or unconscious.");
+          LeaveCriticalSection(&g_msgMutex);
+          Log("CHAT_OPEN: blocked dead_or_unconscious target='" +
+              chatTarget->getName() + "'");
+          return;
         }
 
         bool selectedIsAnimal = IsAnimalCharacterSafe(chatTarget);
