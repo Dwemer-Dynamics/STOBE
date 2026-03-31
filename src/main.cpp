@@ -5404,6 +5404,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isNotify = (msg.find("NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
       bool isRename = (msg.find("NPC_RENAME: ") == 0);
+      bool speakerResolvedFromHeader = false;
 
       hand targetHand = g_talkTargetHand;
       // Do not fall back to selection yet; handles inside the branches
@@ -5619,6 +5620,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         std::string content = "";
         bool found = false;
         bool header_processed = false;
+        speakerResolvedFromHeader = false;
 
         if (isNPCSay || isNPCAction) {
           // AI responses should try to resolve the specific speaker if
@@ -5694,6 +5696,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             if (bestMatch && bestScore > 0) {
               targetHand = bestMatch->getHandle();
               found = true;
+              speakerResolvedFromHeader = true;
             }
 
             // Fallback sphere check if not found in update list or Score too
@@ -5739,6 +5742,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               if (bestMatch && bestScore > 0) {
                 targetHand = bestMatch->getHandle();
                 found = true;
+                speakerResolvedFromHeader = true;
               }
             }
 
@@ -7148,13 +7152,21 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             }
           }
           if (isNPCSay && tc && (uintptr_t)tc > 0x1000 && tc->isPlayerCharacter()) {
-            Character *talkTarget = ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
-            if (talkTarget && (uintptr_t)talkTarget > 0x1000 &&
-                !talkTarget->isPlayerCharacter()) {
-              Log("CHAT_SPEAKER: NPC_SAY retargeted from player " +
-                  tc->getName() + " to talk target " + talkTarget->getName());
-              tc = talkTarget;
-              targetHand = talkTarget->getHandle();
+            // Keep explicit stream speakers (autochat/rechat) on their own actor.
+            // Only retarget legacy fallback cases where no speaker was resolved.
+            if (!speakerResolvedFromHeader) {
+              Character *talkTarget =
+                  ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
+              if (talkTarget && (uintptr_t)talkTarget > 0x1000 &&
+                  !talkTarget->isPlayerCharacter()) {
+                Log("CHAT_SPEAKER: NPC_SAY retargeted from player " +
+                    tc->getName() + " to talk target " + talkTarget->getName());
+                tc = talkTarget;
+                targetHand = talkTarget->getHandle();
+              }
+            } else {
+              Log("CHAT_SPEAKER: NPC_SAY keeping explicit player speaker " +
+                  tc->getName());
             }
           }
 
