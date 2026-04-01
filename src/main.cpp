@@ -8048,9 +8048,10 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             }
             hand limbTarget = resolveActionTargetHand(targetToken, targetHand);
             if (!limbTarget.isValid()) {
-              Log("HOOK_MSG_PROC: REMOVE_LIMB ignored; target unresolved '" +
-                  targetToken + "'");
-              continue;
+              Log("HOOK_MSG_PROC: REMOVE_LIMB target unresolved at parse-time '" +
+                  targetToken +
+                  "'; deferring to runtime token resolution");
+              limbTarget = hand();
             }
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
@@ -8058,6 +8059,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.actor = targetHand;
             act.target = limbTarget;
             act.message = targetToken;
+            act.targetToken = targetToken;
             act.taskValue = limbCode;
             g_uiActionQueue.push_back(act);
             LeaveCriticalSection(&g_uiMutex);

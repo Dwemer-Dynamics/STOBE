@@ -6235,8 +6235,128 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           }
         } else if (act.type == ACT_REMOVE_LIMB) {
           const std::string actorName = SafeCharacterName(npc);
+          Character *limbTarget = target;
+          if ((!limbTarget || (uintptr_t)limbTarget <= 0x1000) &&
+              thisptr && npc && (uintptr_t)npc > 0x1000) {
+            std::string explicitTargetToken = TrimCopySimple(act.targetToken);
+            std::string messageTargetToken = TrimCopySimple(act.message);
+
+            if (act.target.isValid() && act.target.serial != 0) {
+              std::string serialProbe = "";
+              if (!explicitTargetToken.empty()) {
+                serialProbe =
+                    explicitTargetToken + "|" +
+                    ToString((unsigned int)act.target.serial);
+              } else if (!messageTargetToken.empty()) {
+                serialProbe =
+                    messageTargetToken + "|" +
+                    ToString((unsigned int)act.target.serial);
+              } else {
+                serialProbe = ToString((unsigned int)act.target.serial);
+              }
+              Character *resolvedBySerial = ResolveCharacterByTargetToken(
+                  thisptr, serialProbe, npc);
+              if (resolvedBySerial && (uintptr_t)resolvedBySerial > 0x1000) {
+                limbTarget = resolvedBySerial;
+              }
+            }
+
+            if ((!limbTarget || (uintptr_t)limbTarget <= 0x1000) &&
+                !explicitTargetToken.empty()) {
+              Character *resolvedByToken = ResolveCharacterByTargetToken(
+                  thisptr, explicitTargetToken, npc);
+              if (resolvedByToken && (uintptr_t)resolvedByToken > 0x1000) {
+                limbTarget = resolvedByToken;
+              }
+            }
+
+            if ((!limbTarget || (uintptr_t)limbTarget <= 0x1000) &&
+                !messageTargetToken.empty()) {
+              Character *resolvedByMessage = ResolveCharacterByTargetToken(
+                  thisptr, messageTargetToken, npc);
+              if (resolvedByMessage && (uintptr_t)resolvedByMessage > 0x1000) {
+                limbTarget = resolvedByMessage;
+              }
+            }
+
+            if ((!limbTarget || (uintptr_t)limbTarget <= 0x1000) &&
+                act.target.isValid()) {
+              try {
+                Character *resolvedByHandle = act.target.getCharacter();
+                if (resolvedByHandle && (uintptr_t)resolvedByHandle > 0x1000) {
+                  limbTarget = resolvedByHandle;
+                }
+              } catch (...) {
+              }
+            }
+
+            // Dead/KO targets can fall out of update-list resolution but still
+            // exist as CHARACTER objects nearby. Resolve by serial from world
+            // objects as a final fallback.
+            if ((!limbTarget || (uintptr_t)limbTarget <= 0x1000) &&
+                act.target.isValid() && act.target.serial != 0) {
+              auto tryResolveByObjectsNear = [&](const Ogre::Vector3 &anchorPos,
+                                                 RootObject *ignoreObject,
+                                                 float range) -> Character * {
+                if (!thisptr || range <= 0.0f) {
+                  return nullptr;
+                }
+                lektor<RootObject *> nearbyObjects;
+                try {
+                  thisptr->getObjectsWithinSphere(nearbyObjects, anchorPos, range,
+                                                  CHARACTER, 128, ignoreObject);
+                } catch (...) {
+                  nearbyObjects.clear();
+                }
+                for (uint32_t i = 0; i < nearbyObjects.size(); ++i) {
+                  Character *candidate = (Character *)nearbyObjects.stuff[i];
+                  if (!candidate || (uintptr_t)candidate <= 0x1000) {
+                    continue;
+                  }
+                  unsigned int candidateSerial = 0;
+                  try {
+                    candidateSerial = candidate->getHandle().serial;
+                  } catch (...) {
+                    candidateSerial = 0;
+                  }
+                  if (candidateSerial == act.target.serial) {
+                    return candidate;
+                  }
+                }
+                return nullptr;
+              };
+
+              Character *resolvedByObjects = nullptr;
+              try {
+                resolvedByObjects = tryResolveByObjectsNear(
+                    npc->getPosition(), (RootObject *)npc, 1200.0f);
+              } catch (...) {
+                resolvedByObjects = nullptr;
+              }
+
+              if ((!resolvedByObjects ||
+                   (uintptr_t)resolvedByObjects <= 0x1000) &&
+                  thisptr->player && thisptr->player->playerCharacters.size() > 0 &&
+                  thisptr->player->playerCharacters[0]) {
+                Character *playerAnchor = thisptr->player->playerCharacters[0];
+                try {
+                  resolvedByObjects = tryResolveByObjectsNear(
+                      playerAnchor->getPosition(), (RootObject *)playerAnchor,
+                      1800.0f);
+                } catch (...) {
+                  resolvedByObjects = nullptr;
+                }
+              }
+
+              if (resolvedByObjects && (uintptr_t)resolvedByObjects > 0x1000) {
+                limbTarget = resolvedByObjects;
+              }
+            }
+          }
+          target = limbTarget;
           std::string targetName =
-              target ? SafeCharacterName(target) : TrimCopySimple(act.message);
+              limbTarget ? SafeCharacterName(limbTarget)
+                         : TrimCopySimple(act.message);
           if (targetName.empty()) {
             targetName = "target";
           }
@@ -6247,7 +6367,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 actorName + " cannot remove limbs without a hacksaw.", true);
           } else if (!target || (uintptr_t)target <= 0x1000) {
             Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
-                " reason=target_not_found target_token='" + act.message + "'");
+                " reason=target_not_found target_token='" + act.message +
+                "' explicit_target_token='" + TrimCopySimple(act.targetToken) +
+                "' requested_serial=" + ToString((unsigned int)act.target.serial));
             thisptr->showPlayerAMessage_withLog(
                 actorName + " could not find a valid limb-removal target.", true);
           } else {
@@ -6292,9 +6414,13 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             } else {
               ResetCloseActionApproachState(npc, act);
               std::string invalidReason = "";
-              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+              bool targetIsDead = false;
+              if (!IsTakeItemLootTargetValid(thisptr, target, invalidReason,
+                                             targetIsDead)) {
                 if (invalidReason.empty()) {
-                  invalidReason = "target is not in a valid state";
+                  invalidReason =
+                      "target must be dead, knocked out, unconscious, imprisoned, "
+                      "or carried";
                 }
                 Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
                     " target=" + targetName + " reason=" + invalidReason);
