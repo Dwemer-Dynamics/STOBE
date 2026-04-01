@@ -4373,10 +4373,22 @@ static void EmitKnockoutEvent(Character *victim) {
   std::string victimName = ResolveCharacterNameSafe(victim);
   std::string victimFaction = SafeFaction(victim);
   std::string attackerName = TrimCopy(attribution.actorName);
-  std::string message = "Knocked out by " + EnsureLeadingArticle(attribution.weaponName);
-  if (!attackerName.empty() && ToLowerAsciiCopy(attackerName) != "unknown" &&
-      ToLowerAsciiCopy(attackerName) != ToLowerAsciiCopy(victimName)) {
-    message += " from " + attackerName;
+  std::string weaponName = TrimCopy(attribution.weaponName);
+  std::string weaponLower = ToLowerAsciiCopy(weaponName);
+  bool unknownWeapon =
+      weaponName.empty() || weaponLower == "unknown" ||
+      weaponLower == "unknown weapon" || weaponLower == "an unknown weapon" ||
+      weaponLower == "none";
+  bool knownAttacker =
+      !attackerName.empty() && ToLowerAsciiCopy(attackerName) != "unknown" &&
+      ToLowerAsciiCopy(attackerName) != ToLowerAsciiCopy(victimName);
+
+  std::string message = "was Knocked Out.";
+  if (!unknownWeapon) {
+    message = "Knocked out by " + EnsureLeadingArticle(weaponName);
+    if (knownAttacker) {
+      message += " from " + attackerName;
+    }
   }
   LogGameEvent("knockout", victimName, victimFaction, "None", "None", message,
                ResolveCharacterSerialForEvent(victim), 0);

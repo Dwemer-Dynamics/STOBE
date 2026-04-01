@@ -1043,6 +1043,7 @@ static std::string BuildEventStreamData(const std::string &type,
                                         const std::string &message) {
   std::string speaker = NormalizeEventName(actor);
   std::string listener = NormalizeEventName(target);
+  std::string normalizedType = ToLowerAsciiCopy(TrimCopy(type));
   if (speaker.empty()) {
     speaker = listener;
     listener.clear();
@@ -1059,7 +1060,13 @@ static std::string BuildEventStreamData(const std::string &type,
     body = type;
   }
 
-  std::string line = speaker + ": " + body;
+  std::string line = "";
+  if (normalizedType == "knockout" &&
+      ToLowerAsciiCopy(TrimCopy(body)).rfind("was ", 0) == 0) {
+    line = speaker + " " + body;
+  } else {
+    line = speaker + ": " + body;
+  }
   if (!listener.empty() && listener != speaker) {
     line += " (talking to: " + listener + ")";
   }
