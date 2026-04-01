@@ -109,7 +109,8 @@ enum ManualChatActionType {
   MANUAL_CHAT_ACTION_ROLEPLAY_ACTION = 4,
   MANUAL_CHAT_ACTION_DRINK_ITEM = 5,
   MANUAL_CHAT_ACTION_USE_DRUGS = 6,
-  MANUAL_CHAT_ACTION_KILL = 7
+  MANUAL_CHAT_ACTION_KILL = 7,
+  MANUAL_CHAT_ACTION_FORCE_DRINK = 8
 };
 
 struct ManualChatActionChoice {
@@ -126,6 +127,7 @@ const ManualChatActionChoice kManualChatActionChoices[] = {
     {MANUAL_CHAT_ACTION_GIVE_ITEM, "give item", "", "", false},
     {MANUAL_CHAT_ACTION_ROLEPLAY_ACTION, "roleplay action", "", "", false},
     {MANUAL_CHAT_ACTION_DRINK_ITEM, "drink item", "", "", false},
+    {MANUAL_CHAT_ACTION_FORCE_DRINK, "force drink item", "", "", false},
     {MANUAL_CHAT_ACTION_USE_DRUGS, "use drugs", "", "", false},
     {MANUAL_CHAT_ACTION_REMOVE_LIMB, "remove left arm (hacksaw)",
      "remove_limb_left_arm", "LEFT_ARM", false},
@@ -236,6 +238,24 @@ std::string BuildManualDrinkItemActionToken(const std::string &itemName) {
     return "";
   }
   return "DRINK_ITEM@" + normalizedItem;
+}
+
+std::string BuildManualForceDrinkActionToken(const std::string &targetName,
+                                             const std::string &targetHandle,
+                                             const std::string &itemName) {
+  std::string normalizedTargetName = TrimManualActionArg(targetName);
+  std::string normalizedItemName = TrimManualActionArg(itemName);
+  if (normalizedTargetName.empty()) {
+    return "";
+  }
+  if (normalizedItemName.empty()) {
+    normalizedItemName = "Cactus Rum";
+  }
+  std::string targetToken = normalizedTargetName;
+  if (!targetHandle.empty()) {
+    targetToken += "|" + targetHandle;
+  }
+  return "FORCE_DRINK@" + targetToken + "@" + normalizedItemName;
 }
 
 std::string BuildManualUseDrugsActionToken(const std::string &itemName) {
@@ -1580,6 +1600,7 @@ void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
       "RELEASE_PRISONER",
       "GIVE_CATS",        "TAKE_CATS",     "TAKE_ITEM",        "GIVE_ITEM",
       "DROP_ITEM",        "DRINK_ITEM",    "DRINKITEM",        "DRINK-ITEM",
+      "FORCE_DRINK",      "FORCEDRINK",    "FORCE-DRINK",
       "USE_DRUGS",        "USEDRUGS",      "USE-DRUGS",
       "ROLEPLAY_ACTION",  "ROLEPLAYACTION","ROLEPLAY-ACTION",
       "NOTIFY",           "FACTION_RELATIONS","TRAVEL_LOCATION",
@@ -2406,14 +2427,6 @@ void OnChatSendClick(MyGUI::Widget *sender) {
         manualActionPromptSkipReason = "invalid_action_token";
       }
     } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_DRINK_ITEM) {
-      if (manualActionTextArg.empty()) {
-        if (world) {
-          world->showPlayerAMessage_withLog(
-              "Chat blocked: Provide a drink item name.", true);
-        }
-        Log("CHAT_GATE: blocked manual drink item missing item name");
-        return;
-      }
       if (IsCharacterSkeletonRace(player)) {
         if (world) {
           world->showPlayerAMessage_withLog(
@@ -2423,8 +2436,10 @@ void OnChatSendClick(MyGUI::Widget *sender) {
             playerName + "'");
         return;
       }
+      std::string requestedDrinkQuery =
+          manualActionTextArg.empty() ? "Cactus Rum" : manualActionTextArg;
       std::string matchedDrinkItemName = "";
-      if (!ResolveCharacterDrinkItemMatch(player, manualActionTextArg,
+      if (!ResolveCharacterDrinkItemMatch(player, requestedDrinkQuery,
                                           matchedDrinkItemName)) {
         if (world) {
           world->showPlayerAMessage_withLog(
@@ -2433,13 +2448,64 @@ void OnChatSendClick(MyGUI::Widget *sender) {
               true);
         }
         Log("CHAT_GATE: blocked manual drink item no_inventory_match query='" +
-            manualActionTextArg + "' actor='" + playerName + "'");
+            requestedDrinkQuery + "' actor='" + playerName + "'");
         return;
       }
       manualActionCommand = BuildManualDrinkItemActionToken(matchedDrinkItemName);
       if (manualActionCommand.empty()) {
         manualActionPromptSkipReason = "invalid_action_token";
       }
+    } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_FORCE_DRINK) {
+      if (IsCharacterSkeletonRace(player)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Skeleton race cannot force drinks.", true);
+        }
+        Log("CHAT_GATE: blocked manual force drink reason=skeleton_race actor='" +
+            playerName + "'");
+        return;
+      }
+      std::string invalidReason = "";
+      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+        if (invalidReason.empty()) {
+          invalidReason =
+              "target must be knocked out, unconscious, imprisoned, or carried";
+        }
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: " + invalidReason + ".", true);
+        }
+        Log("CHAT_GATE: blocked manual force drink reason='" + invalidReason +
+            "' actor='" + playerName + "' target='" + targetName + "'");
+        return;
+      }
+      std::string requestedDrinkQuery =
+          manualActionTextArg.empty() ? "Cactus Rum" : manualActionTextArg;
+      std::string matchedDrinkItemName = "";
+      if (!ResolveCharacterDrinkItemMatch(player, requestedDrinkQuery,
+                                          matchedDrinkItemName)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Drink item must be Bloodrum, Cactus Rum, Grog, or "
+              "Sake in speaker inventory/equipment.",
+              true);
+        }
+        Log("CHAT_GATE: blocked manual force drink no_inventory_match query='" +
+            requestedDrinkQuery + "' actor='" + playerName + "'");
+        return;
+      }
+      manualActionCommand = BuildManualForceDrinkActionToken(
+          targetName, resolvedTargetHandle, matchedDrinkItemName);
+      if (manualActionCommand.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not build force-drink action.", true);
+        }
+        Log("CHAT_GATE: blocked manual force drink invalid_action_token actor='" +
+            playerName + "'");
+        return;
+      }
+      manualActionPromptEligible = true;
     } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_USE_DRUGS) {
       if (manualActionTextArg.empty()) {
         if (world) {
@@ -3273,6 +3339,9 @@ void OnChatActionChange(MyGUI::ComboBox *sender, size_t index) {
     if (!TryParseActionAmount(currentValue, parsedAmount)) {
       g_chatActionArgInput->setCaption("100");
     }
+  } else if (choice.type == MANUAL_CHAT_ACTION_DRINK_ITEM ||
+             choice.type == MANUAL_CHAT_ACTION_FORCE_DRINK) {
+    g_chatActionArgInput->setCaption("Cactus Rum");
   } else {
     g_chatActionArgInput->setCaption("");
   }

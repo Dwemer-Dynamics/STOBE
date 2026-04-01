@@ -4505,6 +4505,146 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               }
             }
           }
+        } else if (act.type == ACT_FORCE_DRINK) {
+          const std::string actorName = SafeCharacterName(npc);
+          const std::string targetName =
+              target ? SafeCharacterName(target) : std::string("target");
+          std::string requestedDrink = TrimCopySimple(act.message);
+          if (requestedDrink.empty()) {
+            requestedDrink = "Cactus Rum";
+          }
+          if (IsCharacterSkeletonRace(npc)) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot force drinks (skeleton race).", true);
+            Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                " target=" + targetName + " reason=skeleton_race_actor");
+          } else if (!target || (uintptr_t)target <= 0x1000) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid force-drink target.", true);
+            Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                " reason=target_not_found");
+          } else if (IsCharacterSkeletonRace(target)) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot force alcohol into " + targetName +
+                    " (skeleton race).",
+                true);
+            Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                " target=" + targetName + " reason=skeleton_race_target");
+          } else {
+            float actionDistance = -1.0f;
+            std::string rangeReason = "";
+            if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
+                                             actionDistance, rangeReason)) {
+              std::string userReason = "too far away";
+              if (rangeReason == "area_mismatch") {
+                userReason = "not in the same area";
+              }
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " cannot force " + targetName +
+                      " to drink because they are " + userReason + ".",
+                  true);
+              Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                  " target=" + targetName + " reason=" + rangeReason +
+                  " dist=" + ToString(actionDistance) + " max_dist=" +
+                  ToString(kNpcCloseActionRangeUnits));
+            } else {
+              std::string invalidReason = "";
+              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+                if (invalidReason.empty()) {
+                  invalidReason =
+                      "target must be knocked out, unconscious, imprisoned, or "
+                      "carried";
+                }
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot force " + targetName + " to drink: " +
+                        invalidReason + ".",
+                    true);
+                Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + invalidReason);
+              } else {
+                Item *drinkItem = nullptr;
+                std::string drinkItemName = "";
+                std::string drinkCanonicalLabel = "";
+                bool hasDrink = TryResolveDrinkItemForActor(
+                    npc, requestedDrink, drinkItem, drinkItemName,
+                    drinkCanonicalLabel);
+                if (!hasDrink || !drinkItem) {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName +
+                          " could not find that drink (Bloodrum, Cactus Rum, "
+                          "Grog, or Sake).",
+                      true);
+                  Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                      " target=" + targetName + " reason=item_not_found query='" +
+                      requestedDrink + "'");
+                } else if (!ConsumeSingleItemFromActor(npc, drinkItem)) {
+                  const std::string drinkDisplay =
+                      drinkCanonicalLabel.empty() ? drinkItemName
+                                                 : drinkCanonicalLabel;
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " failed to force " + targetName + " to drink " +
+                          drinkDisplay + ".",
+                      true);
+                  Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                      " target=" + targetName + " reason=consume_failed item='" +
+                      drinkDisplay + "'");
+                } else {
+                  int newLevel = 0;
+                  int secondsRemaining = 0;
+                  bool passedOut = false;
+                  if (!AdvanceNpcDrunkLevel(thisptr, target, newLevel,
+                                            secondsRemaining, passedOut)) {
+                    thisptr->showPlayerAMessage_withLog(
+                        actorName + " forced " + targetName + " to drink " +
+                            requestedDrink + ", but they were already blackout "
+                            "drunk.",
+                        true);
+                    Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                        " target=" + targetName +
+                        " reason=target_already_passed_out");
+                  } else {
+                    std::string drinkDisplay = drinkCanonicalLabel.empty()
+                                                   ? drinkItemName
+                                                   : drinkCanonicalLabel;
+                    if (drinkDisplay.empty()) {
+                      drinkDisplay = requestedDrink;
+                    }
+                    if (passedOut) {
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " forced " + targetName + " to drink " +
+                              drinkDisplay + ", and they passed out drunk.",
+                          true);
+                      Log("ACTION_EXEC: FORCE_DRINK actor=" + actorName +
+                          " target=" + targetName + " item='" + drinkDisplay +
+                          "' level=3 passed_out=1 ko_seconds=" +
+                          ToString(secondsRemaining));
+                    } else {
+                      std::string levelText =
+                          (newLevel >= 2) ? "very drunk" : "drunk";
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " forced " + targetName + " to drink " +
+                              drinkDisplay + ". " + targetName + " is now " +
+                              levelText + ".",
+                          true);
+                      Log("ACTION_EXEC: FORCE_DRINK actor=" + actorName +
+                          " target=" + targetName + " item='" + drinkDisplay +
+                          "' level=" + ToString(newLevel) +
+                          " expires_in_seconds=" + ToString(secondsRemaining));
+                    }
+                    inventoryTimer = 999;
+                    try {
+                      npc->reThinkCurrentAIAction();
+                    } catch (...) {
+                    }
+                    try {
+                      target->reThinkCurrentAIAction();
+                    } catch (...) {
+                    }
+                  }
+                }
+              }
+            }
+          }
         } else if (act.type == ACT_USE_DRUGS) {
           const std::string actorName = SafeCharacterName(npc);
           std::string requestedDrug = TrimCopySimple(act.message);

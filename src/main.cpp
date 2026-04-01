@@ -6011,6 +6011,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } else if (actionCommand == "USEDRUGS" ||
                      actionCommand == "USE-DRUGS") {
             actionCommand = "USE_DRUGS";
+          } else if (actionCommand == "FORCEDRINK" ||
+                     actionCommand == "FORCE-DRINK") {
+            actionCommand = "FORCE_DRINK";
           } else if (actionCommand == "REMOVELIMB") {
             actionCommand = "REMOVE_LIMB";
           } else if (actionCommand == "KILLTARGET" ||
@@ -6154,6 +6157,32 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
             targetOut = targetToken;
             limbOut = parsedLimb;
+            return true;
+          };
+          auto parseForceDrinkPayload =
+              [](const std::string &rawPayload, std::string &targetOut,
+                 std::string &drinkOut) -> bool {
+            targetOut.clear();
+            drinkOut.clear();
+            std::string payload = TrimCopy(rawPayload);
+            if (payload.empty()) {
+              return false;
+            }
+            size_t splitPos = payload.find('@');
+            if (splitPos == std::string::npos) {
+              targetOut = TrimCopy(payload);
+              drinkOut = "Cactus Rum";
+              return !targetOut.empty();
+            }
+
+            targetOut = TrimCopy(payload.substr(0, splitPos));
+            drinkOut = TrimCopy(payload.substr(splitPos + 1));
+            if (targetOut.empty()) {
+              return false;
+            }
+            if (drinkOut.empty()) {
+              drinkOut = "Cactus Rum";
+            }
             return true;
           };
           auto parseCatsPayload =
@@ -6878,6 +6907,38 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LeaveCriticalSection(&g_uiMutex);
             Log("HOOK_MSG_PROC: DRINK_ITEM queued actor_serial=" +
                 ToString((unsigned int)targetHand.serial) + " item='" +
+                drinkItemName + "'");
+          } else if (actionCommand == "FORCE_DRINK") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string targetToken = "";
+            std::string drinkItemName = "";
+            if (!parseForceDrinkPayload(actionArgument, targetToken,
+                                        drinkItemName)) {
+              Log("HOOK_MSG_PROC: FORCE_DRINK ignored; invalid payload '" +
+                  actionArgument + "'");
+              continue;
+            }
+            hand forceDrinkTarget =
+                resolveActionTargetHand(targetToken, targetHand);
+            if (!forceDrinkTarget.isValid()) {
+              Log("HOOK_MSG_PROC: FORCE_DRINK ignored; target unresolved '" +
+                  targetToken + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_FORCE_DRINK;
+            act.actor = targetHand;
+            act.target = forceDrinkTarget;
+            act.message = drinkItemName;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: FORCE_DRINK queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)forceDrinkTarget.serial) + " item='" +
                 drinkItemName + "'");
           } else if (actionCommand == "USE_DRUGS") {
             if (shouldSkipSpeakerBoundAction(actionCommand)) {
