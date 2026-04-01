@@ -4448,9 +4448,18 @@ static void EmitLockpickedEvent(Character *npc, int previousSkill,
 
 static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
                             const InventoryEventSnapshot &currentSnapshot) {
+  struct PickupDeltaEntry {
+    std::string name;
+    int count;
+
+    PickupDeltaEntry() : name(""), count(0) {}
+    PickupDeltaEntry(const std::string &entryName, int entryCount)
+        : name(entryName), count(entryCount) {}
+  };
+
   int addedCount = 0;
   int addedStolenCount = 0;
-  std::string itemName = "Unknown Item";
+  std::vector<PickupDeltaEntry> addedItems;
 
   for (std::map<std::string, int>::const_iterator it =
            currentSnapshot.countsByKey.begin();
@@ -4468,14 +4477,14 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
       continue;
     }
     addedCount += delta;
-    if (itemName == "Unknown Item") {
-      std::map<std::string, std::string>::const_iterator displayIt =
-          currentSnapshot.displayNameByKey.find(key);
-      if (displayIt != currentSnapshot.displayNameByKey.end() &&
-          !displayIt->second.empty()) {
-        itemName = displayIt->second;
-      }
+    std::string displayName = "Unknown Item";
+    std::map<std::string, std::string>::const_iterator displayIt =
+        currentSnapshot.displayNameByKey.find(key);
+    if (displayIt != currentSnapshot.displayNameByKey.end() &&
+        !displayIt->second.empty()) {
+      displayName = displayIt->second;
     }
+    addedItems.push_back(PickupDeltaEntry(displayName, delta));
 
     int currentStolen = 0;
     int previousStolen = 0;
@@ -4501,9 +4510,42 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
 
   std::string actorName = ResolveCharacterNameSafe(npc);
   std::string actorFaction = SafeFaction(npc);
-  std::string mode = addedStolenCount > 0 ? "theft" : "normal";
-  std::string message = "picked up " + ToString(addedCount) + "x " + itemName +
-                        " (" + mode + ")";
+  std::string mode = "normal";
+  if (addedStolenCount > 0 && addedStolenCount >= addedCount) {
+    mode = "theft";
+  } else if (addedStolenCount > 0) {
+    mode = "mixed";
+  }
+
+  std::string message = "";
+  if (addedItems.size() <= 1) {
+    std::string itemName = !addedItems.empty() && !addedItems[0].name.empty()
+                               ? addedItems[0].name
+                               : "Unknown Item";
+    message =
+        "picked up " + ToString(addedCount) + "x " + itemName + " (" + mode + ")";
+  } else {
+    std::stable_sort(
+        addedItems.begin(), addedItems.end(),
+        [](const PickupDeltaEntry &left,
+           const PickupDeltaEntry &right) -> bool {
+          if (left.count != right.count) {
+            return left.count > right.count;
+          }
+          return left.name < right.name;
+        });
+
+    std::string breakdown = "";
+    for (size_t i = 0; i < addedItems.size(); ++i) {
+      if (i > 0) {
+        breakdown += ", ";
+      }
+      breakdown += ToString(addedItems[i].count) + "x " + addedItems[i].name;
+    }
+
+    message = "picked up " + ToString(addedCount) + " total: " + breakdown +
+              " (" + mode + ")";
+  }
   LogGameEvent("item_pickup", actorName, actorFaction, "None", "None",
                message, ResolveCharacterSerialForEvent(npc), 0);
 }
