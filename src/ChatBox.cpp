@@ -2978,25 +2978,27 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   CandidateNpc speaker = candidates[speakerIndex];
 
   std::string listener = "";
-  if (candidates.size() > 1) {
-    size_t listenerIndex = speakerIndex;
-    float listenerDistance = 1e30f;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      if (i == speakerIndex) {
-        continue;
-      }
-      if (candidates[i].distance < listenerDistance) {
-        listenerDistance = candidates[i].distance;
-        listenerIndex = i;
-      }
+  std::vector<size_t> listenerIndices;
+  listenerIndices.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (i == speakerIndex) {
+      continue;
     }
-    if (listenerIndex != speakerIndex && listenerIndex < candidates.size()) {
-      listener = candidates[listenerIndex].name;
-    }
+    listenerIndices.push_back(i);
   }
-  if (listener.empty()) {
-    listener = "Player";
+  if (listenerIndices.empty()) {
+    Log("BORED_EVENT: skipped (no eligible NPC listener) speaker=" +
+        speaker.name + " candidate_count=" + ToString((int)candidates.size()));
+    return false;
   }
+  size_t listenerIndex =
+      listenerIndices[(size_t)(rand() % listenerIndices.size())];
+  if (listenerIndex >= candidates.size()) {
+    Log("BORED_EVENT: skipped (listener index out of bounds) speaker=" +
+        speaker.name + " candidate_count=" + ToString((int)candidates.size()));
+    return false;
+  }
+  listener = candidates[listenerIndex].name;
 
   std::vector<std::string> people;
   std::string playerName = player->getName();
