@@ -1064,6 +1064,9 @@ static std::string BuildEventStreamData(const std::string &type,
   if (body.empty()) {
     body = type;
   }
+  if (normalizedType == "init") {
+    return body;
+  }
 
   std::string line = "";
   if (normalizedType == "knockout" &&
@@ -1133,10 +1136,13 @@ void LogGameEvent(const std::string &type, const std::string &actor,
   int anchorBCount = 0;
   int droppedByCap = 0;
   bool usedSecondAnchor = false;
-  std::string peopleJson =
-      BuildEventPeopleJson(GetWorldSafe(), actor, target, actorSerial,
-                           targetSerial, peopleCount, anchorACount, anchorBCount,
-                           droppedByCap, usedSecondAnchor);
+  std::string peopleJson = "[]";
+  if (normalizedType != "init") {
+    peopleJson = BuildEventPeopleJson(GetWorldSafe(), actor, target, actorSerial,
+                                      targetSerial, peopleCount, anchorACount,
+                                      anchorBCount, droppedByCap,
+                                      usedSecondAnchor);
+  }
   int gameTs = ResolveCurrentGameTsForEvent();
   std::wstring endpoint = L"/StobeServer/stream.php?DATA=" +
                           ToWide(BuildStreamQueryData(eventType, eventData, gameTs));

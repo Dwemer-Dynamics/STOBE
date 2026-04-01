@@ -9444,7 +9444,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
           initFaction = "None";
         }
         unsigned int initActorSerial = ResolveCharacterSerialForEvent(initSpeaker);
-        std::string initMessage = "game load detected (fallback init event)";
+        std::string initMessage = "game load detected";
 
         LogGameEvent("init", initActor, initFaction, "", "None", initMessage,
                      initActorSerial, 0);

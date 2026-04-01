@@ -3139,24 +3139,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
   }
   std::string speakerSerial = ResolveCharacterSerialToken(speaker);
 
-  std::vector<std::string> people;
-  if (!speakerSerial.empty()) {
-    AppendUniquePerson(people, speakerName + "|" + speakerSerial);
-  } else {
-    AppendUniquePerson(people, speakerName);
-  }
-  AppendUniquePerson(people, std::string(kNarratorName));
-
-  std::string peopleJson = "[";
-  for (size_t i = 0; i < people.size(); ++i) {
-    if (i > 0) {
-      peopleJson += ",";
-    }
-    peopleJson += "\"" + EscapeJSON(people[i]) + "\"";
-  }
-  peopleJson += "]";
-
-  std::string eventData = speakerName + ": game load detected";
+  std::string peopleJson = "[]";
+  std::string eventData = "game load detected";
   std::wstring endpoint =
       L"/StobeServer/stream.php?DATA=" +
       ToWide(BuildStreamQueryData("init", eventData, ResolveCurrentGameTs())) +
