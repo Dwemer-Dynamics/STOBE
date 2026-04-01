@@ -118,6 +118,12 @@ struct QueuedAction {
   std::string targetToken; // Optional text fallback for explicit target resolution
   std::string ttsHash; // Optional soundcache hash for line-level TTS playback
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
+  DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
+  bool proximityMoveIssued; // True after at least one approach move order.
+
+  QueuedAction()
+      : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
+        proximityMoveIssued(false) {}
 };
 
 extern std::deque<QueuedAction> g_uiActionQueue;

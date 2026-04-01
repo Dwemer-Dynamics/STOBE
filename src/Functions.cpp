@@ -50,6 +50,7 @@ const int kDrugHighDurationSeconds = 5 * 60 * 60;
 const float kDrugHungerMultiplier = 1.5f;
 const float kDrugExtraHungerMultiplier = kDrugHungerMultiplier - 1.0f;
 const float kNpcCloseActionRangeUnits = 25.0f;
+const DWORD kNpcCloseActionApproachTimeoutMs = 10000;
 
 struct NpcDrunkState {
   int level;
@@ -1660,6 +1661,189 @@ std::string NormalizeCarryTargetToken(const std::string &value) {
     normalized = TrimCopySimple(normalized.substr(3));
   }
   return normalized;
+}
+
+enum CloseActionApproachResult {
+  CLOSE_ACTION_APPROACH_NOT_APPLICABLE = 0,
+  CLOSE_ACTION_APPROACH_DEFERRED = 1,
+  CLOSE_ACTION_APPROACH_TIMED_OUT = 2,
+};
+
+static bool IsCloseActionApproachRetryableReason(const std::string &reason) {
+  return reason == "out_of_range" || reason == "area_mismatch";
+}
+
+static std::string DescribeCloseActionRangeReasonForUser(
+    const std::string &reason) {
+  if (reason == "area_mismatch") {
+    return "not in the same area";
+  }
+  if (reason == "distance_failed" || reason == "invalid_handles") {
+    return "not reachable";
+  }
+  return "too far away";
+}
+
+static void ResetCloseActionApproachState(Character *actor, QueuedAction &act) {
+  if (actor && (uintptr_t)actor > 0x1000) {
+    unsigned int actorSerial = 0;
+    try {
+      actorSerial = actor->getHandle().serial;
+    } catch (...) {
+      actorSerial = 0;
+    }
+    if (actorSerial != 0) {
+      try {
+        ClearFollowTarget(actorSerial);
+      } catch (...) {
+      }
+      try {
+        ClearTravelTarget(actorSerial);
+      } catch (...) {
+      }
+    }
+  }
+  act.proximityStartTick = 0;
+  act.proximityMoveIssued = false;
+}
+
+static CloseActionApproachResult TryDeferCloseActionUntilInRange(
+    GameWorld *world, Character *actor, Character *target, QueuedAction &act,
+    const std::string &actionLabel, const std::string &targetDisplayName,
+    float currentDistance, const std::string &rangeReason,
+    float allowedRangeUnits) {
+  if (!world || !actor || !target || (uintptr_t)actor <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
+  }
+  if (!IsCloseActionApproachRetryableReason(rangeReason)) {
+    return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
+  }
+
+  DWORD nowTick = GetTickCount();
+  if (act.proximityStartTick == 0 || nowTick < act.proximityStartTick) {
+    act.proximityStartTick = nowTick;
+    act.proximityMoveIssued = false;
+  }
+  DWORD elapsedMs = nowTick - act.proximityStartTick;
+  if (elapsedMs >= kNpcCloseActionApproachTimeoutMs) {
+    ResetCloseActionApproachState(actor, act);
+    return CLOSE_ACTION_APPROACH_TIMED_OUT;
+  }
+
+  unsigned int actorSerial = 0;
+  try {
+    actorSerial = actor->getHandle().serial;
+  } catch (...) {
+    actorSerial = 0;
+  }
+  hand targetHandle;
+  try {
+    targetHandle = target->getHandle();
+  } catch (...) {
+    targetHandle = hand();
+  }
+  if (actorSerial != 0 && targetHandle.isValid() && targetHandle.serial != 0) {
+    try {
+      SetFollowTarget(actorSerial, targetHandle);
+    } catch (...) {
+    }
+    try {
+      ClearTravelTarget(actorSerial);
+    } catch (...) {
+    }
+  }
+
+  try {
+    if (actor->dialogue && (uintptr_t)actor->dialogue > 0x1000) {
+      actor->dialogue->endDialogue(true);
+      actor->dialogue->setInDialog(false);
+    }
+  } catch (...) {
+  }
+  try {
+    actor->setStandingOrder((MessageForB::StandingOrder)13 /* PASSIVE */, false);
+    actor->setStandingOrder((MessageForB::StandingOrder)12 /* HOLD */, false);
+  } catch (...) {
+  }
+
+  bool destinationQueued = false;
+  bool goalQueued = false;
+  bool jobQueued = false;
+  try {
+    actor->setDestination(target->getPosition(), false);
+    destinationQueued = true;
+  } catch (...) {
+    destinationQueued = false;
+  }
+
+  if (!act.proximityMoveIssued) {
+    try {
+      actor->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
+      goalQueued = true;
+    } catch (...) {
+      goalQueued = false;
+    }
+    try {
+      actor->addJob(STAY_CLOSE_TO_TARGET, (RootObject *)target, true, false,
+                    actor->getPosition());
+      jobQueued = true;
+    } catch (...) {
+      jobQueued = false;
+    }
+  }
+
+  try {
+    CharMovement *movement = actor->getMovement();
+    if (movement && (uintptr_t)movement > 0x1000) {
+      movement->setDesiredSpeedOrders(RUN);
+      movement->setDesiredSpeed(RUN);
+      if (!destinationQueued) {
+        movement->setDestination(target, HIGH_PRIORITY);
+        destinationQueued = true;
+      }
+    }
+  } catch (...) {
+  }
+
+  try {
+    actor->reThinkCurrentAIAction();
+  } catch (...) {
+  }
+
+  try {
+    hand targetHandle = target->getHandle();
+    if (targetHandle.isValid() && targetHandle.serial != 0) {
+      act.target = targetHandle;
+    }
+  } catch (...) {
+  }
+
+  std::string actorName = SafeCharacterName(actor);
+  std::string targetName = TrimCopySimple(targetDisplayName);
+  if (targetName.empty()) {
+    targetName = SafeCharacterName(target);
+  }
+  if (targetName.empty()) {
+    targetName = "the target";
+  }
+  if (!act.proximityMoveIssued) {
+    world->showPlayerAMessage_withLog(
+        actorName + " moves toward " + targetName + " to " + actionLabel + ".",
+        true);
+  }
+
+  Log("ACTION_EXEC: CLOSE_ACTION_APPROACH actor=" + actorName +
+      " action=" + actionLabel + " target=" + targetName +
+      " reason=" + rangeReason + " dist=" + ToString(currentDistance) +
+      " max_dist=" + ToString(allowedRangeUnits) +
+      " elapsed_ms=" + ToString((int)elapsedMs) +
+      " destination_queued=" + std::string(destinationQueued ? "1" : "0") +
+      " goal_queued=" + std::string(goalQueued ? "1" : "0") +
+      " job_queued=" + std::string(jobQueued ? "1" : "0"));
+
+  act.proximityMoveIssued = true;
+  return CLOSE_ACTION_APPROACH_DEFERRED;
 }
 
 bool StringContainsAsciiInsensitive(const std::string &haystack,
@@ -3863,6 +4047,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       bool blockSpeechQueue = false;
       DWORD speechDelayMs = 0;
       bool lockReacquired = false;
+      bool deferActionQueue = false;
+      bool queueDeferredAction = false;
+      QueuedAction deferredAction;
 
       Character *npc = ResolveLiveCharacter(thisptr, act.actor);
       Character *target = ResolveLiveCharacter(thisptr, act.target);
@@ -5010,19 +5197,41 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                                kNpcCloseActionRangeUnits,
                                                actionDistance, rangeReason)) {
                 canLootSource = false;
-                std::string userReason = "too far away";
-                if (rangeReason == "area_mismatch") {
-                  userReason = "not in the same area";
+                CloseActionApproachResult approachResult =
+                    TryDeferCloseActionUntilInRange(
+                        thisptr, npc, sourceCharacter, act, "loot", sourceName,
+                        actionDistance, rangeReason, kNpcCloseActionRangeUnits);
+                if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                  queueDeferredAction = true;
+                  deferActionQueue = true;
+                  deferredAction = act;
+                } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                  const std::string userReason =
+                      DescribeCloseActionRangeReasonForUser(rangeReason);
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " could not reach " + sourceName +
+                          " in time to loot them (" + userReason + ").",
+                      true);
+                  Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                      " source=" + sourceName +
+                      " reason=approach_timeout last_reason=" + rangeReason +
+                      " dist=" + ToString(actionDistance) + " max_dist=" +
+                      ToString(kNpcCloseActionRangeUnits) +
+                      " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+                } else {
+                  const std::string userReason =
+                      DescribeCloseActionRangeReasonForUser(rangeReason);
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " cannot loot " + sourceName +
+                          " because they are " + userReason + ".",
+                      true);
+                  Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                      " source=" + sourceName + " reason=" + rangeReason +
+                      " dist=" + ToString(actionDistance) + " max_dist=" +
+                      ToString(kNpcCloseActionRangeUnits));
                 }
-                thisptr->showPlayerAMessage_withLog(
-                    actorName + " cannot loot " + sourceName + " because they are " +
-                        userReason + ".",
-                    true);
-                Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
-                    " source=" + sourceName + " reason=" + rangeReason +
-                    " dist=" + ToString(actionDistance) + " max_dist=" +
-                    ToString(kNpcCloseActionRangeUnits));
               } else {
+                ResetCloseActionApproachState(npc, act);
                 std::string invalidReason = "";
                 if (!IsTakeItemLootTargetValid(thisptr, sourceCharacter,
                                                invalidReason, sourceIsDead)) {
@@ -5522,19 +5731,42 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             std::string rangeReason = "";
             if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
                                              actionDistance, rangeReason)) {
-              std::string userReason = "too far away";
-              if (rangeReason == "area_mismatch") {
-                userReason = "not in the same area";
+              CloseActionApproachResult approachResult =
+                  TryDeferCloseActionUntilInRange(
+                      thisptr, npc, target, act, "force a drink",
+                      targetName, actionDistance, rangeReason,
+                      kNpcCloseActionRangeUnits);
+              if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                queueDeferredAction = true;
+                deferActionQueue = true;
+                deferredAction = act;
+              } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " could not reach " + targetName +
+                        " in time to force the drink (" + userReason + ").",
+                    true);
+                Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                    " target=" + targetName +
+                    " reason=approach_timeout last_reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits) +
+                    " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+              } else {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot force " + targetName +
+                        " to drink because they are " + userReason + ".",
+                    true);
+                Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
               }
-              thisptr->showPlayerAMessage_withLog(
-                  actorName + " cannot force " + targetName +
-                      " to drink because they are " + userReason + ".",
-                  true);
-              Log("ACTION_EXEC: FORCE_DRINK blocked actor=" + actorName +
-                  " target=" + targetName + " reason=" + rangeReason +
-                  " dist=" + ToString(actionDistance) + " max_dist=" +
-                  ToString(kNpcCloseActionRangeUnits));
             } else {
+              ResetCloseActionApproachState(npc, act);
               std::string invalidReason = "";
               if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
                 if (invalidReason.empty()) {
@@ -5817,159 +6049,183 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             std::string rangeReason = "";
             if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
                                              actionDistance, rangeReason)) {
-              Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
-                  " target=" + targetName + " reason=" + rangeReason +
-                  " dist=" + ToString(actionDistance) + " max_dist=" +
-                  ToString(kNpcCloseActionRangeUnits));
-              std::string userReason = "too far away";
-              if (rangeReason == "area_mismatch") {
-                userReason = "not in the same area";
-              }
-              thisptr->showPlayerAMessage_withLog(
-                  actorName + " cannot remove " + targetName +
-                      "'s limb because they are " + userReason + ".",
-                  true);
-              continue;
-            }
-            std::string invalidReason = "";
-            if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
-              if (invalidReason.empty()) {
-                invalidReason = "target is not in a valid state";
-              }
-              Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
-                  " target=" + targetName + " reason=" + invalidReason);
-              thisptr->showPlayerAMessage_withLog(
-                  actorName + " cannot remove " + targetName +
-                      "'s limb: " + invalidReason + ".",
-                  true);
-            } else {
-              RobotLimbs::Limb limb = RobotLimbs::NULL_LIMB;
-              std::string limbName = "";
-              if (!ResolveRobotLimbFromCode(act.taskValue, limb, limbName) ||
-                  limb == RobotLimbs::NULL_LIMB) {
-                Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
-                    " target=" + targetName + " reason=invalid_limb_code code=" +
-                    ToString(act.taskValue));
+              CloseActionApproachResult approachResult =
+                  TryDeferCloseActionUntilInRange(
+                      thisptr, npc, target, act, "remove a limb from",
+                      targetName, actionDistance, rangeReason,
+                      kNpcCloseActionRangeUnits);
+              if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                queueDeferredAction = true;
+                deferActionQueue = true;
+                deferredAction = act;
+              } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
                 thisptr->showPlayerAMessage_withLog(
-                    actorName + " could not determine which limb to remove.",
+                    actorName + " could not reach " + targetName +
+                        " in time to remove a limb (" + userReason + ").",
+                    true);
+                Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
+                    " target=" + targetName +
+                    " reason=approach_timeout last_reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits) +
+                    " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+              } else {
+                Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot remove " + targetName +
+                        "'s limb because they are " + userReason + ".",
+                    true);
+              }
+            } else {
+              ResetCloseActionApproachState(npc, act);
+              std::string invalidReason = "";
+              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+                if (invalidReason.empty()) {
+                  invalidReason = "target is not in a valid state";
+                }
+                Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + invalidReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot remove " + targetName +
+                        "'s limb: " + invalidReason + ".",
                     true);
               } else {
-                MedicalSystem *medical = nullptr;
-                try {
-                  medical = target->getMedical();
-                } catch (...) {
-                  medical = nullptr;
-                }
-                if (!medical || (uintptr_t)medical <= 0x1000) {
+                RobotLimbs::Limb limb = RobotLimbs::NULL_LIMB;
+                std::string limbName = "";
+                if (!ResolveRobotLimbFromCode(act.taskValue, limb, limbName) ||
+                    limb == RobotLimbs::NULL_LIMB) {
                   Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
-                      " target=" + targetName + " reason=missing_medical");
+                      " target=" + targetName +
+                      " reason=invalid_limb_code code=" +
+                      ToString(act.taskValue));
                   thisptr->showPlayerAMessage_withLog(
-                      actorName + " could not access " + targetName +
-                          "'s medical state.",
+                      actorName + " could not determine which limb to remove.",
                       true);
                 } else {
-                  LimbState limbState = LIMB_ORIGINAL;
-                  bool stateKnown = false;
+                  MedicalSystem *medical = nullptr;
                   try {
-                    limbState = medical->getLimbState(limb);
-                    stateKnown = true;
+                    medical = target->getMedical();
                   } catch (...) {
-                    stateKnown = false;
+                    medical = nullptr;
                   }
-                  if (stateKnown &&
-                      (limbState == LIMB_STUMP || limbState == LIMB_CRUSHED)) {
-                    Log("ACTION_EXEC: REMOVE_LIMB skipped actor=" + actorName +
-                        " target=" + targetName + " limb=" + limbName +
-                        " reason=already_missing");
+                  if (!medical || (uintptr_t)medical <= 0x1000) {
+                    Log("ACTION_EXEC: REMOVE_LIMB blocked actor=" + actorName +
+                        " target=" + targetName + " reason=missing_medical");
                     thisptr->showPlayerAMessage_withLog(
-                        targetName + "'s " + limbName + " is already missing.",
+                        actorName + " could not access " + targetName +
+                            "'s medical state.",
                         true);
                   } else {
-                    bool amputated = false;
+                    LimbState limbState = LIMB_ORIGINAL;
+                    bool stateKnown = false;
                     try {
-                      Ogre::Vector3 force(0.0f, 0.0f, 0.0f);
-                      medical->amputate(limb, true, force);
-                      amputated = true;
+                      limbState = medical->getLimbState(limb);
+                      stateKnown = true;
                     } catch (...) {
-                      amputated = false;
+                      stateKnown = false;
                     }
-                    if (amputated) {
-                      bool limbHealthForced = false;
-                      bool knockoutForced = false;
-                      ForcePostAmputationKnockout(
-                          medical, limb, limbHealthForced, knockoutForced);
-                      unsigned int actorSerial = 0;
-                      unsigned int targetSerial = 0;
-                      try {
-                        actorSerial = npc->getHandle().serial;
-                      } catch (...) {
-                        actorSerial = 0;
-                      }
-                      try {
-                        targetSerial = target->getHandle().serial;
-                      } catch (...) {
-                        targetSerial = 0;
-                      }
-                      auto resolveFactionNameSafe = [](Character *character)
-                          -> std::string {
-                        if (!character || (uintptr_t)character <= 0x1000) {
-                          return "None";
-                        }
-                        try {
-                          Faction *faction =
-                              character->getFaction()
-                                  ? character->getFaction()
-                                  : character->owner;
-                          if (faction && (uintptr_t)faction > 0x1000) {
-                            std::string factionName = faction->getName();
-                            if (!factionName.empty()) {
-                              return factionName;
-                            }
-                            if (faction->data) {
-                              std::string fallback = faction->data->name;
-                              if (fallback.empty()) {
-                                fallback = faction->data->stringID;
-                              }
-                              if (!fallback.empty()) {
-                                return fallback;
-                              }
-                            }
-                          }
-                        } catch (...) {
-                        }
-                        return "None";
-                      };
-                      LogGameEvent(
-                          "limb_loss", actorName, resolveFactionNameSafe(npc),
-                          targetName, resolveFactionNameSafe(target),
-                          "severed " + limbName + " from " + targetName +
-                              " with a hacksaw",
-                          actorSerial, targetSerial);
-                      try {
-                        target->reThinkCurrentAIAction();
-                      } catch (...) {
-                      }
-                      try {
-                        npc->reThinkCurrentAIAction();
-                      } catch (...) {
-                      }
-                      Log("ACTION_EXEC: REMOVE_LIMB success actor=" + actorName +
+                    if (stateKnown &&
+                        (limbState == LIMB_STUMP || limbState == LIMB_CRUSHED)) {
+                      Log("ACTION_EXEC: REMOVE_LIMB skipped actor=" + actorName +
                           " target=" + targetName + " limb=" + limbName +
-                          " limb_health_forced=" +
-                          std::string(limbHealthForced ? "1" : "0") +
-                          " knockout_forced=" +
-                          std::string(knockoutForced ? "1" : "0"));
+                          " reason=already_missing");
                       thisptr->showPlayerAMessage_withLog(
-                          actorName + " removed " + targetName + "'s " +
-                              limbName + ".",
+                          targetName + "'s " + limbName + " is already missing.",
                           true);
                     } else {
-                      Log("ACTION_EXEC: REMOVE_LIMB failed actor=" + actorName +
-                          " target=" + targetName + " limb=" + limbName);
-                      thisptr->showPlayerAMessage_withLog(
-                          actorName + " failed to remove " + targetName + "'s " +
-                              limbName + ".",
-                          true);
+                      bool amputated = false;
+                      try {
+                        Ogre::Vector3 force(0.0f, 0.0f, 0.0f);
+                        medical->amputate(limb, true, force);
+                        amputated = true;
+                      } catch (...) {
+                        amputated = false;
+                      }
+                      if (amputated) {
+                        bool limbHealthForced = false;
+                        bool knockoutForced = false;
+                        ForcePostAmputationKnockout(
+                            medical, limb, limbHealthForced, knockoutForced);
+                        unsigned int actorSerial = 0;
+                        unsigned int targetSerial = 0;
+                        try {
+                          actorSerial = npc->getHandle().serial;
+                        } catch (...) {
+                          actorSerial = 0;
+                        }
+                        try {
+                          targetSerial = target->getHandle().serial;
+                        } catch (...) {
+                          targetSerial = 0;
+                        }
+                        auto resolveFactionNameSafe = [](Character *character)
+                            -> std::string {
+                          if (!character || (uintptr_t)character <= 0x1000) {
+                            return "None";
+                          }
+                          try {
+                            Faction *faction =
+                                character->getFaction()
+                                    ? character->getFaction()
+                                    : character->owner;
+                            if (faction && (uintptr_t)faction > 0x1000) {
+                              std::string factionName = faction->getName();
+                              if (!factionName.empty()) {
+                                return factionName;
+                              }
+                              if (faction->data) {
+                                std::string fallback = faction->data->name;
+                                if (fallback.empty()) {
+                                  fallback = faction->data->stringID;
+                                }
+                                if (!fallback.empty()) {
+                                  return fallback;
+                                }
+                              }
+                            }
+                          } catch (...) {
+                          }
+                          return "None";
+                        };
+                        LogGameEvent(
+                            "limb_loss", actorName, resolveFactionNameSafe(npc),
+                            targetName, resolveFactionNameSafe(target),
+                            "severed " + limbName + " from " + targetName +
+                                " with a hacksaw",
+                            actorSerial, targetSerial);
+                        try {
+                          target->reThinkCurrentAIAction();
+                        } catch (...) {
+                        }
+                        try {
+                          npc->reThinkCurrentAIAction();
+                        } catch (...) {
+                        }
+                        Log("ACTION_EXEC: REMOVE_LIMB success actor=" + actorName +
+                            " target=" + targetName + " limb=" + limbName +
+                            " limb_health_forced=" +
+                            std::string(limbHealthForced ? "1" : "0") +
+                            " knockout_forced=" +
+                            std::string(knockoutForced ? "1" : "0"));
+                        thisptr->showPlayerAMessage_withLog(
+                            actorName + " removed " + targetName + "'s " +
+                                limbName + ".",
+                            true);
+                      } else {
+                        Log("ACTION_EXEC: REMOVE_LIMB failed actor=" + actorName +
+                            " target=" + targetName + " limb=" + limbName);
+                        thisptr->showPlayerAMessage_withLog(
+                            actorName + " failed to remove " + targetName +
+                                "'s " + limbName + ".",
+                            true);
+                      }
                     }
                   }
                 }
@@ -5998,111 +6254,133 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             std::string rangeReason = "";
             if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
                                              actionDistance, rangeReason)) {
-              Log("ACTION_EXEC: KILL blocked actor=" + actorName +
-                  " target=" + targetName + " reason=" + rangeReason +
-                  " dist=" + ToString(actionDistance) + " max_dist=" +
-                  ToString(kNpcCloseActionRangeUnits));
-              std::string userReason = "too far away";
-              if (rangeReason == "area_mismatch") {
-                userReason = "not in the same area";
-              }
-              thisptr->showPlayerAMessage_withLog(
-                  actorName + " cannot kill " + targetName +
-                      " because they are " + userReason + ".",
-                  true);
-              continue;
-            }
-            std::string invalidReason = "";
-            if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
-              if (invalidReason.empty()) {
-                invalidReason = "target is not in a valid state";
-              }
-              Log("ACTION_EXEC: KILL blocked actor=" + actorName +
-                  " target=" + targetName + " reason=" + invalidReason);
-              thisptr->showPlayerAMessage_withLog(
-                  actorName + " cannot kill " + targetName + ": " +
-                      invalidReason + ".",
-                  true);
-            } else {
-              ClearCharacterSpeechBubble(target);
-
-              MedicalSystem *medical = nullptr;
-              try {
-                medical = target->getMedical();
-              } catch (...) {
-                medical = nullptr;
-              }
-              bool bloodForced = false;
-              bool validatedHealth = false;
-              if (medical && (uintptr_t)medical > 0x1000) {
-                try {
-                  medical->blood = 0.0f;
-                  bloodForced = true;
-                } catch (...) {
-                  bloodForced = false;
-                }
-                try {
-                  medical->validateHealthValues();
-                  validatedHealth = true;
-                } catch (...) {
-                  validatedHealth = false;
-                }
-              }
-
-              bool alreadyDead = false;
-              try {
-                alreadyDead = target->isDead();
-              } catch (...) {
-                alreadyDead = false;
-              }
-
-              bool declaredDead = false;
-              if (!alreadyDead) {
-                try {
-                  target->declareDead();
-                  declaredDead = true;
-                } catch (...) {
-                  declaredDead = false;
-                }
-              }
-
-              bool nowDead = alreadyDead || declaredDead;
-              if (!nowDead) {
-                try {
-                  nowDead = target->isDead();
-                } catch (...) {
-                  nowDead = false;
-                }
-              }
-
-              try {
-                target->reThinkCurrentAIAction();
-              } catch (...) {
-              }
-              try {
-                npc->reThinkCurrentAIAction();
-              } catch (...) {
-              }
-
-              if (nowDead) {
-                Log("ACTION_EXEC: KILL success actor=" + actorName +
-                    " target=" + targetName +
-                    " blood_forced=" + std::string(bloodForced ? "1" : "0") +
-                    " medical_validated=" +
-                    std::string(validatedHealth ? "1" : "0") +
-                    " already_dead=" + std::string(alreadyDead ? "1" : "0") +
-                    " declared_dead=" +
-                    std::string(declaredDead ? "1" : "0"));
+              CloseActionApproachResult approachResult =
+                  TryDeferCloseActionUntilInRange(
+                      thisptr, npc, target, act, "kill", targetName,
+                      actionDistance, rangeReason, kNpcCloseActionRangeUnits);
+              if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                queueDeferredAction = true;
+                deferActionQueue = true;
+                deferredAction = act;
+              } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
                 thisptr->showPlayerAMessage_withLog(
-                    actorName + " killed " + targetName + ".", true);
+                    actorName + " could not reach " + targetName +
+                        " in time to kill them (" + userReason + ").",
+                    true);
+                Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                    " target=" + targetName +
+                    " reason=approach_timeout last_reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits) +
+                    " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
               } else {
-                Log("ACTION_EXEC: KILL failed actor=" + actorName +
-                    " target=" + targetName +
-                    " blood_forced=" + std::string(bloodForced ? "1" : "0") +
-                    " medical_validated=" +
-                    std::string(validatedHealth ? "1" : "0"));
+                Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
                 thisptr->showPlayerAMessage_withLog(
-                    actorName + " failed to kill " + targetName + ".", true);
+                    actorName + " cannot kill " + targetName +
+                        " because they are " + userReason + ".",
+                    true);
+              }
+            } else {
+              ResetCloseActionApproachState(npc, act);
+              std::string invalidReason = "";
+              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+                if (invalidReason.empty()) {
+                  invalidReason = "target is not in a valid state";
+                }
+                Log("ACTION_EXEC: KILL blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + invalidReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot kill " + targetName + ": " +
+                        invalidReason + ".",
+                    true);
+              } else {
+                ClearCharacterSpeechBubble(target);
+
+                MedicalSystem *medical = nullptr;
+                try {
+                  medical = target->getMedical();
+                } catch (...) {
+                  medical = nullptr;
+                }
+                bool bloodForced = false;
+                bool validatedHealth = false;
+                if (medical && (uintptr_t)medical > 0x1000) {
+                  try {
+                    medical->blood = 0.0f;
+                    bloodForced = true;
+                  } catch (...) {
+                    bloodForced = false;
+                  }
+                  try {
+                    medical->validateHealthValues();
+                    validatedHealth = true;
+                  } catch (...) {
+                    validatedHealth = false;
+                  }
+                }
+
+                bool alreadyDead = false;
+                try {
+                  alreadyDead = target->isDead();
+                } catch (...) {
+                  alreadyDead = false;
+                }
+
+                bool declaredDead = false;
+                if (!alreadyDead) {
+                  try {
+                    target->declareDead();
+                    declaredDead = true;
+                  } catch (...) {
+                    declaredDead = false;
+                  }
+                }
+
+                bool nowDead = alreadyDead || declaredDead;
+                if (!nowDead) {
+                  try {
+                    nowDead = target->isDead();
+                  } catch (...) {
+                    nowDead = false;
+                  }
+                }
+
+                try {
+                  target->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+                try {
+                  npc->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+
+                if (nowDead) {
+                  Log("ACTION_EXEC: KILL success actor=" + actorName +
+                      " target=" + targetName +
+                      " blood_forced=" + std::string(bloodForced ? "1" : "0") +
+                      " medical_validated=" +
+                      std::string(validatedHealth ? "1" : "0") +
+                      " already_dead=" + std::string(alreadyDead ? "1" : "0") +
+                      " declared_dead=" +
+                      std::string(declaredDead ? "1" : "0"));
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " killed " + targetName + ".", true);
+                } else {
+                  Log("ACTION_EXEC: KILL failed actor=" + actorName +
+                      " target=" + targetName +
+                      " blood_forced=" + std::string(bloodForced ? "1" : "0") +
+                      " medical_validated=" +
+                      std::string(validatedHealth ? "1" : "0"));
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " failed to kill " + targetName + ".", true);
+                }
               }
             }
           }
@@ -6366,19 +6644,42 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               if (!ValidateNpcCloseActionRange(npc, pickupTarget,
                                                kNpcCloseActionRangeUnits,
                                                actionDistance, rangeReason)) {
-                std::string userReason = "too far away";
-                if (rangeReason == "area_mismatch") {
-                  userReason = "not in the same area";
+                CloseActionApproachResult approachResult =
+                    TryDeferCloseActionUntilInRange(
+                        thisptr, npc, pickupTarget, act, "pick up",
+                        targetName, actionDistance, rangeReason,
+                        kNpcCloseActionRangeUnits);
+                if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                  queueDeferredAction = true;
+                  deferActionQueue = true;
+                  deferredAction = act;
+                } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                  const std::string userReason =
+                      DescribeCloseActionRangeReasonForUser(rangeReason);
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " could not reach " + targetName +
+                          " in time to pick them up (" + userReason + ").",
+                      true);
+                  Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                      " target=" + targetName +
+                      " reason=approach_timeout last_reason=" + rangeReason +
+                      " dist=" + ToString(actionDistance) + " max_dist=" +
+                      ToString(kNpcCloseActionRangeUnits) +
+                      " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+                } else {
+                  const std::string userReason =
+                      DescribeCloseActionRangeReasonForUser(rangeReason);
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " cannot pick up " + targetName +
+                          " because they are " + userReason + ".",
+                      true);
+                  Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                      " target=" + targetName + " reason=" + rangeReason +
+                      " dist=" + ToString(actionDistance) + " max_dist=" +
+                      ToString(kNpcCloseActionRangeUnits));
                 }
-                thisptr->showPlayerAMessage_withLog(
-                    actorName + " cannot pick up " + targetName +
-                        " because they are " + userReason + ".",
-                    true);
-                Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
-                    " target=" + targetName + " reason=" + rangeReason +
-                    " dist=" + ToString(actionDistance) + " max_dist=" +
-                    ToString(kNpcCloseActionRangeUnits));
               } else {
+                ResetCloseActionApproachState(npc, act);
                 std::string invalidReason = "";
                 bool targetDead = false;
                 if (!IsPickupNpcTargetValid(thisptr, pickupTarget, invalidReason,
@@ -6618,6 +6919,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         EnterCriticalSection(&g_uiMutex);
         lockReacquired = true;
       }
+      if (queueDeferredAction) {
+        g_uiActionQueue.push_front(deferredAction);
+      }
       if (blockSpeechQueue) {
         DWORD gateNowTick = GetTickCount();
         speechDelayRemainingScaledMs = static_cast<double>(speechDelayMs);
@@ -6635,7 +6939,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       if (lockReacquired) {
         LeaveCriticalSection(&g_uiMutex);
       }
-      if (blockSpeechQueue) {
+      if (blockSpeechQueue || deferActionQueue) {
         break;
       }
     }
