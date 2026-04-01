@@ -6889,61 +6889,248 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 giveItemSummary + "] target='" + giveItemTargetToken +
                 "' target_serial=" + ToString((unsigned int)giveItemTarget.serial));
           } else if (actionCommand == "TAKE_ITEM") {
-            std::string takeItemPayload = TrimCopy(actionArgument);
-            std::string itemQuery = takeItemPayload;
-            std::string targetToken = "";
-            hand takeItemTarget = hand();
-            if (!takeItemPayload.empty()) {
-              size_t splitPos = takeItemPayload.find('@');
-              if (splitPos != std::string::npos) {
-                std::string leftToken =
-                    TrimCopy(takeItemPayload.substr(0, splitPos));
-                std::string rightToken =
-                    TrimCopy(takeItemPayload.substr(splitPos + 1));
-                hand leftTarget = hand();
-                hand rightTarget = hand();
-                if (!leftToken.empty()) {
-                  leftTarget = resolveActionTargetHand(leftToken, targetHand);
-                }
-                if (!rightToken.empty()) {
-                  rightTarget = resolveActionTargetHand(rightToken, targetHand);
-                }
+            std::string takeItemTargetToken = "";
+            std::vector<std::pair<std::string, int>> takeItemRequests;
 
-                if (leftTarget.isValid() &&
-                    (!rightTarget.isValid() || rightToken.empty())) {
-                  targetToken = leftToken;
-                  takeItemTarget = leftTarget;
-                  itemQuery = rightToken;
-                } else if (rightTarget.isValid() &&
-                           (!leftTarget.isValid() || leftToken.empty())) {
-                  targetToken = rightToken;
-                  takeItemTarget = rightTarget;
-                  itemQuery = leftToken;
-                } else if (leftTarget.isValid() && rightTarget.isValid()) {
-                  targetToken = leftToken;
-                  takeItemTarget = leftTarget;
-                  itemQuery = rightToken;
+            auto parseLegacyTakeItemPayload =
+                [&](const std::string &rawPayload, std::string &targetOut,
+                    std::string &itemOut, int &amountOut) -> bool {
+              targetOut.clear();
+              itemOut.clear();
+              amountOut = 1;
+              std::string payload = TrimCopy(rawPayload);
+              if (payload.empty()) {
+                return false;
+              }
+
+              size_t firstAtPos = payload.find('@');
+              if (firstAtPos != std::string::npos &&
+                  firstAtPos == payload.find_last_of('@')) {
+                std::string leftAtToken = TrimCopy(payload.substr(0, firstAtPos));
+                std::string rightAtToken =
+                    TrimCopy(payload.substr(firstAtPos + 1));
+                if (!leftAtToken.empty() && !rightAtToken.empty()) {
+                  bool rightIsDigits = true;
+                  for (size_t i = 0; i < rightAtToken.size(); ++i) {
+                    unsigned char ch = (unsigned char)rightAtToken[i];
+                    if (ch < '0' || ch > '9') {
+                      rightIsDigits = false;
+                      break;
+                    }
+                  }
+                  if (rightIsDigits) {
+                    hand leftAsTarget =
+                        resolveActionTargetHand(leftAtToken, targetHand);
+                    hand rightAsTarget =
+                        resolveActionTargetHand(rightAtToken, targetHand);
+                    if (!leftAsTarget.isValid() && !rightAsTarget.isValid()) {
+                      int parsedAmount = atoi(rightAtToken.c_str());
+                      if (parsedAmount > 0) {
+                        targetOut.clear();
+                        itemOut = leftAtToken;
+                        amountOut = parsedAmount;
+                        return true;
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Primary parser handles target@item and quantity formats.
+              if (parseGiveItemPayload(payload, targetOut, itemOut, amountOut)) {
+                if (!targetOut.empty()) {
+                  hand parsedTarget = resolveActionTargetHand(targetOut, targetHand);
+                  if (!parsedTarget.isValid()) {
+                    targetOut.clear();
+                    itemOut.clear();
+                    amountOut = 1;
+                  }
+                }
+              }
+              if (!itemOut.empty() || !targetOut.empty()) {
+                if (itemOut.empty() && !targetOut.empty()) {
+                  itemOut = "equipment";
+                  amountOut = 1;
+                }
+                return !itemOut.empty() && amountOut > 0;
+              }
+
+              // Target-only shorthand means "loot target equipment".
+              hand shorthandTarget = resolveActionTargetHand(payload, targetHand);
+              if (shorthandTarget.isValid()) {
+                targetOut = payload;
+                itemOut = "equipment";
+                amountOut = 1;
+                return true;
+              }
+
+              // Legacy fallback supports item@target and target@item.
+              size_t splitPos = payload.find('@');
+              if (splitPos == std::string::npos) {
+                return false;
+              }
+              std::string leftToken = TrimCopy(payload.substr(0, splitPos));
+              std::string rightToken = TrimCopy(payload.substr(splitPos + 1));
+              if (leftToken.empty() || rightToken.empty()) {
+                return false;
+              }
+              hand leftTarget = resolveActionTargetHand(leftToken, targetHand);
+              hand rightTarget = resolveActionTargetHand(rightToken, targetHand);
+              std::string itemSpec = "";
+              if (leftTarget.isValid() &&
+                  (!rightTarget.isValid() || rightToken.empty())) {
+                targetOut = leftToken;
+                itemSpec = rightToken;
+              } else if (rightTarget.isValid() &&
+                         (!leftTarget.isValid() || leftToken.empty())) {
+                targetOut = rightToken;
+                itemSpec = leftToken;
+              } else if (leftTarget.isValid() && rightTarget.isValid()) {
+                targetOut = leftToken;
+                itemSpec = rightToken;
+              } else {
+                return false;
+              }
+
+              if (itemSpec.empty()) {
+                itemOut = "equipment";
+                amountOut = 1;
+                return true;
+              }
+
+              std::string ignoredTargetToken = "";
+              if (!parseGiveItemPayload(itemSpec, ignoredTargetToken, itemOut,
+                                        amountOut)) {
+                itemOut = TrimCopy(itemSpec);
+                amountOut = 1;
+              }
+              if (itemOut.empty()) {
+                itemOut = "equipment";
+                amountOut = 1;
+              }
+              return amountOut > 0;
+            };
+
+            std::string trimmedTakeItemArg = TrimCopy(actionArgument);
+            bool listSyntaxRequested =
+                trimmedTakeItemArg.find(',') != std::string::npos ||
+                trimmedTakeItemArg.find(';') != std::string::npos;
+
+            if (listSyntaxRequested) {
+              std::string listPayload = trimmedTakeItemArg;
+              size_t firstAt = listPayload.find('@');
+              if (firstAt != std::string::npos) {
+                std::string targetToken = TrimCopy(listPayload.substr(0, firstAt));
+                std::string itemsToken = TrimCopy(listPayload.substr(firstAt + 1));
+                hand resolvedPrefixTarget =
+                    resolveActionTargetHand(targetToken, targetHand);
+                if (!targetToken.empty() && !itemsToken.empty() &&
+                    resolvedPrefixTarget.isValid()) {
+                  takeItemTargetToken = targetToken;
+                  listPayload = itemsToken;
+                }
+              }
+
+              std::vector<std::string> parts;
+              std::string current = "";
+              std::string listPayloadLower = ToLowerAsciiCopy(listPayload);
+              for (size_t i = 0; i < listPayload.size(); ++i) {
+                char ch = listPayload[i];
+                bool shouldSplit = (ch == ',' || ch == ';');
+                size_t splitAdvance = 0;
+                if (!shouldSplit && i + 5 <= listPayloadLower.size() &&
+                    listPayloadLower.substr(i, 5) == " and ") {
+                  shouldSplit = true;
+                  splitAdvance = 4;
+                }
+                if (shouldSplit) {
+                  std::string part = TrimCopy(current);
+                  if (!part.empty()) {
+                    parts.push_back(part);
+                  }
+                  current.clear();
+                  i += splitAdvance;
+                  continue;
+                }
+                current.push_back(ch);
+              }
+              std::string tail = TrimCopy(current);
+              if (!tail.empty()) {
+                parts.push_back(tail);
+              }
+
+              for (size_t i = 0; i < parts.size(); ++i) {
+                std::string parsedTargetToken = "";
+                std::string parsedItemName = "";
+                int parsedAmount = 1;
+                if (!parseLegacyTakeItemPayload(parts[i], parsedTargetToken,
+                                                parsedItemName, parsedAmount)) {
+                  Log("HOOK_MSG_PROC: TAKE_ITEM list part parse failed part='" +
+                      parts[i] + "'");
+                  continue;
+                }
+                if (!parsedTargetToken.empty() && takeItemTargetToken.empty()) {
+                  takeItemTargetToken = parsedTargetToken;
+                }
+                if (!parsedItemName.empty() && parsedAmount > 0) {
+                  takeItemRequests.push_back(
+                      std::make_pair(parsedItemName, parsedAmount));
                 }
               }
             }
 
-            itemQuery = TrimCopy(itemQuery);
-            if (takeItemTarget.isValid() && itemQuery.empty()) {
-              itemQuery = "equipment";
+            if (takeItemRequests.empty()) {
+              std::string iName = "";
+              int takeItemAmount = 1;
+              std::string parsedTargetToken = "";
+              if (!parseLegacyTakeItemPayload(actionArgument, parsedTargetToken,
+                                              iName, takeItemAmount)) {
+                Log("HOOK_MSG_PROC: TAKE_ITEM ignored; invalid payload '" +
+                    actionArgument + "'");
+                continue;
+              }
+              if (!parsedTargetToken.empty()) {
+                takeItemTargetToken = parsedTargetToken;
+              }
+              takeItemRequests.push_back(std::make_pair(iName, takeItemAmount));
             }
+
+            hand takeItemTarget = hand();
+            if (!takeItemTargetToken.empty()) {
+              takeItemTarget =
+                  resolveActionTargetHand(takeItemTargetToken, targetHand);
+              if (!takeItemTarget.isValid()) {
+                Log("HOOK_MSG_PROC: TAKE_ITEM ignored; target unresolved '" +
+                    takeItemTargetToken + "'");
+                continue;
+              }
+            }
+
             EnterCriticalSection(&g_uiMutex);
-            QueuedAction act;
-            act.type = ACT_TAKE_ITEM;
-            act.actor = targetHand;
-            act.target = takeItemTarget;
-            act.message = itemQuery;
-            g_uiActionQueue.push_back(act);
+            for (size_t i = 0; i < takeItemRequests.size(); ++i) {
+              QueuedAction act;
+              act.type = ACT_TAKE_ITEM;
+              act.actor = targetHand;
+              act.target = takeItemTarget;
+              act.message = takeItemRequests[i].first;
+              act.taskValue = takeItemRequests[i].second;
+              g_uiActionQueue.push_back(act);
+            }
             LeaveCriticalSection(&g_uiMutex);
+
+            std::string takeItemSummary = "";
+            for (size_t i = 0; i < takeItemRequests.size(); ++i) {
+              if (i > 0) {
+                takeItemSummary += ", ";
+              }
+              takeItemSummary += takeItemRequests[i].first + " x" +
+                                 ToString(takeItemRequests[i].second);
+            }
             Log("HOOK_MSG_PROC: TAKE_ITEM queued actor_serial=" +
-                ToString((unsigned int)targetHand.serial) + " target='" +
-                targetToken + "' target_serial=" +
-                ToString((unsigned int)takeItemTarget.serial) + " query='" +
-                itemQuery + "'");
+                ToString((unsigned int)targetHand.serial) + " count=" +
+                ToString((int)takeItemRequests.size()) + " items=[" +
+                takeItemSummary + "] target='" + takeItemTargetToken +
+                "' target_serial=" + ToString((unsigned int)takeItemTarget.serial));
           } else if (actionCommand == "DROP_ITEM") {
             std::string iName = actionArgument;
             EnterCriticalSection(&g_uiMutex);
@@ -7028,157 +7215,14 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             if (notice.empty()) {
               continue;
             }
-            auto tryParseCorpseLootRoleplay =
-                [&](const std::string &rawNotice, std::string &targetTokenOut,
-                    std::string &itemQueryOut) -> bool {
-              targetTokenOut.clear();
-              itemQueryOut.clear();
-              std::string lowered = ToLowerAsciiCopy(rawNotice);
-              bool hasLootVerb =
-                  lowered.find("loot") != std::string::npos ||
-                  lowered.find("strip") != std::string::npos ||
-                  lowered.find("strips") != std::string::npos ||
-                  lowered.find("stripped") != std::string::npos ||
-                  lowered.find("take") != std::string::npos ||
-                  lowered.find("takes") != std::string::npos;
-              bool hasCorpseHint =
-                  lowered.find("corpse") != std::string::npos ||
-                  lowered.find("dead body") != std::string::npos ||
-                  lowered.find(" body") != std::string::npos ||
-                  lowered.find("remains") != std::string::npos;
-              if (!hasLootVerb || !hasCorpseHint) {
-                return false;
-              }
-
-              std::string extractedTarget = "";
-              size_t fromPos = lowered.find(" from ");
-              if (fromPos != std::string::npos) {
-                extractedTarget = TrimCopy(rawNotice.substr(fromPos + 6));
-              }
-              if (extractedTarget.empty()) {
-                size_t corpseOfPos = lowered.find("corpse of ");
-                if (corpseOfPos != std::string::npos) {
-                  extractedTarget = TrimCopy(rawNotice.substr(corpseOfPos + 10));
-                }
-              }
-              if (extractedTarget.empty()) {
-                size_t bodyOfPos = lowered.find("body of ");
-                if (bodyOfPos != std::string::npos) {
-                  extractedTarget = TrimCopy(rawNotice.substr(bodyOfPos + 8));
-                }
-              }
-              if (extractedTarget.empty()) {
-                return false;
-              }
-
-              std::string targetLower = ToLowerAsciiCopy(extractedTarget);
-              size_t talkingPos = targetLower.find("(talking to:");
-              if (talkingPos != std::string::npos) {
-                extractedTarget = TrimCopy(extractedTarget.substr(0, talkingPos));
-              }
-
-              auto stripSuffixInsensitive = [&](std::string value,
-                                                const std::string &suffix)
-                  -> std::string {
-                if (EndsWithAsciiInsensitive(value, suffix) &&
-                    value.size() > suffix.size()) {
-                  return TrimCopy(value.substr(0, value.size() - suffix.size()));
-                }
-                return value;
-              };
-              auto stripTrailingPunctuation = [](std::string value) -> std::string {
-                while (!value.empty()) {
-                  char c = value.back();
-                  if (c == ' ' || c == '\t' || c == '"' || c == '\'' ||
-                      c == '.' || c == ',' || c == ';' || c == ':' || c == '!' ||
-                      c == '?' || c == ')' || c == ']' || c == '}') {
-                    value.erase(value.size() - 1, 1);
-                    continue;
-                  }
-                  break;
-                }
-                while (!value.empty()) {
-                  char c = value.front();
-                  if (c == ' ' || c == '\t' || c == '"' || c == '\'' ||
-                      c == '(' || c == '[' || c == '{') {
-                    value.erase(0, 1);
-                    continue;
-                  }
-                  break;
-                }
-                return TrimCopy(value);
-              };
-
-              extractedTarget = stripTrailingPunctuation(extractedTarget);
-              extractedTarget =
-                  stripSuffixInsensitive(extractedTarget, "'s corpse");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, "' corpse");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, " corpse");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, "'s body");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, "' body");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, " body");
-              extractedTarget =
-                  stripSuffixInsensitive(extractedTarget, "'s remains");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, "' remains");
-              extractedTarget = stripSuffixInsensitive(extractedTarget, " remains");
-              extractedTarget = stripTrailingPunctuation(extractedTarget);
-              if (extractedTarget.empty()) {
-                return false;
-              }
-
-              if (ContainsAsciiInsensitive(lowered, "weapon")) {
-                itemQueryOut = "weapon";
-              } else if (ContainsAsciiInsensitive(lowered, "all") ||
-                         ContainsAsciiInsensitive(lowered, "everything") ||
-                         ContainsAsciiInsensitive(lowered, "inventory") ||
-                         ContainsAsciiInsensitive(lowered, "items")) {
-                itemQueryOut = "all";
-              } else {
-                itemQueryOut = "equipment";
-              }
-
-              targetTokenOut = extractedTarget;
-              return true;
-            };
-
-            std::string corpseLootTargetToken = "";
-            std::string corpseLootQuery = "";
-            bool mappedToTakeItem = false;
-            if (tryParseCorpseLootRoleplay(notice, corpseLootTargetToken,
-                                           corpseLootQuery)) {
-              hand corpseLootTarget =
-                  resolveActionTargetHand(corpseLootTargetToken, targetHand);
-              if (corpseLootTarget.isValid()) {
-                EnterCriticalSection(&g_uiMutex);
-                QueuedAction act;
-                act.type = ACT_TAKE_ITEM;
-                act.actor = targetHand;
-                act.target = corpseLootTarget;
-                act.message = corpseLootQuery;
-                g_uiActionQueue.push_back(act);
-                LeaveCriticalSection(&g_uiMutex);
-                mappedToTakeItem = true;
-                Log("HOOK_MSG_PROC: ROLEPLAY_ACTION mapped actor_serial=" +
-                    ToString((unsigned int)targetHand.serial) + " target='" +
-                    corpseLootTargetToken + "' target_serial=" +
-                    ToString((unsigned int)corpseLootTarget.serial) + " query='" +
-                    corpseLootQuery + "'");
-              } else {
-                Log("HOOK_MSG_PROC: ROLEPLAY_ACTION loot mapping failed; unresolved "
-                    "target '" +
-                    corpseLootTargetToken + "'");
-              }
-            }
-            if (!mappedToTakeItem) {
-              EnterCriticalSection(&g_uiMutex);
-              QueuedAction act;
-              act.type = ACT_NOTIFY;
-              act.actor = targetHand;
-              act.target = hand();
-              act.message = notice;
-              g_uiActionQueue.push_back(act);
-              LeaveCriticalSection(&g_uiMutex);
-            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_NOTIFY;
+            act.actor = targetHand;
+            act.target = hand();
+            act.message = notice;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
           } else if (actionCommand == "TAKE_CATS") {
             std::string catsTargetToken = "";
             int catsAmount = 0;

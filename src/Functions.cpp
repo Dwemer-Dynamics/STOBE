@@ -4248,7 +4248,6 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           }
 
           const std::string actorName = SafeCharacterName(npc);
-          const std::string sourceName = SafeCharacterName(sourceCharacter);
           std::string itemQueryRaw = TrimCopySimple(act.message);
           if (itemQueryRaw.empty() && explicitSourceTarget) {
             itemQueryRaw = "equipment";
@@ -4273,11 +4272,150 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               itemQueryToken == "all" || itemQueryToken == "everything" ||
               itemQueryToken == "inventory" || itemQueryToken == "items" ||
               itemQueryToken == "loot";
+          int requestedCount = act.taskValue > 0 ? act.taskValue : 1;
+          if (requestedCount > 100) {
+            requestedCount = 100;
+          }
+
+          bool inferredLootSource = false;
+          if (!explicitSourceTarget && npc && (uintptr_t)npc > 0x1000 && thisptr) {
+            Character *bestCandidate = nullptr;
+            int bestScore = 0;
+            const auto &chars = thisptr->getCharacterUpdateList();
+            for (auto it = chars.begin(); it != chars.end(); ++it) {
+              Character *candidate = *it;
+              if (!candidate || (uintptr_t)candidate <= 0x1000 ||
+                  candidate == npc || candidate == primaryPlayer) {
+                continue;
+              }
+
+              float candidateDistance = -1.0f;
+              std::string candidateRangeReason = "";
+              if (!ValidateNpcCloseActionRange(npc, candidate,
+                                               kNpcCloseActionRangeUnits,
+                                               candidateDistance,
+                                               candidateRangeReason)) {
+                continue;
+              }
+
+              std::string candidateStateReason = "";
+              bool candidateDead = false;
+              if (!IsTakeItemLootTargetValid(thisptr, candidate, candidateStateReason,
+                                             candidateDead)) {
+                continue;
+              }
+
+              std::vector<Item *> candidateItems;
+              try {
+                GetAllCharacterItems(candidate, candidateItems);
+              } catch (...) {
+                candidateItems.clear();
+              }
+              if (candidateItems.empty()) {
+                continue;
+              }
+
+              bool candidateMatches = false;
+              bool candidateHasEquipped = false;
+              for (size_t itemIdx = 0; itemIdx < candidateItems.size(); ++itemIdx) {
+                Item *candidateItem = candidateItems[itemIdx];
+                if (!candidateItem || (uintptr_t)candidateItem <= 0x1000) {
+                  continue;
+                }
+
+                std::string candidateItemName = "";
+                try {
+                  candidateItemName = candidateItem->getName();
+                } catch (...) {
+                  candidateItemName = "";
+                }
+                if (candidateItemName.empty()) {
+                  continue;
+                }
+
+                bool candidateItemEquipped = false;
+                try {
+                  candidateItemEquipped = candidateItem->isEquipped;
+                } catch (...) {
+                  candidateItemEquipped = false;
+                }
+                if (candidateItemEquipped) {
+                  candidateHasEquipped = true;
+                }
+
+                if (allItemsSweep) {
+                  candidateMatches = true;
+                  break;
+                }
+                if (equipmentSweep) {
+                  if (candidateItemEquipped) {
+                    candidateMatches = true;
+                    break;
+                  }
+                  continue;
+                }
+                if (!itemQueryToken.empty()) {
+                  std::string candidateItemToken =
+                      NormalizeInventoryMatchToken(candidateItemName);
+                  if (InventoryTokensMatch(candidateItemToken, itemQueryToken)) {
+                    candidateMatches = true;
+                    break;
+                  }
+                }
+              }
+
+              if (!candidateMatches && equipmentSweep && candidateDead) {
+                candidateMatches = true;
+              }
+              if (!candidateMatches) {
+                continue;
+              }
+
+              int candidateScore = candidateDead ? 1000 : 600;
+              if (candidateHasEquipped) {
+                candidateScore += 120;
+              }
+              if (!itemQueryToken.empty() && !equipmentSweep && !allItemsSweep) {
+                candidateScore += 200;
+              }
+              if (candidateDistance >= 0.0f) {
+                float proximity = kNpcCloseActionRangeUnits - candidateDistance;
+                if (proximity > 0.0f) {
+                  candidateScore += (int)(proximity * 4.0f);
+                }
+              }
+
+              if (!bestCandidate || candidateScore > bestScore) {
+                bestCandidate = candidate;
+                bestScore = candidateScore;
+              }
+            }
+
+            if (bestCandidate && (uintptr_t)bestCandidate > 0x1000) {
+              sourceCharacter = bestCandidate;
+              explicitSourceTarget = true;
+              inferredLootSource = true;
+            }
+          }
+
+          if (itemQueryRaw.empty() && explicitSourceTarget) {
+            itemQueryRaw = "equipment";
+            itemQueryToken = NormalizeInventoryMatchToken(itemQueryRaw);
+            equipmentSweep = true;
+          }
           if (itemQueryToken.empty() && explicitSourceTarget) {
             equipmentSweep = true;
           }
 
-          auto tryMoveItemToActor = [&](Item *item) -> bool {
+          const std::string sourceName = SafeCharacterName(sourceCharacter);
+          if (inferredLootSource) {
+            Log("ACTION_EXEC: TAKE_ITEM inferred source actor=" + actorName +
+                " source=" + sourceName + " query='" + itemQueryRaw + "'");
+          }
+
+          auto tryMoveItemToActor = [&](Item *item, int maxQuantity,
+                                        int &movedQuantityOut) -> bool {
+            movedQuantityOut = 0;
             if (!item || (uintptr_t)item <= 0x1000 || !sourceCharacter ||
                 (uintptr_t)sourceCharacter <= 0x1000) {
               return false;
@@ -4303,6 +4441,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               }
             } catch (...) {
               transferQuantity = 1;
+            }
+            if (maxQuantity > 0 && transferQuantity > maxQuantity) {
+              transferQuantity = maxQuantity;
             }
 
             Inventory *inv = nullptr;
@@ -4337,6 +4478,14 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               npc->giveItem(toGive, true, false);
             } catch (...) {
               return false;
+            }
+            try {
+              movedQuantityOut = toGive->quantity > 0 ? toGive->quantity : transferQuantity;
+            } catch (...) {
+              movedQuantityOut = transferQuantity;
+            }
+            if (movedQuantityOut < 1) {
+              movedQuantityOut = transferQuantity > 0 ? transferQuantity : 1;
             }
             return true;
           };
@@ -4400,7 +4549,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               GetAllCharacterItems(sourceCharacter, sourceItems);
 
               int movedCount = 0;
+              int movedUnits = 0;
               std::string firstMovedName = "";
+              int remainingToTransfer = requestedCount;
+              if (equipmentSweep || allItemsSweep) {
+                remainingToTransfer = 1000000;
+              }
               for (size_t i = 0; i < sourceItems.size(); ++i) {
                 Item *item = sourceItems[i];
                 if (!item || (uintptr_t)item <= 0x1000) {
@@ -4436,16 +4590,24 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                   continue;
                 }
 
-                if (!tryMoveItemToActor(item)) {
+                int movedQuantity = 0;
+                if (!tryMoveItemToActor(item, remainingToTransfer, movedQuantity)) {
                   continue;
                 }
 
                 ++movedCount;
+                movedUnits += movedQuantity;
                 if (firstMovedName.empty()) {
                   firstMovedName = itemName;
                 }
+                if (remainingToTransfer > 0) {
+                  remainingToTransfer -= movedQuantity;
+                  if (remainingToTransfer < 0) {
+                    remainingToTransfer = 0;
+                  }
+                }
 
-                if (!equipmentSweep && !allItemsSweep) {
+                if (!equipmentSweep && !allItemsSweep && remainingToTransfer <= 0) {
                   break;
                 }
               }
@@ -4469,10 +4631,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                   if (itemName.empty()) {
                     continue;
                   }
-                  if (!tryMoveItemToActor(item)) {
+                  int movedQuantity = 0;
+                  if (!tryMoveItemToActor(item, 1000000, movedQuantity)) {
                     continue;
                   }
                   ++movedCount;
+                  movedUnits += movedQuantity;
                   if (firstMovedName.empty()) {
                     firstMovedName = itemName;
                   }
@@ -4484,6 +4648,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 std::string itemLabel = firstMovedName;
                 if ((equipmentSweep || allItemsSweep) && movedCount > 1) {
                   itemLabel = ToString(movedCount) + " items";
+                } else if (!equipmentSweep && !allItemsSweep && movedUnits > 1 &&
+                           !firstMovedName.empty()) {
+                  itemLabel = ToString(movedUnits) + " x " + firstMovedName;
                 } else if ((equipmentSweep || allItemsSweep) && movedCount == 1 &&
                            itemLabel.empty()) {
                   itemLabel = "equipment";
@@ -4508,7 +4675,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
                 Log("ACTION_EXEC: TAKE_ITEM actor=" + actorName +
                     " source=" + sourceLabel + " query='" + itemQueryRaw +
-                    "' moved_count=" + ToString(movedCount) +
+                    "' requested_count=" + ToString(requestedCount) +
+                    " moved_count=" + ToString(movedCount) +
+                    " moved_units=" + ToString(movedUnits) +
                     " first_item='" + firstMovedName + "' source_dead=" +
                     std::string(sourceIsDead ? "1" : "0"));
                 inventoryTimer = 999;
@@ -4534,7 +4703,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 }
                 Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
                     " source=" + sourceName + " reason=item_not_found query='" +
-                    itemQueryRaw + "' equipment_sweep=" +
+                    itemQueryRaw + "' requested_count=" +
+                    ToString(requestedCount) + " equipment_sweep=" +
                     std::string(equipmentSweep ? "1" : "0") + " all_sweep=" +
                     std::string(allItemsSweep ? "1" : "0"));
               }
