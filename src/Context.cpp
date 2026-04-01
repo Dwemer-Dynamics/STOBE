@@ -95,6 +95,107 @@ std::string TrimCopy(const std::string &value) {
   return value.substr(first, last - first + 1);
 }
 
+std::string ResolveCharacterDisplayNameSafe(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return "";
+  }
+  std::string name = "";
+  try {
+    name = character->getName();
+  } catch (...) {
+    name.clear();
+  }
+  name = TrimCopy(name);
+  if (name.empty()) {
+    try {
+      if (!character->displayName.empty()) {
+        name = character->displayName;
+      }
+    } catch (...) {
+      name.clear();
+    }
+  }
+  name = TrimCopy(name);
+  if (name.empty()) {
+    try {
+      if (character->data && !character->data->name.empty()) {
+        name = character->data->name;
+      }
+    } catch (...) {
+      name.clear();
+    }
+  }
+  return TrimCopy(name);
+}
+
+std::string ResolveCarryTargetNameSafe(const hand &targetHandle) {
+  if (!targetHandle.isValid()) {
+    return "";
+  }
+  try {
+    Character *targetCharacter = targetHandle.getCharacter();
+    if (targetCharacter && (uintptr_t)targetCharacter > 0x1000) {
+      std::string name = ResolveCharacterDisplayNameSafe(targetCharacter);
+      if (!name.empty()) {
+        return name;
+      }
+    }
+  } catch (...) {
+  }
+  try {
+    RootObjectBase *targetBase = targetHandle.getRootObjectBase();
+    if (targetBase && (uintptr_t)targetBase > 0x1000) {
+      std::string name = TrimCopy(targetBase->getName());
+      if (!name.empty()) {
+        return name;
+      }
+    }
+  } catch (...) {
+  }
+  return "";
+}
+
+void BuildCarriedByNameLookup(
+    GameWorld *world,
+    std::map<unsigned int, std::string> &carriedByNameOut) {
+  carriedByNameOut.clear();
+  if (!world || (uintptr_t)world <= 0x1000) {
+    return;
+  }
+  try {
+    const ogre_unordered_set<Character *>::type &chars =
+        world->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it) {
+      Character *carrier = *it;
+      if (!carrier || (uintptr_t)carrier <= 0x1000) {
+        continue;
+      }
+      bool isCarrying = false;
+      hand carriedHandle;
+      try {
+        isCarrying = carrier->isCarryingSomething && carrier->carryingObject.isValid();
+        if (isCarrying) {
+          carriedHandle = carrier->carryingObject;
+        }
+      } catch (...) {
+        isCarrying = false;
+      }
+      if (!isCarrying || !carriedHandle.isValid() || carriedHandle.serial == 0) {
+        continue;
+      }
+      if (carriedByNameOut.count(carriedHandle.serial) > 0) {
+        continue;
+      }
+      std::string carrierName = ResolveCharacterDisplayNameSafe(carrier);
+      if (carrierName.empty()) {
+        carrierName = "someone";
+      }
+      carriedByNameOut[carriedHandle.serial] = carrierName;
+    }
+  } catch (...) {
+  }
+}
+
 int ClampIntRange(int value, int minValue, int maxValue) {
   if (value < minValue) {
     return minValue;
@@ -1452,6 +1553,41 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
     }
   }
 
+  std::map<unsigned int, std::string> carriedByNameBySerial;
+  if (world && (uintptr_t)world > 0x1000) {
+    BuildCarriedByNameLookup(world, carriedByNameBySerial);
+  }
+
+  unsigned int npcSerial = 0;
+  try {
+    npcSerial = npc->getHandle().serial;
+  } catch (...) {
+    npcSerial = 0;
+  }
+
+  bool isBeingCarried = false;
+  std::string carriedByName = "";
+  if (npcSerial != 0) {
+    std::map<unsigned int, std::string>::const_iterator carrierIt =
+        carriedByNameBySerial.find(npcSerial);
+    if (carrierIt != carriedByNameBySerial.end()) {
+      isBeingCarried = true;
+      carriedByName = TrimCopy(carrierIt->second);
+    }
+  }
+
+  bool isCarrying = false;
+  std::string carryingTargetName = "";
+  try {
+    isCarrying = npc->isCarryingSomething && npc->carryingObject.isValid();
+    if (isCarrying) {
+      carryingTargetName = ResolveCarryTargetNameSafe(npc->carryingObject);
+    }
+  } catch (...) {
+    isCarrying = false;
+    carryingTargetName = "";
+  }
+
   std::string json = "{";
   if (gameTs > 0) {
     json += "\"game_ts\":" + ToString(gameTs) + ",";
@@ -1483,6 +1619,17 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   }
   if (orders != "{}") {
     json += "\"orders\":" + orders + ",";
+  }
+  json += "\"is_carrying\": " + std::string(isCarrying ? "true" : "false") +
+          ",";
+  if (!carryingTargetName.empty()) {
+    json += "\"carrying_target_name\":\"" + EscapeJSON(carryingTargetName) +
+            "\",";
+  }
+  json += "\"is_being_carried\": " +
+          std::string(isBeingCarried ? "true" : "false") + ",";
+  if (!carriedByName.empty()) {
+    json += "\"carried_by_name\":\"" + EscapeJSON(carriedByName) + "\",";
   }
   if (!storageId.empty()) {
     json += "\"storage_id\":\"" + EscapeJSON(storageId) + "\",";
@@ -2523,24 +2670,31 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
             "\",";
   }
 
+  std::map<unsigned int, std::string> carriedByNameBySerial;
+  BuildCarriedByNameLookup(world, carriedByNameBySerial);
+  unsigned int npcSerial = 0;
+  try {
+    npcSerial = npc->getHandle().serial;
+  } catch (...) {
+    npcSerial = 0;
+  }
+  bool isBeingCarried = false;
+  std::string carriedByName = "";
+  if (npcSerial != 0) {
+    std::map<unsigned int, std::string>::const_iterator carrierIt =
+        carriedByNameBySerial.find(npcSerial);
+    if (carrierIt != carriedByNameBySerial.end()) {
+      isBeingCarried = true;
+      carriedByName = TrimCopy(carrierIt->second);
+    }
+  }
+
   bool isCarrying = false;
   std::string carryingTargetName = "";
   try {
     isCarrying = npc->isCarryingSomething && npc->carryingObject.isValid();
     if (isCarrying) {
-      Character *carriedCharacter = npc->carryingObject.getCharacter();
-      if (carriedCharacter && (uintptr_t)carriedCharacter > 0x1000) {
-        carryingTargetName = carriedCharacter->getName();
-        if (carryingTargetName.empty() && !carriedCharacter->displayName.empty()) {
-          carryingTargetName = carriedCharacter->displayName;
-        }
-      }
-      if (carryingTargetName.empty()) {
-        RootObjectBase *carriedObject = npc->carryingObject.getRootObjectBase();
-        if (carriedObject && (uintptr_t)carriedObject > 0x1000) {
-          carryingTargetName = carriedObject->getName();
-        }
-      }
+      carryingTargetName = ResolveCarryTargetNameSafe(npc->carryingObject);
     }
   } catch (...) {
     isCarrying = false;
@@ -2551,6 +2705,11 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   if (!carryingTargetName.empty()) {
     json += "\"carrying_target_name\": \"" + EscapeJSON(carryingTargetName) +
             "\",";
+  }
+  json += "\"is_being_carried\": " +
+          std::string(isBeingCarried ? "true" : "false") + ",";
+  if (!carriedByName.empty()) {
+    json += "\"carried_by_name\": \"" + EscapeJSON(carriedByName) + "\",";
   }
 
   std::string name = "Unknown";
@@ -2786,6 +2945,29 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         // IDENTITY STABILITY: Use the origin-faction cache for overhearers too!
         std::string o_sid_fact = o_fn;
         unsigned int o_serial = other->getHandle().serial;
+        bool o_isCarrying = false;
+        std::string o_carryingTargetName = "";
+        bool o_isBeingCarried = false;
+        std::string o_carriedByName = "";
+        try {
+          o_isCarrying =
+              other->isCarryingSomething && other->carryingObject.isValid();
+          if (o_isCarrying) {
+            o_carryingTargetName =
+                ResolveCarryTargetNameSafe(other->carryingObject);
+          }
+        } catch (...) {
+          o_isCarrying = false;
+          o_carryingTargetName.clear();
+        }
+        if (o_serial != 0) {
+          std::map<unsigned int, std::string>::const_iterator oCarrierIt =
+              carriedByNameBySerial.find(o_serial);
+          if (oCarrierIt != carriedByNameBySerial.end()) {
+            o_isBeingCarried = true;
+            o_carriedByName = TrimCopy(oCarrierIt->second);
+          }
+        }
 
         EnterCriticalSection(&g_stateMutex);
         if (g_originFactions.count(o_serial)) {
@@ -2923,6 +3105,18 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         json += "\"movement_speed\": " + ToString(o_activity.movementSpeed) + ",";
         if (!o_activity.attackTargetName.empty()) {
           json += "\"attack_target\":\"" + EscapeJSON(o_activity.attackTargetName) +
+                  "\",";
+        }
+        json += "\"is_carrying\": " +
+                std::string(o_isCarrying ? "true" : "false") + ",";
+        if (!o_carryingTargetName.empty()) {
+          json += "\"carrying_target_name\":\"" +
+                  EscapeJSON(o_carryingTargetName) + "\",";
+        }
+        json += "\"is_being_carried\": " +
+                std::string(o_isBeingCarried ? "true" : "false") + ",";
+        if (!o_carriedByName.empty()) {
+          json += "\"carried_by_name\":\"" + EscapeJSON(o_carriedByName) +
                   "\",";
         }
         json += "\"same_building_as_actor\": " +

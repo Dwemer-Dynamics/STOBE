@@ -2803,6 +2803,52 @@ bool IsTakeItemLootTargetValid(GameWorld *world, Character *target,
   return false;
 }
 
+bool IsPickupNpcTargetValid(GameWorld *world, Character *target,
+                            std::string &reasonOut, bool &isDeadOut) {
+  reasonOut.clear();
+  isDeadOut = false;
+  if (!target || (uintptr_t)target <= 0x1000) {
+    reasonOut = "target not found";
+    return false;
+  }
+
+  bool isDead = false;
+  try {
+    isDead = target->isDead();
+  } catch (...) {
+    isDead = false;
+  }
+  isDeadOut = isDead;
+
+  bool isUnconscious = false;
+  try {
+    isUnconscious = target->isUnconcious();
+  } catch (...) {
+    isUnconscious = false;
+  }
+  bool isKnockedOut = false;
+  try {
+    isKnockedOut = target->isDown();
+  } catch (...) {
+    isKnockedOut = false;
+  }
+  bool isPrisoned = IsCharacterPrisoned(target);
+  if (!(isDead || isUnconscious || isKnockedOut || isPrisoned)) {
+    reasonOut = "target must be dead, knocked out, unconscious, or imprisoned";
+    return false;
+  }
+
+  std::string carrierName = "";
+  if (IsCharacterBeingCarried(world, target, carrierName)) {
+    reasonOut = carrierName.empty()
+                    ? "target is already being carried"
+                    : ("target is already being carried by " + carrierName);
+    return false;
+  }
+
+  return true;
+}
+
 struct UseObjectCandidate {
   Building *building;
   std::string name;
@@ -6255,6 +6301,155 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 actorName + " could not start using " + bestUsable->name + ".",
                 true);
           }
+        } else if (act.type == ACT_PICKUP_NPC) {
+          const std::string actorName = SafeCharacterName(npc);
+          Character *pickupTarget = target;
+          if ((!pickupTarget || (uintptr_t)pickupTarget <= 0x1000) &&
+              thisptr && npc && (uintptr_t)npc > 0x1000) {
+            std::string serialProbe = "";
+            if (act.target.isValid() && act.target.serial != 0) {
+              std::string messageToken = TrimCopySimple(act.message);
+              if (!messageToken.empty()) {
+                serialProbe = messageToken + "|" + ToString((unsigned int)act.target.serial);
+              } else {
+                serialProbe = ToString((unsigned int)act.target.serial);
+              }
+              Character *resolvedBySerial = ResolveCharacterByTargetToken(
+                  thisptr, serialProbe, npc);
+              if (resolvedBySerial && (uintptr_t)resolvedBySerial > 0x1000) {
+                pickupTarget = resolvedBySerial;
+              }
+            }
+            if ((!pickupTarget || (uintptr_t)pickupTarget <= 0x1000) &&
+                !TrimCopySimple(act.message).empty()) {
+              Character *resolvedByName = ResolveCharacterByTargetToken(
+                  thisptr, act.message, npc);
+              if (resolvedByName && (uintptr_t)resolvedByName > 0x1000) {
+                pickupTarget = resolvedByName;
+              }
+            }
+          }
+          std::string targetName =
+              pickupTarget ? SafeCharacterName(pickupTarget)
+                           : TrimCopySimple(act.message);
+          if (targetName.empty()) {
+            targetName = "target";
+          }
+          if (!pickupTarget || (uintptr_t)pickupTarget <= 0x1000) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid pickup target.", true);
+            Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                " reason=target_not_found target_token='" + act.message + "'");
+          } else if (pickupTarget == npc) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot pick themselves up.", true);
+            Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                " reason=self_target");
+          } else {
+            bool actorAlreadyCarrying = false;
+            try {
+              actorAlreadyCarrying =
+                  npc->isCarryingSomething && npc->carryingObject.isValid();
+            } catch (...) {
+              actorAlreadyCarrying = false;
+            }
+            if (actorAlreadyCarrying) {
+              thisptr->showPlayerAMessage_withLog(
+                  actorName +
+                      " is already carrying someone. Use STOP_CARRYING first.",
+                  true);
+              Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                  " reason=already_carrying");
+            } else {
+              float actionDistance = -1.0f;
+              std::string rangeReason = "";
+              if (!ValidateNpcCloseActionRange(npc, pickupTarget,
+                                               kNpcCloseActionRangeUnits,
+                                               actionDistance, rangeReason)) {
+                std::string userReason = "too far away";
+                if (rangeReason == "area_mismatch") {
+                  userReason = "not in the same area";
+                }
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot pick up " + targetName +
+                        " because they are " + userReason + ".",
+                    true);
+                Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+              } else {
+                std::string invalidReason = "";
+                bool targetDead = false;
+                if (!IsPickupNpcTargetValid(thisptr, pickupTarget, invalidReason,
+                                            targetDead)) {
+                  if (invalidReason.empty()) {
+                    invalidReason =
+                        "target must be dead, knocked out, unconscious, or "
+                        "imprisoned";
+                  }
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " cannot pick up " + targetName + ": " +
+                          invalidReason + ".",
+                      true);
+                  Log("ACTION_EXEC: PICKUP_NPC blocked actor=" + actorName +
+                      " target=" + targetName + " reason=" + invalidReason);
+                } else {
+                  bool pickupIssued = false;
+                  try {
+                    npc->pickupObject(pickupTarget);
+                    pickupIssued = true;
+                  } catch (...) {
+                    pickupIssued = false;
+                  }
+                  bool pickupSucceeded = false;
+                  unsigned int carriedSerial = 0;
+                  try {
+                    pickupSucceeded =
+                        npc->isCarryingSomething && npc->carryingObject.isValid();
+                    if (pickupSucceeded) {
+                      carriedSerial = npc->carryingObject.serial;
+                      unsigned int targetSerial = 0;
+                      try {
+                        targetSerial = pickupTarget->getHandle().serial;
+                      } catch (...) {
+                        targetSerial = 0;
+                      }
+                      if (targetSerial != 0 && carriedSerial != targetSerial) {
+                        pickupSucceeded = false;
+                      }
+                    }
+                  } catch (...) {
+                    pickupSucceeded = false;
+                    carriedSerial = 0;
+                  }
+                  if (pickupSucceeded) {
+                    thisptr->showPlayerAMessage_withLog(
+                        actorName + " picked up " + targetName + ".", true);
+                    Log("ACTION_EXEC: PICKUP_NPC success actor=" + actorName +
+                        " target=" + targetName +
+                        " target_dead=" + std::string(targetDead ? "1" : "0") +
+                        " target_serial=" + ToString(carriedSerial));
+                    try {
+                      npc->reThinkCurrentAIAction();
+                    } catch (...) {
+                    }
+                    try {
+                      pickupTarget->reThinkCurrentAIAction();
+                    } catch (...) {
+                    }
+                  } else {
+                    thisptr->showPlayerAMessage_withLog(
+                        actorName + " failed to pick up " + targetName + ".",
+                        true);
+                    Log("ACTION_EXEC: PICKUP_NPC failed actor=" + actorName +
+                        " target=" + targetName +
+                        " pickup_issued=" + std::string(pickupIssued ? "1" : "0"));
+                  }
+                }
+              }
+            }
+          }
         } else if (act.type == ACT_RELEASE) {
           hand carriedHandle;
           bool isCarryingSomething = false;
@@ -6279,75 +6474,25 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             if (carriedName.empty()) {
               carriedName = "their carried target";
             }
-            const std::string normalizedCarriedName =
-                NormalizeCarryTargetToken(carriedName);
-
-            bool explicitTargetProvided =
-                act.target.isValid() || !TrimCopySimple(act.message).empty();
-            bool targetMatches = true;
-            if (explicitTargetProvided) {
-              targetMatches = false;
-              if (act.target.isValid() &&
-                  act.target.serial == carriedHandle.serial) {
-                targetMatches = true;
-              }
-
-              if (!targetMatches && act.target.isValid()) {
-                const std::string requestedHandleName =
-                    NormalizeCarryTargetToken(SafeRootObjectName(act.target));
-                if (!requestedHandleName.empty() &&
-                    !normalizedCarriedName.empty() &&
-                    (requestedHandleName == normalizedCarriedName ||
-                     requestedHandleName.find(normalizedCarriedName) !=
-                         std::string::npos ||
-                     normalizedCarriedName.find(requestedHandleName) !=
-                         std::string::npos)) {
-                  targetMatches = true;
-                }
-              }
-
-              if (!targetMatches) {
-                const std::string requestedByName =
-                    NormalizeCarryTargetToken(act.message);
-                if (!requestedByName.empty() && !normalizedCarriedName.empty() &&
-                    (requestedByName == normalizedCarriedName ||
-                     requestedByName.find(normalizedCarriedName) !=
-                         std::string::npos ||
-                     normalizedCarriedName.find(requestedByName) !=
-                         std::string::npos)) {
-                  targetMatches = true;
-                }
-              }
+            std::string requestedDisplay = TrimCopySimple(act.message);
+            if (requestedDisplay.empty() && act.target.isValid()) {
+              requestedDisplay = SafeRootObjectName(act.target);
+            }
+            if (!requestedDisplay.empty()) {
+              Log("ACTION_EXEC: STOP_CARRYING ignoring explicit target actor=" +
+                  npc->getName() + " requested='" + requestedDisplay +
+                  "' carrying='" + carriedName + "'");
             }
 
-            if (!targetMatches) {
-              std::string requestedDisplay = TrimCopySimple(act.message);
-              if (requestedDisplay.empty()) {
-                requestedDisplay = SafeRootObjectName(act.target);
-              }
-              Log("ACTION_EXEC: STOP_CARRYING target mismatch actor=" +
-                  npc->getName() + " carrying='" + carriedName +
-                  "' requested='" + requestedDisplay + "'");
-              if (!requestedDisplay.empty()) {
-                thisptr->showPlayerAMessage_withLog(
-                    npc->getName() + " is carrying " + carriedName + ", not " +
-                        requestedDisplay + ".",
-                    true);
-              } else {
-                thisptr->showPlayerAMessage_withLog(
-                    npc->getName() + " is carrying " + carriedName + ".", true);
-              }
-            } else {
-              Log("ACTION_EXEC: STOP_CARRYING dropping target actor=" +
-                  npc->getName() + " carried='" + carriedName + "'");
-              npc->dropCarriedObject(false, false);
-              npc->clearAllAIGoals();
-              npc->addJob(IDLE, NULL, true, false, npc->getPosition());
-              npc->addGoal(IDLE, NULL);
-              npc->reThinkCurrentAIAction();
-              thisptr->showPlayerAMessage_withLog(
-                  npc->getName() + " put down " + carriedName + ".", true);
-            }
+            Log("ACTION_EXEC: STOP_CARRYING dropping target actor=" +
+                npc->getName() + " carried='" + carriedName + "'");
+            npc->dropCarriedObject(false, false);
+            npc->clearAllAIGoals();
+            npc->addJob(IDLE, NULL, true, false, npc->getPosition());
+            npc->addGoal(IDLE, NULL);
+            npc->reThinkCurrentAIAction();
+            thisptr->showPlayerAMessage_withLog(
+                npc->getName() + " put down " + carriedName + ".", true);
           }
         } else if (act.type == ACT_FACTION_RELATIONS) {
           std::string targetToken = act.message;

@@ -1294,6 +1294,9 @@ struct NpcWorldEventState {
   bool dead;
   bool unconscious;
   bool enslaved;
+  bool carrying;
+  unsigned int carryingTargetSerial;
+  std::string carryingTargetName;
   bool speechActive;
   bool leftArmPresent;
   bool rightArmPresent;
@@ -1314,14 +1317,14 @@ struct NpcWorldEventState {
 
   NpcWorldEventState()
       : initialized(false), dead(false), unconscious(false), enslaved(false),
-        speechActive(false), leftArmPresent(true), rightArmPresent(true), leftLegPresent(true),
-        rightLegPresent(true),
+        carrying(false), carryingTargetSerial(0), carryingTargetName(""),
+        speechActive(false), leftArmPresent(true), rightArmPresent(true),
+        leftLegPresent(true), rightLegPresent(true),
         leftArmState((int)LIMB_ORIGINAL), rightArmState((int)LIMB_ORIGINAL),
         leftLegState((int)LIMB_ORIGINAL), rightLegState((int)LIMB_ORIGINAL),
-        currentTask((int)NULL_TASK), constructionAction(0), constructionSubjectSerial(0),
-        constructionSubjectName(""),
-        lockpickingSkill(0), lastSpeechLine(""),
-        lastSeenTick(0) {}
+        currentTask((int)NULL_TASK), constructionAction(0),
+        constructionSubjectSerial(0), constructionSubjectName(""),
+        lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
 };
 
 static std::map<unsigned int, InventorySyncState> g_inventorySyncStateBySerial;
@@ -4235,25 +4238,20 @@ static TaskType ResolveCurrentNpcTaskSafe(Character *npc, hand &subjectOut) {
 
     Tasker *action = nullptr;
     try {
-      action = body->getCurrentActionOrMessage();
+      action = body->currentAction;
     } catch (...) {
       action = nullptr;
-    }
-    if (!action || (uintptr_t)action < 0x1000) {
-      try {
-        action = body->getCurrentAction();
-      } catch (...) {
-        action = nullptr;
-      }
     }
     if (!action || (uintptr_t)action < 0x1000) {
       return NULL_TASK;
     }
 
     try {
-      hand subject = body->getCurrentSubject();
+      hand subject = action->subject;
       if (subject.isValid() && !subject.isNull()) {
         subjectOut = subject;
+      } else if (body->target.isValid() && !body->target.isNull()) {
+        subjectOut = body->target;
       }
     } catch (...) {
       subjectOut = hand();
@@ -4261,7 +4259,9 @@ static TaskType ResolveCurrentNpcTaskSafe(Character *npc, hand &subjectOut) {
 
     TaskType taskKey = NULL_TASK;
     try {
-      taskKey = action->key();
+      if (action->taskData && (uintptr_t)action->taskData > 0x1000) {
+        taskKey = action->taskData->key;
+      }
     } catch (...) {
       taskKey = NULL_TASK;
     }
@@ -4548,6 +4548,72 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
   }
   LogGameEvent("item_pickup", actorName, actorFaction, "None", "None",
                message, ResolveCharacterSerialForEvent(npc), 0);
+}
+
+static Character *ResolveCharacterBySerialForCarryEvent(unsigned int serial) {
+  if (serial == 0) {
+    return nullptr;
+  }
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world < 0x1000) {
+    return nullptr;
+  }
+  try {
+    const auto &chars = world->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it) {
+      Character *candidate = *it;
+      if (!candidate || (uintptr_t)candidate < 0x1000) {
+        continue;
+      }
+      unsigned int candidateSerial = 0;
+      try {
+        candidateSerial = candidate->getHandle().serial;
+      } catch (...) {
+        candidateSerial = 0;
+      }
+      if (candidateSerial == serial) {
+        return candidate;
+      }
+    }
+  } catch (...) {
+  }
+  return nullptr;
+}
+
+static void EmitCarryPickupEvent(Character *carrier, unsigned int targetSerial,
+                                 const std::string &targetNameHint) {
+  std::string actorName = ResolveCharacterNameSafe(carrier);
+  std::string actorFaction = SafeFaction(carrier);
+  Character *target = ResolveCharacterBySerialForCarryEvent(targetSerial);
+  std::string targetName = target ? ResolveCharacterNameSafe(target)
+                                  : TrimCopy(targetNameHint);
+  if (targetName.empty()) {
+    targetName = "someone";
+  }
+  std::string targetFaction = target ? SafeFaction(target) : "None";
+  std::string message = "picked up " + targetName;
+  LogGameEvent("carry", actorName, actorFaction, targetName, targetFaction,
+               message, ResolveCharacterSerialForEvent(carrier),
+               targetSerial != 0 ? targetSerial
+                                 : ResolveCharacterSerialForEvent(target));
+}
+
+static void EmitCarryDropEvent(Character *carrier, unsigned int targetSerial,
+                               const std::string &targetNameHint) {
+  std::string actorName = ResolveCharacterNameSafe(carrier);
+  std::string actorFaction = SafeFaction(carrier);
+  Character *target = ResolveCharacterBySerialForCarryEvent(targetSerial);
+  std::string targetName = target ? ResolveCharacterNameSafe(target)
+                                  : TrimCopy(targetNameHint);
+  if (targetName.empty()) {
+    targetName = "their carried target";
+  }
+  std::string targetFaction = target ? SafeFaction(target) : "None";
+  std::string message = "put down " + targetName;
+  LogGameEvent("carry", actorName, actorFaction, targetName, targetFaction,
+               message, ResolveCharacterSerialForEvent(carrier),
+               targetSerial != 0 ? targetSerial
+                                 : ResolveCharacterSerialForEvent(target));
 }
 
 static void PruneNpcWorldEventState() {
@@ -4974,6 +5040,23 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       constructionSubjectSerialNow = currentTaskSubject.serial;
       constructionSubjectNameNow = ResolveConstructionSubjectName(currentTaskSubject);
     }
+    bool carryingNow = false;
+    unsigned int carryingTargetSerialNow = 0;
+    std::string carryingTargetNameNow = "";
+    try {
+      carryingNow = npc->isCarryingSomething && npc->carryingObject.isValid();
+      if (carryingNow) {
+        carryingTargetSerialNow = npc->carryingObject.serial;
+        carryingTargetNameNow = ResolveConstructionSubjectName(npc->carryingObject);
+      }
+    } catch (...) {
+      carryingNow = false;
+      carryingTargetSerialNow = 0;
+      carryingTargetNameNow.clear();
+    }
+    if (carryingNow && carryingTargetNameNow.empty()) {
+      carryingTargetNameNow = "someone";
+    }
 
     NpcWorldEventState &state = g_npcWorldEventStateBySerial[serial];
     if (!state.initialized) {
@@ -4981,6 +5064,9 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.dead = deadNow;
       state.unconscious = unconsciousNow;
       state.enslaved = enslavedNow;
+      state.carrying = carryingNow;
+      state.carryingTargetSerial = carryingTargetSerialNow;
+      state.carryingTargetName = carryingTargetNameNow;
       state.speechActive = speechActiveNow;
       state.leftArmPresent = leftArmPresent;
       state.rightArmPresent = rightArmPresent;
@@ -5028,6 +5114,17 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       EmitSlaveryEvent(npc, true);
     } else if (state.enslaved && !enslavedNow) {
       EmitSlaveryEvent(npc, false);
+    }
+    if (!state.carrying && carryingNow) {
+      EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
+    } else if (state.carrying && !carryingNow) {
+      EmitCarryDropEvent(npc, state.carryingTargetSerial,
+                         state.carryingTargetName);
+    } else if (state.carrying && carryingNow &&
+               state.carryingTargetSerial != carryingTargetSerialNow) {
+      EmitCarryDropEvent(npc, state.carryingTargetSerial,
+                         state.carryingTargetName);
+      EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
     }
 
     if (!IsLimbLostState(state.leftArmState) && IsLimbLostState(leftArmState)) {
@@ -5116,6 +5213,9 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.dead = deadNow;
     state.unconscious = unconsciousNow;
     state.enslaved = enslavedNow;
+    state.carrying = carryingNow;
+    state.carryingTargetSerial = carryingTargetSerialNow;
+    state.carryingTargetName = carryingTargetNameNow;
     state.speechActive = speechActiveNow;
     state.leftArmPresent = leftArmPresent;
     state.rightArmPresent = rightArmPresent;
@@ -6057,8 +6157,21 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           if (actionCommand == "RELEASE_PLAYER" ||
               actionCommand == "RELEASE_PRISONER" ||
               actionCommand == "RELEASEPLAYER" ||
-              actionCommand == "STOPCARRYING") {
+              actionCommand == "STOPCARRYING" ||
+              actionCommand == "DROPNPC" ||
+              actionCommand == "DROP_NPC" ||
+              actionCommand == "DROP-NPC" ||
+              actionCommand == "PUTDOWNNPC" ||
+              actionCommand == "PUT_DOWN_NPC" ||
+              actionCommand == "PUT-DOWN-NPC" ||
+              actionCommand == "RELEASENPC" ||
+              actionCommand == "RELEASE_NPC" ||
+              actionCommand == "RELEASE-NPC") {
             actionCommand = "STOP_CARRYING";
+          } else if (actionCommand == "PICKUPNPC" ||
+                     actionCommand == "PICKUP-NPC" ||
+                     actionCommand == "KIDNAP") {
+            actionCommand = "PICKUP_NPC";
           } else if (actionCommand == "DRINKITEM" ||
                      actionCommand == "DRINK-ITEM") {
             actionCommand = "DRINK_ITEM";
@@ -7679,6 +7792,33 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 targetToken + "' target_serial=" +
                 ToString((unsigned int)forceDrinkTarget.serial) + " item='" +
                 drinkItemName + "'");
+          } else if (actionCommand == "PICKUP_NPC") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string targetToken = TrimCopy(actionArgument);
+            if (targetToken.empty()) {
+              Log("HOOK_MSG_PROC: PICKUP_NPC ignored; empty target payload");
+              continue;
+            }
+            hand pickupTarget = resolveActionTargetHand(targetToken, targetHand);
+            if (!pickupTarget.isValid()) {
+              Log("HOOK_MSG_PROC: PICKUP_NPC ignored; target unresolved '" +
+                  targetToken + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_PICKUP_NPC;
+            act.actor = targetHand;
+            act.target = pickupTarget;
+            act.message = targetToken;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: PICKUP_NPC queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)pickupTarget.serial));
           } else if (actionCommand == "USE_DRUGS") {
             if (shouldSkipSpeakerBoundAction(actionCommand)) {
               continue;
