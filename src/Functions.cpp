@@ -599,6 +599,365 @@ Character *ResolveLiveCharacter(GameWorld *world, const hand &characterHandle) {
   return nullptr;
 }
 
+Character *ResolveCharacterByTargetToken(GameWorld *world,
+                                         const std::string &rawTarget,
+                                         Character *actorToExclude) {
+  if (!world) {
+    return nullptr;
+  }
+  std::string token = TrimCopySimple(rawTarget);
+  if (token.empty()) {
+    return nullptr;
+  }
+
+  auto trimPunctuation = [](std::string value) -> std::string {
+    while (!value.empty()) {
+      char c = value.front();
+      if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '(' ||
+          c == '[' || c == '{') {
+        value.erase(0, 1);
+        continue;
+      }
+      break;
+    }
+    while (!value.empty()) {
+      char c = value.back();
+      if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == ')' ||
+          c == ']' || c == '}' || c == '.' || c == ',' || c == '!' ||
+          c == '?' || c == ':') {
+        value.erase(value.size() - 1, 1);
+        continue;
+      }
+      break;
+    }
+    return value;
+  };
+  token = trimPunctuation(token);
+  if (token.size() >= 2 &&
+      ((token.front() == '"' && token.back() == '"') ||
+       (token.front() == '\'' && token.back() == '\''))) {
+    token = TrimCopySimple(token.substr(1, token.size() - 2));
+  }
+  if (token.empty()) {
+    return nullptr;
+  }
+
+  unsigned int wantedSerial = 0;
+  bool hasSerial = false;
+  size_t pipePos = token.find('|');
+  if (pipePos != std::string::npos) {
+    std::string serialPart = TrimCopySimple(token.substr(pipePos + 1));
+    token = TrimCopySimple(token.substr(0, pipePos));
+    if (!serialPart.empty()) {
+      bool allDigits = true;
+      for (size_t i = 0; i < serialPart.size(); ++i) {
+        unsigned char ch = (unsigned char)serialPart[i];
+        if (ch < '0' || ch > '9') {
+          allDigits = false;
+          break;
+        }
+      }
+      if (allDigits) {
+        wantedSerial = (unsigned int)strtoul(serialPart.c_str(), NULL, 10);
+        hasSerial = (wantedSerial > 0);
+      }
+    }
+  }
+  if (!hasSerial && !token.empty()) {
+    bool allDigits = true;
+    for (size_t i = 0; i < token.size(); ++i) {
+      unsigned char ch = (unsigned char)token[i];
+      if (ch < '0' || ch > '9') {
+        allDigits = false;
+        break;
+      }
+    }
+    if (allDigits) {
+      wantedSerial = (unsigned int)strtoul(token.c_str(), NULL, 10);
+      hasSerial = (wantedSerial > 0);
+      token.clear();
+    }
+  }
+
+  std::string tokenLow = token;
+  std::transform(tokenLow.begin(), tokenLow.end(), tokenLow.begin(), ::tolower);
+  if (tokenLow == "the player") {
+    tokenLow = "player";
+  } else if (tokenLow.find("the ") == 0) {
+    tokenLow = TrimCopySimple(tokenLow.substr(4));
+  } else if (tokenLow.find("a ") == 0) {
+    tokenLow = TrimCopySimple(tokenLow.substr(2));
+  } else if (tokenLow.find("an ") == 0) {
+    tokenLow = TrimCopySimple(tokenLow.substr(3));
+  }
+
+  Character *bestMatch = nullptr;
+  int bestScore = 0;
+  unsigned int excludeSerial = 0;
+  Ogre::Vector3 anchorPosition = Ogre::Vector3::ZERO;
+  bool anchorPositionValid = false;
+  hand anchorIndoorsHandle;
+  bool anchorIsIndoors = false;
+  int anchorFloor = 0;
+  if (actorToExclude && (uintptr_t)actorToExclude > 0x1000) {
+    try {
+      excludeSerial = actorToExclude->getHandle().serial;
+    } catch (...) {
+      excludeSerial = 0;
+    }
+    try {
+      anchorPosition = actorToExclude->getPosition();
+      anchorPositionValid = true;
+    } catch (...) {
+      anchorPositionValid = false;
+    }
+    try {
+      anchorIndoorsHandle = actorToExclude->isIndoors();
+      anchorIsIndoors =
+          anchorIndoorsHandle.isValid() && !anchorIndoorsHandle.isNull();
+    } catch (...) {
+      anchorIsIndoors = false;
+    }
+    try {
+      anchorFloor = actorToExclude->getFloor();
+    } catch (...) {
+      anchorFloor = 0;
+    }
+  }
+
+  const auto &chars = world->getCharacterUpdateList();
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    Character *candidate = *it;
+    if (!candidate || (uintptr_t)candidate <= 0x1000) {
+      continue;
+    }
+
+    unsigned int candidateSerial = 0;
+    try {
+      candidateSerial = candidate->getHandle().serial;
+    } catch (...) {
+      candidateSerial = 0;
+    }
+    if (excludeSerial != 0 && candidateSerial == excludeSerial) {
+      continue;
+    }
+    if (excludeSerial == 0 && actorToExclude &&
+        (uintptr_t)actorToExclude > 0x1000 && candidate == actorToExclude) {
+      continue;
+    }
+
+    int score = 0;
+    if (hasSerial && candidateSerial == wantedSerial) {
+      score = 1000;
+    } else if (!tokenLow.empty()) {
+      std::string candidateName = "";
+      try {
+        candidateName = candidate->getName();
+      } catch (...) {
+        candidateName = "";
+      }
+      std::string candidateLow = candidateName;
+      std::transform(candidateLow.begin(), candidateLow.end(), candidateLow.begin(),
+                     ::tolower);
+      if (candidateLow == tokenLow) {
+        score = 500;
+      } else if (candidateLow.find(tokenLow) == 0) {
+        score = 320;
+      } else if (candidateLow.find(tokenLow) != std::string::npos) {
+        score = 180;
+      } else if (!candidate->displayName.empty()) {
+        std::string displayLow = candidate->displayName;
+        std::transform(displayLow.begin(), displayLow.end(), displayLow.begin(),
+                       ::tolower);
+        if (displayLow == tokenLow) {
+          score = 260;
+        } else if (displayLow.find(tokenLow) != std::string::npos) {
+          score = 140;
+        }
+      }
+    }
+
+    if (score > 0 && anchorPositionValid) {
+      float distance = -1.0f;
+      try {
+        distance = candidate->getPosition().distance(anchorPosition);
+      } catch (...) {
+        distance = -1.0f;
+      }
+      if (distance >= 0.0f) {
+        if (distance <= 8.0f) {
+          score += 260;
+        } else if (distance <= 25.0f) {
+          score += 180;
+        } else if (distance <= 60.0f) {
+          score += 110;
+        } else if (distance <= 120.0f) {
+          score += 40;
+        } else if (!hasSerial && distance >= 300.0f) {
+          score -= 100;
+        }
+      }
+
+      bool candidateIsIndoors = false;
+      hand candidateIndoorsHandle;
+      try {
+        candidateIndoorsHandle = candidate->isIndoors();
+        candidateIsIndoors =
+            candidateIndoorsHandle.isValid() && !candidateIndoorsHandle.isNull();
+      } catch (...) {
+        candidateIsIndoors = false;
+      }
+      if (candidateIsIndoors == anchorIsIndoors) {
+        score += 24;
+      }
+      if (candidateIsIndoors && anchorIsIndoors &&
+          candidateIndoorsHandle.serial == anchorIndoorsHandle.serial) {
+        score += 90;
+      } else if (candidateIsIndoors != anchorIsIndoors) {
+        score -= 30;
+      }
+
+      int candidateFloor = 0;
+      bool candidateFloorValid = true;
+      try {
+        candidateFloor = candidate->getFloor();
+      } catch (...) {
+        candidateFloorValid = false;
+      }
+      if (candidateFloorValid) {
+        if (candidateFloor == anchorFloor) {
+          score += 20;
+        } else {
+          score -= 6;
+        }
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = candidate;
+      if (score == 1000) {
+        break;
+      }
+    }
+  }
+
+  // Fallback: nearby sphere query catches dead/KO actors that may not be in
+  // the regular update set.
+  if (!bestMatch || bestScore < 1000) {
+    Character *anchorCharacter = actorToExclude;
+    if ((!anchorCharacter || (uintptr_t)anchorCharacter <= 0x1000) &&
+        world->player && world->player->playerCharacters.size() > 0 &&
+        world->player->playerCharacters[0]) {
+      anchorCharacter = world->player->playerCharacters[0];
+    }
+    if (anchorCharacter && (uintptr_t)anchorCharacter > 0x1000) {
+      Ogre::Vector3 anchorPos = Ogre::Vector3::ZERO;
+      bool anchorPosValid = false;
+      try {
+        anchorPos = anchorCharacter->getPosition();
+        anchorPosValid = true;
+      } catch (...) {
+        anchorPosValid = false;
+      }
+      if (anchorPosValid) {
+        lektor<RootObject *> nearby;
+        try {
+          world->getCharactersWithinSphere(nearby, anchorPos, 600.0f, 0.0f, 0.0f,
+                                           16, 0, anchorCharacter);
+        } catch (...) {
+          nearby.clear();
+        }
+
+        for (uint32_t idx = 0; idx < nearby.size(); ++idx) {
+          Character *candidate = (Character *)nearby.stuff[idx];
+          if (!candidate || (uintptr_t)candidate <= 0x1000) {
+            continue;
+          }
+
+          unsigned int candidateSerial = 0;
+          try {
+            candidateSerial = candidate->getHandle().serial;
+          } catch (...) {
+            candidateSerial = 0;
+          }
+          if (excludeSerial != 0 && candidateSerial == excludeSerial) {
+            continue;
+          }
+          if (excludeSerial == 0 && actorToExclude &&
+              (uintptr_t)actorToExclude > 0x1000 &&
+              candidate == actorToExclude) {
+            continue;
+          }
+
+          int score = 0;
+          if (hasSerial && candidateSerial == wantedSerial) {
+            score = 1200;
+          } else if (!tokenLow.empty()) {
+            std::string candidateName = "";
+            try {
+              candidateName = candidate->getName();
+            } catch (...) {
+              candidateName = "";
+            }
+            std::string candidateLow = candidateName;
+            std::transform(candidateLow.begin(), candidateLow.end(),
+                           candidateLow.begin(), ::tolower);
+            if (candidateLow == tokenLow) {
+              score = 520;
+            } else if (candidateLow.find(tokenLow) == 0) {
+              score = 340;
+            } else if (candidateLow.find(tokenLow) != std::string::npos) {
+              score = 200;
+            } else if (!candidate->displayName.empty()) {
+              std::string displayLow = candidate->displayName;
+              std::transform(displayLow.begin(), displayLow.end(),
+                             displayLow.begin(), ::tolower);
+              if (displayLow == tokenLow) {
+                score = 280;
+              } else if (displayLow.find(tokenLow) != std::string::npos) {
+                score = 160;
+              }
+            }
+          }
+          if (score <= 0) {
+            continue;
+          }
+
+          try {
+            float distance = candidate->getPosition().distance(anchorPos);
+            if (distance <= 8.0f) {
+              score += 320;
+            } else if (distance <= 25.0f) {
+              score += 220;
+            } else if (distance <= 60.0f) {
+              score += 130;
+            } else if (distance <= 120.0f) {
+              score += 55;
+            } else if (!hasSerial && distance >= 300.0f) {
+              score -= 120;
+            }
+          } catch (...) {
+          }
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = candidate;
+            if (score >= 1200) {
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (bestMatch && bestScore > 0) {
+    return bestMatch;
+  }
+  return nullptr;
+}
+
 Character *ResolveLiveCharacterBySerial(GameWorld *world, unsigned int serial) {
   if (!world || serial == 0) {
     return nullptr;
@@ -4240,14 +4599,30 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               (thisptr->player && thisptr->player->playerCharacters.size() > 0)
                   ? thisptr->player->playerCharacters[0]
                   : nullptr;
-          Character *sourceCharacter = primaryPlayer;
-          bool explicitSourceTarget =
-              target && target != npc && (uintptr_t)target > 0x1000;
-          if (explicitSourceTarget) {
-            sourceCharacter = target;
-          }
-
           const std::string actorName = SafeCharacterName(npc);
+          std::string explicitSourceToken = TrimCopySimple(act.targetToken);
+          bool sourceTargetRequested =
+              act.target.isValid() && act.target.serial != 0 &&
+              (!act.actor.isValid() || act.target.serial != act.actor.serial);
+          if (!sourceTargetRequested && !explicitSourceToken.empty()) {
+            sourceTargetRequested = true;
+          }
+          bool resolvedSourceTarget =
+              target && target != npc && (uintptr_t)target > 0x1000;
+          bool explicitSourceTarget = sourceTargetRequested || resolvedSourceTarget;
+          Character *sourceCharacter = nullptr;
+          if (resolvedSourceTarget) {
+            sourceCharacter = target;
+          } else if (sourceTargetRequested && !explicitSourceToken.empty()) {
+            Character *resolvedByToken =
+                ResolveCharacterByTargetToken(thisptr, explicitSourceToken, npc);
+            if (resolvedByToken && (uintptr_t)resolvedByToken > 0x1000) {
+              sourceCharacter = resolvedByToken;
+              explicitSourceTarget = true;
+            }
+          } else if (!sourceTargetRequested) {
+            sourceCharacter = primaryPlayer;
+          }
           std::string itemQueryRaw = TrimCopySimple(act.message);
           if (itemQueryRaw.empty() && explicitSourceTarget) {
             itemQueryRaw = "equipment";
@@ -4491,11 +4866,20 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           };
 
           if (!sourceCharacter || (uintptr_t)sourceCharacter <= 0x1000) {
-            thisptr->showPlayerAMessage_withLog(
-                actorName + " could not find a valid source to take items from.",
-                true);
-            Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
-                " reason=source_not_found");
+            if (explicitSourceTarget) {
+              thisptr->showPlayerAMessage_withLog(
+                  actorName + " could not find the requested loot target.", true);
+              Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                  " reason=explicit_source_missing target_serial=" +
+                  ToString((unsigned int)act.target.serial));
+            } else {
+              thisptr->showPlayerAMessage_withLog(
+                  actorName +
+                      " could not find a valid source to take items from.",
+                  true);
+              Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                  " reason=source_not_found");
+            }
           } else if (sourceCharacter == npc) {
             thisptr->showPlayerAMessage_withLog(
                 actorName + " cannot take items from themselves.", true);

@@ -6649,21 +6649,86 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
             Character *bestMatch = nullptr;
             int bestScore = 0;
+            Character *actorCharacter = nullptr;
+            Ogre::Vector3 actorPosition = Ogre::Vector3::ZERO;
+            bool actorPositionValid = false;
+            hand actorIndoorsHandle;
+            bool actorIsIndoors = false;
+            int actorFloor = 0;
             if (thisptr) {
               const ogre_unordered_set<Character *>::type &chars =
                   thisptr->getCharacterUpdateList();
+              if (actorHandle.isValid() && actorHandle.serial != 0) {
+                for (auto it = chars.begin(); it != chars.end(); ++it) {
+                  Character *candidate = *it;
+                  if (!candidate || (uintptr_t)candidate < 0x1000) {
+                    continue;
+                  }
+                  unsigned int candidateSerial = 0;
+                  try {
+                    candidateSerial = candidate->getHandle().serial;
+                  } catch (...) {
+                    candidateSerial = 0;
+                  }
+                  if (candidateSerial == actorHandle.serial) {
+                    actorCharacter = candidate;
+                    break;
+                  }
+                }
+              }
+              if (!actorCharacter && actorHandle.isValid()) {
+                try {
+                  Character *directActor = actorHandle.getCharacter();
+                  if (directActor && (uintptr_t)directActor > 0x1000) {
+                    actorCharacter = directActor;
+                  }
+                } catch (...) {
+                  actorCharacter = nullptr;
+                }
+              }
+              if (actorCharacter && (uintptr_t)actorCharacter > 0x1000) {
+                try {
+                  actorPosition = actorCharacter->getPosition();
+                  actorPositionValid = true;
+                } catch (...) {
+                  actorPositionValid = false;
+                }
+                try {
+                  actorIndoorsHandle = actorCharacter->isIndoors();
+                  actorIsIndoors =
+                      actorIndoorsHandle.isValid() && !actorIndoorsHandle.isNull();
+                } catch (...) {
+                  actorIsIndoors = false;
+                }
+                try {
+                  actorFloor = actorCharacter->getFloor();
+                } catch (...) {
+                  actorFloor = 0;
+                }
+              }
               for (auto it = chars.begin(); it != chars.end(); ++it) {
                 Character *candidate = *it;
                 if (!candidate || (uintptr_t)candidate < 0x1000) {
                   continue;
                 }
-                if (actorHandle.isValid() &&
-                    candidate->getHandle().serial == actorHandle.serial) {
+                hand candidateHandle = hand();
+                unsigned int candidateSerial = 0;
+                try {
+                  candidateHandle = candidate->getHandle();
+                  candidateSerial = candidateHandle.serial;
+                } catch (...) {
+                  candidateHandle = hand();
+                  candidateSerial = 0;
+                }
+                if (!candidateHandle.isValid() || candidateSerial == 0) {
+                  continue;
+                }
+                if (actorHandle.isValid() && candidateSerial == actorHandle.serial) {
                   continue;
                 }
 
                 int score = 0;
-                if (hasSerial && candidate->getHandle().serial == wantedSerial) {
+                if (hasSerial && candidateSerial == wantedSerial) {
                   score = 1000;
                 } else if (!tokenLow.empty()) {
                   std::string candidateName = candidate->getName();
@@ -6687,6 +6752,62 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                     }
                   }
                 }
+                if (score > 0 && actorCharacter &&
+                    (uintptr_t)actorCharacter > 0x1000 && actorPositionValid) {
+                  float distance = -1.0f;
+                  try {
+                    distance = candidate->getPosition().distance(actorPosition);
+                  } catch (...) {
+                    distance = -1.0f;
+                  }
+                  if (distance >= 0.0f) {
+                    if (distance <= 8.0f) {
+                      score += 260;
+                    } else if (distance <= 25.0f) {
+                      score += 180;
+                    } else if (distance <= 60.0f) {
+                      score += 110;
+                    } else if (distance <= 120.0f) {
+                      score += 40;
+                    } else if (!hasSerial && distance >= 300.0f) {
+                      score -= 100;
+                    }
+                  }
+
+                  bool candidateIsIndoors = false;
+                  hand candidateIndoorsHandle;
+                  try {
+                    candidateIndoorsHandle = candidate->isIndoors();
+                    candidateIsIndoors = candidateIndoorsHandle.isValid() &&
+                                         !candidateIndoorsHandle.isNull();
+                  } catch (...) {
+                    candidateIsIndoors = false;
+                  }
+                  if (candidateIsIndoors == actorIsIndoors) {
+                    score += 24;
+                  }
+                  if (candidateIsIndoors && actorIsIndoors &&
+                      candidateIndoorsHandle.serial == actorIndoorsHandle.serial) {
+                    score += 90;
+                  } else if (candidateIsIndoors != actorIsIndoors) {
+                    score -= 30;
+                  }
+
+                  int candidateFloor = 0;
+                  bool candidateFloorValid = true;
+                  try {
+                    candidateFloor = candidate->getFloor();
+                  } catch (...) {
+                    candidateFloorValid = false;
+                  }
+                  if (candidateFloorValid) {
+                    if (candidateFloor == actorFloor) {
+                      score += 20;
+                    } else {
+                      score -= 6;
+                    }
+                  }
+                }
 
                 if (score > bestScore) {
                   bestScore = score;
@@ -6698,15 +6819,135 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               }
             }
 
+            // Fallback: nearby sphere query catches dead/KO actors that may not
+            // be present in the regular update set.
+            if (thisptr && (!bestMatch || bestScore < 1000)) {
+              Character *anchorCharacter = actorCharacter;
+              if ((!anchorCharacter || (uintptr_t)anchorCharacter <= 0x1000) &&
+                  thisptr->player &&
+                  thisptr->player->playerCharacters.size() > 0 &&
+                  thisptr->player->playerCharacters[0]) {
+                anchorCharacter = thisptr->player->playerCharacters[0];
+              }
+
+              if (anchorCharacter && (uintptr_t)anchorCharacter > 0x1000) {
+                Ogre::Vector3 anchorPos = Ogre::Vector3::ZERO;
+                bool anchorPosValid = false;
+                try {
+                  anchorPos = anchorCharacter->getPosition();
+                  anchorPosValid = true;
+                } catch (...) {
+                  anchorPosValid = false;
+                }
+
+                if (anchorPosValid) {
+                  lektor<RootObject *> nearby;
+                  try {
+                    thisptr->getCharactersWithinSphere(nearby, anchorPos, 600.0f,
+                                                       0.0f, 0.0f, 16, 0,
+                                                       anchorCharacter);
+                  } catch (...) {
+                    nearby.clear();
+                  }
+
+                  for (uint32_t i = 0; i < nearby.size(); ++i) {
+                    Character *candidate = (Character *)nearby.stuff[i];
+                    if (!candidate || (uintptr_t)candidate < 0x1000) {
+                      continue;
+                    }
+
+                    hand candidateHandle;
+                    unsigned int candidateSerial = 0;
+                    try {
+                      candidateHandle = candidate->getHandle();
+                      candidateSerial = candidateHandle.serial;
+                    } catch (...) {
+                      candidateHandle = hand();
+                      candidateSerial = 0;
+                    }
+                    if (!candidateHandle.isValid() || candidateSerial == 0) {
+                      continue;
+                    }
+                    if (actorHandle.isValid() &&
+                        candidateSerial == actorHandle.serial) {
+                      continue;
+                    }
+
+                    int score = 0;
+                    if (hasSerial && candidateSerial == wantedSerial) {
+                      score = 1200;
+                    } else if (!tokenLow.empty()) {
+                      std::string candidateName = candidate->getName();
+                      std::string candidateLow = candidateName;
+                      std::transform(candidateLow.begin(), candidateLow.end(),
+                                     candidateLow.begin(), ::tolower);
+                      if (candidateLow == tokenLow) {
+                        score = 520;
+                      } else if (candidateLow.find(tokenLow) == 0) {
+                        score = 340;
+                      } else if (candidateLow.find(tokenLow) != std::string::npos) {
+                        score = 200;
+                      } else if (!candidate->displayName.empty()) {
+                        std::string displayLow = candidate->displayName;
+                        std::transform(displayLow.begin(), displayLow.end(),
+                                       displayLow.begin(), ::tolower);
+                        if (displayLow == tokenLow) {
+                          score = 280;
+                        } else if (displayLow.find(tokenLow) !=
+                                   std::string::npos) {
+                          score = 160;
+                        }
+                      }
+                    }
+                    if (score <= 0) {
+                      continue;
+                    }
+
+                    try {
+                      float distance = candidate->getPosition().distance(anchorPos);
+                      if (distance <= 8.0f) {
+                        score += 320;
+                      } else if (distance <= 25.0f) {
+                        score += 220;
+                      } else if (distance <= 60.0f) {
+                        score += 130;
+                      } else if (distance <= 120.0f) {
+                        score += 55;
+                      } else if (!hasSerial && distance >= 300.0f) {
+                        score -= 120;
+                      }
+                    } catch (...) {
+                    }
+
+                    if (score > bestScore) {
+                      bestScore = score;
+                      bestMatch = candidate;
+                      if (score >= 1200) {
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
             if (!bestMatch && !hasSerial &&
                 (tokenLow == "lead" || tokenLow == "leader")) {
               hand playerHandle = resolvePlayerHandle();
-              if (playerHandle.isValid()) {
+              if (playerHandle.isValid() && playerHandle.serial != 0) {
                 return playerHandle;
               }
             }
             if (bestMatch && bestScore > 0) {
-              return bestMatch->getHandle();
+              hand bestHandle = hand();
+              try {
+                bestHandle = bestMatch->getHandle();
+              } catch (...) {
+                bestHandle = hand();
+              }
+              if (bestHandle.isValid() && bestHandle.serial != 0) {
+                return bestHandle;
+              }
             }
             return hand();
           };
@@ -6901,6 +7142,209 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               std::string payload = TrimCopy(rawPayload);
               if (payload.empty()) {
                 return false;
+              }
+
+              auto canonicalLootQueryFromSuffix =
+                  [&](const std::string &rawSuffix) -> std::string {
+                std::string suffix = ToLowerAsciiCopy(TrimCopy(rawSuffix));
+                if (suffix == "equip" || suffix == "equipment" ||
+                    suffix == "gear" || suffix == "armor" ||
+                    suffix == "armour") {
+                  return "equipment";
+                }
+                if (suffix == "all" || suffix == "everything" ||
+                    suffix == "inventory" || suffix == "items" ||
+                    suffix == "loot") {
+                  return "all";
+                }
+                if (suffix == "weapon" || suffix == "weapons") {
+                  return "weapon";
+                }
+                return "";
+              };
+
+              // Handle malformed payloads such as "Blue Eyesequipment"
+              // where target and loot keyword are concatenated.
+              {
+                auto trimTargetPrefixToken = [](std::string value) -> std::string {
+                  while (!value.empty()) {
+                    char tail = value.back();
+                    if (tail == '-' || tail == '_' || tail == ':' || tail == '.' ||
+                        tail == ',' || tail == ';' || tail == '/' || tail == '\\' ||
+                        tail == '|' || std::isspace((unsigned char)tail)) {
+                      value.erase(value.size() - 1, 1);
+                      continue;
+                    }
+                    break;
+                  }
+                  while (!value.empty()) {
+                    char head = value.front();
+                    if (head == '-' || head == '_' || head == ':' || head == '.' ||
+                        head == ',' || head == ';' || head == '/' || head == '\\' ||
+                        head == '|' || std::isspace((unsigned char)head)) {
+                      value.erase(0, 1);
+                      continue;
+                    }
+                    break;
+                  }
+                  return TrimCopy(value);
+                };
+                auto extractPrefixByLootSuffix =
+                    [&](const std::string &rawValue, const std::string &suffix,
+                        std::string &prefixOut) -> bool {
+                  prefixOut.clear();
+                  std::string loweredValue = ToLowerAsciiCopy(rawValue);
+                  std::string suffixLower = ToLowerAsciiCopy(suffix);
+                  if (loweredValue.length() > suffixLower.length() &&
+                      loweredValue.compare(loweredValue.length() - suffixLower.length(),
+                                           suffixLower.length(), suffixLower) == 0) {
+                    prefixOut =
+                        rawValue.substr(0, rawValue.length() - suffixLower.length());
+                    return true;
+                  }
+                  const char *joiners[] = {"/", "\\", "-", "_", ":", "|"};
+                  for (size_t joinIdx = 0; joinIdx < sizeof(joiners) / sizeof(joiners[0]);
+                       ++joinIdx) {
+                    std::string joined = std::string(joiners[joinIdx]) + suffixLower;
+                    if (loweredValue.length() <= joined.length()) {
+                      continue;
+                    }
+                    if (loweredValue.compare(loweredValue.length() - joined.length(),
+                                             joined.length(), joined) != 0) {
+                      continue;
+                    }
+                    prefixOut = rawValue.substr(0, rawValue.length() - joined.length());
+                    return true;
+                  }
+                  return false;
+                };
+                auto extractSuffixByLootPrefix =
+                    [&](const std::string &rawValue, const std::string &prefix,
+                        std::string &suffixOut) -> bool {
+                  suffixOut.clear();
+                  std::string loweredValue = ToLowerAsciiCopy(rawValue);
+                  std::string prefixLower = ToLowerAsciiCopy(prefix);
+                  if (loweredValue.length() > prefixLower.length() &&
+                      loweredValue.compare(0, prefixLower.length(), prefixLower) ==
+                          0) {
+                    suffixOut = rawValue.substr(prefixLower.length());
+                    return true;
+                  }
+                  const char *joiners[] = {"/", "\\", "-", "_", ":", "|"};
+                  for (size_t joinIdx = 0; joinIdx < sizeof(joiners) / sizeof(joiners[0]);
+                       ++joinIdx) {
+                    std::string joined = prefixLower + std::string(joiners[joinIdx]);
+                    if (loweredValue.length() <= joined.length()) {
+                      continue;
+                    }
+                    if (loweredValue.compare(0, joined.length(), joined) != 0) {
+                      continue;
+                    }
+                    suffixOut = rawValue.substr(joined.length());
+                    return true;
+                  }
+                  return false;
+                };
+
+                const std::string loweredPayload = ToLowerAsciiCopy(payload);
+                const char *suffixes[] = {"equipment", "equip",  "gear",
+                                          "armor",     "armour", "all",
+                                          "everything","inventory","items",
+                                          "loot",      "weapon", "weapons"};
+                for (size_t suffixIdx = 0; suffixIdx < sizeof(suffixes) / sizeof(suffixes[0]);
+                     ++suffixIdx) {
+                  const std::string suffix = suffixes[suffixIdx];
+                  std::string prefix = "";
+                  if (!extractPrefixByLootSuffix(payload, suffix, prefix)) {
+                    continue;
+                  }
+                  prefix = trimTargetPrefixToken(prefix);
+                  if (prefix.empty()) {
+                    continue;
+                  }
+                  std::string canonicalQuery = canonicalLootQueryFromSuffix(suffix);
+                  if (canonicalQuery.empty()) {
+                    continue;
+                  }
+
+                  hand candidateTarget = resolveActionTargetHand(prefix, targetHand);
+                  if (!candidateTarget.isValid() && canonicalQuery == "all") {
+                    // Support malformed variants like "Blue Eyesequipment/all".
+                    const char *nestedSuffixes[] = {"equipment", "equip", "gear",
+                                                    "armor", "armour", "weapon",
+                                                    "weapons"};
+                    for (size_t nestedIdx = 0;
+                         nestedIdx < sizeof(nestedSuffixes) / sizeof(nestedSuffixes[0]);
+                         ++nestedIdx) {
+                      std::string nestedPrefix = "";
+                      if (!extractPrefixByLootSuffix(prefix, nestedSuffixes[nestedIdx],
+                                                     nestedPrefix)) {
+                        continue;
+                      }
+                      nestedPrefix = trimTargetPrefixToken(nestedPrefix);
+                      if (nestedPrefix.empty()) {
+                        continue;
+                      }
+                      hand nestedTarget =
+                          resolveActionTargetHand(nestedPrefix, targetHand);
+                      if (!nestedTarget.isValid()) {
+                        continue;
+                      }
+                      targetOut = nestedPrefix;
+                      itemOut = canonicalQuery;
+                      amountOut = 1;
+                      return true;
+                    }
+                  }
+
+                  if (candidateTarget.isValid()) {
+                    targetOut = prefix;
+                    itemOut = canonicalQuery;
+                    amountOut = 1;
+                    return true;
+                  }
+
+                  // If this looks like a named target intent, don't downgrade to
+                  // taking items from player inventory.
+                  if (prefix.find(' ') != std::string::npos) {
+                    return false;
+                  }
+                }
+
+                // Support malformed variants like "equipmentBlue Eyes",
+                // where loot keyword is concatenated before target.
+                for (size_t suffixIdx = 0; suffixIdx < sizeof(suffixes) / sizeof(suffixes[0]);
+                     ++suffixIdx) {
+                  const std::string suffix = suffixes[suffixIdx];
+                  std::string trailingTarget = "";
+                  if (!extractSuffixByLootPrefix(payload, suffix, trailingTarget)) {
+                    continue;
+                  }
+                  trailingTarget = trimTargetPrefixToken(trailingTarget);
+                  if (trailingTarget.empty()) {
+                    continue;
+                  }
+
+                  std::string canonicalQuery = canonicalLootQueryFromSuffix(suffix);
+                  if (canonicalQuery.empty()) {
+                    continue;
+                  }
+
+                  hand candidateTarget =
+                      resolveActionTargetHand(trailingTarget, targetHand);
+                  if (candidateTarget.isValid()) {
+                    targetOut = trailingTarget;
+                    itemOut = canonicalQuery;
+                    amountOut = 1;
+                    return true;
+                  }
+
+                  // If this looks like a named target intent, don't downgrade to
+                  // taking items from player inventory.
+                  if (trailingTarget.find(' ') != std::string::npos) {
+                    return false;
+                  }
+                }
               }
 
               size_t firstAtPos = payload.find('@');
@@ -7099,10 +7543,11 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             if (!takeItemTargetToken.empty()) {
               takeItemTarget =
                   resolveActionTargetHand(takeItemTargetToken, targetHand);
-              if (!takeItemTarget.isValid()) {
-                Log("HOOK_MSG_PROC: TAKE_ITEM ignored; target unresolved '" +
-                    takeItemTargetToken + "'");
-                continue;
+              if (!takeItemTarget.isValid() || takeItemTarget.serial == 0) {
+                Log("HOOK_MSG_PROC: TAKE_ITEM target unresolved at parse-time '" +
+                    takeItemTargetToken +
+                    "'; deferring to runtime token resolution");
+                takeItemTarget = hand();
               }
             }
 
@@ -7113,6 +7558,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               act.actor = targetHand;
               act.target = takeItemTarget;
               act.message = takeItemRequests[i].first;
+              act.targetToken = takeItemTargetToken;
               act.taskValue = takeItemRequests[i].second;
               g_uiActionQueue.push_back(act);
             }

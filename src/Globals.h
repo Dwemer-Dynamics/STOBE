@@ -112,7 +112,8 @@ struct QueuedAction {
   ActionType type;
   hand actor;
   hand target;
-  std::string message; // Item name, notification text, or target token fallback
+  std::string message;    // Item name or notification text
+  std::string targetToken; // Optional text fallback for explicit target resolution
   std::string ttsHash; // Optional soundcache hash for line-level TTS playback
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
 };

@@ -1823,9 +1823,13 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
       ttsHash.clear();
       ttsDurationMs = 0;
     }
-    size_t slashPos = subtitle.find('/');
-    if (slashPos != std::string::npos) {
-      subtitle = TrimChatLine(subtitle.substr(0, slashPos));
+    bool isActionPayload = EqualsIgnoreCase(actionKind, "ActionQueue") ||
+                           EqualsIgnoreCase(actionKind, "Action");
+    if (!isActionPayload) {
+      size_t slashPos = subtitle.find('/');
+      if (slashPos != std::string::npos) {
+        subtitle = TrimChatLine(subtitle.substr(0, slashPos));
+      }
     }
   }
 
