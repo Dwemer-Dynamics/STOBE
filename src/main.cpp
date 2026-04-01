@@ -6889,14 +6889,61 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 giveItemSummary + "] target='" + giveItemTargetToken +
                 "' target_serial=" + ToString((unsigned int)giveItemTarget.serial));
           } else if (actionCommand == "TAKE_ITEM") {
-            std::string iName = actionArgument;
+            std::string takeItemPayload = TrimCopy(actionArgument);
+            std::string itemQuery = takeItemPayload;
+            std::string targetToken = "";
+            hand takeItemTarget = hand();
+            if (!takeItemPayload.empty()) {
+              size_t splitPos = takeItemPayload.find('@');
+              if (splitPos != std::string::npos) {
+                std::string leftToken =
+                    TrimCopy(takeItemPayload.substr(0, splitPos));
+                std::string rightToken =
+                    TrimCopy(takeItemPayload.substr(splitPos + 1));
+                hand leftTarget = hand();
+                hand rightTarget = hand();
+                if (!leftToken.empty()) {
+                  leftTarget = resolveActionTargetHand(leftToken, targetHand);
+                }
+                if (!rightToken.empty()) {
+                  rightTarget = resolveActionTargetHand(rightToken, targetHand);
+                }
+
+                if (leftTarget.isValid() &&
+                    (!rightTarget.isValid() || rightToken.empty())) {
+                  targetToken = leftToken;
+                  takeItemTarget = leftTarget;
+                  itemQuery = rightToken;
+                } else if (rightTarget.isValid() &&
+                           (!leftTarget.isValid() || leftToken.empty())) {
+                  targetToken = rightToken;
+                  takeItemTarget = rightTarget;
+                  itemQuery = leftToken;
+                } else if (leftTarget.isValid() && rightTarget.isValid()) {
+                  targetToken = leftToken;
+                  takeItemTarget = leftTarget;
+                  itemQuery = rightToken;
+                }
+              }
+            }
+
+            itemQuery = TrimCopy(itemQuery);
+            if (takeItemTarget.isValid() && itemQuery.empty()) {
+              itemQuery = "equipment";
+            }
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
             act.type = ACT_TAKE_ITEM;
             act.actor = targetHand;
-            act.message = iName;
+            act.target = takeItemTarget;
+            act.message = itemQuery;
             g_uiActionQueue.push_back(act);
             LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: TAKE_ITEM queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)takeItemTarget.serial) + " query='" +
+                itemQuery + "'");
           } else if (actionCommand == "DROP_ITEM") {
             std::string iName = actionArgument;
             EnterCriticalSection(&g_uiMutex);
@@ -6981,14 +7028,157 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             if (notice.empty()) {
               continue;
             }
-            EnterCriticalSection(&g_uiMutex);
-            QueuedAction act;
-            act.type = ACT_NOTIFY;
-            act.actor = targetHand;
-            act.target = hand();
-            act.message = notice;
-            g_uiActionQueue.push_back(act);
-            LeaveCriticalSection(&g_uiMutex);
+            auto tryParseCorpseLootRoleplay =
+                [&](const std::string &rawNotice, std::string &targetTokenOut,
+                    std::string &itemQueryOut) -> bool {
+              targetTokenOut.clear();
+              itemQueryOut.clear();
+              std::string lowered = ToLowerAsciiCopy(rawNotice);
+              bool hasLootVerb =
+                  lowered.find("loot") != std::string::npos ||
+                  lowered.find("strip") != std::string::npos ||
+                  lowered.find("strips") != std::string::npos ||
+                  lowered.find("stripped") != std::string::npos ||
+                  lowered.find("take") != std::string::npos ||
+                  lowered.find("takes") != std::string::npos;
+              bool hasCorpseHint =
+                  lowered.find("corpse") != std::string::npos ||
+                  lowered.find("dead body") != std::string::npos ||
+                  lowered.find(" body") != std::string::npos ||
+                  lowered.find("remains") != std::string::npos;
+              if (!hasLootVerb || !hasCorpseHint) {
+                return false;
+              }
+
+              std::string extractedTarget = "";
+              size_t fromPos = lowered.find(" from ");
+              if (fromPos != std::string::npos) {
+                extractedTarget = TrimCopy(rawNotice.substr(fromPos + 6));
+              }
+              if (extractedTarget.empty()) {
+                size_t corpseOfPos = lowered.find("corpse of ");
+                if (corpseOfPos != std::string::npos) {
+                  extractedTarget = TrimCopy(rawNotice.substr(corpseOfPos + 10));
+                }
+              }
+              if (extractedTarget.empty()) {
+                size_t bodyOfPos = lowered.find("body of ");
+                if (bodyOfPos != std::string::npos) {
+                  extractedTarget = TrimCopy(rawNotice.substr(bodyOfPos + 8));
+                }
+              }
+              if (extractedTarget.empty()) {
+                return false;
+              }
+
+              std::string targetLower = ToLowerAsciiCopy(extractedTarget);
+              size_t talkingPos = targetLower.find("(talking to:");
+              if (talkingPos != std::string::npos) {
+                extractedTarget = TrimCopy(extractedTarget.substr(0, talkingPos));
+              }
+
+              auto stripSuffixInsensitive = [&](std::string value,
+                                                const std::string &suffix)
+                  -> std::string {
+                if (EndsWithAsciiInsensitive(value, suffix) &&
+                    value.size() > suffix.size()) {
+                  return TrimCopy(value.substr(0, value.size() - suffix.size()));
+                }
+                return value;
+              };
+              auto stripTrailingPunctuation = [](std::string value) -> std::string {
+                while (!value.empty()) {
+                  char c = value.back();
+                  if (c == ' ' || c == '\t' || c == '"' || c == '\'' ||
+                      c == '.' || c == ',' || c == ';' || c == ':' || c == '!' ||
+                      c == '?' || c == ')' || c == ']' || c == '}') {
+                    value.erase(value.size() - 1, 1);
+                    continue;
+                  }
+                  break;
+                }
+                while (!value.empty()) {
+                  char c = value.front();
+                  if (c == ' ' || c == '\t' || c == '"' || c == '\'' ||
+                      c == '(' || c == '[' || c == '{') {
+                    value.erase(0, 1);
+                    continue;
+                  }
+                  break;
+                }
+                return TrimCopy(value);
+              };
+
+              extractedTarget = stripTrailingPunctuation(extractedTarget);
+              extractedTarget =
+                  stripSuffixInsensitive(extractedTarget, "'s corpse");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, "' corpse");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, " corpse");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, "'s body");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, "' body");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, " body");
+              extractedTarget =
+                  stripSuffixInsensitive(extractedTarget, "'s remains");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, "' remains");
+              extractedTarget = stripSuffixInsensitive(extractedTarget, " remains");
+              extractedTarget = stripTrailingPunctuation(extractedTarget);
+              if (extractedTarget.empty()) {
+                return false;
+              }
+
+              if (ContainsAsciiInsensitive(lowered, "weapon")) {
+                itemQueryOut = "weapon";
+              } else if (ContainsAsciiInsensitive(lowered, "all") ||
+                         ContainsAsciiInsensitive(lowered, "everything") ||
+                         ContainsAsciiInsensitive(lowered, "inventory") ||
+                         ContainsAsciiInsensitive(lowered, "items")) {
+                itemQueryOut = "all";
+              } else {
+                itemQueryOut = "equipment";
+              }
+
+              targetTokenOut = extractedTarget;
+              return true;
+            };
+
+            std::string corpseLootTargetToken = "";
+            std::string corpseLootQuery = "";
+            bool mappedToTakeItem = false;
+            if (tryParseCorpseLootRoleplay(notice, corpseLootTargetToken,
+                                           corpseLootQuery)) {
+              hand corpseLootTarget =
+                  resolveActionTargetHand(corpseLootTargetToken, targetHand);
+              if (corpseLootTarget.isValid()) {
+                EnterCriticalSection(&g_uiMutex);
+                QueuedAction act;
+                act.type = ACT_TAKE_ITEM;
+                act.actor = targetHand;
+                act.target = corpseLootTarget;
+                act.message = corpseLootQuery;
+                g_uiActionQueue.push_back(act);
+                LeaveCriticalSection(&g_uiMutex);
+                mappedToTakeItem = true;
+                Log("HOOK_MSG_PROC: ROLEPLAY_ACTION mapped actor_serial=" +
+                    ToString((unsigned int)targetHand.serial) + " target='" +
+                    corpseLootTargetToken + "' target_serial=" +
+                    ToString((unsigned int)corpseLootTarget.serial) + " query='" +
+                    corpseLootQuery + "'");
+              } else {
+                Log("HOOK_MSG_PROC: ROLEPLAY_ACTION loot mapping failed; unresolved "
+                    "target '" +
+                    corpseLootTargetToken + "'");
+              }
+            }
+            if (!mappedToTakeItem) {
+              EnterCriticalSection(&g_uiMutex);
+              QueuedAction act;
+              act.type = ACT_NOTIFY;
+              act.actor = targetHand;
+              act.target = hand();
+              act.message = notice;
+              g_uiActionQueue.push_back(act);
+              LeaveCriticalSection(&g_uiMutex);
+            }
           } else if (actionCommand == "TAKE_CATS") {
             std::string catsTargetToken = "";
             int catsAmount = 0;

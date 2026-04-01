@@ -2381,6 +2381,50 @@ bool IsRemoveLimbTargetValid(GameWorld *world, Character *target,
   return false;
 }
 
+bool IsTakeItemLootTargetValid(GameWorld *world, Character *target,
+                               std::string &reasonOut, bool &isDeadOut) {
+  reasonOut.clear();
+  isDeadOut = false;
+  if (!target || (uintptr_t)target <= 0x1000) {
+    reasonOut = "target not found";
+    return false;
+  }
+
+  bool isDead = false;
+  try {
+    isDead = target->isDead();
+  } catch (...) {
+    isDead = false;
+  }
+  isDeadOut = isDead;
+  if (isDead) {
+    return true;
+  }
+
+  bool isUnconscious = false;
+  try {
+    isUnconscious = target->isUnconcious();
+  } catch (...) {
+    isUnconscious = false;
+  }
+  bool isKnockedOut = false;
+  try {
+    isKnockedOut = target->isDown();
+  } catch (...) {
+    isKnockedOut = false;
+  }
+  bool isPrisoned = IsCharacterPrisoned(target);
+  std::string carrierName = "";
+  bool isCarried = IsCharacterBeingCarried(world, target, carrierName);
+  if (isUnconscious || isKnockedOut || isPrisoned || isCarried) {
+    return true;
+  }
+
+  reasonOut =
+      "target must be dead, knocked out, unconscious, imprisoned, or carried";
+  return false;
+}
+
 struct UseObjectCandidate {
   Building *building;
   std::string name;
@@ -4192,47 +4236,307 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             }
           }
         } else if (act.type == ACT_TAKE_ITEM) {
-          Character *player =
+          Character *primaryPlayer =
               (thisptr->player && thisptr->player->playerCharacters.size() > 0)
                   ? thisptr->player->playerCharacters[0]
                   : nullptr;
-          if (player) {
-            std::vector<Item *> pItems;
-            GetAllCharacterItems(player, pItems);
-            std::string targetName = act.message;
-            size_t fnot = targetName.find_first_not_of(" \t\n\r\"'");
-            if (fnot != std::string::npos) {
-              targetName.erase(0, fnot);
-              size_t lnot = targetName.find_last_not_of(" \t\n\r\"'");
-              if (lnot != std::string::npos)
-                targetName.erase(lnot + 1);
-            }
-            std::transform(targetName.begin(), targetName.end(),
-                           targetName.begin(), ::tolower);
+          Character *sourceCharacter = primaryPlayer;
+          bool explicitSourceTarget =
+              target && target != npc && (uintptr_t)target > 0x1000;
+          if (explicitSourceTarget) {
+            sourceCharacter = target;
+          }
 
-            for (uint32_t i = 0; i < pItems.size(); ++i) {
-              std::string itemName = pItems[i]->getName();
-              std::transform(itemName.begin(), itemName.end(), itemName.begin(),
-                             ::tolower);
-              if (itemName.find(targetName) != std::string::npos) {
-                Log("ACTION_EXEC: Taking item: " + pItems[i]->getName());
-                if (pItems[i]->isEquipped)
-                  player->unequipItem(pItems[i]->inventorySection, pItems[i]);
-                Inventory *inv = pItems[i]->getInventory();
-                if (!inv)
-                  inv = player->getInventory();
-                Item *detached =
-                    inv ? inv->removeItemDontDestroy_returnsItem(
-                              pItems[i], pItems[i]->quantity, false)
-                        : nullptr;
-                npc->giveItem(detached ? detached : pItems[i], true, false);
-                thisptr->showPlayerAMessage_withLog(npc->getName() + " took " +
-                                                        pItems[i]->getName() +
-                                                        " from you.",
-                                                    true);
-                npc->reThinkCurrentAIAction();
+          const std::string actorName = SafeCharacterName(npc);
+          const std::string sourceName = SafeCharacterName(sourceCharacter);
+          std::string itemQueryRaw = TrimCopySimple(act.message);
+          if (itemQueryRaw.empty() && explicitSourceTarget) {
+            itemQueryRaw = "equipment";
+          }
+          size_t fnot = itemQueryRaw.find_first_not_of(" \t\n\r\"'");
+          if (fnot != std::string::npos) {
+            itemQueryRaw.erase(0, fnot);
+            size_t lnot = itemQueryRaw.find_last_not_of(" \t\n\r\"'");
+            if (lnot != std::string::npos) {
+              itemQueryRaw.erase(lnot + 1);
+            }
+          } else {
+            itemQueryRaw.clear();
+          }
+
+          std::string itemQueryToken = NormalizeInventoryMatchToken(itemQueryRaw);
+          bool equipmentSweep =
+              itemQueryToken == "equipment" || itemQueryToken == "equip" ||
+              itemQueryToken == "gear" || itemQueryToken == "armor" ||
+              itemQueryToken == "armour";
+          bool allItemsSweep =
+              itemQueryToken == "all" || itemQueryToken == "everything" ||
+              itemQueryToken == "inventory" || itemQueryToken == "items" ||
+              itemQueryToken == "loot";
+          if (itemQueryToken.empty() && explicitSourceTarget) {
+            equipmentSweep = true;
+          }
+
+          auto tryMoveItemToActor = [&](Item *item) -> bool {
+            if (!item || (uintptr_t)item <= 0x1000 || !sourceCharacter ||
+                (uintptr_t)sourceCharacter <= 0x1000) {
+              return false;
+            }
+
+            bool wasEquipped = false;
+            try {
+              wasEquipped = item->isEquipped;
+            } catch (...) {
+              wasEquipped = false;
+            }
+            if (wasEquipped) {
+              try {
+                sourceCharacter->unequipItem(item->inventorySection, item);
+              } catch (...) {
+              }
+            }
+
+            int transferQuantity = 1;
+            try {
+              if (item->quantity > 0) {
+                transferQuantity = item->quantity;
+              }
+            } catch (...) {
+              transferQuantity = 1;
+            }
+
+            Inventory *inv = nullptr;
+            try {
+              inv = item->getInventory();
+            } catch (...) {
+              inv = nullptr;
+            }
+            if (!inv) {
+              try {
+                inv = sourceCharacter->getInventory();
+              } catch (...) {
+                inv = nullptr;
+              }
+            }
+
+            Item *detached = nullptr;
+            try {
+              detached =
+                  inv ? inv->removeItemDontDestroy_returnsItem(item, transferQuantity,
+                                                               false)
+                      : nullptr;
+            } catch (...) {
+              detached = nullptr;
+            }
+
+            Item *toGive = detached ? detached : item;
+            if (!toGive || (uintptr_t)toGive <= 0x1000) {
+              return false;
+            }
+            try {
+              npc->giveItem(toGive, true, false);
+            } catch (...) {
+              return false;
+            }
+            return true;
+          };
+
+          if (!sourceCharacter || (uintptr_t)sourceCharacter <= 0x1000) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid source to take items from.",
+                true);
+            Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                " reason=source_not_found");
+          } else if (sourceCharacter == npc) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot take items from themselves.", true);
+            Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                " reason=self_transfer");
+          } else if (itemQueryToken.empty() && !equipmentSweep && !allItemsSweep) {
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not parse an item to take.", true);
+            Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                " source=" + sourceName + " reason=empty_item_query raw='" +
+                act.message + "'");
+          } else {
+            bool sourceIsDead = false;
+            bool canLootSource = true;
+            if (explicitSourceTarget) {
+              float actionDistance = -1.0f;
+              std::string rangeReason = "";
+              if (!ValidateNpcCloseActionRange(npc, sourceCharacter,
+                                               kNpcCloseActionRangeUnits,
+                                               actionDistance, rangeReason)) {
+                canLootSource = false;
+                std::string userReason = "too far away";
+                if (rangeReason == "area_mismatch") {
+                  userReason = "not in the same area";
+                }
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot loot " + sourceName + " because they are " +
+                        userReason + ".",
+                    true);
+                Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                    " source=" + sourceName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+              } else {
+                std::string invalidReason = "";
+                if (!IsTakeItemLootTargetValid(thisptr, sourceCharacter,
+                                               invalidReason, sourceIsDead)) {
+                  canLootSource = false;
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " cannot loot " + sourceName + ": " +
+                          invalidReason + ".",
+                      true);
+                  Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                      " source=" + sourceName + " reason=" + invalidReason);
+                }
+              }
+            }
+
+            if (canLootSource) {
+              std::vector<Item *> sourceItems;
+              GetAllCharacterItems(sourceCharacter, sourceItems);
+
+              int movedCount = 0;
+              std::string firstMovedName = "";
+              for (size_t i = 0; i < sourceItems.size(); ++i) {
+                Item *item = sourceItems[i];
+                if (!item || (uintptr_t)item <= 0x1000) {
+                  continue;
+                }
+
+                std::string itemName = "";
+                try {
+                  itemName = item->getName();
+                } catch (...) {
+                  itemName = "";
+                }
+                if (itemName.empty()) {
+                  continue;
+                }
+
+                bool matches = false;
+                if (allItemsSweep) {
+                  matches = true;
+                } else if (equipmentSweep) {
+                  bool isEquipped = false;
+                  try {
+                    isEquipped = item->isEquipped;
+                  } catch (...) {
+                    isEquipped = false;
+                  }
+                  matches = isEquipped;
+                } else {
+                  std::string itemToken = NormalizeInventoryMatchToken(itemName);
+                  matches = InventoryTokensMatch(itemToken, itemQueryToken);
+                }
+                if (!matches) {
+                  continue;
+                }
+
+                if (!tryMoveItemToActor(item)) {
+                  continue;
+                }
+
+                ++movedCount;
+                if (firstMovedName.empty()) {
+                  firstMovedName = itemName;
+                }
+
+                if (!equipmentSweep && !allItemsSweep) {
+                  break;
+                }
+              }
+
+              // Some dead bodies expose items without the equipped flag set.
+              // If "equipment" was requested and none matched, fall back to
+              // looting remaining corpse inventory.
+              if (movedCount == 0 && equipmentSweep && explicitSourceTarget &&
+                  sourceIsDead) {
+                for (size_t i = 0; i < sourceItems.size(); ++i) {
+                  Item *item = sourceItems[i];
+                  if (!item || (uintptr_t)item <= 0x1000) {
+                    continue;
+                  }
+                  std::string itemName = "";
+                  try {
+                    itemName = item->getName();
+                  } catch (...) {
+                    itemName = "";
+                  }
+                  if (itemName.empty()) {
+                    continue;
+                  }
+                  if (!tryMoveItemToActor(item)) {
+                    continue;
+                  }
+                  ++movedCount;
+                  if (firstMovedName.empty()) {
+                    firstMovedName = itemName;
+                  }
+                }
+              }
+
+              if (movedCount > 0) {
+                std::string sourceLabel = explicitSourceTarget ? sourceName : "you";
+                std::string itemLabel = firstMovedName;
+                if ((equipmentSweep || allItemsSweep) && movedCount > 1) {
+                  itemLabel = ToString(movedCount) + " items";
+                } else if ((equipmentSweep || allItemsSweep) && movedCount == 1 &&
+                           itemLabel.empty()) {
+                  itemLabel = "equipment";
+                }
+                if (itemLabel.empty()) {
+                  itemLabel = "an item";
+                }
+
+                if (!explicitSourceTarget) {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " took " + itemLabel + " from you.", true);
+                } else if (sourceIsDead) {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " looted " + itemLabel + " from " + sourceLabel +
+                          "'s corpse.",
+                      true);
+                } else {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " took " + itemLabel + " from " + sourceLabel + ".",
+                      true);
+                }
+
+                Log("ACTION_EXEC: TAKE_ITEM actor=" + actorName +
+                    " source=" + sourceLabel + " query='" + itemQueryRaw +
+                    "' moved_count=" + ToString(movedCount) +
+                    " first_item='" + firstMovedName + "' source_dead=" +
+                    std::string(sourceIsDead ? "1" : "0"));
                 inventoryTimer = 999;
-                break;
+                try {
+                  npc->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+                if (explicitSourceTarget) {
+                  try {
+                    sourceCharacter->reThinkCurrentAIAction();
+                  } catch (...) {
+                  }
+                }
+              } else {
+                if (!explicitSourceTarget) {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " could not find that item on you.", true);
+                } else {
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " could not find matching loot on " + sourceName +
+                          ".",
+                      true);
+                }
+                Log("ACTION_EXEC: TAKE_ITEM blocked actor=" + actorName +
+                    " source=" + sourceName + " reason=item_not_found query='" +
+                    itemQueryRaw + "' equipment_sweep=" +
+                    std::string(equipmentSweep ? "1" : "0") + " all_sweep=" +
+                    std::string(allItemsSweep ? "1" : "0"));
               }
             }
           }
