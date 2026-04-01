@@ -6067,12 +6067,17 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } catch (...) {
             actionActorIsPlayerFaction = false;
           }
-          std::string actionEventMessage = "action command received: " + actionCommand + "@";
-          if (!actionArgument.empty()) {
-            actionEventMessage += actionArgument;
+          bool logAsInfoAction = (actionCommand != "REMOVE_LIMB");
+          if (logAsInfoAction) {
+            std::string actionEventMessage =
+                "action command received: " + actionCommand + "@";
+            if (!actionArgument.empty()) {
+              actionEventMessage += actionArgument;
+            }
+            LogGameEvent("infoaction", actionActorName, actionActorFaction,
+                         "None", "None", actionEventMessage, targetHand.serial,
+                         0);
           }
-          LogGameEvent("infoaction", actionActorName, actionActorFaction, "None",
-                       "None", actionEventMessage, targetHand.serial, 0);
           auto shouldSkipSpeakerBoundAction =
               [&](const std::string &commandName) -> bool {
             if (!targetHand.isValid() || targetHand.serial == 0 ||

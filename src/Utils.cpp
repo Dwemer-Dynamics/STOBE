@@ -90,6 +90,70 @@ bool IsDialogueLikeEventType(const std::string &type) {
          normalized == "inputtext" || normalized == "bored";
 }
 
+static std::map<std::string, DWORD> g_recentLimbLossEventTicks;
+static const DWORD kLimbLossDuplicateWindowMs = 15000;
+
+std::string ExtractLimbLossKeyToken(const std::string &message) {
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(message));
+  if (normalized.empty()) {
+    return "unknown";
+  }
+
+  size_t severedPos = normalized.find("severed ");
+  if (severedPos != std::string::npos) {
+    size_t limbStart = severedPos + 8;
+    if (limbStart < normalized.size()) {
+      size_t fromPos = normalized.find(" from ", limbStart);
+      if (fromPos != std::string::npos && fromPos > limbStart) {
+        std::string limbToken =
+            TrimCopy(normalized.substr(limbStart, fromPos - limbStart));
+        if (!limbToken.empty()) {
+          return limbToken;
+        }
+      }
+    }
+  }
+
+  return normalized;
+}
+
+bool ShouldDropDuplicateLimbLossEvent(const std::string &target,
+                                      unsigned int targetSerial,
+                                      const std::string &message) {
+  DWORD nowTick = GetTickCount();
+  std::string victimKey = "";
+  if (targetSerial != 0) {
+    victimKey = ToString((int)targetSerial);
+  } else {
+    victimKey = ToLowerAsciiCopy(TrimCopy(target));
+  }
+  if (victimKey.empty()) {
+    victimKey = "unknown";
+  }
+  std::string limbKey = ExtractLimbLossKeyToken(message);
+  std::string dedupeKey = victimKey + "|" + limbKey;
+
+  auto existing = g_recentLimbLossEventTicks.find(dedupeKey);
+  if (existing != g_recentLimbLossEventTicks.end() &&
+      nowTick - existing->second < kLimbLossDuplicateWindowMs) {
+    return true;
+  }
+  g_recentLimbLossEventTicks[dedupeKey] = nowTick;
+
+  if (g_recentLimbLossEventTicks.size() > 256) {
+    for (auto it = g_recentLimbLossEventTicks.begin();
+         it != g_recentLimbLossEventTicks.end();) {
+      if (nowTick - it->second > (kLimbLossDuplicateWindowMs * 4)) {
+        it = g_recentLimbLossEventTicks.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  return false;
+}
+
 bool ShouldFilterChatEventLine(const std::string &type,
                                const std::string &message) {
   if (ToLowerAsciiCopy(TrimCopy(type)) != "chat") {
@@ -1007,6 +1071,15 @@ void LogGameEvent(const std::string &type, const std::string &actor,
                   const std::string &targetFaction,
                   const std::string &message, unsigned int actorSerial,
                   unsigned int targetSerial) {
+  std::string normalizedType = ToLowerAsciiCopy(TrimCopy(type));
+  if (normalizedType == "limb_loss" &&
+      ShouldDropDuplicateLimbLossEvent(target, targetSerial, message)) {
+    Log("EVENT_STREAM: dropped duplicate limb_loss target_serial=" +
+        ToString((int)targetSerial) + " target=" + target +
+        " message=" + message);
+    return;
+  }
+
   if (ShouldFilterChatEventLine(type, message)) {
     Log("EVENT_STREAM: dropped filtered chat line actor=" + actor +
         " message=" + message);

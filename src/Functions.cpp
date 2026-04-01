@@ -4911,6 +4911,53 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                       bool knockoutForced = false;
                       ForcePostAmputationKnockout(
                           medical, limb, limbHealthForced, knockoutForced);
+                      unsigned int actorSerial = 0;
+                      unsigned int targetSerial = 0;
+                      try {
+                        actorSerial = npc->getHandle().serial;
+                      } catch (...) {
+                        actorSerial = 0;
+                      }
+                      try {
+                        targetSerial = target->getHandle().serial;
+                      } catch (...) {
+                        targetSerial = 0;
+                      }
+                      auto resolveFactionNameSafe = [](Character *character)
+                          -> std::string {
+                        if (!character || (uintptr_t)character <= 0x1000) {
+                          return "None";
+                        }
+                        try {
+                          Faction *faction =
+                              character->getFaction()
+                                  ? character->getFaction()
+                                  : character->owner;
+                          if (faction && (uintptr_t)faction > 0x1000) {
+                            std::string factionName = faction->getName();
+                            if (!factionName.empty()) {
+                              return factionName;
+                            }
+                            if (faction->data) {
+                              std::string fallback = faction->data->name;
+                              if (fallback.empty()) {
+                                fallback = faction->data->stringID;
+                              }
+                              if (!fallback.empty()) {
+                                return fallback;
+                              }
+                            }
+                          }
+                        } catch (...) {
+                        }
+                        return "None";
+                      };
+                      LogGameEvent(
+                          "limb_loss", actorName, resolveFactionNameSafe(npc),
+                          targetName, resolveFactionNameSafe(target),
+                          "severed " + limbName + " from " + targetName +
+                              " with a hacksaw",
+                          actorSerial, targetSerial);
                       try {
                         target->reThinkCurrentAIAction();
                       } catch (...) {
