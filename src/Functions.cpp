@@ -3264,6 +3264,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static hand activeSpeechTarget;
   static unsigned int activeSpeechTargetSerial = 0;
   static DWORD holdPlaybackLogTick = 0;
+  static DWORD pausedQueueLogTick = 0;
 
   UpdateNarratorTimedPopupLifecycle();
 
@@ -3271,6 +3272,25 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   UpdateNpcDrugStates(thisptr);
 
   if (TryEnterCriticalSection(&g_uiMutex)) {
+    bool gamePaused = false;
+    try {
+      gamePaused = (thisptr && thisptr->isPaused());
+    } catch (...) {
+      gamePaused = false;
+    }
+    if (gamePaused) {
+      DWORD nowTick = GetTickCount();
+      if (!g_uiActionQueue.empty() && nowTick - pausedQueueLogTick >= 1500) {
+        pausedQueueLogTick = nowTick;
+        const QueuedAction &nextAction = g_uiActionQueue.front();
+        Log("ACTION_QUEUE: paused; deferring queued actions size=" +
+            ToString((int)g_uiActionQueue.size()) +
+            " next_type=" + ToString((int)nextAction.type));
+      }
+      LeaveCriticalSection(&g_uiMutex);
+      return;
+    }
+
     if (holdForTtsPlayback) {
       Character *holdTarget = nullptr;
       if (activeSpeechTargetSerial != 0) {
