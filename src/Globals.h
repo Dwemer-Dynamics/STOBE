@@ -41,6 +41,7 @@ extern float g_speechBubbleLife;
 extern int g_rechatDispatchCooldownMs;
 extern int g_ttsVolumePercent;
 extern bool g_ttsEnabled;
+extern bool g_speedDialogue;
 extern int g_dynamicProfileIntervalMinutes;
 
 // State tracking for inventory/debugger

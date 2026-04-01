@@ -30,6 +30,7 @@ float g_speechBubbleLife = 5.0f;
 int g_rechatDispatchCooldownMs = 350;
 int g_ttsVolumePercent = 100;
 bool g_ttsEnabled = true;
+bool g_speedDialogue = true;
 int g_dynamicProfileIntervalMinutes = 20;
 
 std::string g_activeInventoryJson = "[]";

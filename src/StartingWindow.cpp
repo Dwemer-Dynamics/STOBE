@@ -6,7 +6,6 @@
 #include "Utils.h"
 #include "WelcomeWindow.h"
 #include <kenshi/GameWorld.h>
-#include <shellapi.h>
 #include <windows.h>
 #include <mygui/MyGUI_Button.h>
 #include <mygui/MyGUI_Colour.h>
@@ -93,10 +92,6 @@ void CloseStartingUI() {
 void OnStartingAiNpcsClick(MyGUI::Widget *sender) { CreateAiNpcInfoUI(); }
 void OnStartingAiDiariesClick(MyGUI::Widget *sender) { CreateAiDiaryUI(); }
 void OnStartingPluginSettingsClick(MyGUI::Widget *sender) { CreateSettingsUI(); }
-void OnStartingServerHomeClick(MyGUI::Widget *sender) {
-  const std::string url = GetStobeServerHomeUrl();
-  ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
-}
 void OnStartingWelcomeClick(MyGUI::Widget *sender) { CreateWelcomeUI(); }
 
 void OnStartingWindowButtonPressed(MyGUI::Window *sender,
@@ -169,16 +164,8 @@ void CreateStartingUI() {
   pluginSettingsBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
-  MyGUI::Button *serverHomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.66f, 0.9f, 0.12f,
-      MyGUI::Align::Top | MyGUI::Align::HStretch,
-      "Stobe_StartingServerHomeBtn");
-  serverHomeBtn->setCaption(WideFromUtf8(T("Open server page")).c_str());
-  serverHomeBtn->eventMouseButtonClick +=
-      MyGUI::newDelegate(OnStartingServerHomeClick);
-
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.80f, 0.9f, 0.12f,
+      "Kenshi_Button1", 0.05f, 0.66f, 0.9f, 0.12f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
@@ -201,7 +188,6 @@ void RefreshStartingUI() {
   RefreshMap items[] = {{"Stobe_StartingAiNpcsBtn", "Stobe NPCs"},
                         {"Stobe_StartingAiDiariesBtn", "Stobe Diaries"},
                         {"Stobe_StartingPluginSetBtn", "General Settings"},
-                        {"Stobe_StartingServerHomeBtn", "Open server page"},
                         {"Stobe_StartingWelBtn", "MOTD"}};
 
   for (int i = 0; i < sizeof(items) / sizeof(items[0]); ++i) {

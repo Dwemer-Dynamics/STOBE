@@ -3,6 +3,8 @@
 #include <vector>
 #include <windows.h>
 
+class GameWorld;
+
 void Log(const std::string &msg);
 std::string ToString(int val);
 std::string ToString(unsigned int val);
@@ -15,6 +17,7 @@ std::string JsonReadField(const std::string &json, const std::string &key);
 void LoadStobeRuntimeConfig();
 void SaveStobeRuntimeConfig();
 void SetHotkeyFromString(const std::string &keyStr);
+float ResolveDialogueGameSpeedMultiplier(GameWorld *world);
 void SleepIfPaused(DWORD ms);
 void ResetRuntimeLogsForSession();
 std::string SanitizeDialogueForEventStream(const std::string &value);

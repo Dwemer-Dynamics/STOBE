@@ -307,6 +307,25 @@ DWORD ResolveSpeechQueueDelayMs(const QueuedAction &act) {
   return delayMs;
 }
 
+DWORD ResolveSpeechQueueRemainingRealMs(double remainingScaledMs,
+                                        float speedMultiplier) {
+  if (remainingScaledMs <= 0.0) {
+    return 0;
+  }
+  if (!(speedMultiplier > 0.0f)) {
+    speedMultiplier = 1.0f;
+  }
+  double remainingReal =
+      remainingScaledMs / static_cast<double>(speedMultiplier);
+  if (remainingReal <= 1.0) {
+    return 1;
+  }
+  if (remainingReal >= 600000.0) {
+    return 600000;
+  }
+  return static_cast<DWORD>(remainingReal + 0.999);
+}
+
 static bool IsNarratorTimedPopupMessage(const std::string &message) {
   const std::string trimmed = TrimCopySimple(message);
   if (trimmed.empty()) {
@@ -3668,6 +3687,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static unsigned int activeSpeechTargetSerial = 0;
   static DWORD holdPlaybackLogTick = 0;
   static DWORD pausedQueueLogTick = 0;
+  static double speechDelayRemainingScaledMs = 0.0;
+  static DWORD speechDelayLastTick = 0;
 
   UpdateNarratorTimedPopupLifecycle();
 
@@ -3676,13 +3697,57 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
   if (TryEnterCriticalSection(&g_uiMutex)) {
     bool gamePaused = false;
+    float gameSpeedMultiplier = ResolveDialogueGameSpeedMultiplier(thisptr);
     try {
       gamePaused = (thisptr && thisptr->isPaused());
     } catch (...) {
       gamePaused = false;
     }
     if (gamePaused) {
-      DWORD nowTick = GetTickCount();
+      gameSpeedMultiplier = 1.0f;
+    }
+
+    DWORD nowTick = GetTickCount();
+    if (g_nextSpeechActionTick == 0) {
+      speechDelayRemainingScaledMs = 0.0;
+      speechDelayLastTick = 0;
+    } else {
+      if (speechDelayRemainingScaledMs <= 0.0) {
+        if (g_nextSpeechActionTick > nowTick) {
+          speechDelayRemainingScaledMs =
+              static_cast<double>(g_nextSpeechActionTick - nowTick);
+          speechDelayLastTick = nowTick;
+        } else {
+          g_nextSpeechActionTick = 0;
+          speechDelayRemainingScaledMs = 0.0;
+          speechDelayLastTick = 0;
+        }
+      }
+      if (!gamePaused && g_nextSpeechActionTick != 0 &&
+          speechDelayRemainingScaledMs > 0.0) {
+        if (speechDelayLastTick == 0 || speechDelayLastTick > nowTick) {
+          speechDelayLastTick = nowTick;
+        }
+        DWORD elapsedMs = nowTick - speechDelayLastTick;
+        if (elapsedMs > 0) {
+          speechDelayRemainingScaledMs -=
+              static_cast<double>(elapsedMs) *
+              static_cast<double>(gameSpeedMultiplier);
+          speechDelayLastTick = nowTick;
+        }
+        if (speechDelayRemainingScaledMs <= 0.0) {
+          g_nextSpeechActionTick = 0;
+          speechDelayRemainingScaledMs = 0.0;
+          speechDelayLastTick = 0;
+        } else {
+          g_nextSpeechActionTick =
+              nowTick + ResolveSpeechQueueRemainingRealMs(
+                            speechDelayRemainingScaledMs, gameSpeedMultiplier);
+        }
+      }
+    }
+
+    if (gamePaused) {
       if (!g_uiActionQueue.empty() && nowTick - pausedQueueLogTick >= 1500) {
         pausedQueueLogTick = nowTick;
         const QueuedAction &nextAction = g_uiActionQueue.front();
@@ -3706,10 +3771,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         InterruptTtsPlayback();
       } else if (holdTarget && holdTarget->dialogue &&
                  (uintptr_t)holdTarget->dialogue > 0x1000) {
-        float speed = thisptr->getFrameSpeedMultiplier();
-        if (speed < 1.0f) {
-          speed = 1.0f;
-        }
+        float speed = ResolveDialogueGameSpeedMultiplier(thisptr);
         float keepAlive = 0.45f * speed;
         if (holdTarget->dialogue->speechTextTimer < keepAlive) {
           holdTarget->dialogue->speechTextTimer = keepAlive;
@@ -3735,6 +3797,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       activeSpeechTarget = hand();
       activeSpeechTargetSerial = 0;
       g_nextSpeechActionTick = 0;
+      speechDelayRemainingScaledMs = 0.0;
+      speechDelayLastTick = 0;
     }
 
     while (!g_uiActionQueue.empty()) {
@@ -3775,7 +3839,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         bool hasTtsClip = g_ttsEnabled && !act.ttsHash.empty();
         bool playbackQueued = false;
         if (hasTtsClip) {
-          playbackQueued = QueueTtsPlayback(act.ttsHash);
+          playbackQueued =
+              QueueTtsPlayback(act.ttsHash, -1, 0,
+                               ResolveDialogueGameSpeedMultiplier(thisptr));
         }
         if (hasTtsClip) {
           Log("ACTION_TIMING: NOTIFY tts_hash=" + act.ttsHash.substr(0, 8) +
@@ -3814,14 +3880,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           target->say(act.message);
           forcedSayFallback = true;
 
-          // ðŸš¨ FIX: Speech bubbles disappear too fast at high game speeds.
-          // Scale the timer by game speed to keep real-time duration stable.
-          // When TTS metadata is present, sync bubble lifetime to clip length.
+          // Keep bubble lifetime aligned to the dialogue line. Queue/audio
+          // pacing is scaled separately by current game speed.
           if (target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
             target->dialogue->npcReplyText = act.message;
-            float speed = thisptr->getFrameSpeedMultiplier();
-            if (speed < 1.0f)
-              speed = 1.0f;
             float baseDuration = g_speechBubbleLife;
             if (g_ttsEnabled && act.ttsHash.size() == 32 && act.taskValue > 0) {
               baseDuration = (float)act.taskValue / 1000.0f + 0.20f;
@@ -3832,7 +3894,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             if (baseDuration < 1.0f) {
               baseDuration = 1.0f;
             }
-            float duration = baseDuration * speed;
+            float duration = baseDuration;
             target->dialogue->speechTextTimer = duration;
             target->dialogue->speechTextTimer_forced = duration;
             appliedBubbleDuration = duration;
@@ -3867,7 +3929,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                               ttsSpeakerLoaded, ttsAttenuated);
           if (ttsVolumePercent > 0) {
             playbackQueued =
-                QueueTtsPlayback(act.ttsHash, ttsVolumePercent, act.target.serial);
+                QueueTtsPlayback(act.ttsHash, ttsVolumePercent,
+                                 act.target.serial,
+                                 ResolveDialogueGameSpeedMultiplier(thisptr));
           } else {
             ttsSkipReason =
                 ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
@@ -3914,9 +3978,6 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                  !IsCharacterUnavailableForDialogue(target)) {
         float appliedBubbleDuration = 0.0f;
         if (target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
-          float speed = thisptr->getFrameSpeedMultiplier();
-          if (speed < 1.0f)
-            speed = 1.0f;
           float baseDuration = g_speechBubbleLife;
           if (g_ttsEnabled && !act.ttsHash.empty() && act.taskValue > 0) {
             baseDuration = (float)act.taskValue / 1000.0f + 0.20f;
@@ -3927,7 +3988,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           if (baseDuration < 1.0f) {
             baseDuration = 1.0f;
           }
-          float duration = baseDuration * speed;
+          float duration = baseDuration;
           target->dialogue->speechTextTimer = duration;
           target->dialogue->speechTextTimer_forced = duration;
           appliedBubbleDuration = duration;
@@ -3945,7 +4006,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                               ttsSpeakerLoaded, ttsAttenuated);
           if (ttsVolumePercent > 0) {
             playbackQueued =
-                QueueTtsPlayback(act.ttsHash, ttsVolumePercent, act.target.serial);
+                QueueTtsPlayback(act.ttsHash, ttsVolumePercent,
+                                 act.target.serial,
+                                 ResolveDialogueGameSpeedMultiplier(thisptr));
           } else {
             ttsSkipReason =
                 ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
@@ -6411,8 +6474,18 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         lockReacquired = true;
       }
       if (blockSpeechQueue) {
-        g_nextSpeechActionTick = GetTickCount() + speechDelayMs;
-        g_lastDialogueTick = GetTickCount();
+        DWORD gateNowTick = GetTickCount();
+        speechDelayRemainingScaledMs = static_cast<double>(speechDelayMs);
+        speechDelayLastTick = gateNowTick;
+        if (speechDelayRemainingScaledMs <= 0.0) {
+          g_nextSpeechActionTick = 0;
+        } else {
+          float gateSpeed = ResolveDialogueGameSpeedMultiplier(thisptr);
+          g_nextSpeechActionTick =
+              gateNowTick + ResolveSpeechQueueRemainingRealMs(
+                                speechDelayRemainingScaledMs, gateSpeed);
+        }
+        g_lastDialogueTick = gateNowTick;
       }
       if (lockReacquired) {
         LeaveCriticalSection(&g_uiMutex);

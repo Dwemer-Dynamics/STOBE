@@ -39,6 +39,7 @@ MyGUI::Button *g_boredEventsToggle = nullptr;
 MyGUI::Button *g_animalTalksToggle = nullptr;
 MyGUI::Button *g_motdToggle = nullptr;
 MyGUI::Button *g_ttsToggle = nullptr;
+MyGUI::Button *g_speedDialogueToggle = nullptr;
 
 bool g_pendingAutoChat = false;
 bool g_pendingBoredEvents = true;
@@ -46,6 +47,7 @@ bool g_pendingAnimalTalks = false;
 bool g_pendingNearestSpeaker = true;
 bool g_pendingMOTD = true;
 bool g_pendingTtsEnabled = true;
+bool g_pendingSpeedDialogue = true;
 
 int ClampInt(int value, int minValue, int maxValue) {
   if (value < minValue)
@@ -201,6 +203,7 @@ void LoadPendingFromRuntime() {
   g_pendingNearestSpeaker = g_useNearestPlayerSpeaker;
   g_pendingMOTD = g_enableWelcome;
   g_pendingTtsEnabled = g_ttsEnabled;
+  g_pendingSpeedDialogue = g_speedDialogue;
 }
 
 void RefreshPluginSettingsUI() {
@@ -237,6 +240,8 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_animalTalksToggle, "Animal Talks", g_pendingAnimalTalks);
   SetToggleCaption(g_motdToggle, "MOTD", g_pendingMOTD);
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
+  SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
+                   g_pendingSpeedDialogue);
 }
 
 void OnSettingsSaveClick(MyGUI::Widget *sender) {
@@ -273,6 +278,7 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   g_enableWelcome = g_pendingMOTD;
   bool previousTtsEnabled = g_ttsEnabled;
   g_ttsEnabled = g_pendingTtsEnabled;
+  g_speedDialogue = g_pendingSpeedDialogue;
 
   int talkRadius = ParseIntOrDefault(
       g_talkRadiusEdit ? g_talkRadiusEdit->getCaption() : "", (int)g_proximityRadius);
@@ -340,6 +346,12 @@ void OnPluginTtsToggleClick(MyGUI::Widget *sender) {
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
 }
 
+void OnPluginSpeedDialogueToggleClick(MyGUI::Widget *sender) {
+  g_pendingSpeedDialogue = !g_pendingSpeedDialogue;
+  SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
+                   g_pendingSpeedDialogue);
+}
+
 void OnSettingsOpenConfigClick(MyGUI::Widget *sender) {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -404,6 +416,7 @@ void CloseSettingsUI() {
   g_animalTalksToggle = nullptr;
   g_motdToggle = nullptr;
   g_ttsToggle = nullptr;
+  g_speedDialogueToggle = nullptr;
 }
 
 void OnSettingsWindowButtonPressed(MyGUI::Window *sender,
@@ -424,7 +437,7 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.25f, 0.12f, 0.50f, 0.576f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.17f, 0.08f, 0.66f, 0.70f, MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
@@ -436,16 +449,14 @@ void CreateSettingsUI() {
   const float fieldX = 0.52f;
   const float labelW = 0.45f;
   const float fieldW = 0.43f;
-  const float rowH = 0.065f;
-  const float rowGap = 0.01f;
-  const float rangeHintH = 0.05f;
-  const float rangeHintGap = 0.055f;
-  const float sectionGap = 0.03f;
-  const float toggleH = 0.08f;
-  const float actionBtnH = 0.09f;
-  const float toggleRowGap = 0.10f;
-  const float speakerLabelH = 0.035f;
-  const float speakerComboH = 0.055f;
+  const float rowH = 0.055f;
+  const float rowGap = 0.006f;
+  const float rangeHintH = 0.04f;
+  const float rangeHintGap = 0.045f;
+  const float sectionGap = 0.015f;
+  const float toggleH = 0.07f;
+  const float actionBtnH = 0.08f;
+  const float toggleRowGap = 0.082f;
   float y = 0.03f;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Chat Hotkey",
@@ -506,7 +517,7 @@ void CreateSettingsUI() {
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_BoredRangeEdit");
   y += rowH + rowGap;
 
-  CreateLabel(client, labelX, y, labelW, rowH, "Board Event Interval (sec)",
+  CreateLabel(client, labelX, y, labelW, rowH, "Bored Event Interval (sec)",
               "Stobe_Plugin_BoredIntervalLabel");
   g_boredIntervalEdit = client->createWidgetReal<MyGUI::EditBox>(
       "Kenshi_EditBox", fieldX, y, fieldW, rowH,
@@ -542,28 +553,36 @@ void CreateSettingsUI() {
   y += toggleRowGap;
 
   g_animalTalksToggle = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, y, 0.21f, toggleH,
+      "Kenshi_Button1", 0.05f, y, 0.28f, toggleH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_AnimalTalksToggle");
   g_animalTalksToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginAnimalTalksToggleClick);
 
   g_ttsToggle = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.28f, y, 0.21f, toggleH,
+      "Kenshi_Button1", 0.36f, y, 0.28f, toggleH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_TTSToggle");
   g_ttsToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginTtsToggleClick);
 
-  CreateLabel(client, 0.51f, y, 0.28f, speakerLabelH, "Speaker Mode",
+  g_speedDialogueToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.67f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_SpeedDialogueToggle");
+  g_speedDialogueToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginSpeedDialogueToggleClick);
+  y += toggleRowGap;
+
+  CreateLabel(client, labelX, y, labelW, rowH, "Speaker Mode",
               "Stobe_Plugin_SpeakerModeLabel");
   g_speakerModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", 0.51f, y + speakerLabelH, 0.44f, speakerComboH,
+      "Kenshi_ComboBox", fieldX, y, fieldW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_SpeakerModeCombo");
   g_speakerModeCombo->setComboModeDrop(true);
   g_speakerModeCombo->eventComboAccept +=
       MyGUI::newDelegate(OnSpeakerModeComboChanged);
   g_speakerModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnSpeakerModeComboChanged);
-  y += toggleRowGap;
+  y += rowH + sectionGap;
 
   MyGUI::Button *saveBtn = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", 0.05f, y, 0.21f, actionBtnH,

@@ -585,6 +585,8 @@ void LoadStobeRuntimeConfig() {
   g_ttsEnabled =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "TtsEnabled", 1) !=
       0;
+  g_speedDialogue = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                                      "Speed Dialogue", 1) != 0;
   g_boredEventIntervalSeconds = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoardEventIntervalSeconds", 240);
   g_dynamicProfileIntervalMinutes =
@@ -609,6 +611,7 @@ void LoadStobeRuntimeConfig() {
       ", BoredEventRange=" + ToString(g_boredEventRange) +
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+      ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
       ", BoredEventInterval=" + ToString(g_boredEventIntervalSeconds) + "s" +
       ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalMinutes) +
       "m" +
@@ -652,6 +655,8 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "TtsEnabled",
                              g_ttsEnabled ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "Speed Dialogue",
+                             g_speedDialogue ? "1" : "0", iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoardEventIntervalSeconds",
                              ToString(g_boredEventIntervalSeconds).c_str(),
                              iniPath.c_str());
@@ -1148,16 +1153,79 @@ void LogGameEvent(const std::string &type, const std::string &actor,
       " target_serial=" + ToString((int)targetSerial) +
       " data=" + eventData);
 }
-void SleepIfPaused(DWORD ms) {
-  DWORD start = GetTickCount();
-  while (GetTickCount() - start < ms) {
-    GameWorld *world = GetWorldSafe();
-    if (world && world->isPaused()) {
-      Sleep(100);
-      start +=
-          100; // Shift start so the actual message delay remains consistent
-      continue;
+float ResolveDialogueGameSpeedMultiplier(GameWorld *world) {
+  if (!g_speedDialogue) {
+    return 1.0f;
+  }
+
+  float speed = 1.0f;
+  if (world) {
+    try {
+      speed = world->getFrameSpeedMultiplier();
+    } catch (...) {
+      speed = 1.0f;
     }
-    Sleep(100);
+  }
+  if (!(speed > 0.0f)) {
+    speed = 1.0f;
+  }
+  if (speed < 1.0f) {
+    speed = 1.0f;
+  } else if (speed > 3.0f) {
+    speed = 3.0f;
+  }
+  return speed;
+}
+void SleepIfPaused(DWORD ms) {
+  if (ms == 0) {
+    return;
+  }
+
+  double remainingScaledMs = static_cast<double>(ms);
+  DWORD lastTick = GetTickCount();
+
+  while (remainingScaledMs > 0.0) {
+    GameWorld *world = GetWorldSafe();
+    bool paused = false;
+    if (world) {
+      try {
+        paused = world->isPaused();
+      } catch (...) {
+        paused = false;
+      }
+    }
+
+    float speed = paused ? 1.0f : ResolveDialogueGameSpeedMultiplier(world);
+
+    DWORD nowTick = GetTickCount();
+    DWORD elapsed = nowTick - lastTick;
+    lastTick = nowTick;
+
+    if (!paused && elapsed > 0) {
+      remainingScaledMs -=
+          static_cast<double>(elapsed) * static_cast<double>(speed);
+      if (remainingScaledMs <= 0.0) {
+        break;
+      }
+    }
+
+    DWORD sleepSliceMs = 100;
+    if (!paused) {
+      double remainingRealMs = remainingScaledMs /
+                               static_cast<double>(speed > 0.0f ? speed : 1.0f);
+      if (remainingRealMs <= 2.0) {
+        sleepSliceMs = 1;
+      } else if (remainingRealMs <= 8.0) {
+        sleepSliceMs = 2;
+      } else if (remainingRealMs <= 20.0) {
+        sleepSliceMs = 5;
+      } else if (remainingRealMs <= 50.0) {
+        sleepSliceMs = 10;
+      } else {
+        sleepSliceMs = 25;
+      }
+    }
+
+    Sleep(sleepSliceMs);
   }
 }

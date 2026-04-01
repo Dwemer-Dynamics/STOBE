@@ -19,6 +19,7 @@ struct TtsPlaybackTask {
   LONG generation;
   int volumePercentOverride;
   unsigned int speakerSerial;
+  float playbackSpeedMultiplier;
 };
 
 LONG g_ttsPlaybackBusy = 0;
@@ -35,6 +36,26 @@ long long RoundToLongLong(double value) {
 
 LONG CurrentTtsPlaybackGeneration() {
   return InterlockedCompareExchange(&g_ttsPlaybackGeneration, 0, 0);
+}
+
+unsigned int ReadLe32(const unsigned char *bytes) {
+  if (!bytes) {
+    return 0;
+  }
+  return static_cast<unsigned int>(bytes[0]) |
+         (static_cast<unsigned int>(bytes[1]) << 8) |
+         (static_cast<unsigned int>(bytes[2]) << 16) |
+         (static_cast<unsigned int>(bytes[3]) << 24);
+}
+
+void WriteLe32(unsigned char *bytes, unsigned int value) {
+  if (!bytes) {
+    return;
+  }
+  bytes[0] = static_cast<unsigned char>(value & 0xFF);
+  bytes[1] = static_cast<unsigned char>((value >> 8) & 0xFF);
+  bytes[2] = static_cast<unsigned char>((value >> 16) & 0xFF);
+  bytes[3] = static_cast<unsigned char>((value >> 24) & 0xFF);
 }
 
 std::string ShortHashForLog(const std::string &hash) {
@@ -117,6 +138,64 @@ int EstimateWavDurationMs(const std::string &wavData) {
     durationMs = 600000;
   }
   return durationMs;
+}
+
+void ApplyWavSpeedMultiplierInPlace(std::string &wavData,
+                                    float playbackSpeedMultiplier) {
+  if (wavData.size() < 44 || wavData.compare(0, 4, "RIFF") != 0 ||
+      wavData.compare(8, 4, "WAVE") != 0) {
+    return;
+  }
+  if (!(playbackSpeedMultiplier > 1.0f)) {
+    return;
+  }
+  if (playbackSpeedMultiplier > 3.0f) {
+    playbackSpeedMultiplier = 3.0f;
+  }
+
+  unsigned char *bytes = reinterpret_cast<unsigned char *>(&wavData[0]);
+  size_t chunkPos = 12;
+  while (chunkPos + 8 <= wavData.size()) {
+    unsigned int chunkSize = ReadLe32(bytes + chunkPos + 4);
+    size_t chunkDataPos = chunkPos + 8;
+    size_t paddedChunkSize =
+        static_cast<size_t>(chunkSize) + static_cast<size_t>(chunkSize & 1U);
+    if (chunkDataPos + paddedChunkSize > wavData.size()) {
+      break;
+    }
+
+    bool isFmt = bytes[chunkPos] == 'f' && bytes[chunkPos + 1] == 'm' &&
+                 bytes[chunkPos + 2] == 't' && bytes[chunkPos + 3] == ' ';
+    if (isFmt && chunkSize >= 16) {
+      unsigned int sampleRate = ReadLe32(bytes + chunkDataPos + 4);
+      unsigned int byteRate = ReadLe32(bytes + chunkDataPos + 8);
+      if (sampleRate == 0 || byteRate == 0) {
+        return;
+      }
+
+      double scaledSampleRate =
+          static_cast<double>(sampleRate) * playbackSpeedMultiplier;
+      if (scaledSampleRate < 1.0) {
+        scaledSampleRate = 1.0;
+      } else if (scaledSampleRate > 384000.0) {
+        scaledSampleRate = 384000.0;
+      }
+      double scaledByteRate =
+          static_cast<double>(byteRate) * playbackSpeedMultiplier;
+      if (scaledByteRate < 1.0) {
+        scaledByteRate = 1.0;
+      } else if (scaledByteRate > 4294967295.0) {
+        scaledByteRate = 4294967295.0;
+      }
+
+      WriteLe32(bytes + chunkDataPos + 4,
+                static_cast<unsigned int>(scaledSampleRate + 0.5));
+      WriteLe32(bytes + chunkDataPos + 8,
+                static_cast<unsigned int>(scaledByteRate + 0.5));
+      return;
+    }
+    chunkPos = chunkDataPos + paddedChunkSize;
+  }
 }
 
 void ApplyWavVolumeInPlace(std::string &wavData, int volumePercent) {
@@ -370,6 +449,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   LONG generation = task->generation;
   int volumePercentOverride = task->volumePercentOverride;
   unsigned int speakerSerial = task->speakerSerial;
+  float playbackSpeedMultiplier = task->playbackSpeedMultiplier;
   delete task;
   DWORD threadStartTick = GetTickCount();
 
@@ -414,6 +494,18 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
     InterlockedExchange(&g_ttsPlaybackBusy, 0);
     return 0;
   }
+  if (!(playbackSpeedMultiplier > 0.0f)) {
+    playbackSpeedMultiplier = 1.0f;
+  }
+  if (playbackSpeedMultiplier < 1.0f) {
+    playbackSpeedMultiplier = 1.0f;
+  } else if (playbackSpeedMultiplier > 3.0f) {
+    playbackSpeedMultiplier = 3.0f;
+  }
+  if (playbackSpeedMultiplier > 1.001f) {
+    ApplyWavSpeedMultiplierInPlace(wavData, playbackSpeedMultiplier);
+  }
+
   int durationMs = EstimateWavDurationMs(wavData);
   if (durationMs <= 0) {
     durationMs = 5000;
@@ -442,6 +534,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " est_ms=" + ToString(durationMs) +
       " volume_pct=" + ToString(volumePercent) +
       " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
+      " speed=" + ToString(playbackSpeedMultiplier) +
       " speaker_serial=" + ToString((int)speakerSerial) +
       " download_ms=" + ToString((int)downloadMs));
 
@@ -487,7 +580,8 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 } // namespace
 
 bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
-                      unsigned int speakerSerial) {
+                      unsigned int speakerSerial,
+                      float playbackSpeedMultiplier) {
   if (!IsHexHash(ttsHash)) {
     Log("TTS_PLAYBACK: rejected invalid hash");
     return false;
@@ -506,6 +600,7 @@ bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
   task->generation = CurrentTtsPlaybackGeneration();
   task->volumePercentOverride = volumePercentOverride;
   task->speakerSerial = speakerSerial;
+  task->playbackSpeedMultiplier = playbackSpeedMultiplier;
 
   HANDLE threadHandle = CreateThread(NULL, 0, PlaybackThreadProc, task, 0, NULL);
   if (threadHandle) {
@@ -513,6 +608,7 @@ bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
     Log("TTS_PLAYBACK: enqueued hash=" + ShortHashForLog(ttsHash) +
         " generation=" + ToString((int)task->generation) +
         " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
+        " speed=" + ToString(playbackSpeedMultiplier) +
         " speaker_serial=" + ToString((int)speakerSerial));
     return true;
   }
