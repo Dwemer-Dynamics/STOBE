@@ -1867,6 +1867,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
       return false;
     }
     std::string queueLine = "";
+    std::string explicitTalkTargetToken = "";
     if (narratorSpeaker) {
       queueLine = "NOTIFY:" + std::string(kNarratorName) + ": " + subtitle;
     } else {
@@ -1884,6 +1885,32 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         }
         queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       }
+
+      if (state->task) {
+        std::string listenerName = TrimChatLine(state->task->previousSpeaker);
+        std::string listenerHandle =
+            TrimChatLine(state->task->previousSpeakerHandle);
+        if (!listenerName.empty() && !EqualsIgnoreCase(listenerName, actor)) {
+          bool listenerHandleIsDigits = !listenerHandle.empty();
+          for (size_t i = 0; i < listenerHandle.size(); ++i) {
+            unsigned char ch = (unsigned char)listenerHandle[i];
+            if (ch < '0' || ch > '9') {
+              listenerHandleIsDigits = false;
+              break;
+            }
+          }
+          if (!listenerHandleIsDigits) {
+            listenerHandle.clear();
+          }
+          explicitTalkTargetToken = listenerName;
+          if (!listenerHandle.empty()) {
+            explicitTalkTargetToken += "|" + listenerHandle;
+          }
+        }
+      }
+    }
+    if (!explicitTalkTargetToken.empty()) {
+      queueLine += " [TALKTARGET:" + explicitTalkTargetToken + "]";
     }
     if (g_ttsEnabled && !ttsHash.empty()) {
       queueLine += " [TTSHASH:" + ttsHash + "]";

@@ -1181,6 +1181,185 @@ bool IsCharacterUnavailableForDialogue(Character *character) {
   }
 }
 
+static bool IsCharacterStandingForSpeechFacing(Character *character) {
+  if (IsCharacterUnavailableForDialogue(character)) {
+    return false;
+  }
+
+  bool isDown = false;
+  try {
+    isDown = character->isDown();
+  } catch (...) {
+    isDown = true;
+  }
+  if (isDown) {
+    return false;
+  }
+
+  ProneState proneState = PS_KO;
+  try {
+    proneState = character->getProneState();
+  } catch (...) {
+    proneState = PS_KO;
+  }
+  if (proneState != PS_NORMAL) {
+    return false;
+  }
+
+  try {
+    if (character->inSomething != IN_NOTHING) {
+      return false;
+    }
+  } catch (...) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool IsCharacterStandingStillForSpeechFacing(Character *character) {
+  if (!IsCharacterStandingForSpeechFacing(character)) {
+    return false;
+  }
+
+  float currentSpeed = 0.0f;
+  bool hasSpeed = false;
+  try {
+    CharMovement *movement = character->getMovement();
+    if (movement && (uintptr_t)movement > 0x1000) {
+      currentSpeed = movement->getCurrentSpeed();
+      hasSpeed = true;
+    }
+  } catch (...) {
+  }
+
+  if (!hasSpeed) {
+    try {
+      currentSpeed = character->getMovementSpeed();
+      hasSpeed = true;
+    } catch (...) {
+      hasSpeed = false;
+    }
+  }
+
+  if (!hasSpeed) {
+    return false;
+  }
+
+  return currentSpeed <= 0.35f;
+}
+
+static Character *ResolveSpeechListenerForFacing(Character *speaker) {
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return nullptr;
+  }
+  Dialogue *dialogue = nullptr;
+  try {
+    dialogue = speaker->dialogue;
+  } catch (...) {
+    dialogue = nullptr;
+  }
+  if (!dialogue || (uintptr_t)dialogue <= 0x1000) {
+    return nullptr;
+  }
+
+  auto tryResolve = [&](const hand &candidateHandle) -> Character * {
+    if (!candidateHandle.isValid() || candidateHandle.serial == 0) {
+      return nullptr;
+    }
+    Character *candidate = nullptr;
+    try {
+      candidate = candidateHandle.getCharacter();
+    } catch (...) {
+      candidate = nullptr;
+    }
+    if (!candidate || (uintptr_t)candidate <= 0x1000 || candidate == speaker) {
+      return nullptr;
+    }
+    return candidate;
+  };
+
+  try {
+    Character *target = tryResolve(dialogue->getConversationTarget());
+    if (target) {
+      return target;
+    }
+  } catch (...) {
+  }
+  try {
+    Character *target = tryResolve(dialogue->conversationTarget);
+    if (target) {
+      return target;
+    }
+  } catch (...) {
+  }
+  try {
+    Character *target = tryResolve(dialogue->waitingForReplyFrom);
+    if (target) {
+      return target;
+    }
+  } catch (...) {
+  }
+  try {
+    Character *target = tryResolve(dialogue->conversationMaster);
+    if (target) {
+      return target;
+    }
+  } catch (...) {
+  }
+
+  return nullptr;
+}
+
+static bool TryFaceSpeakerTowardListenerForSpeech(Character *speaker,
+                                                  Character *listener) {
+  if (!speaker || !listener || (uintptr_t)speaker <= 0x1000 ||
+      (uintptr_t)listener <= 0x1000 || speaker == listener) {
+    return false;
+  }
+
+  if (!IsCharacterStandingStillForSpeechFacing(speaker) ||
+      !IsCharacterStandingForSpeechFacing(listener)) {
+    return false;
+  }
+
+  Ogre::Vector3 speakerPos = Ogre::Vector3::ZERO;
+  Ogre::Vector3 listenerPos = Ogre::Vector3::ZERO;
+  try {
+    speakerPos = speaker->getPosition();
+    listenerPos = listener->getPosition();
+  } catch (...) {
+    return false;
+  }
+
+  Ogre::Vector3 direction = listenerPos - speakerPos;
+  direction.y = 0.0f;
+  if (direction.squaredLength() < 0.001f) {
+    return false;
+  }
+
+  bool faced = false;
+  try {
+    CharMovement *movement = speaker->getMovement();
+    if (movement && (uintptr_t)movement > 0x1000) {
+      Ogre::Vector3 faceDir = direction;
+      faceDir.normalise();
+      movement->faceDirection(faceDir);
+      movement->lookatPosition(listenerPos);
+      faced = true;
+    }
+  } catch (...) {
+  }
+
+  try {
+    speaker->lookatPosition(listenerPos, true);
+    faced = true;
+  } catch (...) {
+  }
+
+  return faced;
+}
+
 static bool IsActionIndoorsHandleValid(const hand &indoorsHandle) {
   return indoorsHandle.isValid() && !indoorsHandle.isNull();
 }
@@ -4096,6 +4275,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         bool isPC = target->isPlayerCharacter();
         float appliedBubbleDuration = 0.0f;
         bool forcedSayFallback = false;
+        Character *listenerForFacing = nullptr;
+        std::string explicitTalkTargetToken = TrimCopySimple(act.targetToken);
+        if (!explicitTalkTargetToken.empty()) {
+          listenerForFacing = ResolveCharacterByTargetToken(
+              thisptr, explicitTalkTargetToken, target);
+        }
+        if (!listenerForFacing) {
+          listenerForFacing = ResolveSpeechListenerForFacing(target);
+        }
         Log("ACTION_EXEC: SAY [" + target->getName() + "]: " + act.message +
             (isPC ? " (PC)" : " (NPC)"));
         try {
@@ -4105,9 +4293,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             target->dialogue->endDialogue(true);
             target->dialogue->setInDialog(false);
           }
+          if (listenerForFacing) {
+            TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+          }
 
           // Primary method: sayALine (supports multiple lines/delays)
           target->sayALine(act.message, !isPC);
+          if (listenerForFacing) {
+            TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+          }
           // Force native floating text path as well. This is the most reliable
           // way to surface overhead speech bubbles across player and NPC actors.
           target->say(act.message);
@@ -4210,6 +4404,18 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       } else if (act.type == ACT_PLAY_TTS && target &&
                  !IsCharacterUnavailableForDialogue(target)) {
         float appliedBubbleDuration = 0.0f;
+        Character *listenerForFacing = nullptr;
+        std::string explicitTalkTargetToken = TrimCopySimple(act.targetToken);
+        if (!explicitTalkTargetToken.empty()) {
+          listenerForFacing = ResolveCharacterByTargetToken(
+              thisptr, explicitTalkTargetToken, target);
+        }
+        if (!listenerForFacing) {
+          listenerForFacing = ResolveSpeechListenerForFacing(target);
+        }
+        if (listenerForFacing) {
+          TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+        }
         if (target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
           float baseDuration = g_speechBubbleLife;
           if (g_ttsEnabled && !act.ttsHash.empty() && act.taskValue > 0) {

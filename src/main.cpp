@@ -1107,6 +1107,75 @@ static bool ShouldDropDuplicateNonAiDialogue(unsigned int actorSerial,
   return false;
 }
 
+static std::string ExtractInlineMetadataToken(std::string &message,
+                                              const std::string &marker) {
+  std::string trimmed = TrimCopy(message);
+  size_t markerPos = trimmed.rfind(marker);
+  if (markerPos == std::string::npos) {
+    message = trimmed;
+    return "";
+  }
+
+  size_t valuePos = markerPos + marker.length();
+  size_t endPos = trimmed.find(']', valuePos);
+  if (endPos == std::string::npos) {
+    message = trimmed;
+    return "";
+  }
+
+  std::string token = TrimCopy(trimmed.substr(valuePos, endPos - valuePos));
+  if (token.empty()) {
+    message = trimmed;
+    return "";
+  }
+
+  trimmed.erase(markerPos, endPos - markerPos + 1);
+  message = TrimCopy(trimmed);
+  return token;
+}
+
+static std::string ExtractTrailingTalkingToToken(std::string &message) {
+  std::string trimmed = TrimCopy(message);
+  std::string lowered = ToLowerAsciiCopy(trimmed);
+  const std::string marker = "(talking to:";
+  size_t markerPos = lowered.rfind(marker);
+  if (markerPos == std::string::npos) {
+    message = trimmed;
+    return "";
+  }
+
+  size_t closePos = trimmed.find(')', markerPos);
+  if (closePos == std::string::npos) {
+    message = trimmed;
+    return "";
+  }
+
+  std::string tail = TrimCopy(trimmed.substr(closePos + 1));
+  if (!tail.empty()) {
+    message = trimmed;
+    return "";
+  }
+
+  size_t valuePos = markerPos + marker.length();
+  std::string token = TrimCopy(trimmed.substr(valuePos, closePos - valuePos));
+  if (token.empty()) {
+    message = trimmed;
+    return "";
+  }
+
+  trimmed.erase(markerPos);
+  message = TrimCopy(trimmed);
+  return token;
+}
+
+static std::string ExtractTalkTargetToken(std::string &message) {
+  std::string token = ExtractInlineMetadataToken(message, "[TALKTARGET:");
+  if (!token.empty()) {
+    return token;
+  }
+  return ExtractTrailingTalkingToToken(message);
+}
+
 static std::string ExtractTrailingTtsHash(std::string &message) {
   std::string trimmed = TrimCopy(message);
   size_t markerPos = trimmed.rfind("[TTSHASH:");
@@ -8224,6 +8293,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         }
         int ttsDurationMs = ExtractTrailingTtsDurationMs(bubbleContent);
         std::string ttsHash = ExtractTrailingTtsHash(bubbleContent);
+        std::string talkTargetToken = ExtractTalkTargetToken(bubbleContent);
         const bool hadStructuredMessage = !structuredMessage.empty();
         const bool hadTtsMetadata = !ttsHash.empty() || ttsDurationMs > 0;
         if (!g_ttsEnabled) {
@@ -8339,6 +8409,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.actor = sayTargetHand;
             act.target = sayTargetHand;
             act.message = bubbleContent;
+            act.targetToken = talkTargetToken;
             act.ttsHash = ttsHash;
             int speechTimingMs = ttsDurationMs;
             if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
