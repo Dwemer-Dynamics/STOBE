@@ -31,6 +31,7 @@
 #include <kenshi/util/YesNoMaybe.h>
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Colour.h>
+#include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <ogre/OgreColourValue.h>
@@ -76,19 +77,26 @@ struct NpcDrugState {
 
 static std::map<unsigned int, NpcDrunkState> g_npcDrunkStates;
 static std::map<unsigned int, NpcDrugState> g_npcDrugStates;
+static MyGUI::EditBox *g_narratorTimedPopupBackdrop = nullptr;
 static MyGUI::TextBox *g_narratorTimedPopupText = nullptr;
 static bool g_narratorTimedPopupVisible = false;
 static DWORD g_narratorTimedPopupShownTick = 0;
 static DWORD g_narratorTimedPopupDurationMs = 0;
 
 static bool TrySetNarratorTimedPopupVisible(bool visible) {
-  if (!g_narratorTimedPopupText) {
+  if (!g_narratorTimedPopupBackdrop && !g_narratorTimedPopupText) {
     return false;
   }
   try {
-    g_narratorTimedPopupText->setVisible(visible);
+    if (g_narratorTimedPopupBackdrop) {
+      g_narratorTimedPopupBackdrop->setVisible(visible);
+    }
+    if (g_narratorTimedPopupText) {
+      g_narratorTimedPopupText->setVisible(visible);
+    }
     return true;
   } catch (...) {
+    g_narratorTimedPopupBackdrop = nullptr;
     g_narratorTimedPopupText = nullptr;
     return false;
   }
@@ -100,9 +108,13 @@ static bool TryShowNarratorTimedPopupText(const wchar_t *caption) {
   }
   try {
     g_narratorTimedPopupText->setCaption(caption);
+    if (g_narratorTimedPopupBackdrop) {
+      g_narratorTimedPopupBackdrop->setVisible(true);
+    }
     g_narratorTimedPopupText->setVisible(true);
     return true;
   } catch (...) {
+    g_narratorTimedPopupBackdrop = nullptr;
     g_narratorTimedPopupText = nullptr;
     return false;
   }
@@ -347,7 +359,7 @@ static void HideNarratorTimedPopup() {
 }
 
 static bool EnsureNarratorTimedPopupWidget() {
-  if (g_narratorTimedPopupText) {
+  if (g_narratorTimedPopupBackdrop && g_narratorTimedPopupText) {
     return true;
   }
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
@@ -356,29 +368,59 @@ static bool EnsureNarratorTimedPopupWidget() {
   }
 
   try {
+    const float kNarratorPopupTextX = 0.135f;
+    const float kNarratorPopupTextY = 0.044f;
+    const float kNarratorPopupTextW = 0.73f;
+    const float kNarratorPopupTextH = 0.078f;
+    const float kNarratorPopupPadX = 0.007f;
+    const float kNarratorPopupPadY = 0.006f;
+    const float kNarratorPopupBackdropX = kNarratorPopupTextX - kNarratorPopupPadX;
+    const float kNarratorPopupBackdropY = kNarratorPopupTextY - kNarratorPopupPadY;
+    const float kNarratorPopupBackdropW =
+        kNarratorPopupTextW + (kNarratorPopupPadX * 2.0f);
+    const float kNarratorPopupBackdropH =
+        kNarratorPopupTextH + (kNarratorPopupPadY * 2.0f);
+
+    g_narratorTimedPopupBackdrop = gui->createWidgetReal<MyGUI::EditBox>(
+        "Kenshi_EditBox", kNarratorPopupBackdropX, kNarratorPopupBackdropY,
+        kNarratorPopupBackdropW, kNarratorPopupBackdropH,
+        MyGUI::Align::Top | MyGUI::Align::HCenter, "Popup",
+        "Stobe_NarratorTimedPopupBackdrop");
+    if (!g_narratorTimedPopupBackdrop) {
+      return false;
+    }
+    g_narratorTimedPopupBackdrop->setEnabled(false);
+    g_narratorTimedPopupBackdrop->setVisible(false);
+
     g_narratorTimedPopupText = gui->createWidgetReal<MyGUI::TextBox>(
-        "Kenshi_TextboxStandardText", 0.13f, 0.04f, 0.74f, 0.09f,
+        "Kenshi_TextboxStandardText", kNarratorPopupTextX, kNarratorPopupTextY,
+        kNarratorPopupTextW, kNarratorPopupTextH,
         MyGUI::Align::Top | MyGUI::Align::HCenter, "Popup",
         "Stobe_NarratorTimedPopupText");
     if (!g_narratorTimedPopupText) {
+      g_narratorTimedPopupBackdrop = nullptr;
       return false;
     }
     g_narratorTimedPopupText->setTextAlign(MyGUI::Align::Center);
     g_narratorTimedPopupText->setTextColour(MyGUI::Colour(1.0f, 0.91f, 0.56f));
     g_narratorTimedPopupText->setVisible(false);
   } catch (...) {
+    g_narratorTimedPopupBackdrop = nullptr;
     g_narratorTimedPopupText = nullptr;
     return false;
   }
 
-  return g_narratorTimedPopupText != nullptr;
+  return g_narratorTimedPopupBackdrop != nullptr &&
+         g_narratorTimedPopupText != nullptr;
 }
 
 static void UpdateNarratorTimedPopupLifecycle() {
   if (!g_narratorTimedPopupVisible) {
     return;
   }
-  if (!g_narratorTimedPopupText || !MyGUI::Gui::getInstancePtr()) {
+  if (!g_narratorTimedPopupBackdrop || !g_narratorTimedPopupText ||
+      !MyGUI::Gui::getInstancePtr()) {
+    g_narratorTimedPopupBackdrop = nullptr;
     g_narratorTimedPopupText = nullptr;
     g_narratorTimedPopupVisible = false;
     g_narratorTimedPopupShownTick = 0;
@@ -406,6 +448,7 @@ static bool ShowNarratorTimedPopup(const std::string &message, DWORD durationMs)
 
   const std::wstring wideMessage = WideFromUtf8(message);
   if (!TryShowNarratorTimedPopupText(wideMessage.c_str())) {
+    g_narratorTimedPopupBackdrop = nullptr;
     g_narratorTimedPopupText = nullptr;
     g_narratorTimedPopupVisible = false;
     g_narratorTimedPopupShownTick = 0;
