@@ -662,44 +662,51 @@ Character *ResolveCharacterByTargetToken(GameWorld *world,
     return nullptr;
   }
 
+  auto tryParseSerialDigits = [](const std::string &value,
+                                 unsigned int &serialOut) -> bool {
+    serialOut = 0;
+    std::string digits = TrimCopySimple(value);
+    if (digits.empty()) {
+      return false;
+    }
+    for (size_t i = 0; i < digits.size(); ++i) {
+      unsigned char ch = (unsigned char)digits[i];
+      if (ch < '0' || ch > '9') {
+        return false;
+      }
+    }
+    serialOut = (unsigned int)strtoul(digits.c_str(), NULL, 10);
+    return serialOut > 0;
+  };
+
   unsigned int wantedSerial = 0;
   bool hasSerial = false;
+  std::string tokenLow = token;
+  std::transform(tokenLow.begin(), tokenLow.end(), tokenLow.begin(), ::tolower);
+  if (tokenLow.find("serial:") == 0) {
+    hasSerial = tryParseSerialDigits(token.substr(7), wantedSerial);
+    token.clear();
+  } else if (tokenLow.find("id:") == 0) {
+    hasSerial = tryParseSerialDigits(token.substr(3), wantedSerial);
+    token.clear();
+  }
+
   size_t pipePos = token.find('|');
   if (pipePos != std::string::npos) {
     std::string serialPart = TrimCopySimple(token.substr(pipePos + 1));
     token = TrimCopySimple(token.substr(0, pipePos));
-    if (!serialPart.empty()) {
-      bool allDigits = true;
-      for (size_t i = 0; i < serialPart.size(); ++i) {
-        unsigned char ch = (unsigned char)serialPart[i];
-        if (ch < '0' || ch > '9') {
-          allDigits = false;
-          break;
-        }
-      }
-      if (allDigits) {
-        wantedSerial = (unsigned int)strtoul(serialPart.c_str(), NULL, 10);
-        hasSerial = (wantedSerial > 0);
-      }
+    if (!serialPart.empty() && !hasSerial) {
+      hasSerial = tryParseSerialDigits(serialPart, wantedSerial);
     }
   }
   if (!hasSerial && !token.empty()) {
-    bool allDigits = true;
-    for (size_t i = 0; i < token.size(); ++i) {
-      unsigned char ch = (unsigned char)token[i];
-      if (ch < '0' || ch > '9') {
-        allDigits = false;
-        break;
-      }
-    }
-    if (allDigits) {
-      wantedSerial = (unsigned int)strtoul(token.c_str(), NULL, 10);
-      hasSerial = (wantedSerial > 0);
+    if (tryParseSerialDigits(token, wantedSerial)) {
+      hasSerial = true;
       token.clear();
     }
   }
 
-  std::string tokenLow = token;
+  tokenLow = token;
   std::transform(tokenLow.begin(), tokenLow.end(), tokenLow.begin(), ::tolower);
   if (tokenLow == "the player") {
     tokenLow = "player";

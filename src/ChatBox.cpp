@@ -52,6 +52,7 @@ bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
+std::string TrimChatLine(const std::string &value);
 
 bool TryReleaseUserPauseSafe(GameWorld *world) {
   if (!world) {
@@ -463,6 +464,40 @@ bool IsCharacterUnavailableForConversation(Character *character) {
   } catch (...) {
     return true;
   }
+}
+
+bool IsDigitsOnlyToken(const std::string &value) {
+  if (value.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < value.size(); ++i) {
+    unsigned char ch = (unsigned char)value[i];
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string BuildTalkTargetMetadataToken(const std::string &listenerName,
+                                         const std::string &listenerHandle) {
+  std::string normalizedHandle = TrimChatLine(listenerHandle);
+  if (IsDigitsOnlyToken(normalizedHandle)) {
+    return "serial:" + normalizedHandle;
+  }
+
+  std::string normalizedName = TrimChatLine(listenerName);
+  if (normalizedName.empty()) {
+    return "";
+  }
+  for (size_t i = 0; i < normalizedName.size(); ++i) {
+    if (normalizedName[i] == '[') {
+      normalizedName[i] = '(';
+    } else if (normalizedName[i] == ']') {
+      normalizedName[i] = ')';
+    }
+  }
+  return TrimChatLine(normalizedName);
 }
 
 std::string ResolveConversationStateSuffix(Character *character) {
@@ -1891,21 +1926,8 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         std::string listenerHandle =
             TrimChatLine(state->task->previousSpeakerHandle);
         if (!listenerName.empty() && !EqualsIgnoreCase(listenerName, actor)) {
-          bool listenerHandleIsDigits = !listenerHandle.empty();
-          for (size_t i = 0; i < listenerHandle.size(); ++i) {
-            unsigned char ch = (unsigned char)listenerHandle[i];
-            if (ch < '0' || ch > '9') {
-              listenerHandleIsDigits = false;
-              break;
-            }
-          }
-          if (!listenerHandleIsDigits) {
-            listenerHandle.clear();
-          }
-          explicitTalkTargetToken = listenerName;
-          if (!listenerHandle.empty()) {
-            explicitTalkTargetToken += "|" + listenerHandle;
-          }
+          explicitTalkTargetToken =
+              BuildTalkTargetMetadataToken(listenerName, listenerHandle);
         }
       }
     }

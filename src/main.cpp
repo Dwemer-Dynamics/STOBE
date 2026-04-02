@@ -125,6 +125,127 @@ static bool ContainsAsciiInsensitive(const std::string &value,
          std::string::npos;
 }
 
+static std::string TrimCopy(const std::string &value);
+
+static bool IsSpeechSerialBoundaryChar(char ch) {
+  const unsigned char uch = static_cast<unsigned char>(ch);
+  return std::isspace(uch) || ch == '.' || ch == ',' || ch == ';' ||
+         ch == ':' || ch == '!' || ch == '?' || ch == '(' || ch == ')' ||
+         ch == '[' || ch == ']' || ch == '{' || ch == '}' || ch == '"' ||
+         ch == '\'' || ch == '/' || ch == '\\' || ch == '-' || ch == '_';
+}
+
+// Some queue lines can leak engine serial fragments into spoken text
+// (e.g. "|80120293|"). Strip those before showing speech bubbles.
+static std::string StripLeakedSpeechSerialTokens(std::string value) {
+  if (value.empty()) {
+    return "";
+  }
+
+  std::string cleaned;
+  cleaned.reserve(value.size());
+  bool removedAny = false;
+
+  for (size_t i = 0; i < value.size();) {
+    if (value[i] != '|') {
+      cleaned.push_back(value[i]);
+      ++i;
+      continue;
+    }
+
+    size_t digitsStart = i + 1;
+    size_t cursor = digitsStart;
+    while (cursor < value.size() &&
+           std::isdigit(static_cast<unsigned char>(value[cursor]))) {
+      ++cursor;
+    }
+
+    const size_t digitCount = cursor - digitsStart;
+    const bool hasLongDigitRun = (digitCount >= 6);
+    const bool hasClosingPipe = (cursor < value.size() && value[cursor] == '|');
+    const size_t tokenEnd = hasClosingPipe ? (cursor + 1) : cursor;
+
+    bool removeToken = false;
+    if (hasLongDigitRun && hasClosingPipe) {
+      removeToken = true;
+    } else if (hasLongDigitRun &&
+               (cursor >= value.size() ||
+                IsSpeechSerialBoundaryChar(value[cursor]))) {
+      const bool leftBoundary =
+          (i == 0) || IsSpeechSerialBoundaryChar(value[i - 1]);
+      if (leftBoundary) {
+        removeToken = true;
+      }
+    }
+
+    if (removeToken) {
+      removedAny = true;
+      i = tokenEnd;
+      continue;
+    }
+
+    cleaned.push_back(value[i]);
+    ++i;
+  }
+
+  if (!removedAny) {
+    return value;
+  }
+
+  std::string trimmed = TrimCopy(cleaned);
+  std::string collapsed;
+  collapsed.reserve(trimmed.size());
+  bool prevSpace = false;
+  for (size_t i = 0; i < trimmed.size(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(trimmed[i]);
+    if (std::isspace(ch)) {
+      if (!prevSpace) {
+        collapsed.push_back(' ');
+        prevSpace = true;
+      }
+      continue;
+    }
+    prevSpace = false;
+    collapsed.push_back(trimmed[i]);
+  }
+
+  return TrimCopy(collapsed);
+}
+
+static std::string StripDanglingTrailingClosingBrackets(std::string value) {
+  value = TrimCopy(value);
+  if (value.empty()) {
+    return "";
+  }
+
+  size_t openCount = 0;
+  size_t closeCount = 0;
+  for (size_t i = 0; i < value.size(); ++i) {
+    if (value[i] == '[') {
+      ++openCount;
+    } else if (value[i] == ']') {
+      ++closeCount;
+    }
+  }
+
+  if (closeCount <= openCount) {
+    return value;
+  }
+
+  while (!value.empty() && closeCount > openCount) {
+    value = TrimCopy(value);
+    if (value.empty() || value[value.size() - 1] != ']') {
+      break;
+    }
+    value.erase(value.size() - 1);
+    if (closeCount > 0) {
+      --closeCount;
+    }
+  }
+
+  return TrimCopy(value);
+}
+
 static bool IsLikelyTradeDialogueReply(const std::string &line) {
   std::string trimmed = line;
   size_t first = trimmed.find_first_not_of(" \t\r\n");
@@ -949,6 +1070,12 @@ static std::string SanitizeCapturedDialogueLine(std::string value) {
     return "";
   }
 
+  value = StripLeakedSpeechSerialTokens(value);
+  value = StripDanglingTrailingClosingBrackets(value);
+  if (value.empty()) {
+    return "";
+  }
+
   // Drop embedded NUL tails if engine-provided text contains binary remnants.
   size_t nulPos = value.find('\0');
   if (nulPos != std::string::npos) {
@@ -1117,7 +1244,28 @@ static std::string ExtractInlineMetadataToken(std::string &message,
   }
 
   size_t valuePos = markerPos + marker.length();
-  size_t endPos = trimmed.find(']', valuePos);
+  size_t endPos = std::string::npos;
+  for (size_t candidate = trimmed.find(']', valuePos);
+       candidate != std::string::npos;
+       candidate = trimmed.find(']', candidate + 1)) {
+    size_t next = candidate + 1;
+    while (next < trimmed.size() &&
+           std::isspace((unsigned char)trimmed[next])) {
+      ++next;
+    }
+    if (next >= trimmed.size()) {
+      endPos = candidate;
+      break;
+    }
+    unsigned char nextCh = (unsigned char)trimmed[next];
+    if (trimmed[next] == '[' || trimmed[next] == '(' || trimmed[next] == ')' ||
+        trimmed[next] == '.' || trimmed[next] == ',' || trimmed[next] == ';' ||
+        trimmed[next] == ':' || trimmed[next] == '!' || trimmed[next] == '?' ||
+        std::isspace(nextCh)) {
+      endPos = candidate;
+      break;
+    }
+  }
   if (endPos == std::string::npos) {
     message = trimmed;
     return "";
@@ -8746,6 +8894,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         int ttsDurationMs = ExtractTrailingTtsDurationMs(bubbleContent);
         std::string ttsHash = ExtractTrailingTtsHash(bubbleContent);
         std::string talkTargetToken = ExtractTalkTargetToken(bubbleContent);
+        bubbleContent = StripLeakedSpeechSerialTokens(bubbleContent);
+        bubbleContent = StripDanglingTrailingClosingBrackets(bubbleContent);
         const bool hadStructuredMessage = !structuredMessage.empty();
         const bool hadTtsMetadata = !ttsHash.empty() || ttsDurationMs > 0;
         if (!g_ttsEnabled) {
