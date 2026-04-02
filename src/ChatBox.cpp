@@ -2741,8 +2741,39 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 void OnChatCancelClick(MyGUI::Widget *sender) { CloseChatUI(); }
 void OnBoredEventClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
-  std::string preferredSpeakerName = TrimChatLine(g_chatTargetNameStr);
-  std::string preferredSpeakerSerial = TrimChatLine(g_chatTargetHandleStr);
+  std::string preferredSpeakerName = TrimChatLine(g_chatPlayerNameStr);
+  std::string preferredSpeakerSerial = "";
+  std::string targetName = TrimChatLine(g_chatTargetNameStr);
+  std::string targetSerial = TrimChatLine(g_chatTargetHandleStr);
+
+  if (world) {
+    Character *targetNpc =
+        ResolveChatTargetCharacter(world, targetName, targetSerial);
+    Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+    if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
+      std::string resolvedName = TrimChatLine(bestSpeaker->getName());
+      if (!resolvedName.empty()) {
+        preferredSpeakerName = resolvedName;
+        g_chatPlayerNameStr = resolvedName;
+      }
+      preferredSpeakerSerial = ResolveCharacterSerialToken(bestSpeaker);
+    } else if (!preferredSpeakerName.empty()) {
+      Character *resolvedSpeaker =
+          ResolveChatTargetCharacter(world, preferredSpeakerName, "");
+      if (resolvedSpeaker && (uintptr_t)resolvedSpeaker > 0x1000) {
+        preferredSpeakerSerial = ResolveCharacterSerialToken(resolvedSpeaker);
+      }
+    }
+  }
+
+  if (preferredSpeakerName.empty()) {
+    preferredSpeakerName = targetName;
+    preferredSpeakerSerial = targetSerial;
+  }
+
+  Log("BORED_EVENT: manual trigger requested speaker=" + preferredSpeakerName +
+      " speaker_serial=" + preferredSpeakerSerial + " target=" + targetName +
+      " target_serial=" + targetSerial);
   LONG generation = BeginChatInterruptGeneration();
 
   EnterCriticalSection(&g_stateMutex);
@@ -2911,9 +2942,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       continue;
     }
 
-    bool isPlayerCharacter = false;
     try {
-      isPlayerCharacter = other->isPlayerCharacter();
       if (other->isDead() || other->isUnconcious()) {
         continue;
       }
@@ -2921,7 +2950,10 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       continue;
     }
 
-    if (isPlayerCharacter && !(forceDirectorMode && preferredMatch)) {
+    // For bored events we only exclude the actual controlled player character.
+    // Other player-faction squadmates are valid NPC speakers/listeners.
+    bool isActualPlayerCharacter = (other == player);
+    if (isActualPlayerCharacter && !(forceDirectorMode && preferredMatch)) {
       continue;
     }
 
