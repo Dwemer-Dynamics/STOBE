@@ -1511,6 +1511,8 @@ struct NpcWorldEventState {
   bool dead;
   bool unconscious;
   bool enslaved;
+  bool hasMoney;
+  int money;
   bool carrying;
   unsigned int carryingTargetSerial;
   std::string carryingTargetName;
@@ -1534,6 +1536,7 @@ struct NpcWorldEventState {
 
   NpcWorldEventState()
       : initialized(false), dead(false), unconscious(false), enslaved(false),
+        hasMoney(false), money(0),
         carrying(false), carryingTargetSerial(0), carryingTargetName(""),
         speechActive(false), leftArmPresent(true), rightArmPresent(true),
         leftLegPresent(true), rightLegPresent(true),
@@ -3925,6 +3928,71 @@ static Character *ResolveCharacterFromHandSafe(const hand &h) {
   return npc;
 }
 
+static Character *ResolveLikelyTraderForActor(GameWorld *world, Character *actor) {
+  auto isValidTrader = [&](Character *candidate) -> bool {
+    if (!candidate || (uintptr_t)candidate < 0x1000 || candidate == actor) {
+      return false;
+    }
+    bool trader = false;
+    try {
+      trader = candidate->isATrader();
+    } catch (...) {
+      trader = false;
+    }
+    return trader;
+  };
+
+  Character *talkTarget = ResolveCharacterFromHandSafe(g_talkTargetHand);
+  if (isValidTrader(talkTarget)) {
+    return talkTarget;
+  }
+  Character *selectionTarget = ResolveCharacterFromHandSafe(g_lastSelectionHand);
+  if (isValidTrader(selectionTarget)) {
+    return selectionTarget;
+  }
+
+  if (!world || !actor || (uintptr_t)world < 0x1000 || (uintptr_t)actor < 0x1000) {
+    return nullptr;
+  }
+
+  Ogre::Vector3 actorPos = Ogre::Vector3::ZERO;
+  bool actorPosValid = false;
+  try {
+    actorPos = actor->getPosition();
+    actorPosValid = true;
+  } catch (...) {
+    actorPosValid = false;
+  }
+  if (!actorPosValid) {
+    return nullptr;
+  }
+
+  lektor<RootObject *> nearby;
+  world->getCharactersWithinSphere(nearby, actorPos, 30.0f, 0.0f, 0.0f, 16, 0,
+                                   actor);
+
+  Character *best = nullptr;
+  float bestDistance = 1e9f;
+  for (uint32_t i = 0; i < nearby.size(); ++i) {
+    Character *candidate = (Character *)nearby.stuff[i];
+    if (!isValidTrader(candidate)) {
+      continue;
+    }
+    float distance = 9999.0f;
+    try {
+      distance = candidate->getPosition().distance(actorPos);
+    } catch (...) {
+      distance = 9999.0f;
+    }
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+
+  return best;
+}
+
 static Character *ResolveDialogueListenerForSpeech(Character *speaker,
                                                    Dialogue *dialogueHint,
                                                    std::string &sourceOut) {
@@ -4176,6 +4244,43 @@ static bool TryResolveRootObjectMoneySafe(RootObject *obj, int &moneyOut) {
 
   try {
     Ownerships *ownerships = obj->getOwnerships();
+    if (ownerships && (uintptr_t)ownerships > 0x1000) {
+      int ownershipMoney = ownerships->getMoney();
+      if (!hasValue || ownershipMoney > resolved) {
+        resolved = ownershipMoney;
+        hasValue = true;
+      }
+    }
+  } catch (...) {
+  }
+
+  if (!hasValue) {
+    return false;
+  }
+  if (resolved < 0) {
+    resolved = 0;
+  }
+  moneyOut = resolved;
+  return true;
+}
+
+static bool TryResolveCharacterMoneySafe(Character *npc, int &moneyOut) {
+  moneyOut = 0;
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  int resolved = 0;
+  bool hasValue = false;
+  try {
+    resolved = npc->getMoney();
+    hasValue = true;
+  } catch (...) {
+    hasValue = false;
+  }
+
+  try {
+    Ownerships *ownerships = npc->getOwnerships();
     if (ownerships && (uintptr_t)ownerships > 0x1000) {
       int ownershipMoney = ownerships->getMoney();
       if (!hasValue || ownershipMoney > resolved) {
@@ -4682,6 +4787,58 @@ static std::string ResolveInventoryDisplayNameForKey(
   return "Unknown Item";
 }
 
+struct InventoryDeltaDisplayEntry {
+  std::string name;
+  int count;
+
+  InventoryDeltaDisplayEntry() : name(""), count(0) {}
+  InventoryDeltaDisplayEntry(const std::string &entryName, int entryCount)
+      : name(entryName), count(entryCount) {}
+};
+
+static std::string BuildInventoryDeltaItemsText(
+    const std::map<std::string, int> &deltaByKey,
+    const InventoryEventSnapshot &preferredSnapshot,
+    const InventoryEventSnapshot &fallbackSnapshot) {
+  std::vector<InventoryDeltaDisplayEntry> items;
+  for (std::map<std::string, int>::const_iterator it = deltaByKey.begin();
+       it != deltaByKey.end(); ++it) {
+    if (it->second <= 0) {
+      continue;
+    }
+    std::string itemName =
+        ResolveInventoryDisplayNameForKey(it->first, preferredSnapshot,
+                                          fallbackSnapshot);
+    items.push_back(InventoryDeltaDisplayEntry(itemName, it->second));
+  }
+  if (items.empty()) {
+    return "";
+  }
+
+  std::stable_sort(
+      items.begin(), items.end(),
+      [](const InventoryDeltaDisplayEntry &left,
+         const InventoryDeltaDisplayEntry &right) -> bool {
+        if (left.count != right.count) {
+          return left.count > right.count;
+        }
+        return left.name < right.name;
+      });
+
+  std::string itemsText = "";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (items[i].count <= 0) {
+      continue;
+    }
+    if (!itemsText.empty()) {
+      itemsText += ", ";
+    }
+    std::string itemName = items[i].name.empty() ? "Unknown Item" : items[i].name;
+    itemsText += ToString(items[i].count) + "x " + itemName;
+  }
+  return itemsText;
+}
+
 static void ComputeInventoryDeltaByKey(
     const InventoryEventSnapshot &beforeSnapshot,
     const InventoryEventSnapshot &afterSnapshot,
@@ -4726,7 +4883,8 @@ static void ComputeInventoryDeltaByKey(
 static void EmitPickupEvent(
     Character *npc, const NpcWorldEventState &state,
     const InventoryEventSnapshot &currentSnapshot,
-    const std::map<std::string, int> *matchedTransferGainByKey) {
+    const std::map<std::string, int> *matchedTransferGainByKey,
+    bool hasMoneyAfter, int moneyAfter) {
   struct PickupDeltaEntry {
     std::string name;
     int count;
@@ -4811,6 +4969,62 @@ static void EmitPickupEvent(
 
   std::string actorName = ResolveCharacterNameSafe(npc);
   std::string actorFaction = SafeFaction(npc);
+
+  bool isPlayerActor = false;
+  try {
+    isPlayerActor = npc && (uintptr_t)npc > 0x1000 && npc->isPlayerCharacter();
+  } catch (...) {
+    isPlayerActor = false;
+  }
+  int catsSpent = 0;
+  if (state.hasMoney && hasMoneyAfter && state.money > moneyAfter) {
+    catsSpent = state.money - moneyAfter;
+  }
+
+  if (isPlayerActor && catsSpent > 0) {
+    GameWorld *world = GetWorldSafe();
+    Character *seller = ResolveLikelyTraderForActor(world, npc);
+    bool sellerValid = seller && (uintptr_t)seller > 0x1000 && seller != npc;
+    bool sellerIsTrader = false;
+    if (sellerValid) {
+      try {
+        sellerIsTrader = seller->isATrader();
+      } catch (...) {
+        sellerIsTrader = false;
+      }
+    }
+    if (sellerValid && sellerIsTrader) {
+      std::string sellerName = ResolveCharacterNameSafe(seller);
+      std::string sellerFaction = SafeFaction(seller);
+      std::map<std::string, int> buyDeltaByKey;
+      for (std::map<std::string, int>::const_iterator it =
+               currentSnapshot.countsByKey.begin();
+           it != currentSnapshot.countsByKey.end(); ++it) {
+        int beforeCount = 0;
+        std::map<std::string, int>::const_iterator beforeIt =
+            state.inventory.countsByKey.find(it->first);
+        if (beforeIt != state.inventory.countsByKey.end()) {
+          beforeCount = beforeIt->second;
+        }
+        if (it->second > beforeCount) {
+          buyDeltaByKey[it->first] = it->second - beforeCount;
+        }
+      }
+      std::string itemsText =
+          BuildInventoryDeltaItemsText(buyDeltaByKey, currentSnapshot, state.inventory);
+      if (itemsText.empty()) {
+        itemsText = ToString(addedCount) + "x Unknown Item";
+      }
+      std::string message =
+          "bought " + itemsText + " from " + sellerName + " for " +
+          ToString(catsSpent) + " cats";
+      LogGameEvent("trade", actorName, actorFaction, sellerName, sellerFaction,
+                   message, ResolveCharacterSerialForEvent(npc),
+                   ResolveCharacterSerialForEvent(seller));
+      return;
+    }
+  }
+
   std::string mode = "normal";
   if (addedStolenCount > 0 && addedStolenCount >= addedCount) {
     mode = "theft";
@@ -4870,8 +5084,12 @@ struct PendingInventoryPickupEvent {
   Character *npc;
   NpcWorldEventState priorState;
   InventoryEventSnapshot currentSnapshot;
+  bool hasMoneyAfter;
+  int moneyAfter;
 
-  PendingInventoryPickupEvent() : serial(0), npc(nullptr), priorState() {}
+  PendingInventoryPickupEvent()
+      : serial(0), npc(nullptr), priorState(), hasMoneyAfter(false),
+        moneyAfter(0) {}
 };
 
 struct TransferEventAggregation {
@@ -5591,6 +5809,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     bool deadNow = false;
     bool unconsciousNow = false;
     bool enslavedNow = false;
+    bool hasMoneyNow = false;
+    int moneyNow = 0;
     int lockpickingNow = 0;
     try {
       deadNow = npc->isDead();
@@ -5600,6 +5820,7 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     } catch (...) {
       continue;
     }
+    hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -5690,6 +5911,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.dead = deadNow;
       state.unconscious = unconsciousNow;
       state.enslaved = enslavedNow;
+      state.hasMoney = hasMoneyNow;
+      state.money = moneyNow;
       state.carrying = carryingNow;
       state.carryingTargetSerial = carryingTargetSerialNow;
       state.carryingTargetName = carryingTargetNameNow;
@@ -5731,8 +5954,51 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     NpcWorldEventState previousState = state;
     std::map<std::string, int> gainByKey;
     std::map<std::string, int> lossByKey;
+    bool suppressPickupEvent = false;
     ComputeInventoryDeltaByKey(previousState.inventory, inventorySnapshot,
                                gainByKey, lossByKey);
+    if (!gainByKey.empty() || !lossByKey.empty()) {
+      bool hasMoneyDelta = previousState.hasMoney && hasMoneyNow;
+      int moneyDelta = hasMoneyDelta ? (moneyNow - previousState.money) : 0;
+      Character *tradeCounterparty = nullptr;
+      if (isPlayerActor && hasMoneyDelta && moneyDelta != 0) {
+        tradeCounterparty = ResolveLikelyTraderForActor(world, npc);
+      }
+      if (tradeCounterparty && (uintptr_t)tradeCounterparty > 0x1000) {
+        std::string actorName = ResolveCharacterNameSafe(npc);
+        std::string actorFaction = SafeFaction(npc);
+        std::string traderName = ResolveCharacterNameSafe(tradeCounterparty);
+        std::string traderFaction = SafeFaction(tradeCounterparty);
+        unsigned int traderSerial = ResolveCharacterSerialForEvent(tradeCounterparty);
+
+        if (moneyDelta < 0 && !gainByKey.empty()) {
+          std::string itemsText = BuildInventoryDeltaItemsText(
+              gainByKey, inventorySnapshot, previousState.inventory);
+          if (itemsText.empty()) {
+            itemsText = "items";
+          }
+          std::string message =
+              "bought " + itemsText + " from " + traderName + " for " +
+              ToString(-moneyDelta) + " cats";
+          LogGameEvent("trade", actorName, actorFaction, traderName, traderFaction,
+                       message, serial, traderSerial);
+          gainByKey.clear();
+          suppressPickupEvent = true;
+        } else if (moneyDelta > 0 && !lossByKey.empty()) {
+          std::string itemsText = BuildInventoryDeltaItemsText(
+              lossByKey, previousState.inventory, inventorySnapshot);
+          if (itemsText.empty()) {
+            itemsText = "items";
+          }
+          std::string message =
+              "sold " + itemsText + " to " + traderName + " for " +
+              ToString(moneyDelta) + " cats";
+          LogGameEvent("trade", actorName, actorFaction, traderName, traderFaction,
+                       message, serial, traderSerial);
+          lossByKey.clear();
+        }
+      }
+    }
     if (!gainByKey.empty() || !lossByKey.empty()) {
       PendingInventoryTransferDelta transferDelta;
       transferDelta.serial = serial;
@@ -5745,12 +6011,15 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       transferDelta.lossByKey = lossByKey;
       pendingTransferDeltas.push_back(transferDelta);
     }
-    if (inventorySnapshot.totalCount > previousState.inventory.totalCount) {
+    if (!suppressPickupEvent &&
+        inventorySnapshot.totalCount > previousState.inventory.totalCount) {
       PendingInventoryPickupEvent pickupEvent;
       pickupEvent.serial = serial;
       pickupEvent.npc = npc;
       pickupEvent.priorState = previousState;
       pickupEvent.currentSnapshot = inventorySnapshot;
+      pickupEvent.hasMoneyAfter = hasMoneyNow;
+      pickupEvent.moneyAfter = moneyNow;
       pendingPickupEvents.push_back(pickupEvent);
     }
 
@@ -5865,6 +6134,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.dead = deadNow;
     state.unconscious = unconsciousNow;
     state.enslaved = enslavedNow;
+    state.hasMoney = hasMoneyNow;
+    state.money = moneyNow;
     state.carrying = carryingNow;
     state.carryingTargetSerial = carryingTargetSerialNow;
     state.carryingTargetName = carryingTargetNameNow;
@@ -5899,7 +6170,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       matchedGain = &matchedIt->second;
     }
     EmitPickupEvent(pickupEvent.npc, pickupEvent.priorState,
-                    pickupEvent.currentSnapshot, matchedGain);
+                    pickupEvent.currentSnapshot, matchedGain,
+                    pickupEvent.hasMoneyAfter, pickupEvent.moneyAfter);
   }
 
   static DWORD lastPruneTick = 0;
