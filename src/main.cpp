@@ -1450,6 +1450,7 @@ static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
 static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
+static const DWORD kNpcWorldEventWarmupMs = 10 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
@@ -4515,8 +4516,69 @@ static void EmitLockpickedEvent(Character *npc, int previousSkill,
                ResolveCharacterSerialForEvent(npc), 0);
 }
 
-static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
-                            const InventoryEventSnapshot &currentSnapshot) {
+static std::string ResolveInventoryDisplayNameForKey(
+    const std::string &key, const InventoryEventSnapshot &preferredSnapshot,
+    const InventoryEventSnapshot &fallbackSnapshot) {
+  std::map<std::string, std::string>::const_iterator preferredIt =
+      preferredSnapshot.displayNameByKey.find(key);
+  if (preferredIt != preferredSnapshot.displayNameByKey.end() &&
+      !preferredIt->second.empty()) {
+    return preferredIt->second;
+  }
+  std::map<std::string, std::string>::const_iterator fallbackIt =
+      fallbackSnapshot.displayNameByKey.find(key);
+  if (fallbackIt != fallbackSnapshot.displayNameByKey.end() &&
+      !fallbackIt->second.empty()) {
+    return fallbackIt->second;
+  }
+  return "Unknown Item";
+}
+
+static void ComputeInventoryDeltaByKey(
+    const InventoryEventSnapshot &beforeSnapshot,
+    const InventoryEventSnapshot &afterSnapshot,
+    std::map<std::string, int> &gainByKeyOut,
+    std::map<std::string, int> &lossByKeyOut) {
+  gainByKeyOut.clear();
+  lossByKeyOut.clear();
+
+  for (std::map<std::string, int>::const_iterator it =
+           afterSnapshot.countsByKey.begin();
+       it != afterSnapshot.countsByKey.end(); ++it) {
+    const std::string &key = it->first;
+    int afterCount = it->second;
+    int beforeCount = 0;
+    std::map<std::string, int>::const_iterator beforeIt =
+        beforeSnapshot.countsByKey.find(key);
+    if (beforeIt != beforeSnapshot.countsByKey.end()) {
+      beforeCount = beforeIt->second;
+    }
+    if (afterCount > beforeCount) {
+      gainByKeyOut[key] = afterCount - beforeCount;
+    }
+  }
+
+  for (std::map<std::string, int>::const_iterator it =
+           beforeSnapshot.countsByKey.begin();
+       it != beforeSnapshot.countsByKey.end(); ++it) {
+    const std::string &key = it->first;
+    int beforeCount = it->second;
+    int afterCount = 0;
+    std::map<std::string, int>::const_iterator afterIt =
+        afterSnapshot.countsByKey.find(key);
+    if (afterIt != afterSnapshot.countsByKey.end()) {
+      afterCount = afterIt->second;
+    }
+    if (beforeCount > afterCount) {
+      lossByKeyOut[key] = beforeCount - afterCount;
+    }
+  }
+}
+
+static void EmitPickupEvent(
+    Character *npc, const NpcWorldEventState &state,
+    const InventoryEventSnapshot &currentSnapshot,
+    const std::map<std::string, int> *matchedTransferGainByKey) {
   struct PickupDeltaEntry {
     std::string name;
     int count;
@@ -4545,14 +4607,23 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
     if (delta <= 0) {
       continue;
     }
-    addedCount += delta;
-    std::string displayName = "Unknown Item";
-    std::map<std::string, std::string>::const_iterator displayIt =
-        currentSnapshot.displayNameByKey.find(key);
-    if (displayIt != currentSnapshot.displayNameByKey.end() &&
-        !displayIt->second.empty()) {
-      displayName = displayIt->second;
+    if (matchedTransferGainByKey) {
+      std::map<std::string, int>::const_iterator matchedIt =
+          matchedTransferGainByKey->find(key);
+      if (matchedIt != matchedTransferGainByKey->end()) {
+        int matchedQty = matchedIt->second;
+        if (matchedQty > 0) {
+          int consumed = matchedQty > delta ? delta : matchedQty;
+          delta -= consumed;
+        }
+      }
     }
+    if (delta <= 0) {
+      continue;
+    }
+    addedCount += delta;
+    std::string displayName =
+        ResolveInventoryDisplayNameForKey(key, currentSnapshot, state.inventory);
     addedItems.push_back(PickupDeltaEntry(displayName, delta));
 
     int currentStolen = 0;
@@ -4568,6 +4639,19 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
       previousStolen = stolenPrevIt->second;
     }
     int stolenDelta = currentStolen - previousStolen;
+    if (matchedTransferGainByKey) {
+      std::map<std::string, int>::const_iterator matchedIt =
+          matchedTransferGainByKey->find(key);
+      if (matchedIt != matchedTransferGainByKey->end()) {
+        int matchedQty = matchedIt->second;
+        if (matchedQty > 0 && stolenDelta > 0) {
+          stolenDelta -= matchedQty;
+          if (stolenDelta < 0) {
+            stolenDelta = 0;
+          }
+        }
+      }
+    }
     if (stolenDelta > 0) {
       addedStolenCount += stolenDelta;
     }
@@ -4617,6 +4701,324 @@ static void EmitPickupEvent(Character *npc, const NpcWorldEventState &state,
   }
   LogGameEvent("item_pickup", actorName, actorFaction, "None", "None",
                message, ResolveCharacterSerialForEvent(npc), 0);
+}
+
+struct PendingInventoryTransferDelta {
+  unsigned int serial;
+  Character *npc;
+  std::string actorName;
+  std::string actorFaction;
+  InventoryEventSnapshot beforeSnapshot;
+  InventoryEventSnapshot afterSnapshot;
+  std::map<std::string, int> gainByKey;
+  std::map<std::string, int> lossByKey;
+
+  PendingInventoryTransferDelta()
+      : serial(0), npc(nullptr), actorName(""), actorFaction("") {}
+};
+
+struct PendingInventoryPickupEvent {
+  unsigned int serial;
+  Character *npc;
+  NpcWorldEventState priorState;
+  InventoryEventSnapshot currentSnapshot;
+
+  PendingInventoryPickupEvent() : serial(0), npc(nullptr), priorState() {}
+};
+
+struct TransferEventAggregation {
+  unsigned int fromSerial;
+  unsigned int toSerial;
+  std::string fromName;
+  std::string fromFaction;
+  std::string toName;
+  std::string toFaction;
+  std::map<std::string, int> qtyByKey;
+  std::map<std::string, std::string> displayNameByKey;
+  std::vector<std::string> itemOrder;
+
+  TransferEventAggregation()
+      : fromSerial(0), toSerial(0), fromName(""), fromFaction(""),
+        toName(""), toFaction("") {}
+};
+
+struct PendingTransferLoss {
+  unsigned int fromSerial;
+  std::string fromName;
+  std::string fromFaction;
+  std::string itemKey;
+  std::string itemName;
+  int qty;
+  DWORD observedTick;
+
+  PendingTransferLoss()
+      : fromSerial(0), fromName(""), fromFaction(""), itemKey(""),
+        itemName(""), qty(0), observedTick(0) {}
+};
+
+static std::string BuildTransferPairKey(unsigned int fromSerial,
+                                        unsigned int toSerial) {
+  return ToString(fromSerial) + "->" + ToString(toSerial);
+}
+
+static void EmitInventoryTransferEventsFromDeltas(
+    const std::vector<PendingInventoryTransferDelta> &deltas,
+    std::map<unsigned int, std::map<std::string, int> > &matchedGainBySerialOut) {
+  matchedGainBySerialOut.clear();
+
+  static std::deque<PendingTransferLoss> pendingLosses;
+  DWORD nowTick = GetTickCount();
+  const DWORD kPendingLossMaxAgeMs = 6000;
+  const size_t kPendingLossMaxEntries = 512;
+
+  std::map<std::string, TransferEventAggregation> aggregatedByPair;
+  std::map<std::string, TransferEventAggregation> agedOutByPair;
+
+  auto appendAggregation = [&](std::map<std::string, TransferEventAggregation> &dest,
+                               unsigned int fromSerial,
+                               const std::string &fromName,
+                               const std::string &fromFaction,
+                               unsigned int toSerial, const std::string &toName,
+                               const std::string &toFaction,
+                               const std::string &itemKey,
+                               const std::string &itemName, int matchedQty) {
+    if (fromSerial == 0 || itemKey.empty() || matchedQty <= 0) {
+      return;
+    }
+    std::string pairKey = BuildTransferPairKey(fromSerial, toSerial);
+    TransferEventAggregation &agg = dest[pairKey];
+    agg.fromSerial = fromSerial;
+    agg.toSerial = toSerial;
+    if (agg.fromName.empty()) {
+      agg.fromName = fromName;
+    }
+    if (agg.fromFaction.empty()) {
+      agg.fromFaction = fromFaction;
+    }
+    if (agg.toName.empty()) {
+      agg.toName = toName;
+    }
+    if (agg.toFaction.empty()) {
+      agg.toFaction = toFaction;
+    }
+    if (agg.qtyByKey.count(itemKey) == 0) {
+      agg.itemOrder.push_back(itemKey);
+    }
+    agg.qtyByKey[itemKey] += matchedQty;
+    if (agg.displayNameByKey.count(itemKey) == 0) {
+      agg.displayNameByKey[itemKey] = itemName;
+    }
+  };
+
+  for (std::deque<PendingTransferLoss>::iterator it = pendingLosses.begin();
+       it != pendingLosses.end();) {
+    bool expired = (it->observedTick == 0) ||
+                   (nowTick - it->observedTick > kPendingLossMaxAgeMs);
+    bool empty = it->qty <= 0 || it->itemKey.empty() || it->fromSerial == 0;
+    if (expired || empty) {
+      if (!empty && expired) {
+        appendAggregation(agedOutByPair, it->fromSerial, it->fromName,
+                          it->fromFaction, 0, "Ground", "None", it->itemKey,
+                          it->itemName, it->qty);
+      }
+      it = pendingLosses.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  if (!deltas.empty()) {
+    std::vector<PendingInventoryTransferDelta> working = deltas;
+    auto appendMatch = [&](unsigned int fromSerial, const std::string &fromName,
+                           const std::string &fromFaction, unsigned int toSerial,
+                           const std::string &toName,
+                           const std::string &toFaction,
+                           const std::string &itemKey,
+                           const std::string &itemName, int matchedQty) {
+      appendAggregation(aggregatedByPair, fromSerial, fromName, fromFaction,
+                        toSerial, toName, toFaction, itemKey, itemName,
+                        matchedQty);
+    };
+
+    for (size_t toIndex = 0; toIndex < working.size(); ++toIndex) {
+      PendingInventoryTransferDelta &toDelta = working[toIndex];
+      if (toDelta.serial == 0) {
+        continue;
+      }
+
+      for (std::map<std::string, int>::iterator gainIt = toDelta.gainByKey.begin();
+           gainIt != toDelta.gainByKey.end(); ++gainIt) {
+        const std::string &itemKey = gainIt->first;
+        int gainRemaining = gainIt->second;
+        if (gainRemaining <= 0) {
+          continue;
+        }
+
+        for (size_t fromIndex = 0;
+             fromIndex < working.size() && gainRemaining > 0; ++fromIndex) {
+          if (fromIndex == toIndex) {
+            continue;
+          }
+          PendingInventoryTransferDelta &fromDelta = working[fromIndex];
+          if (fromDelta.serial == 0 || fromDelta.serial == toDelta.serial) {
+            continue;
+          }
+          std::map<std::string, int>::iterator lossIt =
+              fromDelta.lossByKey.find(itemKey);
+          if (lossIt == fromDelta.lossByKey.end() || lossIt->second <= 0) {
+            continue;
+          }
+
+          int matchedQty =
+              gainRemaining < lossIt->second ? gainRemaining : lossIt->second;
+          if (matchedQty <= 0) {
+            continue;
+          }
+
+          gainRemaining -= matchedQty;
+          gainIt->second -= matchedQty;
+          lossIt->second -= matchedQty;
+          matchedGainBySerialOut[toDelta.serial][itemKey] += matchedQty;
+          appendMatch(fromDelta.serial, fromDelta.actorName, fromDelta.actorFaction,
+                      toDelta.serial, toDelta.actorName, toDelta.actorFaction,
+                      itemKey,
+                      ResolveInventoryDisplayNameForKey(
+                          itemKey, fromDelta.beforeSnapshot, toDelta.afterSnapshot),
+                      matchedQty);
+        }
+
+        if (gainRemaining > 0) {
+          for (std::deque<PendingTransferLoss>::iterator pendingIt =
+                   pendingLosses.begin();
+               pendingIt != pendingLosses.end() && gainRemaining > 0;
+               ++pendingIt) {
+            if (pendingIt->qty <= 0 || pendingIt->itemKey != itemKey) {
+              continue;
+            }
+            if (pendingIt->fromSerial == 0 ||
+                pendingIt->fromSerial == toDelta.serial) {
+              continue;
+            }
+            int matchedQty =
+                gainRemaining < pendingIt->qty ? gainRemaining : pendingIt->qty;
+            if (matchedQty <= 0) {
+              continue;
+            }
+            gainRemaining -= matchedQty;
+            gainIt->second -= matchedQty;
+            pendingIt->qty -= matchedQty;
+            matchedGainBySerialOut[toDelta.serial][itemKey] += matchedQty;
+            appendMatch(
+                pendingIt->fromSerial, pendingIt->fromName, pendingIt->fromFaction,
+                toDelta.serial, toDelta.actorName, toDelta.actorFaction, itemKey,
+                pendingIt->itemName.empty()
+                    ? ResolveInventoryDisplayNameForKey(
+                          itemKey, toDelta.afterSnapshot, toDelta.beforeSnapshot)
+                    : pendingIt->itemName,
+                matchedQty);
+          }
+        }
+      }
+    }
+
+    for (std::deque<PendingTransferLoss>::iterator it = pendingLosses.begin();
+         it != pendingLosses.end();) {
+      if (it->qty <= 0) {
+        it = pendingLosses.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    for (size_t fromIndex = 0; fromIndex < working.size(); ++fromIndex) {
+      PendingInventoryTransferDelta &fromDelta = working[fromIndex];
+      if (fromDelta.serial == 0) {
+        continue;
+      }
+      for (std::map<std::string, int>::const_iterator lossIt =
+               fromDelta.lossByKey.begin();
+           lossIt != fromDelta.lossByKey.end(); ++lossIt) {
+        const std::string &itemKey = lossIt->first;
+        int lossQty = lossIt->second;
+        if (itemKey.empty() || lossQty <= 0) {
+          continue;
+        }
+        PendingTransferLoss pending;
+        pending.fromSerial = fromDelta.serial;
+        pending.fromName = fromDelta.actorName;
+        pending.fromFaction = fromDelta.actorFaction;
+        pending.itemKey = itemKey;
+        pending.itemName = ResolveInventoryDisplayNameForKey(
+            itemKey, fromDelta.beforeSnapshot, fromDelta.afterSnapshot);
+        pending.qty = lossQty;
+        pending.observedTick = nowTick;
+        pendingLosses.push_back(pending);
+      }
+    }
+  }
+
+  while (pendingLosses.size() > kPendingLossMaxEntries) {
+    const PendingTransferLoss &overflow = pendingLosses.front();
+    if (overflow.qty > 0 && overflow.fromSerial != 0 && !overflow.itemKey.empty()) {
+      appendAggregation(agedOutByPair, overflow.fromSerial, overflow.fromName,
+                        overflow.fromFaction, 0, "Ground", "None",
+                        overflow.itemKey, overflow.itemName, overflow.qty);
+    }
+    pendingLosses.pop_front();
+  }
+
+  auto emitAggregations =
+      [&](std::map<std::string, TransferEventAggregation> &byPair) {
+        for (std::map<std::string, TransferEventAggregation>::iterator it =
+                 byPair.begin();
+             it != byPair.end(); ++it) {
+          TransferEventAggregation &agg = it->second;
+          if (agg.qtyByKey.empty()) {
+            continue;
+          }
+
+          std::string itemsText = "";
+          for (size_t i = 0; i < agg.itemOrder.size(); ++i) {
+            const std::string &itemKey = agg.itemOrder[i];
+            std::map<std::string, int>::const_iterator qtyIt =
+                agg.qtyByKey.find(itemKey);
+            if (qtyIt == agg.qtyByKey.end() || qtyIt->second <= 0) {
+              continue;
+            }
+            std::string itemName = "Unknown Item";
+            std::map<std::string, std::string>::const_iterator nameIt =
+                agg.displayNameByKey.find(itemKey);
+            if (nameIt != agg.displayNameByKey.end() && !nameIt->second.empty()) {
+              itemName = nameIt->second;
+            }
+            if (!itemsText.empty()) {
+              itemsText += ", ";
+            }
+            itemsText += ToString(qtyIt->second) + "x " + itemName;
+          }
+          if (itemsText.empty()) {
+            continue;
+          }
+
+          std::string fromName = agg.fromName.empty() ? "Unknown" : agg.fromName;
+          std::string toName = agg.toName.empty() ? "Unknown" : agg.toName;
+          std::string fromFaction =
+              agg.fromFaction.empty() ? "None" : agg.fromFaction;
+          std::string toFaction = agg.toFaction.empty() ? "None" : agg.toFaction;
+
+          std::string toNameLower = ToLowerAsciiCopy(TrimCopy(toName));
+          bool isGroundDrop = (agg.toSerial == 0) || (toNameLower == "ground");
+          std::string message = isGroundDrop
+                                    ? ("dropped " + itemsText +
+                                       " on the ground")
+                                    : ("transferred " + itemsText + " to " +
+                                       toName);
+          LogGameEvent("trade", fromName, fromFaction, toName, toFaction,
+                       message, agg.fromSerial, agg.toSerial);
+        }
+      };
+  emitAggregations(aggregatedByPair);
+  emitAggregations(agedOutByPair);
 }
 
 static Character *ResolveCharacterBySerialForCarryEvent(unsigned int serial) {
@@ -4988,6 +5390,7 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   std::set<unsigned int> seen;
   candidates.reserve(kNpcWorldEventCandidateLimit + 4);
 
+  AddInventorySyncCandidate(player, candidates, seen);
   AddInventorySyncCandidate(selection, candidates, seen);
   Character *talkTarget = nullptr;
   try {
@@ -5015,11 +5418,17 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     }
   }
 
+  std::vector<PendingInventoryTransferDelta> pendingTransferDeltas;
+  std::vector<PendingInventoryPickupEvent> pendingPickupEvents;
+  pendingTransferDeltas.reserve(candidates.size());
+  pendingPickupEvents.reserve(candidates.size());
+
   for (size_t i = 0; i < candidates.size(); ++i) {
     Character *npc = candidates[i];
-    if (!npc || (uintptr_t)npc < 0x1000 || npc == player) {
+    if (!npc || (uintptr_t)npc < 0x1000) {
       continue;
     }
+    bool isPlayerActor = (npc == player);
 
     unsigned int serial = 0;
     try {
@@ -5171,112 +5580,138 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       continue;
     }
 
-    if (!state.unconscious && unconsciousNow) {
-      EmitKnockoutEvent(npc);
-    } else if (state.unconscious && !unconsciousNow && !deadNow) {
-      EmitRecoveredEvent(npc);
+    NpcWorldEventState previousState = state;
+    std::map<std::string, int> gainByKey;
+    std::map<std::string, int> lossByKey;
+    ComputeInventoryDeltaByKey(previousState.inventory, inventorySnapshot,
+                               gainByKey, lossByKey);
+    if (!gainByKey.empty() || !lossByKey.empty()) {
+      PendingInventoryTransferDelta transferDelta;
+      transferDelta.serial = serial;
+      transferDelta.npc = npc;
+      transferDelta.actorName = ResolveCharacterNameSafe(npc);
+      transferDelta.actorFaction = SafeFaction(npc);
+      transferDelta.beforeSnapshot = previousState.inventory;
+      transferDelta.afterSnapshot = inventorySnapshot;
+      transferDelta.gainByKey = gainByKey;
+      transferDelta.lossByKey = lossByKey;
+      pendingTransferDeltas.push_back(transferDelta);
     }
-    if (!state.dead && deadNow) {
-      EmitDeathEvent(npc);
-    }
-    if (!state.enslaved && enslavedNow) {
-      EmitSlaveryEvent(npc, true);
-    } else if (state.enslaved && !enslavedNow) {
-      EmitSlaveryEvent(npc, false);
-    }
-    if (!state.carrying && carryingNow) {
-      EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
-    } else if (state.carrying && !carryingNow) {
-      EmitCarryDropEvent(npc, state.carryingTargetSerial,
-                         state.carryingTargetName);
-    } else if (state.carrying && carryingNow &&
-               state.carryingTargetSerial != carryingTargetSerialNow) {
-      EmitCarryDropEvent(npc, state.carryingTargetSerial,
-                         state.carryingTargetName);
-      EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
-    }
-
-    if (!IsLimbLostState(state.leftArmState) && IsLimbLostState(leftArmState)) {
-      Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
-          " limb=left_arm state " + ToString(state.leftArmState) + "->" +
-          ToString(leftArmState));
-      EmitLimbLossEvent(npc, "left arm");
-    } else if (state.leftArmPresent && !leftArmPresent) {
-      Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
-          " limb=left_arm part_present 1->0");
-      EmitLimbLossEvent(npc, "left arm");
-    }
-    if (!IsLimbLostState(state.rightArmState) && IsLimbLostState(rightArmState)) {
-      Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
-          " limb=right_arm state " + ToString(state.rightArmState) + "->" +
-          ToString(rightArmState));
-      EmitLimbLossEvent(npc, "right arm");
-    } else if (state.rightArmPresent && !rightArmPresent) {
-      Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
-          " limb=right_arm part_present 1->0");
-      EmitLimbLossEvent(npc, "right arm");
-    }
-    if (!IsLimbLostState(state.leftLegState) && IsLimbLostState(leftLegState)) {
-      Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
-          " limb=left_leg state " + ToString(state.leftLegState) + "->" +
-          ToString(leftLegState));
-      EmitLimbLossEvent(npc, "left leg");
-    } else if (state.leftLegPresent && !leftLegPresent) {
-      Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
-          " limb=left_leg part_present 1->0");
-      EmitLimbLossEvent(npc, "left leg");
-    }
-    if (!IsLimbLostState(state.rightLegState) && IsLimbLostState(rightLegState)) {
-      Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
-          " limb=right_leg state " + ToString(state.rightLegState) + "->" +
-          ToString(rightLegState));
-      EmitLimbLossEvent(npc, "right leg");
-    } else if (state.rightLegPresent && !rightLegPresent) {
-      Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
-          " limb=right_leg part_present 1->0");
-      EmitLimbLossEvent(npc, "right leg");
+    if (inventorySnapshot.totalCount > previousState.inventory.totalCount) {
+      PendingInventoryPickupEvent pickupEvent;
+      pickupEvent.serial = serial;
+      pickupEvent.npc = npc;
+      pickupEvent.priorState = previousState;
+      pickupEvent.currentSnapshot = inventorySnapshot;
+      pendingPickupEvents.push_back(pickupEvent);
     }
 
-    if (inventorySnapshot.totalCount > state.inventory.totalCount) {
-      EmitPickupEvent(npc, state, inventorySnapshot);
-    }
-    if (lockpickingNow > state.lockpickingSkill) {
-      EmitLockpickedEvent(npc, state.lockpickingSkill, lockpickingNow);
-    }
-    bool constructionChanged =
-        state.constructionAction != (int)constructionActionNow;
-    bool constructionTargetChanged =
-        !constructionChanged &&
-        constructionActionNow != CONSTRUCTION_ACTION_NONE &&
-        ((constructionSubjectSerialNow != 0 &&
-          constructionSubjectSerialNow != state.constructionSubjectSerial) ||
-         ((constructionSubjectSerialNow == 0 || state.constructionSubjectSerial == 0) &&
-          !constructionSubjectNameNow.empty() &&
-          constructionSubjectNameNow != state.constructionSubjectName));
-    if (constructionActionNow == CONSTRUCTION_ACTION_BUILD &&
-        (constructionChanged || constructionTargetChanged)) {
-      EmitBuildEvent(npc, constructionSubjectNameNow);
-    } else if (constructionActionNow == CONSTRUCTION_ACTION_DISMANTLE &&
-               (constructionChanged || constructionTargetChanged)) {
-      EmitDismantleEvent(npc, constructionSubjectNameNow);
-    }
+    if (!isPlayerActor) {
+      if (!state.unconscious && unconsciousNow) {
+        EmitKnockoutEvent(npc);
+      } else if (state.unconscious && !unconsciousNow && !deadNow) {
+        EmitRecoveredEvent(npc);
+      }
+      if (!state.dead && deadNow) {
+        EmitDeathEvent(npc);
+      }
+      if (!state.enslaved && enslavedNow) {
+        EmitSlaveryEvent(npc, true);
+      } else if (state.enslaved && !enslavedNow) {
+        EmitSlaveryEvent(npc, false);
+      }
+      if (!state.carrying && carryingNow) {
+        EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
+      } else if (state.carrying && !carryingNow) {
+        EmitCarryDropEvent(npc, state.carryingTargetSerial,
+                           state.carryingTargetName);
+      } else if (state.carrying && carryingNow &&
+                 state.carryingTargetSerial != carryingTargetSerialNow) {
+        EmitCarryDropEvent(npc, state.carryingTargetSerial,
+                           state.carryingTargetName);
+        EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
+      }
 
-    bool hasAmbientSpeech = speechActiveNow && !normalizedSpeechLine.empty();
-    bool speechChanged =
-        hasAmbientSpeech &&
-        (!state.speechActive || normalizedSpeechLine != state.lastSpeechLine);
-    if (speechChanged && !speechHadTtsMetadata &&
-        !IsNpcInSpeechFlowBySerial(serial) &&
-        !ShouldDropDuplicateNonAiDialogue(serial, false, speechLine)) {
-      // Ambient sweep capture stores base dialogue with no explicit target.
-      unsigned int listenerSerial = 0;
-      std::string listenerName = "None";
-      std::string listenerFaction = "None";
-      LogGameEvent("chat", ResolveCharacterNameSafe(npc), SafeFaction(npc),
-                   listenerName, listenerFaction, speechLine, serial,
-                   listenerSerial);
-      Log("EVENT_SCAN: ambient speech captured serial=" + ToString(serial) +
-          " speaker=" + ResolveCharacterNameSafe(npc));
+      if (!IsLimbLostState(state.leftArmState) && IsLimbLostState(leftArmState)) {
+        Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
+            " limb=left_arm state " + ToString(state.leftArmState) + "->" +
+            ToString(leftArmState));
+        EmitLimbLossEvent(npc, "left arm");
+      } else if (state.leftArmPresent && !leftArmPresent) {
+        Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
+            " limb=left_arm part_present 1->0");
+        EmitLimbLossEvent(npc, "left arm");
+      }
+      if (!IsLimbLostState(state.rightArmState) && IsLimbLostState(rightArmState)) {
+        Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
+            " limb=right_arm state " + ToString(state.rightArmState) + "->" +
+            ToString(rightArmState));
+        EmitLimbLossEvent(npc, "right arm");
+      } else if (state.rightArmPresent && !rightArmPresent) {
+        Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
+            " limb=right_arm part_present 1->0");
+        EmitLimbLossEvent(npc, "right arm");
+      }
+      if (!IsLimbLostState(state.leftLegState) && IsLimbLostState(leftLegState)) {
+        Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
+            " limb=left_leg state " + ToString(state.leftLegState) + "->" +
+            ToString(leftLegState));
+        EmitLimbLossEvent(npc, "left leg");
+      } else if (state.leftLegPresent && !leftLegPresent) {
+        Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
+            " limb=left_leg part_present 1->0");
+        EmitLimbLossEvent(npc, "left leg");
+      }
+      if (!IsLimbLostState(state.rightLegState) && IsLimbLostState(rightLegState)) {
+        Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
+            " limb=right_leg state " + ToString(state.rightLegState) + "->" +
+            ToString(rightLegState));
+        EmitLimbLossEvent(npc, "right leg");
+      } else if (state.rightLegPresent && !rightLegPresent) {
+        Log("EVENT_SCAN: limb missing transition serial=" + ToString(serial) +
+            " limb=right_leg part_present 1->0");
+        EmitLimbLossEvent(npc, "right leg");
+      }
+
+      if (lockpickingNow > state.lockpickingSkill) {
+        EmitLockpickedEvent(npc, state.lockpickingSkill, lockpickingNow);
+      }
+      bool constructionChanged =
+          state.constructionAction != (int)constructionActionNow;
+      bool constructionTargetChanged =
+          !constructionChanged &&
+          constructionActionNow != CONSTRUCTION_ACTION_NONE &&
+          ((constructionSubjectSerialNow != 0 &&
+            constructionSubjectSerialNow != state.constructionSubjectSerial) ||
+           ((constructionSubjectSerialNow == 0 ||
+             state.constructionSubjectSerial == 0) &&
+            !constructionSubjectNameNow.empty() &&
+            constructionSubjectNameNow != state.constructionSubjectName));
+      if (constructionActionNow == CONSTRUCTION_ACTION_BUILD &&
+          (constructionChanged || constructionTargetChanged)) {
+        EmitBuildEvent(npc, constructionSubjectNameNow);
+      } else if (constructionActionNow == CONSTRUCTION_ACTION_DISMANTLE &&
+                 (constructionChanged || constructionTargetChanged)) {
+        EmitDismantleEvent(npc, constructionSubjectNameNow);
+      }
+
+      bool hasAmbientSpeech = speechActiveNow && !normalizedSpeechLine.empty();
+      bool speechChanged =
+          hasAmbientSpeech &&
+          (!state.speechActive || normalizedSpeechLine != state.lastSpeechLine);
+      if (speechChanged && !speechHadTtsMetadata &&
+          !IsNpcInSpeechFlowBySerial(serial) &&
+          !ShouldDropDuplicateNonAiDialogue(serial, false, speechLine)) {
+        // Ambient sweep capture stores base dialogue with no explicit target.
+        unsigned int listenerSerial = 0;
+        std::string listenerName = "None";
+        std::string listenerFaction = "None";
+        LogGameEvent("chat", ResolveCharacterNameSafe(npc), SafeFaction(npc),
+                     listenerName, listenerFaction, speechLine, serial,
+                     listenerSerial);
+        Log("EVENT_SCAN: ambient speech captured serial=" + ToString(serial) +
+            " speaker=" + ResolveCharacterNameSafe(npc));
+      }
     }
 
     state.dead = deadNow;
@@ -5302,6 +5737,21 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.lastSpeechLine = speechActiveNow ? normalizedSpeechLine : "";
     state.inventory = inventorySnapshot;
     state.lastSeenTick = nowTick;
+  }
+
+  std::map<unsigned int, std::map<std::string, int> > matchedTransferGainBySerial;
+  EmitInventoryTransferEventsFromDeltas(pendingTransferDeltas,
+                                        matchedTransferGainBySerial);
+  for (size_t i = 0; i < pendingPickupEvents.size(); ++i) {
+    const PendingInventoryPickupEvent &pickupEvent = pendingPickupEvents[i];
+    const std::map<std::string, int> *matchedGain = nullptr;
+    std::map<unsigned int, std::map<std::string, int> >::const_iterator matchedIt =
+        matchedTransferGainBySerial.find(pickupEvent.serial);
+    if (matchedIt != matchedTransferGainBySerial.end()) {
+      matchedGain = &matchedIt->second;
+    }
+    EmitPickupEvent(pickupEvent.npc, pickupEvent.priorState,
+                    pickupEvent.currentSnapshot, matchedGain);
   }
 
   static DWORD lastPruneTick = 0;
@@ -8525,18 +8975,27 @@ Item *buyItem_hook(Inventory *inv, Item *itemToBuy, RootObject *sendingTo) {
     int catsCost = buyerSpent > 0 ? buyerSpent : sellerGained;
 
     std::string itemName = "Unknown Item";
+    int itemQty = 1;
     if (itemToBuy && (uintptr_t)itemToBuy > 0x1000) {
       try {
         itemName = itemToBuy->getName();
+        itemQty = itemToBuy->quantity;
       } catch (...) {
         itemName = "Unknown Item";
+        itemQty = 1;
       }
     }
     if (itemName == "Unknown Item" && result && (uintptr_t)result > 0x1000) {
       try {
         itemName = result->getName();
+        if (itemQty <= 0) {
+          itemQty = result->quantity;
+        }
       } catch (...) {
       }
+    }
+    if (itemQty <= 0) {
+      itemQty = 1;
     }
 
     std::string buyerName = ResolveRootObjectNameSafe(buyerObj);
@@ -8549,7 +9008,8 @@ Item *buyItem_hook(Inventory *inv, Item *itemToBuy, RootObject *sendingTo) {
       sellerFaction = "None";
     }
 
-    std::string message = "bought " + itemName;
+    std::string message =
+        "bought " + ToString(itemQty) + "x " + itemName;
     if (sellerName != "None") {
       message += " from " + sellerName;
     }
@@ -9475,10 +9935,14 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
 
     bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
+    bool npcEventSyncReady =
+        (nowTick - worldBecameStableTick) >= kNpcWorldEventWarmupMs;
+    if (npcEventSyncReady) {
+      RunNpcWorldEventSweep(world, sel);
+    }
     if (heavySyncReady) {
       RunInventorySyncSweep(world, sel);
       RunPlayerFactionPortraitSweep(world);
-      RunNpcWorldEventSweep(world, sel);
       RunInfoTelemetrySweep(world, sel);
     } else if (nowTick - lastHeavySyncGuardLogTick >= 10000) {
       lastHeavySyncGuardLogTick = nowTick;
