@@ -1093,6 +1093,33 @@ std::string BuildMedicalPayload(Character *character) {
   addPart("left_leg", med->leftLeg);
   addPart("right_leg", med->rightLeg);
 
+  auto isLimbMissing = [&](RobotLimbs::Limb limb) -> bool {
+    int limbState = (int)LIMB_ORIGINAL;
+    bool limbPartPresent = true;
+    try {
+      limbState = (int)med->getLimbState(limb);
+    } catch (...) {
+      limbState = (int)LIMB_ORIGINAL;
+    }
+    try {
+      MedicalSystem::HealthPartStatus *limbPart = med->getPart(limb);
+      limbPartPresent = limbPart && (uintptr_t)limbPart >= 0x1000;
+    } catch (...) {
+      limbPartPresent = true;
+    }
+    bool limbLostState =
+        (limbState == (int)LIMB_STUMP || limbState == (int)LIMB_CRUSHED);
+    return limbLostState || !limbPartPresent;
+  };
+  json += "\"left_arm_missing\": " +
+          std::string(isLimbMissing(RobotLimbs::LEFT_ARM) ? "1" : "0") + ",";
+  json += "\"right_arm_missing\": " +
+          std::string(isLimbMissing(RobotLimbs::RIGHT_ARM) ? "1" : "0") + ",";
+  json += "\"left_leg_missing\": " +
+          std::string(isLimbMissing(RobotLimbs::LEFT_LEG) ? "1" : "0") + ",";
+  json += "\"right_leg_missing\": " +
+          std::string(isLimbMissing(RobotLimbs::RIGHT_LEG) ? "1" : "0") + ",";
+
   int extraHead = 0;
   int extraTorso = 0;
   int extraArm = 0;
