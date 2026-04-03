@@ -623,15 +623,49 @@ void LoadStobeRuntimeConfig() {
       0;
   g_speedDialogue = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                                       "Speed Dialogue", 1) != 0;
-  g_boredEventIntervalSeconds = ReadLayeredIniInt(
-      baseIniPath, customIniPath, "Settings", "BoardEventIntervalSeconds", 240);
-  g_dynamicProfileIntervalMinutes =
-      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
-                        "DynamicProfileIntervalMinutes", 20);
-  if (g_dynamicProfileIntervalMinutes < 1) {
-    g_dynamicProfileIntervalMinutes = 1;
-  } else if (g_dynamicProfileIntervalMinutes > 720) {
-    g_dynamicProfileIntervalMinutes = 720;
+  int boredEventIntervalHours = ReadLayeredIniInt(
+      baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
+  if (boredEventIntervalHours < 1) {
+    boredEventIntervalHours = ReadLayeredIniInt(
+        baseIniPath, customIniPath, "Settings", "BoardEventIntervalHours", -1);
+  }
+  if (boredEventIntervalHours < 1) {
+    int legacyIntervalSeconds = ReadLayeredIniInt(
+        baseIniPath, customIniPath, "Settings", "BoardEventIntervalSeconds",
+        3 * 3600);
+    if (legacyIntervalSeconds < 1) {
+      legacyIntervalSeconds = 3600;
+    }
+    if (legacyIntervalSeconds <= 300) {
+      // Treat old second-based defaults (240s) as "unset" and migrate to the
+      // new default rather than collapsing to 1h.
+      boredEventIntervalHours = 3;
+    } else {
+      boredEventIntervalHours = (legacyIntervalSeconds + 3599) / 3600;
+    }
+  }
+  g_boredEventIntervalHours = boredEventIntervalHours;
+  if (g_boredEventIntervalHours < 1) {
+    g_boredEventIntervalHours = 1;
+  } else if (g_boredEventIntervalHours > 720) {
+    g_boredEventIntervalHours = 720;
+  }
+  int dynamicProfileIntervalHours = ReadLayeredIniInt(
+      baseIniPath, customIniPath, "Settings", "DynamicProfileIntervalHours", -1);
+  if (dynamicProfileIntervalHours < 1) {
+    int legacyIntervalMinutes =
+        ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                          "DynamicProfileIntervalMinutes", 24 * 60);
+    if (legacyIntervalMinutes < 1) {
+      legacyIntervalMinutes = 60;
+    }
+    dynamicProfileIntervalHours = (legacyIntervalMinutes + 59) / 60;
+  }
+  g_dynamicProfileIntervalHours = dynamicProfileIntervalHours;
+  if (g_dynamicProfileIntervalHours < 1) {
+    g_dynamicProfileIntervalHours = 1;
+  } else if (g_dynamicProfileIntervalHours > 720) {
+    g_dynamicProfileIntervalHours = 720;
   }
 
   g_enableBoredEvents =
@@ -648,9 +682,9 @@ void LoadStobeRuntimeConfig() {
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
-      ", BoredEventInterval=" + ToString(g_boredEventIntervalSeconds) + "s" +
-      ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalMinutes) +
-      "m" +
+      ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
+      ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
+      "h" +
       ", AnimalTalks=" + (g_enableAnimalTalks ? "true" : "false") +
       ", NearestSpeaker=" +
       (g_useNearestPlayerSpeaker ? "true" : "false") +
@@ -695,11 +729,11 @@ void SaveStobeRuntimeConfig() {
                              g_ttsEnabled ? "1" : "0", iniPath.c_str());
   WritePrivateProfileStringA("Settings", "Speed Dialogue",
                              g_speedDialogue ? "1" : "0", iniPath.c_str());
-  WritePrivateProfileStringA("Settings", "BoardEventIntervalSeconds",
-                             ToString(g_boredEventIntervalSeconds).c_str(),
+  WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
+                             ToString(g_boredEventIntervalHours).c_str(),
                              iniPath.c_str());
-  WritePrivateProfileStringA("Settings", "DynamicProfileIntervalMinutes",
-                             ToString(g_dynamicProfileIntervalMinutes).c_str(),
+  WritePrivateProfileStringA("Settings", "DynamicProfileIntervalHours",
+                             ToString(g_dynamicProfileIntervalHours).c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableBoredEventConversations",
                              g_enableBoredEvents ? "1" : "0", iniPath.c_str());
@@ -714,6 +748,12 @@ void SaveStobeRuntimeConfig() {
   WritePrivateProfileStringA("Settings", "DialogueSpeedSeconds", NULL,
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "DialogueSpeed", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "BoardEventIntervalHours", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "BoardEventIntervalSeconds", NULL,
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "DynamicProfileIntervalMinutes", NULL,
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "Language", NULL, iniPath.c_str());
   WritePrivateProfileStringA("Settings", "WhisperRadius", NULL,

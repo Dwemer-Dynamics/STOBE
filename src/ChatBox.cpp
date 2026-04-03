@@ -2909,6 +2909,16 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
   EnterCriticalSection(&g_stateMutex);
   g_triggerBoredEvent = false;
   g_lastBoredEventTick = GetTickCount();
+  if (world) {
+    try {
+      TimeOfDay nowTod = world->getTimeStamp_inGameHours();
+      g_lastBoredEventGameTs = (int)nowTod.getTotalSeconds();
+    } catch (...) {
+      g_lastBoredEventGameTs = 0;
+    }
+  } else {
+    g_lastBoredEventGameTs = 0;
+  }
   LeaveCriticalSection(&g_stateMutex);
 
   bool dispatched =

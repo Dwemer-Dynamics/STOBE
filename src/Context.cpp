@@ -3262,13 +3262,23 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
             std::string(world->isPaused() ? "true" : "false") + ",";
 
     // AI Timers for Debugger
-    DWORD now = GetTickCount();
-    DWORD elapsed = now - g_lastBoredEventTick;
-    json += "\"bored_event_timer_ms\": " + ToString((int)elapsed) + ",";
-    const int boredEventExtraDelayMs = 10000;
+    int nowGameTs = (int)tod.getTotalSeconds();
+    int boredElapsedGamets = 0;
+    if (g_lastBoredEventGameTs > 0 && nowGameTs >= g_lastBoredEventGameTs) {
+      boredElapsedGamets = nowGameTs - g_lastBoredEventGameTs;
+    }
+    const int boredEventExtraDelayGamets = 10;
+    int boredIntervalGamets = g_boredEventIntervalHours * 3600 + boredEventExtraDelayGamets;
+    json += "\"bored_event_timer_ms\": " +
+            ToString((int)(boredElapsedGamets * 1000)) + ",";
     json += "\"bored_event_interval_ms\": " +
-            ToString((int)(g_boredEventIntervalSeconds * 1000 + boredEventExtraDelayMs)) + ",";
+            ToString((int)(boredIntervalGamets * 1000)) + ",";
+    json += "\"bored_event_timer_ingame_seconds\": " +
+            ToString((int)boredElapsedGamets) + ",";
+    json += "\"bored_event_interval_ingame_seconds\": " +
+            ToString((int)boredIntervalGamets) + ",";
 
+    DWORD now = GetTickCount();
     DWORD speech_elapsed = now - g_lastDialogueTick;
     json += "\"speech_delay_ms\": " + ToString((int)speech_elapsed) + ",";
     json += "\"speech_interval_ms\": " +

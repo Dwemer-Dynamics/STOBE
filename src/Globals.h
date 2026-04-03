@@ -20,6 +20,7 @@ extern CRITICAL_SECTION g_msgMutex;
 extern hand g_talkTargetHand;
 extern DWORD g_mainThreadId;
 extern DWORD g_lastBoredEventTick;
+extern int g_lastBoredEventGameTs;
 extern DWORD g_lastDialogueTick;
 extern DWORD g_nextSpeechActionTick;
 extern DWORD g_lastRechatDispatchTick;
@@ -31,7 +32,7 @@ extern float g_boredEventRange;
 extern float g_proximityRadius;
 extern float g_shoutRadius;
 extern float g_visionRange;
-extern int g_boredEventIntervalSeconds;
+extern int g_boredEventIntervalHours;
 extern bool g_enableBoredEvents;
 extern bool g_triggerBoredEvent;
 extern float g_minFactionRelation;
@@ -42,7 +43,7 @@ extern int g_rechatDispatchCooldownMs;
 extern int g_ttsVolumePercent;
 extern bool g_ttsEnabled;
 extern bool g_speedDialogue;
-extern int g_dynamicProfileIntervalMinutes;
+extern int g_dynamicProfileIntervalHours;
 
 // State tracking for inventory/debugger
 extern std::string g_activeInventoryJson;

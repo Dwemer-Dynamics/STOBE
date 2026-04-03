@@ -2534,11 +2534,11 @@ static bool SyncPlayerCatsValue(Character *player, bool force,
 
 static bool SyncDynamicProfileIntervalToConfOpts(bool force,
                                                  const std::string &reason) {
-  int intervalMinutes = g_dynamicProfileIntervalMinutes;
-  if (intervalMinutes < 1) {
-    intervalMinutes = 1;
-  } else if (intervalMinutes > 720) {
-    intervalMinutes = 720;
+  int intervalHours = g_dynamicProfileIntervalHours;
+  if (intervalHours < 1) {
+    intervalHours = 1;
+  } else if (intervalHours > 720) {
+    intervalHours = 720;
   }
 
   DWORD nowTick = GetTickCount();
@@ -2547,7 +2547,7 @@ static bool SyncDynamicProfileIntervalToConfOpts(bool force,
   DWORD sinceLastSent = 0;
   EnterCriticalSection(&g_stateMutex);
   changed = (!g_dynamicProfileIntervalSyncHasValue ||
-             intervalMinutes != g_dynamicProfileIntervalSyncLastValue);
+             intervalHours != g_dynamicProfileIntervalSyncLastValue);
   sinceLastSent = g_dynamicProfileIntervalSyncHasValue
                       ? (nowTick - g_dynamicProfileIntervalSyncLastSentTick)
                       : 0;
@@ -2555,7 +2555,7 @@ static bool SyncDynamicProfileIntervalToConfOpts(bool force,
       sinceLastSent >= kDynamicProfileIntervalResendIntervalMs) {
     shouldSend = true;
     g_dynamicProfileIntervalSyncHasValue = true;
-    g_dynamicProfileIntervalSyncLastValue = intervalMinutes;
+    g_dynamicProfileIntervalSyncLastValue = intervalHours;
     g_dynamicProfileIntervalSyncLastSentTick = nowTick;
   }
   LeaveCriticalSection(&g_stateMutex);
@@ -2565,11 +2565,11 @@ static bool SyncDynamicProfileIntervalToConfOpts(bool force,
   }
 
   std::string payload =
-      "{\"id\":\"DYNAMIC_PROFILE_INTERVAL_MINUTES\",\"value\":\"" +
-      ToString(intervalMinutes) + "\",\"only_if_changed\":true}";
+      "{\"id\":\"DYNAMIC_PROFILE_INTERVAL_HOURS\",\"value\":\"" +
+      ToString(intervalHours) + "\",\"only_if_changed\":true}";
   AsyncPostToStobe(L"/conf_opts", payload);
-  Log("DYNAMIC_PROFILE_SYNC: sent interval_minutes=" +
-      ToString(intervalMinutes) + " changed=" +
+  Log("DYNAMIC_PROFILE_SYNC: sent interval_hours=" +
+      ToString(intervalHours) + " changed=" +
       std::string(changed ? "1" : "0") + " reason=" + reason);
   return true;
 }
@@ -6808,11 +6808,34 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
               if (var == "g_enableBoredEvents") {
                 g_enableBoredEvents = (val == "1");
-                g_lastBoredEventTick = GetTickCount(); // Reset timer on toggle
+                g_lastBoredEventTick = GetTickCount();
+                g_lastBoredEventGameTs = 0; // Re-arm interval on toggle.
+              } else if (var == "g_boredEventIntervalHours") {
+                g_boredEventIntervalHours = atoi(val.c_str());
+                if (g_boredEventIntervalHours < 1) {
+                  g_boredEventIntervalHours = 1;
+                } else if (g_boredEventIntervalHours > 720) {
+                  g_boredEventIntervalHours = 720;
+                }
+                g_lastBoredEventTick = GetTickCount();
+                g_lastBoredEventGameTs = 0; // Re-arm interval on frequency change.
               } else if (var == "g_boredEventIntervalSeconds") {
-                g_boredEventIntervalSeconds = atoi(val.c_str());
-                g_lastBoredEventTick =
-                    GetTickCount(); // Reset timer on frequency change
+                int legacySeconds = atoi(val.c_str());
+                if (legacySeconds < 1) {
+                  legacySeconds = 3600;
+                }
+                if (legacySeconds <= 300) {
+                  g_boredEventIntervalHours = 3;
+                } else {
+                  g_boredEventIntervalHours = (legacySeconds + 3599) / 3600;
+                }
+                if (g_boredEventIntervalHours < 1) {
+                  g_boredEventIntervalHours = 1;
+                } else if (g_boredEventIntervalHours > 720) {
+                  g_boredEventIntervalHours = 720;
+                }
+                g_lastBoredEventTick = GetTickCount();
+                g_lastBoredEventGameTs = 0; // Re-arm interval on legacy frequency change.
               } else if (var == "g_proximityRadius")
                 g_proximityRadius = (float)atof(val.c_str());
               else if (var == "g_boredEventRange")
@@ -6954,6 +6977,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         }
       } else if (isPlayerSay || isNPCAction || isNPCSay) {
         g_lastBoredEventTick = GetTickCount();
+        g_lastBoredEventGameTs = ResolveCurrentGameTsSafe(GetWorldSafe());
 
         // ???? FIX: For PLAYER_SAY, ensure the bubble appears over the player,
         // not the target NPC.
@@ -10476,36 +10500,46 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     LeaveCriticalSection(&g_stateMutex);
 
     DWORD now = GetTickCount();
-    static DWORD lastBoredLoopTick = 0;
-    if (lastBoredLoopTick == 0) {
-      lastBoredLoopTick = now;
-    }
-    DWORD loopDelta = now - lastBoredLoopTick;
-    lastBoredLoopTick = now;
     bool worldPaused = world->isPaused();
-    if (!forceTrigger && worldPaused && g_lastBoredEventTick != 0) {
-      DWORD shiftedTick = g_lastBoredEventTick + loopDelta;
-      if (shiftedTick < g_lastBoredEventTick) {
-        shiftedTick = now;
-      }
-      g_lastBoredEventTick = shiftedTick;
+    int nowGameTs = 0;
+    try {
+      TimeOfDay nowTod = world->getTimeStamp_inGameHours();
+      nowGameTs = (int)nowTod.getTotalSeconds();
+    } catch (...) {
+      nowGameTs = 0;
+    }
+    if (nowGameTs <= 0) {
+      nowGameTs = g_lastBoredEventGameTs;
     }
 
-    int intervalSeconds = g_boredEventIntervalSeconds;
-    if (intervalSeconds < 5) {
-      intervalSeconds = 5;
-    } else if (intervalSeconds > 3600) {
-      intervalSeconds = 3600;
+    int intervalHours = g_boredEventIntervalHours;
+    if (intervalHours < 1) {
+      intervalHours = 1;
+    } else if (intervalHours > 720) {
+      intervalHours = 720;
     }
-    const DWORD extraBoredDelayMs = 10000;
-    DWORD intervalMs = static_cast<DWORD>(intervalSeconds) * 1000 + extraBoredDelayMs;
-    if (!forceTrigger && g_lastBoredEventTick == 0) {
+
+    const int extraBoredDelayGamets = 10;
+    const int intervalGamets = intervalHours * 3600 + extraBoredDelayGamets;
+
+    if (!forceTrigger && g_lastBoredEventGameTs > 0 &&
+        nowGameTs > 0 && nowGameTs + 5 < g_lastBoredEventGameTs) {
+      // Game load/rewind: rebase so bored events do not immediately spam.
+      g_lastBoredEventGameTs = nowGameTs;
       g_lastBoredEventTick = now;
-      Log("BORED_EVENT: startup cooldown armed for " +
-          ToString(intervalSeconds + 10) + "s");
     }
+
+    if (!forceTrigger && g_lastBoredEventGameTs <= 0) {
+      g_lastBoredEventGameTs = nowGameTs;
+      g_lastBoredEventTick = now;
+      Log("BORED_EVENT: startup cooldown armed for " + ToString(intervalHours) +
+          "h (+10s ingame grace)");
+    }
+
     bool periodicDue =
-        !forceTrigger && !worldPaused && ((now - g_lastBoredEventTick) >= intervalMs);
+        !forceTrigger && !worldPaused && nowGameTs > 0 &&
+        g_lastBoredEventGameTs > 0 &&
+        ((nowGameTs - g_lastBoredEventGameTs) >= intervalGamets);
 
     if (forceTrigger || periodicDue) {
       bool speechBusy = IsTtsPlaybackActive();
@@ -10516,9 +10550,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
           LeaveCriticalSection(&g_stateMutex);
           Log("BORED_EVENT: delayed (active TTS playback)");
         } else {
+          g_lastBoredEventGameTs = nowGameTs;
           g_lastBoredEventTick = now;
         }
       } else {
+        g_lastBoredEventGameTs = nowGameTs;
         g_lastBoredEventTick = now;
         bool dispatched = TriggerBoredEvent(world, forceTrigger);
         if (!dispatched && forceTrigger) {
