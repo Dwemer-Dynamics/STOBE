@@ -1557,11 +1557,12 @@ static const DWORD kInventorySweepIntervalMs = 6000;
 static const DWORD kInventoryMinResendMs = 1200;
 static const size_t kInventorySweepCandidateLimit = 8;
 static const DWORD kInventoryStateRetentionMs = 15 * 60 * 1000;
-static const size_t kItemImageBatchLimit = 5;
-static const DWORD kItemImageMinResendMs = 30 * 60 * 1000;
+static const size_t kItemImageBatchLimit = 12;
+static const size_t kItemImageConsiderMultiplier = 12;
+static const DWORD kItemImageMinResendMs = 10 * 60 * 1000;
 static const DWORD kItemImageStateRetentionMs = 60 * 60 * 1000;
-static const DWORD kItemImageRunCooldownMs = 10 * 1000;
-static const DWORD kItemImageStartupDelayMs = 20 * 1000;
+static const DWORD kItemImageRunCooldownMs = 3 * 1000;
+static const DWORD kItemImageStartupDelayMs = 5 * 1000;
 static const size_t kItemImageRequestQueueMax = 64;
 static DWORD g_itemImageLastRunTick = 0;
 static DWORD g_worldStableSinceTick = 0;
@@ -2755,16 +2756,15 @@ static bool IsItemImageSyncReasonAllowed(const std::string &reason) {
   if (key.empty()) {
     return false;
   }
-  if (key == "periodic") {
-    return false;
-  }
   if (key == "selection_change" || key == "chat_open" ||
-      key == "dialogue_npc" || key == "dialogue_player") {
+      key == "dialogue_npc" || key == "dialogue_player" ||
+      key == "periodic") {
     return true;
   }
   if (key.find("dialogue") != std::string::npos ||
       key.find("description") != std::string::npos ||
-      key.find("chat") != std::string::npos) {
+      key.find("chat") != std::string::npos ||
+      key.find("inventory") != std::string::npos) {
     return true;
   }
   return false;
@@ -3517,14 +3517,17 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
   size_t queued = 0;
   size_t captureFailed = 0;
   size_t considered = 0;
+  bool truncatedByBatchOrConsiderLimit = false;
   std::string firstCaptureReason = "";
   std::string entriesJson = "[";
   for (std::map<std::string, Item *>::iterator it = uniqueByIdKey.begin();
        it != uniqueByIdKey.end(); ++it) {
     if (queued >= kItemImageBatchLimit) {
+      truncatedByBatchOrConsiderLimit = true;
       break;
     }
-    if (considered >= kItemImageBatchLimit * 6) {
+    if (considered >= kItemImageBatchLimit * kItemImageConsiderMultiplier) {
+      truncatedByBatchOrConsiderLimit = true;
       break;
     }
     ++considered;
@@ -3634,6 +3637,12 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
   Log("ITEM_IMAGE_SYNC: sent entries=" + ToString((int)queued) +
       " considered=" + ToString((int)considered) +
       " capture_failed=" + ToString((int)captureFailed) + " reason=" + reason);
+
+  if (truncatedByBatchOrConsiderLimit && queued >= kItemImageBatchLimit) {
+    QueueItemImageSyncRequest(npc, "inventory_sync_overflow");
+    Log("ITEM_IMAGE_SYNC: queued continuation after batch cap reason=inventory_sync_overflow");
+  }
+
   return queued;
 }
 

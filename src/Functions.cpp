@@ -532,8 +532,7 @@ int ResolveTtsPlaybackVolumePercent(GameWorld *world, Character *speaker,
   }
 
   // Fade out by camera distance, and fully mute beyond far range.
-  // Range boost: 100% (double) max audible distance for plugin TTS playback.
-  const float kPlaybackRangeMultiplier = 2.0f;
+  const float kPlaybackRangeMultiplier = 5.0f;
   const float kNearDistanceUnits = 40.0f;
   float farDistanceUnits = g_shoutRadius;
   // Keep TTS audible for squad chatter even when shout radius is configured low.
