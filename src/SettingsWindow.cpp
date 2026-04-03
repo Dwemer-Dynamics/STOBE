@@ -26,6 +26,7 @@ MyGUI::Window *g_settingsWindow = nullptr;
 
 namespace {
 MyGUI::ComboBox *g_hotkeyCombo = nullptr;
+MyGUI::ComboBox *g_generalHotkeyCombo = nullptr;
 MyGUI::ComboBox *g_pluginChatModeCombo = nullptr;
 MyGUI::ComboBox *g_speakerModeCombo = nullptr;
 MyGUI::EditBox *g_talkRadiusEdit = nullptr;
@@ -144,6 +145,34 @@ void PopulateHotkeyCombo() {
   g_hotkeyCombo->setIndexSelected(selected);
 }
 
+void PopulateGeneralHotkeyCombo() {
+  if (!g_generalHotkeyCombo)
+    return;
+  g_generalHotkeyCombo->removeAllItems();
+  g_generalHotkeyCombo->addItem(WideFromUtf8("=").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("F7").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("F8").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("F11").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("F12").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("O").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("[").c_str());
+  g_generalHotkeyCombo->addItem(WideFromUtf8("}").c_str());
+
+  std::string current = g_generalHotkeyStr;
+  if (current == "]") {
+    current = "}";
+  }
+
+  size_t selected = 0;
+  for (size_t i = 0; i < g_generalHotkeyCombo->getItemCount(); ++i) {
+    if (g_generalHotkeyCombo->getItemNameAt(i) == current) {
+      selected = i;
+      break;
+    }
+  }
+  g_generalHotkeyCombo->setIndexSelected(selected);
+}
+
 void PopulateChatModeCombo() {
   if (!g_pluginChatModeCombo)
     return;
@@ -172,6 +201,12 @@ void OnHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
     return;
   std::string selected = sender->getItemNameAt(index);
   SetHotkeyFromString(selected);
+}
+
+void OnGeneralHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
+  if (!sender || index == MyGUI::ITEM_NONE)
+    return;
+  SetGeneralHotkeyFromString(sender->getItemNameAt(index));
 }
 
 void OnPluginModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -233,6 +268,7 @@ void RefreshPluginSettingsUI() {
   }
 
   PopulateHotkeyCombo();
+  PopulateGeneralHotkeyCombo();
   PopulateChatModeCombo();
   PopulateSpeakerModeCombo();
   SetToggleCaption(g_autoChatToggle, "Auto Chat", g_pendingAutoChat);
@@ -251,6 +287,11 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   if (g_hotkeyCombo && g_hotkeyCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
     SetHotkeyFromString(
         g_hotkeyCombo->getItemNameAt(g_hotkeyCombo->getIndexSelected()));
+  }
+  if (g_generalHotkeyCombo &&
+      g_generalHotkeyCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
+    SetGeneralHotkeyFromString(g_generalHotkeyCombo->getItemNameAt(
+        g_generalHotkeyCombo->getIndexSelected()));
   }
 
   if (g_pluginChatModeCombo &&
@@ -403,6 +444,7 @@ void CloseSettingsUI() {
   }
 
   g_hotkeyCombo = nullptr;
+  g_generalHotkeyCombo = nullptr;
   g_pluginChatModeCombo = nullptr;
   g_speakerModeCombo = nullptr;
   g_talkRadiusEdit = nullptr;
@@ -437,7 +479,7 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.17f, 0.08f, 0.66f, 0.70f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.17f, 0.06f, 0.66f, 0.74f, MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
@@ -458,6 +500,19 @@ void CreateSettingsUI() {
   const float actionBtnH = 0.08f;
   const float toggleRowGap = 0.082f;
   float y = 0.03f;
+
+  CreateLabel(client, labelX, y, labelW, rowH, "STOBE Settings Key",
+              "Stobe_Plugin_GeneralHotkeyLabel");
+  g_generalHotkeyCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", fieldX, y, fieldW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_GeneralHotkeyCombo");
+  g_generalHotkeyCombo->setComboModeDrop(true);
+  g_generalHotkeyCombo->eventComboAccept +=
+      MyGUI::newDelegate(OnGeneralHotkeyComboChanged);
+  g_generalHotkeyCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnGeneralHotkeyComboChanged);
+  y += rowH + rowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Chat Hotkey",
               "Stobe_Plugin_HotkeyLabel");
@@ -484,7 +539,7 @@ void CreateSettingsUI() {
 
   MyGUI::TextBox *rangeHint = CreateLabel(
       client, labelX, y, 0.90f, rangeHintH,
-      "Range units: ~10 unit = ~1 meter. Whisper is fixed at 20 units.",
+      "Range units: ~10 unis = ~1 meter. Whisper is fixed at 20 units.",
       "Stobe_Plugin_RangeUnitsHint");
   rangeHint->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.35f));
   y += rangeHintGap;

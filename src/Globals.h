@@ -54,6 +54,8 @@ extern hand g_playerHand;
 extern CRITICAL_SECTION g_stateMutex;
 extern int g_chatHotkey;
 extern std::string g_chatHotkeyStr;
+extern int g_generalHotkey;
+extern std::string g_generalHotkeyStr;
 extern std::string g_chatMode;
 extern bool g_autoChatEnabled;
 extern bool g_useNearestPlayerSpeaker;

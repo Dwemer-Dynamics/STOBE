@@ -541,11 +541,46 @@ void SetHotkeyFromString(const std::string &keyStr) {
   }
 }
 
+void SetGeneralHotkeyFromString(const std::string &keyStr) {
+  std::string normalized = keyStr;
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    if (normalized[i] >= 'a' && normalized[i] <= 'z') {
+      normalized[i] = (char)(normalized[i] - ('a' - 'A'));
+    }
+  }
+  normalized = TrimCopy(normalized);
+
+  g_generalHotkeyStr = normalized;
+  if (normalized == "=")
+    g_generalHotkey = VK_OEM_PLUS;
+  else if (normalized == "F7")
+    g_generalHotkey = VK_F7;
+  else if (normalized == "F8")
+    g_generalHotkey = VK_F8;
+  else if (normalized == "F11")
+    g_generalHotkey = VK_F11;
+  else if (normalized == "F12")
+    g_generalHotkey = VK_F12;
+  else if (normalized == "O")
+    g_generalHotkey = 'O';
+  else if (normalized == "[")
+    g_generalHotkey = VK_OEM_4;
+  else if (normalized == "}" || normalized == "]") {
+    g_generalHotkey = VK_OEM_6;
+    g_generalHotkeyStr = "}";
+  } else {
+    g_generalHotkey = VK_OEM_PLUS;
+    g_generalHotkeyStr = "=";
+  }
+}
+
 void LoadStobeRuntimeConfig() {
   std::string baseIniPath = GetStobeIniPath(false);
   std::string customIniPath = GetStobeCustomIniPath(true);
   EnsureCustomIniSeeded(baseIniPath, customIniPath);
 
+  SetGeneralHotkeyFromString(ReadLayeredIniString(
+      baseIniPath, customIniPath, "Settings", "GeneralHotkey", "="));
   SetHotkeyFromString(ReadLayeredIniString(baseIniPath, customIniPath,
                                            "Settings", "ChatHotkey", "/"));
   g_chatMode = NormalizeIniChatMode(ReadLayeredIniString(
@@ -630,6 +665,8 @@ void LoadStobeRuntimeConfig() {
 void SaveStobeRuntimeConfig() {
   std::string iniPath = GetStobeCustomIniPath(true);
 
+  WritePrivateProfileStringA("Settings", "GeneralHotkey",
+                             g_generalHotkeyStr.c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatHotkey", g_chatHotkeyStr.c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatMode", g_chatMode.c_str(),

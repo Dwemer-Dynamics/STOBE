@@ -51,6 +51,8 @@ std::map<unsigned int, TravelTarget> g_travelTargets;
 
 int g_chatHotkey = VK_OEM_2; // '/' by default
 std::string g_chatHotkeyStr = "/";
+int g_generalHotkey = VK_OEM_PLUS; // '=' by default
+std::string g_generalHotkeyStr = "=";
 std::string g_chatMode = "chat";
 bool g_autoChatEnabled = false;
 bool g_useNearestPlayerSpeaker = true;

@@ -137,8 +137,9 @@ void CreateStartingUI() {
   MyGUI::TextBox *hotkeyLabel = client->createWidgetReal<MyGUI::TextBox>(
       "Kenshi_TextboxStandardText", 0.05f, 0.02f, 0.9f, 0.20f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHotkeys");
-  hotkeyLabel->setCaption(WideFromUtf8("=: Open/Close Menu\nChat Hotkey: " +
-                                     g_chatHotkeyStr)
+  hotkeyLabel->setCaption(WideFromUtf8("Menu Key [" + g_generalHotkeyStr +
+                                       "]: Open/Close Menu\nChat Hotkey: " +
+                                       g_chatHotkeyStr)
                               .c_str());
   hotkeyLabel->setTextColour(MyGUI::Colour(1.0f, 0.86f, 0.20f));
   hotkeyLabel->setTextAlign(MyGUI::Align::Center);
@@ -160,7 +161,7 @@ void CreateStartingUI() {
       "Kenshi_Button1", 0.05f, 0.52f, 0.9f, 0.12f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
-  pluginSettingsBtn->setCaption(WideFromUtf8(T("General Settings")).c_str());
+  pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
   pluginSettingsBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
@@ -187,7 +188,7 @@ void RefreshStartingUI() {
   };
   RefreshMap items[] = {{"Stobe_StartingAiNpcsBtn", "Stobe NPCs"},
                         {"Stobe_StartingAiDiariesBtn", "Stobe Diaries"},
-                        {"Stobe_StartingPluginSetBtn", "General Settings"},
+                        {"Stobe_StartingPluginSetBtn", "Settings"},
                         {"Stobe_StartingWelBtn", "MOTD"}};
 
   for (int i = 0; i < sizeof(items) / sizeof(items[0]); ++i) {
@@ -206,7 +207,8 @@ void RefreshStartingUI() {
   MyGUI::Widget *hkWidget = client->findWidget("Stobe_StartingHotkeys");
   if (hkWidget && hkWidget->castType<MyGUI::TextBox>(false)) {
     hkWidget->castType<MyGUI::TextBox>()->setCaption(
-        WideFromUtf8("=: Open/Close Menu\nChat Hotkey: " + g_chatHotkeyStr)
+        WideFromUtf8("Menu Key [" + g_generalHotkeyStr +
+                     "]: Open/Close Menu\nChat Hotkey: " + g_chatHotkeyStr)
             .c_str());
     hkWidget->castType<MyGUI::TextBox>()->setTextColour(
         MyGUI::Colour(1.0f, 0.86f, 0.20f));

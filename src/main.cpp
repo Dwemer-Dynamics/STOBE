@@ -10279,7 +10279,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       DWORD now = GetTickCount();
       if ((LONG)(now - motdAutoOpenDeadlineTick) >= 0 &&
           motdAutoOpenDeadlineTick != 0) {
-  // Do not open MOTD late during gameplay; leave manual open via = menu.
+  // Do not open MOTD late during gameplay; leave manual open via general menu hotkey.
         g_welcomeShown = true;
         motdAutoOpenQueued = false;
         motdAutoOpenTick = 0;
@@ -10305,13 +10305,13 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
   }
 
-  // Left menu hotkey (= key) - only once world/UI are stable.
-  if ((GetAsyncKeyState(VK_OEM_PLUS) & 0x8000)) {
+  // Left menu hotkey (configurable) - only once world/UI are stable.
+  if ((GetAsyncKeyState(g_generalHotkey) & 0x8000)) {
     static DWORD lastSettingsTick = 0;
     DWORD now = GetTickCount();
     if (now - lastSettingsTick > 500) {
       lastSettingsTick = now;
-      Log("UI: = pressed.");
+      Log("UI: general hotkey pressed [" + g_generalHotkeyStr + "].");
       if (g_startingWindow) {
         CloseStartingUI();
         Log("UI: CloseStartingUI done.");
