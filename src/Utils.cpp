@@ -2,6 +2,7 @@
 #include "ChatBox.h"
 #include "ChatUIGlobals.h"
 #include "Comm.h"
+#include "Context.h"
 #include "Globals.h"
 #include <fstream>
 #include <iomanip>
@@ -816,6 +817,172 @@ static bool IsEventAreaCompatible(Character *anchor, Character *candidate) {
   return true;
 }
 
+static std::string NormalizeEventGeoToken(const std::string &rawValue) {
+  std::string value = TrimCopy(rawValue);
+  if (value.empty()) {
+    return "";
+  }
+  std::string lowered = ToLowerAsciiCopy(value);
+  if (lowered == "unknown" || lowered == "none" || lowered == "null" ||
+      lowered == "n/a") {
+    return "";
+  }
+  return value;
+}
+
+static bool TryParseEventGeoBool(const std::string &rawValue, bool &valueOut) {
+  std::string value = TrimCopy(rawValue);
+  if (value.empty()) {
+    return false;
+  }
+  std::string lowered = ToLowerAsciiCopy(value);
+  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
+      lowered == "on") {
+    valueOut = true;
+    return true;
+  }
+  if (lowered == "0" || lowered == "false" || lowered == "no" ||
+      lowered == "off") {
+    valueOut = false;
+    return true;
+  }
+  return false;
+}
+
+static void AppendEventGeoQueryFromCharacter(std::wstring &endpoint,
+                                             Character *character) {
+  if (!character || reinterpret_cast<uintptr_t>(character) <= 0x1000) {
+    return;
+  }
+
+  std::string contextJson = BuildNpcContextEnvelope(character, "player");
+  if (contextJson.empty() || contextJson == "{}") {
+    return;
+  }
+
+  std::string rawTown = JsonReadField(contextJson, "town");
+  std::string rawZone = JsonReadField(contextJson, "zone");
+  std::string rawRegion = JsonReadField(contextJson, "region");
+  std::string town = NormalizeEventGeoToken(rawTown);
+  std::string zone = NormalizeEventGeoToken(rawZone);
+  std::string region = NormalizeEventGeoToken(rawRegion);
+  std::string environmentJson = JsonReadField(contextJson, "environment");
+  std::string rawBuilding = JsonReadField(environmentJson, "building_name");
+  std::string rawEnvZone = JsonReadField(environmentJson, "zone_name");
+  std::string rawEnvRegionName = JsonReadField(environmentJson, "region_name");
+  std::string rawEnvRegion = JsonReadField(environmentJson, "region");
+  std::string building = NormalizeEventGeoToken(rawBuilding);
+  if (zone.empty()) {
+    zone = NormalizeEventGeoToken(rawEnvZone);
+  }
+  if (region.empty()) {
+    region = NormalizeEventGeoToken(rawEnvRegionName);
+  }
+  if (region.empty()) {
+    region = NormalizeEventGeoToken(rawEnvRegion);
+  }
+  if (zone.empty()) {
+    zone = town;
+  }
+  auto safeGeoToken = [](const std::string &value) {
+    return value.empty() ? std::string("(empty)") : value;
+  };
+
+  bool indoorsValue = false;
+  bool outdoorsValue = false;
+  bool inTownValue = false;
+  bool indoorsKnown = TryParseEventGeoBool(
+      JsonReadField(environmentJson, "indoors"), indoorsValue);
+  bool outdoorsKnown = TryParseEventGeoBool(
+      JsonReadField(environmentJson, "outdoors"), outdoorsValue);
+  bool inTownKnown = TryParseEventGeoBool(
+      JsonReadField(environmentJson, "in_town"), inTownValue);
+
+  bool useBuilding = IsValidIndoorsHandleForEvent(character->isIndoors());
+  if (indoorsKnown && indoorsValue) {
+    useBuilding = true;
+  }
+  if ((outdoorsKnown && outdoorsValue) || (indoorsKnown && !indoorsValue)) {
+    useBuilding = false;
+  }
+  if (!useBuilding) {
+    building.clear();
+  }
+
+  std::string location = "";
+  if (useBuilding && !building.empty() && !zone.empty()) {
+    location = building + ", " + zone;
+  } else if (useBuilding && !building.empty()) {
+    location = building;
+  } else if (!zone.empty()) {
+    location = zone;
+  } else if (!region.empty()) {
+    location = region;
+  }
+
+  if (!location.empty()) {
+    endpoint += L"&location=" + ToWide(UrlEncode(location));
+  }
+  if (!zone.empty()) {
+    endpoint += L"&city=" + ToWide(UrlEncode(zone));
+  }
+  if (!region.empty()) {
+    endpoint += L"&region=" + ToWide(UrlEncode(region));
+  }
+  if (!building.empty()) {
+    endpoint += L"&loc_building=" + ToWide(UrlEncode(building));
+  }
+  if (!zone.empty()) {
+    endpoint += L"&loc_zone=" + ToWide(UrlEncode(zone));
+  }
+  if (!region.empty()) {
+    endpoint += L"&loc_region=" + ToWide(UrlEncode(region));
+  }
+  endpoint += L"&loc_indoors=" + std::wstring(useBuilding ? L"1" : L"0");
+
+  std::string floorToken =
+      NormalizeEventGeoToken(JsonReadField(environmentJson, "floor"));
+  std::string xToken = NormalizeEventGeoToken(JsonReadField(environmentJson, "x"));
+  std::string yToken = NormalizeEventGeoToken(JsonReadField(environmentJson, "y"));
+  std::string zToken = NormalizeEventGeoToken(JsonReadField(environmentJson, "z"));
+  if (!floorToken.empty()) {
+    endpoint += L"&loc_floor=" + ToWide(UrlEncode(floorToken));
+  }
+  if (!xToken.empty()) {
+    endpoint += L"&loc_x=" + ToWide(UrlEncode(xToken));
+  }
+  if (!yToken.empty()) {
+    endpoint += L"&loc_y=" + ToWide(UrlEncode(yToken));
+  }
+  if (!zToken.empty()) {
+    endpoint += L"&loc_z=" + ToWide(UrlEncode(zToken));
+  }
+  std::string actorName = "";
+  try {
+    actorName = character->getName();
+  } catch (...) {
+    actorName.clear();
+  }
+  if (actorName.empty()) {
+    actorName = "Unknown";
+  }
+  Log("GEO_DEBUG_QUERY: source=event actor=" + actorName +
+      " raw_town=" + safeGeoToken(rawTown) + " raw_zone=" + safeGeoToken(rawZone) +
+      " raw_region=" + safeGeoToken(rawRegion) +
+      " raw_building=" + safeGeoToken(rawBuilding) +
+      " raw_env_zone=" + safeGeoToken(rawEnvZone) +
+      " raw_env_region_name=" + safeGeoToken(rawEnvRegionName) +
+      " raw_env_region=" + safeGeoToken(rawEnvRegion) +
+      " location=" + safeGeoToken(location) +
+      " building=" + safeGeoToken(building) + " zone=" + safeGeoToken(zone) +
+      " region=" + safeGeoToken(region) +
+      " indoors=" + std::string(useBuilding ? "1" : "0") +
+      " in_town=" +
+      std::string((inTownKnown && inTownValue) ? "1" : (inTownKnown ? "0" : "?")) +
+      " floor=" + safeGeoToken(floorToken) + " x=" + safeGeoToken(xToken) +
+      " y=" + safeGeoToken(yToken) + " z=" + safeGeoToken(zToken));
+}
+
 static unsigned int ResolveCharacterSerialSafe(Character *npc) {
   if (!npc || reinterpret_cast<uintptr_t>(npc) <= 0x1000) {
     return 0;
@@ -1148,6 +1315,20 @@ void LogGameEvent(const std::string &type, const std::string &actor,
   std::wstring endpoint = L"/StobeServer/stream.php?DATA=" +
                           ToWide(BuildStreamQueryData(eventType, eventData, gameTs));
   endpoint += L"&people=" + ToWide(UrlEncode(peopleJson));
+
+  GameWorld *world = GetWorldSafe();
+  Character *geoAnchor = FindCharacterBySerialForEvent(world, actorSerial);
+  if (!geoAnchor && targetSerial != 0) {
+    geoAnchor = FindCharacterBySerialForEvent(world, targetSerial);
+  }
+  if (!geoAnchor && !NormalizeEventName(actor).empty()) {
+    geoAnchor = FindCharacterByNameForEvent(world, actor);
+  }
+  if (!geoAnchor && !NormalizeEventName(target).empty()) {
+    geoAnchor = FindCharacterByNameForEvent(world, target);
+  }
+  AppendEventGeoQueryFromCharacter(endpoint, geoAnchor);
+
   AsyncPostToStobeSerial(endpoint, "");
   Log("EVENT_STREAM: queued type=" + eventType +
       " gamets=" + ToString(gameTs) +

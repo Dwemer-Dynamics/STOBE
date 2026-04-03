@@ -21,6 +21,8 @@
 #include <kenshi/Enums.h>
 #include <kenshi/util/hand.h>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <vector>
@@ -71,6 +73,19 @@ std::string SlotToString(AttachSlot slot) {
 }
 
 namespace {
+std::string GeoDebugToken(const std::string &value) {
+  size_t first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return "(empty)";
+  }
+  size_t last = value.find_last_not_of(" \t\r\n");
+  std::string trimmed = value.substr(first, last - first + 1);
+  if (trimmed.empty()) {
+    return "(empty)";
+  }
+  return trimmed;
+}
+
 bool IsIndoorsHandleValid(const hand &indoorsHandle) {
   return indoorsHandle.isValid() && !indoorsHandle.isNull();
 }
@@ -520,6 +535,36 @@ std::string ResolveGameDataString(GameData *data, const char *key) {
   return value;
 }
 
+bool TryResolveGameDataNumber(GameData *data, const char *key, float &valueOut) {
+  if (!data || !key) {
+    return false;
+  }
+  std::string keyName = key;
+
+  auto fit = data->fdata.find(keyName);
+  if (fit != data->fdata.end()) {
+    valueOut = fit->second;
+    return true;
+  }
+
+  auto iit = data->idata.find(keyName);
+  if (iit != data->idata.end()) {
+    valueOut = (float)iit->second;
+    return true;
+  }
+
+  auto sit = data->sdata.find(keyName);
+  if (sit != data->sdata.end()) {
+    const std::string raw = TrimCopy(sit->second);
+    if (!raw.empty()) {
+      valueOut = (float)atof(raw.c_str());
+      return true;
+    }
+  }
+
+  return false;
+}
+
 std::string ResolveGameDataRefName(GameData *data, const char *key) {
   if (!data || !key) {
     return "";
@@ -761,6 +806,615 @@ std::string ResolveTownZoneName(TownBase *town) {
   }
 
   return "";
+}
+
+std::string ResolveTownRegionName(TownBase *town) {
+  if (!town || (uintptr_t)town <= 0x1000) {
+    return "";
+  }
+  RootObjectBase *townBase = (RootObjectBase *)town;
+  if (!townBase || (uintptr_t)townBase <= 0x1000) {
+    return "";
+  }
+  GameData *townData = townBase->getGameData();
+  if (!townData || (uintptr_t)townData <= 0x1000) {
+    return "";
+  }
+
+  const char *stringKeys[] = {"region_name", "region",      "biome_name",
+                              "biome",       "territory",   "district",
+                              "province",    "area_name",   "area",
+                              "zone_name",   "zone"};
+  for (size_t i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); ++i) {
+    std::string value = ResolveGameDataString(townData, stringKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *refKeys[] = {"region",   "biome",      "region_name",
+                           "biome_group", "territory", "district",
+                           "province", "area",       "zone",
+                           "zone_name"};
+  for (size_t i = 0; i < sizeof(refKeys) / sizeof(refKeys[0]); ++i) {
+    std::string value = ResolveGameDataRefName(townData, refKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *listKeys[] = {"region", "biome", "territory", "district",
+                            "province", "area", "zone"};
+  for (size_t i = 0; i < sizeof(listKeys) / sizeof(listKeys[0]); ++i) {
+    const std::string key = listKeys[i];
+    if (!townData->listExistsAndNotEmpty(key)) {
+      continue;
+    }
+    std::string value = TrimCopy(townData->getFromList(key, 0));
+    if (!IsUnknownToken(value)) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+float ResolveTownBoundaryRadius(TownBase *town) {
+  if (!town || (uintptr_t)town <= 0x1000) {
+    return -1.0f;
+  }
+  RootObjectBase *townBase = (RootObjectBase *)town;
+  if (!townBase || (uintptr_t)townBase <= 0x1000) {
+    return -1.0f;
+  }
+  GameData *townData = townBase->getGameData();
+  if (!townData || (uintptr_t)townData <= 0x1000) {
+    return -1.0f;
+  }
+
+  const char *radiusKeys[] = {"radius",         "town_radius",
+                              "town_size",      "border_radius",
+                              "border_range",   "borders_range",
+                              "discovery_range"};
+  for (size_t i = 0; i < sizeof(radiusKeys) / sizeof(radiusKeys[0]); ++i) {
+    float value = -1.0f;
+    if (TryResolveGameDataNumber(townData, radiusKeys[i], value) && value > 0.0f) {
+      return value;
+    }
+  }
+  return -1.0f;
+}
+
+bool IsNpcInsideTownContext(Character *npc, TownBase *town) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return false;
+  }
+
+  bool insideWalls = false;
+  try {
+    insideWalls = (npc->amInsideTownWalls() != 0);
+  } catch (...) {
+    insideWalls = false;
+  }
+
+  if (!town || (uintptr_t)town <= 0x1000) {
+    return insideWalls;
+  }
+
+  RootObjectBase *townBase = (RootObjectBase *)town;
+  if (!townBase || (uintptr_t)townBase <= 0x1000) {
+    return insideWalls;
+  }
+
+  Ogre::Vector3 npcPos;
+  Ogre::Vector3 townPos;
+  try {
+    npcPos = npc->getPosition();
+    townPos = townBase->getPosition();
+  } catch (...) {
+    return insideWalls;
+  }
+
+  const float dx = npcPos.x - townPos.x;
+  const float dy = npcPos.y - townPos.y;
+  const float dz = npcPos.z - townPos.z;
+  const float distanceToTownCenter = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+  const float townRadius = ResolveTownBoundaryRadius(town);
+  if (townRadius > 0.0f) {
+    // If engine wall flag lingers while we're clearly outside radius, override it.
+    if (distanceToTownCenter > (townRadius * 1.20f)) {
+      return false;
+    }
+    if (distanceToTownCenter <= (townRadius * 1.05f)) {
+      return true;
+    }
+  } else {
+    // Some settlements do not expose reliable radius metadata.
+    // Use center-distance heuristics to avoid stale town labels while still
+    // allowing un-walled settlements to register as "in town" when nearby.
+    if (distanceToTownCenter <= 650.0f) {
+      return true;
+    }
+    if (distanceToTownCenter >= 1200.0f) {
+      return false;
+    }
+  }
+
+  return insideWalls;
+}
+
+bool IsLikelyWorldZoneName(const std::string &rawValue) {
+  std::string value = TrimCopy(rawValue);
+  if (value.empty() || IsUnknownToken(value)) {
+    return false;
+  }
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char c) { return (char)std::tolower(c); });
+  if (lowered.rfind("the ", 0) == 0) {
+    lowered = lowered.substr(4);
+  }
+
+  static const char *kKnownZones[] = {
+      "arach",           "bast",          "black desert",   "bonefields",
+      "border zone",     "burning forest","cannibal plains","darkfinger",
+      "deadlands",       "dreg",          "fishman island", "floodlands",
+      "fog islands",     "forbidden isle","great desert",   "great plateau",
+      "greenbeach",      "gut",           "heng",           "hidden forest",
+      "high bonefields", "howler maze",   "iron valleys",   "leviathan coast",
+      "narrow valley",   "okrans gulf",   "okrans pride",   "outlands",
+      "purple sands",    "raptor island", "royal valley",   "shem",
+      "shun",            "sinkuun",       "skinners roam",  "sonorous dark",
+      "stobes gamble",   "stenn desert",  "stormgap coast", "swamp",
+      "the crater",      "the grid",      "the hook",       "the pits",
+      "the pits east",   "unwanted zone", "watchers rim",   "wend"};
+
+  for (size_t i = 0; i < sizeof(kKnownZones) / sizeof(kKnownZones[0]); ++i) {
+    std::string known = kKnownZones[i];
+    if (lowered == known) {
+      return true;
+    }
+    if (known.rfind("the ", 0) == 0 && lowered == known.substr(4)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string ResolveMappedRegionFromTownName(const std::string &rawTownName) {
+  std::string key = TrimCopy(rawTownName);
+  if (key.empty() || IsUnknownToken(key)) {
+    return "";
+  }
+  std::transform(key.begin(), key.end(), key.begin(),
+                 [](unsigned char c) { return (char)std::tolower(c); });
+  key = CollapseWhitespace(key);
+  if (key.empty()) {
+    return "";
+  }
+
+  static std::map<std::string, std::string> kTownToRegion;
+  if (kTownToRegion.empty()) {
+    kTownToRegion["the hub"] = "Border Zone";
+    kTownToRegion["squin"] = "Stenn Desert";
+    kTownToRegion["admag"] = "Stenn Desert";
+    kTownToRegion["stack"] = "Okran's Pride";
+    kTownToRegion["bad teeth"] = "Okran's Pride";
+    kTownToRegion["blister hill"] = "Okran's Pride";
+    kTownToRegion["world's end"] = "Hidden Forest";
+    kTownToRegion["mongrel"] = "Fog Islands";
+    kTownToRegion["shark"] = "Swamp";
+    kTownToRegion["mud town"] = "Swamp";
+    kTownToRegion["rot"] = "Swamp";
+    kTownToRegion["black desert city"] = "Deadlands";
+    kTownToRegion["flats lagoon"] = "The Grid";
+    kTownToRegion["clownsteady"] = "The Hook";
+    kTownToRegion["drifter's last"] = "The Hook";
+    kTownToRegion["bark"] = "The Hook";
+    kTownToRegion["heft"] = "Great Desert";
+    kTownToRegion["sho-battai"] = "Great Desert";
+    kTownToRegion["stoat"] = "Great Desert";
+    kTownToRegion["heng"] = "Heng";
+    kTownToRegion["catun"] = "The Pits East";
+    kTownToRegion["mourn"] = "Bonefields";
+    kTownToRegion["black scratch"] = "Stormgap Coast";
+    kTownToRegion["spring"] = "Stobe's Gamble";
+    kTownToRegion["tower of abuse"] = "Venge";
+  }
+
+  auto it = kTownToRegion.find(key);
+  if (it != kTownToRegion.end()) {
+    return it->second;
+  }
+  return "";
+}
+
+std::string ResolveRootObjectZoneName(RootObjectBase *objectBase);
+std::string ResolveRootObjectRegionName(RootObjectBase *objectBase);
+
+std::string ResolveNearestTownMappedRegion(GameWorld *world, Character *npc) {
+  if (!world || !npc || (uintptr_t)npc <= 0x1000) {
+    return "";
+  }
+
+  float searchRadius = g_visionRange;
+  if (searchRadius < 30000.0f) {
+    searchRadius = 30000.0f;
+  } else if (searchRadius > 80000.0f) {
+    searchRadius = 80000.0f;
+  }
+
+  float bestDistance = 3.4e38f;
+  std::string bestRegion = "";
+
+  auto considerObjects = [&](itemType objectType, int maxCount) {
+    lektor<RootObject *> nearby;
+    world->getObjectsWithinSphere(nearby, npc->getPosition(), searchRadius,
+                                  objectType, maxCount, (RootObject *)npc);
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      RootObjectBase *poi = (RootObjectBase *)nearby.stuff[i];
+      if (!poi || (uintptr_t)poi <= 0x1000) {
+        continue;
+      }
+
+      std::string poiName = TrimCopy(poi->getName());
+      std::string poiZone = ResolveRootObjectZoneName(poi);
+      std::string poiRegion = ResolveRootObjectRegionName(poi);
+
+      std::string mappedRegion = ResolveMappedRegionFromTownName(poiName);
+      if (mappedRegion.empty() && IsLikelyWorldZoneName(poiRegion)) {
+        mappedRegion = poiRegion;
+      }
+      if (mappedRegion.empty() && IsLikelyWorldZoneName(poiZone)) {
+        mappedRegion = poiZone;
+      }
+      if (mappedRegion.empty()) {
+        continue;
+      }
+
+      float distance = npc->getPosition().distance(poi->getPosition());
+      if (distance >= bestDistance) {
+        continue;
+      }
+      bestDistance = distance;
+      bestRegion = mappedRegion;
+    }
+  };
+
+  considerObjects(TOWN, 64);
+  considerObjects(LOCATION, 96);
+  return bestRegion;
+}
+
+std::string ResolveNearestWorldZoneName(GameWorld *world, Character *npc) {
+  if (!world || !npc || (uintptr_t)npc <= 0x1000) {
+    return "";
+  }
+
+  float searchRadius = g_visionRange;
+  if (searchRadius < 1500.0f) {
+    searchRadius = 1500.0f;
+  } else if (searchRadius > 12000.0f) {
+    searchRadius = 12000.0f;
+  }
+
+  auto resolveFromType = [&](itemType objectType, int maxCount,
+                             std::string &zoneOut, float &distanceOut) {
+    zoneOut.clear();
+    distanceOut = 3.4e38f;
+
+    lektor<RootObject *> nearbyPois;
+    world->getObjectsWithinSphere(nearbyPois, npc->getPosition(), searchRadius,
+                                  objectType, maxCount, (RootObject *)npc);
+
+    for (uint32_t i = 0; i < nearbyPois.size(); ++i) {
+      RootObjectBase *poi = (RootObjectBase *)nearbyPois.stuff[i];
+      if (!poi || (uintptr_t)poi <= 0x1000) {
+        continue;
+      }
+
+      std::string poiRegion = ResolveRootObjectRegionName(poi);
+      std::string poiZone = ResolveRootObjectZoneName(poi);
+      std::string poiName = TrimCopy(poi->getName());
+      std::string candidate = "";
+      if (IsLikelyWorldZoneName(poiRegion)) {
+        candidate = poiRegion;
+      } else if (IsLikelyWorldZoneName(poiZone)) {
+        candidate = poiZone;
+      } else if (IsLikelyWorldZoneName(poiName)) {
+        candidate = poiName;
+      }
+      if (candidate.empty()) {
+        continue;
+      }
+
+      float distance = npc->getPosition().distance(poi->getPosition());
+      if (distance >= distanceOut) {
+        continue;
+      }
+      distanceOut = distance;
+      zoneOut = candidate;
+    }
+  };
+
+  std::string locationZone = "";
+  float locationDistance = 3.4e38f;
+  resolveFromType(LOCATION, 48, locationZone, locationDistance);
+
+  std::string townZone = "";
+  float townDistance = 3.4e38f;
+  resolveFromType(TOWN, 24, townZone, townDistance);
+
+  if (!locationZone.empty() && !townZone.empty()) {
+    return (locationDistance <= townDistance) ? locationZone : townZone;
+  }
+  if (!locationZone.empty()) {
+    return locationZone;
+  }
+  return townZone;
+}
+
+std::string ResolveRootObjectZoneName(RootObjectBase *objectBase) {
+  if (!objectBase || (uintptr_t)objectBase <= 0x1000) {
+    return "";
+  }
+  GameData *objectData = objectBase->getGameData();
+  if (!objectData || (uintptr_t)objectData <= 0x1000) {
+    return "";
+  }
+
+  const char *stringKeys[] = {"zone_name",  "region_name", "zone",     "region",
+                              "biome_name", "biome",       "territory", "district",
+                              "province",   "area_name",   "area"};
+  for (size_t i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); ++i) {
+    std::string value = ResolveGameDataString(objectData, stringKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *refKeys[] = {"zone",      "region",     "biome",
+                           "zone_name", "region_name","biome_group",
+                           "territory", "district",   "province",
+                           "area"};
+  for (size_t i = 0; i < sizeof(refKeys) / sizeof(refKeys[0]); ++i) {
+    std::string value = ResolveGameDataRefName(objectData, refKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *listKeys[] = {"zone", "region", "biome", "territory", "district",
+                            "province", "area"};
+  for (size_t i = 0; i < sizeof(listKeys) / sizeof(listKeys[0]); ++i) {
+    const std::string key = listKeys[i];
+    if (!objectData->listExistsAndNotEmpty(key)) {
+      continue;
+    }
+    std::string value = TrimCopy(objectData->getFromList(key, 0));
+    if (!IsUnknownToken(value)) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+std::string ResolveRootObjectRegionName(RootObjectBase *objectBase) {
+  if (!objectBase || (uintptr_t)objectBase <= 0x1000) {
+    return "";
+  }
+  GameData *objectData = objectBase->getGameData();
+  if (!objectData || (uintptr_t)objectData <= 0x1000) {
+    return "";
+  }
+
+  const char *stringKeys[] = {"region_name", "region",      "biome_name",
+                              "biome",       "territory",   "district",
+                              "province",    "area_name",   "area",
+                              "zone_name",   "zone"};
+  for (size_t i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); ++i) {
+    std::string value = ResolveGameDataString(objectData, stringKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *refKeys[] = {"region",      "biome",      "region_name",
+                           "biome_group", "territory",  "district",
+                           "province",    "area",       "zone",
+                           "zone_name"};
+  for (size_t i = 0; i < sizeof(refKeys) / sizeof(refKeys[0]); ++i) {
+    std::string value = ResolveGameDataRefName(objectData, refKeys[i]);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+
+  const char *listKeys[] = {"region", "biome", "territory", "district",
+                            "province", "area", "zone"};
+  for (size_t i = 0; i < sizeof(listKeys) / sizeof(listKeys[0]); ++i) {
+    const std::string key = listKeys[i];
+    if (!objectData->listExistsAndNotEmpty(key)) {
+      continue;
+    }
+    std::string value = TrimCopy(objectData->getFromList(key, 0));
+    if (!IsUnknownToken(value)) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+void ResolveNearbyTownAndZoneFallback(GameWorld *world, Character *npc,
+                                      TownBase *currentTown,
+                                      std::string &townNameInOut,
+                                      std::string &zoneNameInOut) {
+  if (!world || !npc || (uintptr_t)npc <= 0x1000) {
+    return;
+  }
+  const std::string initialTownName = townNameInOut;
+  const std::string initialZoneName = zoneNameInOut;
+  std::string npcName = ResolveCharacterDisplayNameSafe(npc);
+  if (npcName.empty()) {
+    npcName = "Unknown";
+  }
+  bool inTownContext = IsNpcInsideTownContext(npc, currentTown);
+  if (!inTownContext) {
+    // Avoid stale labels when actor has moved outside town walls.
+    // Re-resolve zone from nearby world context below.
+    townNameInOut.clear();
+    zoneNameInOut.clear();
+    if (!initialTownName.empty() || !initialZoneName.empty()) {
+      Log("GEO_DEBUG_CTX: cleared stale town context npc=" + npcName +
+          " initial_town=" + GeoDebugToken(initialTownName) +
+          " initial_zone=" + GeoDebugToken(initialZoneName));
+    }
+  }
+
+  if (!townNameInOut.empty() && !zoneNameInOut.empty()) {
+    return;
+  }
+
+  float searchRadius = g_visionRange;
+  if (searchRadius < 1500.0f) {
+    searchRadius = 1500.0f;
+  } else if (searchRadius > 12000.0f) {
+    searchRadius = 12000.0f;
+  }
+
+  auto resolveNearestPoi = [&](itemType objectType, int maxCount, std::string &nameOut,
+                               std::string &zoneOut, float *distanceOut) {
+    nameOut.clear();
+    zoneOut.clear();
+    if (distanceOut) {
+      *distanceOut = 3.4e38f;
+    }
+
+    lektor<RootObject *> nearbyPois;
+    world->getObjectsWithinSphere(nearbyPois, npc->getPosition(), searchRadius,
+                                  objectType, maxCount, (RootObject *)npc);
+
+    float bestDistance = 3.4e38f;
+    for (uint32_t i = 0; i < nearbyPois.size(); ++i) {
+      RootObjectBase *poi = (RootObjectBase *)nearbyPois.stuff[i];
+      if (!poi || (uintptr_t)poi <= 0x1000) {
+        continue;
+      }
+
+      std::string poiName = TrimCopy(poi->getName());
+      if (IsUnknownToken(poiName)) {
+        poiName.clear();
+      }
+      std::string poiZone = ResolveRootObjectZoneName(poi);
+      if (poiName.empty() && poiZone.empty()) {
+        continue;
+      }
+
+      float distance = npc->getPosition().distance(poi->getPosition());
+      if (distance >= bestDistance) {
+        continue;
+      }
+      bestDistance = distance;
+      nameOut = poiName;
+      zoneOut = poiZone;
+    }
+    if (distanceOut) {
+      *distanceOut = bestDistance;
+    }
+  };
+
+  if (zoneNameInOut.empty()) {
+    std::string nearestLocationName;
+    std::string nearestLocationZone;
+    resolveNearestPoi(LOCATION, 48, nearestLocationName, nearestLocationZone, nullptr);
+    if (!nearestLocationZone.empty() &&
+        (inTownContext || IsLikelyWorldZoneName(nearestLocationZone))) {
+      zoneNameInOut = nearestLocationZone;
+    } else if (IsLikelyWorldZoneName(nearestLocationName)) {
+      zoneNameInOut = nearestLocationName;
+    }
+  }
+
+  // Town backfill is only valid while actually in a town context.
+  if (inTownContext) {
+    std::string nearestTownName;
+    std::string nearestTownZone;
+    float nearestTownDistance = 3.4e38f;
+    resolveNearestPoi(TOWN, 24, nearestTownName, nearestTownZone, &nearestTownDistance);
+
+    float currentTownDistance = 3.4e38f;
+    if (currentTown && (uintptr_t)currentTown > 0x1000) {
+      RootObjectBase *townBase = (RootObjectBase *)currentTown;
+      if (townBase && (uintptr_t)townBase > 0x1000) {
+        try {
+          currentTownDistance = npc->getPosition().distance(townBase->getPosition());
+        } catch (...) {
+          currentTownDistance = 3.4e38f;
+        }
+      }
+    }
+
+    bool shouldAdoptNearestTown = false;
+    if (!nearestTownName.empty()) {
+      std::string nearestTownMappedRegion =
+          ResolveMappedRegionFromTownName(nearestTownName);
+      bool nearestTownLooksValid =
+          !nearestTownZone.empty() || !nearestTownMappedRegion.empty();
+      if (townNameInOut.empty()) {
+        // Only trust nearest-town labels that can map to a known region/zone.
+        shouldAdoptNearestTown = nearestTownLooksValid;
+      } else if (!IsUnknownToken(townNameInOut)) {
+        std::string currentTownLower = townNameInOut;
+        std::string nearestTownLower = nearestTownName;
+        std::transform(currentTownLower.begin(), currentTownLower.end(),
+                       currentTownLower.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        std::transform(nearestTownLower.begin(), nearestTownLower.end(),
+                       nearestTownLower.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        const bool namesDiffer = (currentTownLower != nearestTownLower);
+        if (namesDiffer && nearestTownLooksValid && nearestTownDistance < 3.4e38f &&
+            currentTownDistance < 3.4e38f) {
+          // If current-town pointer is farther than nearest town by a meaningful
+          // margin, treat current pointer as stale and snap to nearest town.
+          if ((currentTownDistance - nearestTownDistance) > 180.0f) {
+            shouldAdoptNearestTown = true;
+          }
+        }
+      }
+    }
+
+    if (shouldAdoptNearestTown) {
+      townNameInOut = nearestTownName;
+      if (!nearestTownZone.empty()) {
+        zoneNameInOut = nearestTownZone;
+      }
+      Log("GEO_DEBUG_CTX: adopted nearest town npc=" + npcName +
+          " from_town=" + GeoDebugToken(initialTownName) +
+          " to_town=" + GeoDebugToken(townNameInOut) +
+          " nearest_town_distance=" + ToString(nearestTownDistance) +
+          " current_town_distance=" + ToString(currentTownDistance) +
+          " nearest_town_zone=" + GeoDebugToken(nearestTownZone));
+    } else if (zoneNameInOut.empty() && !nearestTownZone.empty()) {
+      zoneNameInOut = nearestTownZone;
+    } else if (!nearestTownName.empty() && !nearestTownZone.empty()) {
+      Log("GEO_DEBUG_CTX: nearest town ignored npc=" + npcName +
+          " current_town=" + GeoDebugToken(townNameInOut) +
+          " candidate_town=" + GeoDebugToken(nearestTownName) +
+          " nearest_town_distance=" + ToString(nearestTownDistance) +
+          " current_town_distance=" + ToString(currentTownDistance));
+    }
+  }
+
+  if (initialTownName != townNameInOut || initialZoneName != zoneNameInOut) {
+    Log("GEO_DEBUG_CTX: fallback_result npc=" + npcName +
+        " in_town=" + std::string(inTownContext ? "1" : "0") +
+        " town=" + GeoDebugToken(townNameInOut) +
+        " zone=" + GeoDebugToken(zoneNameInOut));
+  }
 }
 
 float Clamp01(float value) {
@@ -2865,10 +3519,58 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   TownBase *town = npc->getCurrentTownLocation();
   std::string townName = "";
   std::string zoneName = "";
+  std::string townRegionName = "";
   if (town) {
     townName = ((RootObjectBase *)town)->getName();
     zoneName = ResolveTownZoneName(town);
+    townRegionName = ResolveTownRegionName(town);
   }
+  ResolveNearbyTownAndZoneFallback(world, npc, town, townName, zoneName);
+  bool inTownWalls = IsNpcInsideTownContext(npc, town);
+  std::string zonePromptName = "";
+  if (inTownWalls) {
+    if (!townName.empty()) {
+      zonePromptName = townName;
+    } else if (!zoneName.empty() && !IsLikelyWorldZoneName(zoneName)) {
+      zonePromptName = zoneName;
+    }
+  }
+  std::string regionPromptName = "";
+  if (IsLikelyWorldZoneName(townRegionName)) {
+    regionPromptName = townRegionName;
+  } else if (IsLikelyWorldZoneName(zoneName)) {
+    regionPromptName = zoneName;
+  } else if (!zonePromptName.empty() && IsLikelyWorldZoneName(zonePromptName)) {
+    regionPromptName = zonePromptName;
+  }
+  if (regionPromptName.empty()) {
+    regionPromptName = ResolveMappedRegionFromTownName(townName);
+  }
+  if (regionPromptName.empty()) {
+    regionPromptName = ResolveMappedRegionFromTownName(zonePromptName);
+  }
+  if (regionPromptName.empty()) {
+    regionPromptName = ResolveNearestTownMappedRegion(world, npc);
+  }
+  if (regionPromptName.empty()) {
+    regionPromptName = ResolveNearestWorldZoneName(world, npc);
+  }
+  unsigned int geoNpcSerial = 0;
+  try {
+    geoNpcSerial = npc->getHandle().serial;
+  } catch (...) {
+    geoNpcSerial = 0;
+  }
+  Log("GEO_DEBUG_CTX: envelope npc=" + name +
+      " serial=" + ToString((int)geoNpcSerial) +
+      " in_town_walls=" + std::string(inTownWalls ? "1" : "0") +
+      " indoors=" + std::string(npcIsIndoors ? "1" : "0") +
+      " building=" + GeoDebugToken(npcBuildingName) +
+      " town_raw=" + GeoDebugToken(townName) +
+      " zone_raw=" + GeoDebugToken(zoneName) +
+      " town_region_raw=" + GeoDebugToken(townRegionName) +
+      " zone_prompt=" + GeoDebugToken(zonePromptName) +
+      " region_prompt=" + GeoDebugToken(regionPromptName));
 
   std::string cachedTraderInventoryJson = "[]";
   int cachedTraderInventoryCount = 0;
@@ -3606,16 +4308,19 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   json += "\"building_name\": \"" + EscapeJSON(npcBuildingName) + "\",";
   json += "\"floor\": " + ToString(npcFloor) + ",";
   json += "\"in_town\": " +
-          std::string(npc->amInsideTownWalls() ? "true" : "false") + ",";
+          std::string(inTownWalls ? "true" : "false") + ",";
   json += "\"town_name\": \"" + EscapeJSON(townName) + "\",";
-  json += "\"zone_name\": \"" + EscapeJSON(zoneName) + "\",";
-  json += "\"region\": \"" + EscapeJSON(zoneName) + "\",";
+  json += "\"zone_name\": \"" + EscapeJSON(zonePromptName) + "\",";
+  json += "\"region_name\": \"" + EscapeJSON(regionPromptName) + "\",";
+  json += "\"region\": \"" + EscapeJSON(regionPromptName) + "\",";
   json += "\"x\": " + ToString(npcPos.x) + ",";
   json += "\"y\": " + ToString(npcPos.y) + ",";
   json += "\"z\": " + ToString(npcPos.z) + ",";
   json += "\"weather\": " + ToString((int)npc->getCurrentWeatherAffectStatus());
   json += "},";
   json += "\"town\": \"" + EscapeJSON(townName) + "\",";
+  json += "\"zone\": \"" + EscapeJSON(zonePromptName) + "\",";
+  json += "\"region\": \"" + EscapeJSON(regionPromptName) + "\",";
 
   std::string inventoryJson = "[]";
   // Hotfix: do not walk live inventory during context build.

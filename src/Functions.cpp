@@ -4566,7 +4566,21 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               true);
         } else if (act.type == ACT_ATTACK && target) {
           if (npc->getFaction() && npc->getFaction()->isThePlayer()) {
-            PerformLeaveSquad(npc, thisptr, "");
+            bool targetInPlayerFaction = false;
+            try {
+              targetInPlayerFaction =
+                  (target->getFaction() && target->getFaction()->isThePlayer());
+            } catch (...) {
+              targetInPlayerFaction = false;
+            }
+
+            // Only leave player squad when explicitly attacking someone
+            // in the current player faction.
+            if (targetInPlayerFaction) {
+              PerformLeaveSquad(npc, thisptr, "");
+            }
+
+            // Clear existing goals so the attack command can take over.
             npc->clearAllAIGoals();
           }
           npc->attackTarget(target);

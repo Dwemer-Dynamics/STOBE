@@ -1283,6 +1283,26 @@ std::string NormalizeGeoToken(const std::string &rawValue) {
   return value;
 }
 
+bool TryParseGeoBoolToken(const std::string &rawValue, bool &valueOut) {
+  std::string value = TrimChatLine(rawValue);
+  if (value.empty()) {
+    return false;
+  }
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
+      lowered == "on") {
+    valueOut = true;
+    return true;
+  }
+  if (lowered == "0" || lowered == "false" || lowered == "no" ||
+      lowered == "off") {
+    valueOut = false;
+    return true;
+  }
+  return false;
+}
+
 void AppendGeoQueryFromPlayer(std::wstring &endpoint, Character *player) {
   if (!player || (uintptr_t)player <= 0x1000) {
     return;
@@ -1293,34 +1313,122 @@ void AppendGeoQueryFromPlayer(std::wstring &endpoint, Character *player) {
     return;
   }
 
-  std::string town = NormalizeGeoToken(JsonReadField(contextJson, "town"));
+  std::string rawTown = JsonReadField(contextJson, "town");
+  std::string rawZone = JsonReadField(contextJson, "zone");
+  std::string rawRegion = JsonReadField(contextJson, "region");
+  std::string town = NormalizeGeoToken(rawTown);
+  std::string zone = NormalizeGeoToken(rawZone);
+  std::string region = NormalizeGeoToken(rawRegion);
   std::string environmentJson = JsonReadField(contextJson, "environment");
-  std::string building =
-      NormalizeGeoToken(JsonReadField(environmentJson, "building_name"));
-  std::string zone = NormalizeGeoToken(JsonReadField(environmentJson, "zone_name"));
-  std::string region = NormalizeGeoToken(JsonReadField(environmentJson, "region"));
-  std::string resolvedRegion = zone.empty() ? region : zone;
+  std::string rawBuilding = JsonReadField(environmentJson, "building_name");
+  std::string rawEnvZone = JsonReadField(environmentJson, "zone_name");
+  std::string rawEnvRegionName = JsonReadField(environmentJson, "region_name");
+  std::string rawEnvRegion = JsonReadField(environmentJson, "region");
+  std::string building = NormalizeGeoToken(rawBuilding);
+  if (zone.empty()) {
+    zone = NormalizeGeoToken(rawEnvZone);
+  }
+  if (region.empty()) {
+    region = NormalizeGeoToken(rawEnvRegionName);
+  }
+  if (region.empty()) {
+    region = NormalizeGeoToken(rawEnvRegion);
+  }
+  if (zone.empty()) {
+    zone = town;
+  }
+  auto safeGeoToken = [](const std::string &value) {
+    return value.empty() ? std::string("(empty)") : value;
+  };
+
+  std::string floorToken = NormalizeGeoToken(JsonReadField(environmentJson, "floor"));
+  std::string xToken = NormalizeGeoToken(JsonReadField(environmentJson, "x"));
+  std::string yToken = NormalizeGeoToken(JsonReadField(environmentJson, "y"));
+  std::string zToken = NormalizeGeoToken(JsonReadField(environmentJson, "z"));
+
+  bool indoorsValue = false;
+  bool outdoorsValue = false;
+  bool inTownValue = false;
+  bool indoorsKnown =
+      TryParseGeoBoolToken(JsonReadField(environmentJson, "indoors"), indoorsValue);
+  bool outdoorsKnown =
+      TryParseGeoBoolToken(JsonReadField(environmentJson, "outdoors"), outdoorsValue);
+  bool inTownKnown =
+      TryParseGeoBoolToken(JsonReadField(environmentJson, "in_town"), inTownValue);
+  bool useBuilding = IsIndoorsHandleValid(player->isIndoors());
+  if (indoorsKnown && indoorsValue) {
+    useBuilding = true;
+  }
+  if ((outdoorsKnown && outdoorsValue) || (indoorsKnown && !indoorsValue)) {
+    useBuilding = false;
+  }
+  if (!useBuilding) {
+    building.clear();
+  }
+  std::string playerName = "Unknown";
+  try {
+    playerName = player->getName();
+  } catch (...) {
+    playerName = "Unknown";
+  }
 
   std::string location = "";
-  if (!building.empty() && !town.empty()) {
-    location = building + ", " + town;
-  } else if (!town.empty()) {
-    location = town;
-  } else if (!building.empty()) {
+  if (useBuilding && !building.empty() && !zone.empty()) {
+    location = building + ", " + zone;
+  } else if (useBuilding && !building.empty()) {
     location = building;
-  } else if (!resolvedRegion.empty()) {
-    location = resolvedRegion;
+  } else if (!zone.empty()) {
+    location = zone;
+  } else if (!region.empty()) {
+    location = region;
   }
 
   if (!location.empty()) {
     endpoint += L"&location=" + ToWide(UrlEncode(location));
   }
-  if (!town.empty()) {
-    endpoint += L"&city=" + ToWide(UrlEncode(town));
+  if (!zone.empty()) {
+    endpoint += L"&city=" + ToWide(UrlEncode(zone));
   }
-  if (!resolvedRegion.empty()) {
-    endpoint += L"&region=" + ToWide(UrlEncode(resolvedRegion));
+  if (!region.empty()) {
+    endpoint += L"&region=" + ToWide(UrlEncode(region));
   }
+  if (!building.empty()) {
+    endpoint += L"&loc_building=" + ToWide(UrlEncode(building));
+  }
+  if (!zone.empty()) {
+    endpoint += L"&loc_zone=" + ToWide(UrlEncode(zone));
+  }
+  if (!region.empty()) {
+    endpoint += L"&loc_region=" + ToWide(UrlEncode(region));
+  }
+  endpoint += L"&loc_indoors=" + std::wstring(useBuilding ? L"1" : L"0");
+  if (!floorToken.empty()) {
+    endpoint += L"&loc_floor=" + ToWide(UrlEncode(floorToken));
+  }
+  if (!xToken.empty()) {
+    endpoint += L"&loc_x=" + ToWide(UrlEncode(xToken));
+  }
+  if (!yToken.empty()) {
+    endpoint += L"&loc_y=" + ToWide(UrlEncode(yToken));
+  }
+  if (!zToken.empty()) {
+    endpoint += L"&loc_z=" + ToWide(UrlEncode(zToken));
+  }
+  Log("GEO_DEBUG_QUERY: source=chatbox actor=" + playerName +
+      " raw_town=" + safeGeoToken(rawTown) + " raw_zone=" + safeGeoToken(rawZone) +
+      " raw_region=" + safeGeoToken(rawRegion) +
+      " raw_building=" + safeGeoToken(rawBuilding) +
+      " raw_env_zone=" + safeGeoToken(rawEnvZone) +
+      " raw_env_region_name=" + safeGeoToken(rawEnvRegionName) +
+      " raw_env_region=" + safeGeoToken(rawEnvRegion) +
+      " location=" + safeGeoToken(location) +
+      " building=" + safeGeoToken(building) + " zone=" + safeGeoToken(zone) +
+      " region=" + safeGeoToken(region) +
+      " indoors=" + std::string(useBuilding ? "1" : "0") +
+      " in_town=" +
+      std::string((inTownKnown && inTownValue) ? "1" : (inTownKnown ? "0" : "?")) +
+      " floor=" + safeGeoToken(floorToken) + " x=" + safeGeoToken(xToken) +
+      " y=" + safeGeoToken(yToken) + " z=" + safeGeoToken(zToken));
 }
 
 bool TryMarkRechatDispatch(LONG generation) {

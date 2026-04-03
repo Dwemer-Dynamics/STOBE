@@ -5485,6 +5485,30 @@ static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
   return value;
 }
 
+static bool TryParseInfoTelemetryBool(const std::string &rawValue,
+                                      bool &valueOut) {
+  std::string value = TrimCopy(rawValue);
+  if (value.empty()) {
+    return false;
+  }
+  std::string lowered = ToLowerAsciiCopy(value);
+  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
+      lowered == "on") {
+    valueOut = true;
+    return true;
+  }
+  if (lowered == "0" || lowered == "false" || lowered == "no" ||
+      lowered == "off") {
+    valueOut = false;
+    return true;
+  }
+  return false;
+}
+
+static bool IsInfoTelemetryIndoorsHandleValid(const hand &indoorsHandle) {
+  return indoorsHandle.isValid() && !indoorsHandle.isNull();
+}
+
 static bool BuildInfolocPayload(Character *player, std::string &digestOut,
                                 std::string &messageOut) {
   digestOut = "";
@@ -5498,39 +5522,109 @@ static bool BuildInfolocPayload(Character *player, std::string &digestOut,
     return false;
   }
 
-  std::string town = NormalizeInfoTelemetryToken(JsonReadField(contextJson, "town"));
+  std::string rawTown = JsonReadField(contextJson, "town");
+  std::string rawZone = JsonReadField(contextJson, "zone");
+  std::string rawRegion = JsonReadField(contextJson, "region");
+  std::string town = NormalizeInfoTelemetryToken(rawTown);
+  std::string zone = NormalizeInfoTelemetryToken(rawZone);
+  std::string region = NormalizeInfoTelemetryToken(rawRegion);
   std::string environmentJson = JsonReadField(contextJson, "environment");
-  std::string building = NormalizeInfoTelemetryToken(
-      JsonReadField(environmentJson, "building_name"));
-  std::string zone =
-      NormalizeInfoTelemetryToken(JsonReadField(environmentJson, "zone_name"));
-  std::string region =
-      NormalizeInfoTelemetryToken(JsonReadField(environmentJson, "region"));
-  std::string resolvedRegion = zone.empty() ? region : zone;
+  std::string rawBuilding = JsonReadField(environmentJson, "building_name");
+  std::string rawEnvZone = JsonReadField(environmentJson, "zone_name");
+  std::string rawEnvRegionName = JsonReadField(environmentJson, "region_name");
+  std::string rawEnvRegion = JsonReadField(environmentJson, "region");
+  std::string building = NormalizeInfoTelemetryToken(rawBuilding);
+  if (zone.empty()) {
+    zone = NormalizeInfoTelemetryToken(rawEnvZone);
+  }
+  if (region.empty()) {
+    region = NormalizeInfoTelemetryToken(rawEnvRegionName);
+  }
+  if (region.empty()) {
+    region = NormalizeInfoTelemetryToken(rawEnvRegion);
+  }
+  if (zone.empty()) {
+    zone = town;
+  }
+  auto safeGeoToken = [](const std::string &value) {
+    return value.empty() ? std::string("(empty)") : value;
+  };
+  bool indoorsValue = false;
+  bool outdoorsValue = false;
+  bool inTownValue = false;
+  bool indoorsKnown = TryParseInfoTelemetryBool(
+      JsonReadField(environmentJson, "indoors"), indoorsValue);
+  bool outdoorsKnown = TryParseInfoTelemetryBool(
+      JsonReadField(environmentJson, "outdoors"), outdoorsValue);
+  bool inTownKnown = TryParseInfoTelemetryBool(
+      JsonReadField(environmentJson, "in_town"), inTownValue);
+  bool useBuilding =
+      IsInfoTelemetryIndoorsHandleValid(player->isIndoors());
+  if (indoorsKnown && indoorsValue) {
+    useBuilding = true;
+  }
+  if ((outdoorsKnown && outdoorsValue) || (indoorsKnown && !indoorsValue)) {
+    useBuilding = false;
+  }
+  if (!useBuilding) {
+    building.clear();
+  }
+  std::string playerName = "Unknown";
+  try {
+    playerName = player->getName();
+  } catch (...) {
+    playerName = "Unknown";
+  }
 
   std::string location = "";
-  if (!building.empty() && !town.empty()) {
-    location = building + ", " + town;
-  } else if (!town.empty()) {
-    location = town;
-  } else if (!building.empty()) {
+  if (useBuilding && !building.empty() && !zone.empty()) {
+    location = building + ", " + zone;
+  } else if (useBuilding && !building.empty()) {
     location = building;
-  } else if (!resolvedRegion.empty()) {
-    location = resolvedRegion;
+  } else if (!zone.empty()) {
+    location = zone;
+  } else if (!region.empty()) {
+    location = region;
   }
   if (location.empty()) {
+    Log("GEO_DEBUG_INFOLOC: skipped empty location actor=" + playerName +
+        " raw_town=" + safeGeoToken(rawTown) + " raw_zone=" + safeGeoToken(rawZone) +
+        " raw_region=" + safeGeoToken(rawRegion) +
+        " raw_building=" + safeGeoToken(rawBuilding) +
+        " raw_env_zone=" + safeGeoToken(rawEnvZone) +
+        " raw_env_region_name=" + safeGeoToken(rawEnvRegionName) +
+        " raw_env_region=" + safeGeoToken(rawEnvRegion) +
+        " building=" + safeGeoToken(building) + " town=" + safeGeoToken(town) +
+        " zone=" + safeGeoToken(zone) + " region=" + safeGeoToken(region) +
+        " indoors=" + std::string(useBuilding ? "1" : "0") +
+        " in_town=" +
+        std::string((inTownKnown && inTownValue) ? "1" : (inTownKnown ? "0" : "?")));
     return false;
   }
 
   std::string locationWithRegion = location;
-  if (!resolvedRegion.empty() &&
-      ToLowerAsciiCopy(locationWithRegion).find(ToLowerAsciiCopy(resolvedRegion)) ==
+  if (!region.empty() &&
+      ToLowerAsciiCopy(locationWithRegion).find(ToLowerAsciiCopy(region)) ==
           std::string::npos) {
-    locationWithRegion += ", " + resolvedRegion;
+    locationWithRegion += ", " + region;
   }
 
   messageOut = "location update: " + locationWithRegion;
-  digestOut = ToLowerAsciiCopy(location + "|" + town + "|" + resolvedRegion);
+  digestOut = ToLowerAsciiCopy(location + "|" + zone + "|" + region);
+  Log("GEO_DEBUG_INFOLOC: actor=" + playerName +
+      " message=" + safeGeoToken(messageOut) +
+      " digest=" + safeGeoToken(digestOut) +
+      " raw_town=" + safeGeoToken(rawTown) + " raw_zone=" + safeGeoToken(rawZone) +
+      " raw_region=" + safeGeoToken(rawRegion) +
+      " raw_building=" + safeGeoToken(rawBuilding) +
+      " raw_env_zone=" + safeGeoToken(rawEnvZone) +
+      " raw_env_region_name=" + safeGeoToken(rawEnvRegionName) +
+      " raw_env_region=" + safeGeoToken(rawEnvRegion) +
+      " building=" + safeGeoToken(building) + " town=" + safeGeoToken(town) +
+      " zone=" + safeGeoToken(zone) + " region=" + safeGeoToken(region) +
+      " indoors=" + std::string(useBuilding ? "1" : "0") +
+      " in_town=" +
+      std::string((inTownKnown && inTownValue) ? "1" : (inTownKnown ? "0" : "?")));
   return !digestOut.empty();
 }
 
