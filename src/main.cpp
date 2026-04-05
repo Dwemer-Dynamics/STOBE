@@ -29,6 +29,7 @@
 #include <kenshi/CharMovement.h>
 #include <kenshi/Dialogue.h>
 #include <kenshi/Faction.h>
+#include <kenshi/FactionRelations.h>
 #include <kenshi/GameData.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/Inventory.h>
@@ -767,6 +768,104 @@ static std::string SafeFactionName(Faction *faction) {
   } catch (...) {
   }
   return "";
+}
+
+static std::string SafeFactionStringId(Faction *faction) {
+  if (!faction || (uintptr_t)faction <= 0x1000) {
+    return "";
+  }
+  try {
+    if (faction->data && (uintptr_t)faction->data > 0x1000) {
+      return TrimCopy(faction->data->stringID);
+    }
+  } catch (...) {
+  }
+  return "";
+}
+
+static int SafeFactionNumericId(Faction *faction) {
+  if (!faction || (uintptr_t)faction <= 0x1000) {
+    return 0;
+  }
+  try {
+    if (faction->data && (uintptr_t)faction->data > 0x1000) {
+      return static_cast<int>(faction->data->id);
+    }
+  } catch (...) {
+  }
+  return 0;
+}
+
+static std::string BuildFactionRelationStableToken(const std::string &stringId,
+                                                   int numericId,
+                                                   const std::string &name) {
+  std::string sid = TrimCopy(stringId);
+  if (!sid.empty()) {
+    return "sid:" + ToLowerAsciiCopy(sid);
+  }
+  if (numericId > 0) {
+    return "id:" + ToString(numericId);
+  }
+  std::string trimmedName = TrimCopy(name);
+  if (!trimmedName.empty()) {
+    return "name:" + ToLowerAsciiCopy(trimmedName);
+  }
+  return "";
+}
+
+static std::string BuildFactionRelationMergeKey(
+    const std::string &sourceStringId, int sourceNumericId,
+    const std::string &sourceName, const std::string &targetStringId,
+    int targetNumericId, const std::string &targetName) {
+  std::string sourceToken = BuildFactionRelationStableToken(
+      sourceStringId, sourceNumericId, sourceName);
+  std::string targetToken = BuildFactionRelationStableToken(
+      targetStringId, targetNumericId, targetName);
+  if (sourceToken.empty() || targetToken.empty()) {
+    return "";
+  }
+  return sourceToken + "->" + targetToken;
+}
+
+struct FactionRelationSnapshotEntry {
+  std::string mergeKey;
+  std::string sourceName;
+  std::string sourceStringId;
+  int sourceNumericId;
+  std::string targetName;
+  std::string targetStringId;
+  int targetNumericId;
+  double relation;
+  bool alliance;
+  bool war;
+  bool coexists;
+
+  FactionRelationSnapshotEntry()
+      : mergeKey(""), sourceName(""), sourceStringId(""), sourceNumericId(0),
+        targetName(""), targetStringId(""), targetNumericId(0), relation(0.0),
+        alliance(false), war(false), coexists(false) {}
+};
+
+static bool IsFactionRelationEntryDifferent(
+    const FactionRelationSnapshotEntry &left,
+    const FactionRelationSnapshotEntry &right) {
+  const double kRelationEpsilon = 0.001;
+  if (std::fabs(left.relation - right.relation) > kRelationEpsilon) {
+    return true;
+  }
+  if (left.alliance != right.alliance || left.war != right.war ||
+      left.coexists != right.coexists) {
+    return true;
+  }
+  if (left.sourceName != right.sourceName ||
+      left.sourceStringId != right.sourceStringId ||
+      left.sourceNumericId != right.sourceNumericId ||
+      left.targetName != right.targetName ||
+      left.targetStringId != right.targetStringId ||
+      left.targetNumericId != right.targetNumericId) {
+    return true;
+  }
+  return false;
 }
 
 static std::string BuildWorldStateEntityRulesJson(
@@ -1614,6 +1713,11 @@ static std::string g_playerSquadsSyncLastDigest = "";
 static DWORD g_playerSquadsSyncLastSentTick = 0;
 static std::set<std::string> g_playerSquadsLastKeys;
 static const DWORD kPlayerSquadsResendIntervalMs = 60 * 1000;
+static std::map<std::string, FactionRelationSnapshotEntry>
+    g_factionRelationStateByKey;
+static DWORD g_lastFactionRelationSyncTick = 0;
+static const DWORD kFactionRelationSyncIntervalMs = 30 * 1000;
+static const size_t kFactionRelationSyncHardCap = 262144;
 
 static std::string ShortInventoryHashForLog(const std::string &hash) {
   if (hash.length() <= 12) {
@@ -2330,6 +2434,13 @@ static void ResetPlayerSquadsSyncState() {
   g_playerSquadsSyncLastDigest = "";
   g_playerSquadsSyncLastSentTick = 0;
   g_playerSquadsLastKeys.clear();
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void ResetFactionRelationSyncState() {
+  EnterCriticalSection(&g_stateMutex);
+  g_factionRelationStateByKey.clear();
+  g_lastFactionRelationSyncTick = 0;
   LeaveCriticalSection(&g_stateMutex);
 }
 
@@ -5837,6 +5948,221 @@ static void RunInfoTelemetrySweep(GameWorld *world, Character *selection) {
       }
     }
   }
+}
+
+static void RunFactionRelationSync(GameWorld *world) {
+  if (!world || (uintptr_t)world < 0x1000 || !world->factionMgr ||
+      (uintptr_t)world->factionMgr < 0x1000) {
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  std::map<std::string, FactionRelationSnapshotEntry> previousState;
+  EnterCriticalSection(&g_stateMutex);
+  if (g_lastFactionRelationSyncTick != 0 &&
+      (nowTick - g_lastFactionRelationSyncTick) < kFactionRelationSyncIntervalMs) {
+    LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
+  previousState = g_factionRelationStateByKey;
+  LeaveCriticalSection(&g_stateMutex);
+
+  const lektor<Faction *> *allFactions = nullptr;
+  try {
+    allFactions = world->factionMgr->getAllFactions();
+  } catch (...) {
+    allFactions = nullptr;
+  }
+  if (!allFactions || allFactions->count == 0) {
+    EnterCriticalSection(&g_stateMutex);
+    g_lastFactionRelationSyncTick = nowTick;
+    g_factionRelationStateByKey.clear();
+    LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
+
+  std::map<std::string, FactionRelationSnapshotEntry> currentState;
+  size_t scannedPairs = 0;
+  bool truncated = false;
+
+  bool hardStop = false;
+  for (uint32_t i = 0; i < allFactions->count && !hardStop; ++i) {
+    Faction *sourceFaction = allFactions->stuff[i];
+    if (!sourceFaction || (uintptr_t)sourceFaction <= 0x1000 ||
+        !sourceFaction->relations ||
+        (uintptr_t)sourceFaction->relations <= 0x1000) {
+      continue;
+    }
+
+    std::string sourceName = SafeFactionName(sourceFaction);
+    std::string sourceStringId = SafeFactionStringId(sourceFaction);
+    int sourceNumericId = SafeFactionNumericId(sourceFaction);
+    if (sourceName.empty() && sourceStringId.empty() && sourceNumericId <= 0) {
+      continue;
+    }
+
+    for (uint32_t j = 0; j < allFactions->count; ++j) {
+      if (scannedPairs >= kFactionRelationSyncHardCap) {
+        truncated = true;
+        hardStop = true;
+        break;
+      }
+
+      Faction *targetFaction = allFactions->stuff[j];
+      if (!targetFaction || (uintptr_t)targetFaction <= 0x1000 ||
+          targetFaction == sourceFaction) {
+        continue;
+      }
+
+      std::string targetName = SafeFactionName(targetFaction);
+      std::string targetStringId = SafeFactionStringId(targetFaction);
+      int targetNumericId = SafeFactionNumericId(targetFaction);
+      if (targetName.empty() && targetStringId.empty() && targetNumericId <= 0) {
+        continue;
+      }
+
+      std::string mergeKey =
+          BuildFactionRelationMergeKey(sourceStringId, sourceNumericId,
+                                       sourceName, targetStringId, targetNumericId,
+                                       targetName);
+      if (mergeKey.empty()) {
+        continue;
+      }
+
+      double relationValue = 0.0;
+      bool relationResolved = false;
+      try {
+        relationValue =
+            static_cast<double>(sourceFaction->relations->getFactionRelation(
+                targetFaction));
+        relationResolved = true;
+      } catch (...) {
+        relationResolved = false;
+      }
+      if (!relationResolved) {
+        continue;
+      }
+
+      bool alliance = false;
+      bool war = false;
+      bool coexists = false;
+      try {
+        FactionRelations::RelationData *relationData =
+            sourceFaction->relations->getRelationData(targetFaction);
+        if (relationData && (uintptr_t)relationData > 0x1000) {
+          alliance = relationData->alliance;
+          war = relationData->war;
+          coexists = relationData->coexists;
+        }
+      } catch (...) {
+      }
+
+      FactionRelationSnapshotEntry entry;
+      entry.mergeKey = mergeKey;
+      entry.sourceName = sourceName;
+      entry.sourceStringId = sourceStringId;
+      entry.sourceNumericId = sourceNumericId;
+      entry.targetName = targetName;
+      entry.targetStringId = targetStringId;
+      entry.targetNumericId = targetNumericId;
+      entry.relation = relationValue;
+      entry.alliance = alliance;
+      entry.war = war;
+      entry.coexists = coexists;
+      currentState[mergeKey] = entry;
+      ++scannedPairs;
+    }
+  }
+
+  std::vector<FactionRelationSnapshotEntry> changedEntries;
+  changedEntries.reserve(currentState.size());
+  for (std::map<std::string, FactionRelationSnapshotEntry>::const_iterator it =
+           currentState.begin();
+       it != currentState.end(); ++it) {
+    std::map<std::string, FactionRelationSnapshotEntry>::const_iterator previousIt =
+        previousState.find(it->first);
+    if (previousIt == previousState.end() ||
+        IsFactionRelationEntryDifferent(it->second, previousIt->second)) {
+      changedEntries.push_back(it->second);
+    }
+  }
+
+  std::vector<std::string> removedKeys;
+  for (std::map<std::string, FactionRelationSnapshotEntry>::const_iterator it =
+           previousState.begin();
+       it != previousState.end(); ++it) {
+    if (currentState.find(it->first) == currentState.end()) {
+      removedKeys.push_back(it->first);
+    }
+  }
+
+  EnterCriticalSection(&g_stateMutex);
+  g_lastFactionRelationSyncTick = nowTick;
+  g_factionRelationStateByKey = currentState;
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (changedEntries.empty() && removedKeys.empty()) {
+    if (truncated) {
+      Log("FACTION_REL_SYNC: no delta but scan truncated at " +
+          ToString((int)kFactionRelationSyncHardCap) + " pairs.");
+    }
+    return;
+  }
+
+  bool isFullSnapshot = previousState.empty();
+  int gameTs = ResolveCurrentGameTsSafe(world);
+  std::string payload = "{";
+  payload += "\"source\":\"faction_relations_snapshot\",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload +=
+      "\"full_snapshot\":" + std::string(isFullSnapshot ? "true" : "false") + ",";
+  payload += "\"truncated\":" + std::string(truncated ? "true" : "false") + ",";
+  payload += "\"scanned_pairs\":" + ToString((int)scannedPairs) + ",";
+  payload += "\"changed_count\":" + ToString((int)changedEntries.size()) + ",";
+  payload += "\"removed_count\":" + ToString((int)removedKeys.size()) + ",";
+
+  payload += "\"relations\":[";
+  for (size_t i = 0; i < changedEntries.size(); ++i) {
+    const FactionRelationSnapshotEntry &entry = changedEntries[i];
+    if (i > 0) {
+      payload += ",";
+    }
+    payload += "{";
+    payload += "\"merge_key\":\"" + EscapeJSON(entry.mergeKey) + "\",";
+    payload += "\"source_name\":\"" + EscapeJSON(entry.sourceName) + "\",";
+    payload += "\"source_string_id\":\"" + EscapeJSON(entry.sourceStringId) +
+               "\",";
+    payload += "\"source_numeric_id\":" + ToString(entry.sourceNumericId) + ",";
+    payload += "\"target_name\":\"" + EscapeJSON(entry.targetName) + "\",";
+    payload += "\"target_string_id\":\"" + EscapeJSON(entry.targetStringId) +
+               "\",";
+    payload += "\"target_numeric_id\":" + ToString(entry.targetNumericId) + ",";
+    payload += "\"relation\":" + ToString(static_cast<float>(entry.relation)) +
+               ",";
+    payload += "\"alliance\":" + std::string(entry.alliance ? "true" : "false") +
+               ",";
+    payload += "\"war\":" + std::string(entry.war ? "true" : "false") + ",";
+    payload += "\"coexists\":" + std::string(entry.coexists ? "true" : "false");
+    payload += "}";
+  }
+  payload += "],";
+
+  payload += "\"removed\":[";
+  for (size_t i = 0; i < removedKeys.size(); ++i) {
+    if (i > 0) {
+      payload += ",";
+    }
+    payload += "{\"merge_key\":\"" + EscapeJSON(removedKeys[i]) + "\"}";
+  }
+  payload += "]";
+  payload += "}";
+
+  AsyncPostToStobe(L"/faction_relations", payload);
+  Log("FACTION_REL_SYNC: sent changed=" + ToString((int)changedEntries.size()) +
+      " removed=" + ToString((int)removedKeys.size()) +
+      " scanned_pairs=" + ToString((int)scannedPairs) +
+      " full_snapshot=" + std::string(isFullSnapshot ? "1" : "0") +
+      " truncated=" + std::string(truncated ? "1" : "0"));
 }
 
 static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
@@ -10247,6 +10573,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerCatsSyncState();
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
+      ResetFactionRelationSyncState();
       heavySweepPrimed = false;
       lastHeavySyncGuardLogTick = 0;
       motdAutoOpenQueued = false;
@@ -10493,6 +10820,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       RunInventorySyncSweep(world, sel);
       RunPlayerFactionPortraitSweep(world);
       RunInfoTelemetrySweep(world, sel);
+      RunFactionRelationSync(world);
     } else if (nowTick - lastHeavySyncGuardLogTick >= 10000) {
       lastHeavySyncGuardLogTick = nowTick;
       Log("SYNC_GUARD: heavy periodic sweeps delayed until world warmup completes.");

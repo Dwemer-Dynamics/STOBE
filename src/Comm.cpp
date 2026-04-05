@@ -574,6 +574,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/faction_relations") {
+    request.path = L"/StobeServer/faction_relations.php";
+    return request;
+  }
+
   if (endpoint == L"/conf_opts") {
     request.path = L"/StobeServer/conf_opts.php";
     return request;
