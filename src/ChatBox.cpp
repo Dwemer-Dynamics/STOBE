@@ -861,6 +861,172 @@ Character *ResolveConfiguredPlayerSpeaker(GameWorld *world, Character *target) {
   return ResolveNearestPlayerSpeaker(world, target);
 }
 
+struct RechatResponderChoice {
+  std::string name;
+  std::string serial;
+  std::string source;
+};
+
+bool TrySelectRechatResponder(GameWorld *world, Character *player,
+                              Character *speakerNpc,
+                              const std::string &speakerName,
+                              const std::string &preferredName,
+                              const std::string &preferredHandle,
+                              RechatResponderChoice &outChoice) {
+  outChoice.name.clear();
+  outChoice.serial.clear();
+  outChoice.source.clear();
+  if (!world || !speakerNpc || (uintptr_t)speakerNpc <= 0x1000) {
+    return false;
+  }
+
+  const float maxPlayerDistance =
+      (g_proximityRadius < 10.0f) ? 10.0f : g_proximityRadius;
+  const float speakerPriorityDistance = 800.0f;
+
+  auto isEligible = [&](Character *candidate, std::string &nameOut,
+                        std::string &serialOut, float &speakerDistanceOut,
+                        float &playerDistanceOut) -> bool {
+    nameOut.clear();
+    serialOut.clear();
+    speakerDistanceOut = 0.0f;
+    playerDistanceOut = 0.0f;
+    if (!candidate || (uintptr_t)candidate <= 0x1000) {
+      return false;
+    }
+    if (candidate == speakerNpc) {
+      return false;
+    }
+    if (player && candidate == player) {
+      return false;
+    }
+    if (IsCharacterUnavailableForConversation(candidate)) {
+      return false;
+    }
+    if (!ShouldIncludeAnimalForTalk(candidate)) {
+      return false;
+    }
+    if (!IsConversationAreaCompatible(speakerNpc, candidate)) {
+      return false;
+    }
+
+    try {
+      nameOut = TrimChatLine(candidate->getName());
+      serialOut = ToString(candidate->getHandle().serial);
+      speakerDistanceOut =
+          speakerNpc->getPosition().distance(candidate->getPosition());
+      if (player && (uintptr_t)player > 0x1000) {
+        playerDistanceOut = player->getPosition().distance(candidate->getPosition());
+      }
+    } catch (...) {
+      return false;
+    }
+
+    if (nameOut.empty() || IsNarratorName(nameOut)) {
+      return false;
+    }
+    if (!speakerName.empty() && EqualsIgnoreCase(nameOut, speakerName)) {
+      return false;
+    }
+    if (player && (uintptr_t)player > 0x1000) {
+      if (playerDistanceOut <= 1.0f || playerDistanceOut > maxPlayerDistance) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  Character *preferred =
+      ResolveChatTargetCharacter(world, preferredName, preferredHandle);
+  if (preferred && (uintptr_t)preferred > 0x1000) {
+    std::string preferredResolvedName = "";
+    std::string preferredResolvedSerial = "";
+    float preferredSpeakerDistance = 0.0f;
+    float preferredPlayerDistance = 0.0f;
+    if (isEligible(preferred, preferredResolvedName, preferredResolvedSerial,
+                   preferredSpeakerDistance, preferredPlayerDistance)) {
+      outChoice.name = preferredResolvedName;
+      outChoice.serial = preferredResolvedSerial;
+      outChoice.source = "preferred_listener";
+      return true;
+    }
+  }
+
+  struct Candidate {
+    std::string name;
+    std::string serial;
+    float speakerDistance;
+    float playerDistance;
+  };
+  std::vector<Candidate> candidates;
+  std::set<std::string> seenSerials;
+  const ogre_unordered_set<Character *>::type &chars =
+      world->getCharacterUpdateList();
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    Character *candidate = *it;
+    std::string candidateName = "";
+    std::string candidateSerial = "";
+    float candidateSpeakerDistance = 0.0f;
+    float candidatePlayerDistance = 0.0f;
+    if (!isEligible(candidate, candidateName, candidateSerial,
+                    candidateSpeakerDistance, candidatePlayerDistance)) {
+      continue;
+    }
+    if (!candidateSerial.empty()) {
+      if (seenSerials.count(candidateSerial) > 0) {
+        continue;
+      }
+      seenSerials.insert(candidateSerial);
+    }
+    Candidate entry;
+    entry.name = candidateName;
+    entry.serial = candidateSerial;
+    entry.speakerDistance = candidateSpeakerDistance;
+    entry.playerDistance = candidatePlayerDistance;
+    candidates.push_back(entry);
+  }
+
+  if (candidates.empty()) {
+    return false;
+  }
+
+  static bool seeded = false;
+  if (!seeded) {
+    seeded = true;
+    srand((unsigned int)GetTickCount());
+  }
+
+  std::vector<size_t> firstPass;
+  std::vector<size_t> secondPass;
+  firstPass.reserve(candidates.size());
+  secondPass.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    secondPass.push_back(i);
+    if (candidates[i].speakerDistance <= speakerPriorityDistance) {
+      firstPass.push_back(i);
+    }
+  }
+
+  size_t selectedIndex = (size_t)-1;
+  std::string selectedSource = "";
+  if (!firstPass.empty()) {
+    selectedIndex = firstPass[(size_t)(rand() % firstPass.size())];
+    selectedSource = "speaker_proximity";
+  } else if (!secondPass.empty()) {
+    selectedIndex = secondPass[(size_t)(rand() % secondPass.size())];
+    selectedSource = "player_distance_fallback";
+  }
+
+  if (selectedIndex == (size_t)-1 || selectedIndex >= candidates.size()) {
+    return false;
+  }
+
+  outChoice.name = candidates[selectedIndex].name;
+  outChoice.serial = candidates[selectedIndex].serial;
+  outChoice.source = selectedSource;
+  return !outChoice.name.empty();
+}
+
 bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *target,
                             const std::string &selectedMode,
                             bool requireStrictTalkValidation,
@@ -1487,6 +1653,36 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
     previousSpeaker = "Player";
   }
   std::string previousSpeakerHandle = TrimChatLine(currentTask.previousSpeakerHandle);
+  GameWorld *world = GetWorldSafe();
+  Character *player = nullptr;
+  Character *speakerNpc = nullptr;
+  if (world && world->player && world->player->playerCharacters.size() > 0) {
+    player = world->player->playerCharacters[0];
+  }
+  if (world) {
+    speakerNpc = ResolveChatTargetCharacter(world, speaker, speakerHandle);
+  }
+
+  RechatResponderChoice responderChoice;
+  bool responderSelected =
+      TrySelectRechatResponder(world, player, speakerNpc, speaker, previousSpeaker,
+                               previousSpeakerHandle, responderChoice);
+  if (!responderSelected || responderChoice.name.empty()) {
+    Log("RECHAT: skipped (no eligible responder) speaker=" + speaker +
+        " preferred_listener=" + previousSpeaker +
+        " preferred_listener_serial=" + previousSpeakerHandle);
+    return;
+  }
+  std::string selectedResponder = responderChoice.name;
+  std::string selectedResponderHandle = responderChoice.serial;
+  Character *responderNpc = nullptr;
+  if (world) {
+    responderNpc = ResolveChatTargetCharacter(world, selectedResponder,
+                                              selectedResponderHandle);
+  }
+  if (!responderNpc || (uintptr_t)responderNpc <= 0x1000) {
+    selectedResponderHandle.clear();
+  }
 
   std::string eventData = speaker + ": " + subtitle +
                           " (talking to: " + previousSpeaker + ")";
@@ -1503,9 +1699,14 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
 
   std::wstring endpoint = L"/StobeServer/stream.php?DATA=" +
                           ToWide(BuildStreamQueryData("rechat", eventData, gameTs)) +
-                          L"&profile=" + ToWide(UrlEncode(speaker)) +
+                          L"&profile=" + ToWide(UrlEncode(selectedResponder)) +
                           L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
                           L"&rechat_depth=" + ToWide(ToString(nextRechatDepth));
+  endpoint += L"&rechat_target=" + ToWide(UrlEncode(selectedResponder));
+  if (!selectedResponderHandle.empty()) {
+    endpoint +=
+        L"&rechat_target_sid=" + ToWide(UrlEncode(selectedResponderHandle));
+  }
   std::string initiatorSpeaker = TrimChatLine(currentTask.initiatorSpeaker);
   std::string initiatorSpeakerHandle =
       TrimChatLine(currentTask.initiatorSpeakerHandle);
@@ -1519,57 +1720,35 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
     endpoint += L"&mode=" + ToWide(UrlEncode(currentTask.requestMode));
   }
   std::string peopleJson = "";
-  std::string peopleSource = "minimal_speaker_target";
-  GameWorld *world = GetWorldSafe();
-  Character *speakerNpc = nullptr;
-  Character *listenerNpc = nullptr;
-  if (world) {
-    speakerNpc = ResolveChatTargetCharacter(world, speaker, speakerHandle);
-    listenerNpc =
-        ResolveChatTargetCharacter(world, previousSpeaker, previousSpeakerHandle);
-  }
-  if (speakerNpc && (uintptr_t)speakerNpc > 0x1000) {
-    std::string speakerNameForPeople = speaker;
-    if (speakerNameForPeople.empty()) {
-      speakerNameForPeople = speakerNpc->getName();
-    }
-    std::string listenerNameForPeople = previousSpeaker;
-    std::string listenerHandleForPeople = previousSpeakerHandle;
-    if (listenerNpc && (uintptr_t)listenerNpc > 0x1000) {
-      if (listenerNameForPeople.empty()) {
-        listenerNameForPeople = listenerNpc->getName();
-      }
-      if (listenerHandleForPeople.empty()) {
-        listenerHandleForPeople = ToString(listenerNpc->getHandle().serial);
-      }
-    }
-    // Rebuild listeners per hop around the current speaker so only nearby NPCs
-    // in talk range can hear/respond.
+  std::string peopleSource = "minimal_rechat_pair";
+  if (responderNpc && (uintptr_t)responderNpc > 0x1000) {
+    // Rebuild listeners per hop around the selected responder (Herika-style).
+    // This keeps the local conversation set anchored to who will speak next.
     peopleJson =
-        BuildPeopleJson(world, speakerNameForPeople, listenerNameForPeople,
-                        listenerHandleForPeople, "chat", speakerNpc);
+        BuildPeopleJson(world, selectedResponder, speaker, speakerHandle, "chat",
+                        responderNpc);
     if (!peopleJson.empty()) {
-      peopleSource = "rebuilt_from_current_speaker";
-      if (speakerHandle.empty()) {
-        speakerHandle = ToString(speakerNpc->getHandle().serial);
+      peopleSource = "rebuilt_from_selected_responder";
+      if (selectedResponderHandle.empty()) {
+        selectedResponderHandle = ToString(responderNpc->getHandle().serial);
       }
     }
   }
   if (peopleJson.empty()) {
     std::vector<std::string> minimalPeople;
+    if (!selectedResponder.empty()) {
+      if (!selectedResponderHandle.empty()) {
+        AppendUniquePerson(minimalPeople,
+                           selectedResponder + "|" + selectedResponderHandle);
+      } else {
+        AppendUniquePerson(minimalPeople, selectedResponder);
+      }
+    }
     if (!speaker.empty()) {
       if (!speakerHandle.empty()) {
         AppendUniquePerson(minimalPeople, speaker + "|" + speakerHandle);
       } else {
         AppendUniquePerson(minimalPeople, speaker);
-      }
-    }
-    if (!previousSpeaker.empty()) {
-      if (!previousSpeakerHandle.empty()) {
-        AppendUniquePerson(minimalPeople,
-                           previousSpeaker + "|" + previousSpeakerHandle);
-      } else {
-        AppendUniquePerson(minimalPeople, previousSpeaker);
       }
     }
     peopleJson = "[";
@@ -1584,16 +1763,12 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   if (!peopleJson.empty()) {
     endpoint += L"&people=" + ToWide(UrlEncode(peopleJson));
   }
-  Character *player = nullptr;
-  if (world && world->player && world->player->playerCharacters.size() > 0) {
-    player = world->player->playerCharacters[0];
-  }
   AppendGeoQueryFromPlayer(endpoint, player);
 
   StreamChatTask *nextTask = new StreamChatTask();
   nextTask->endpoint = endpoint;
-  nextTask->npcName = speaker;
-  nextTask->handleStr = speakerHandle;
+  nextTask->npcName = selectedResponder;
+  nextTask->handleStr = selectedResponderHandle;
   nextTask->peopleJson = peopleJson;
   nextTask->previousSpeaker = speaker;
   nextTask->previousSpeakerHandle = speakerHandle;
@@ -1607,8 +1782,12 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
       CreateThread(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
   if (followupThread) {
     CloseHandle(followupThread);
-    Log("RECHAT: dispatched follow-up for speaker " + speaker +
-        " targeting " + previousSpeaker + " people_source=" + peopleSource +
+    Log("RECHAT: dispatched follow-up speaker=" + speaker +
+        " selected_responder=" + selectedResponder +
+        " selected_responder_serial=" + selectedResponderHandle +
+        " selection_source=" + responderChoice.source +
+        " previous_listener=" + previousSpeaker +
+        " people_source=" + peopleSource +
         " people_len=" + ToString((int)peopleJson.length()) +
         " depth=" + ToString(nextRechatDepth));
   } else {
