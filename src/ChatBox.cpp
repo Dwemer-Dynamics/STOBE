@@ -460,10 +460,20 @@ bool IsCharacterUnavailableForConversation(Character *character) {
     return true;
   }
   try {
-    return character->isDead() || character->isUnconcious();
+    if (character->isDead() || character->isUnconcious()) {
+      return true;
+    }
   } catch (...) {
     return true;
   }
+  try {
+    if (character->isDown()) {
+      return true;
+    }
+  } catch (...) {
+    return true;
+  }
+  return false;
 }
 
 bool IsDigitsOnlyToken(const std::string &value) {
@@ -825,7 +835,21 @@ Character *ResolveNearestPlayerSpeaker(GameWorld *world, Character *target) {
     return nullptr;
   }
 
-  Character *fallback = world->player->playerCharacters[0];
+  Character *fallback = nullptr;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *candidate = world->player->playerCharacters[i];
+    if (!candidate || (uintptr_t)candidate <= 0x1000) {
+      continue;
+    }
+    if (IsCharacterUnavailableForConversation(candidate)) {
+      continue;
+    }
+    fallback = candidate;
+    break;
+  }
+  if (!fallback) {
+    fallback = world->player->playerCharacters[0];
+  }
   if (!target || (uintptr_t)target <= 0x1000) {
     return fallback;
   }
@@ -835,6 +859,9 @@ Character *ResolveNearestPlayerSpeaker(GameWorld *world, Character *target) {
   for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
     Character *candidate = world->player->playerCharacters[i];
     if (!candidate || (uintptr_t)candidate <= 0x1000) {
+      continue;
+    }
+    if (IsCharacterUnavailableForConversation(candidate)) {
       continue;
     }
     // If the target is a squadmate, pick another squadmate as the speaker.
@@ -855,10 +882,26 @@ Character *ResolveConfiguredPlayerSpeaker(GameWorld *world, Character *target) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return nullptr;
   }
-  if (!g_useNearestPlayerSpeaker) {
-    return world->player->playerCharacters[0];
+  Character *primary = world->player->playerCharacters[0];
+  if (g_useNearestPlayerSpeaker) {
+    Character *nearest = ResolveNearestPlayerSpeaker(world, target);
+    if (nearest && !IsCharacterUnavailableForConversation(nearest)) {
+      return nearest;
+    }
+  } else if (primary && !IsCharacterUnavailableForConversation(primary)) {
+    return primary;
   }
-  return ResolveNearestPlayerSpeaker(world, target);
+
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *candidate = world->player->playerCharacters[i];
+    if (!candidate || (uintptr_t)candidate <= 0x1000) {
+      continue;
+    }
+    if (!IsCharacterUnavailableForConversation(candidate)) {
+      return candidate;
+    }
+  }
+  return primary;
 }
 
 struct RechatResponderChoice {
@@ -1036,6 +1079,12 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
       (uintptr_t)target <= 0x1000) {
     failReason = "Target not available.";
     Log("CHAT_VALIDATE: fail target unavailable");
+    return false;
+  }
+
+  if (IsCharacterUnavailableForConversation(player)) {
+    failReason = "Selected speaker cannot talk right now.";
+    Log("CHAT_VALIDATE: fail speaker unavailable");
     return false;
   }
 
@@ -2581,6 +2630,9 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     validationOk = (narratorSpeakerNpc && (uintptr_t)narratorSpeakerNpc > 0x1000);
     if (!validationOk) {
       sendFailReason = "Select a valid speaker before using narrator mode.";
+    } else if (IsCharacterUnavailableForConversation(narratorSpeakerNpc)) {
+      validationOk = false;
+      sendFailReason = "Selected speaker cannot talk right now.";
     }
   } else {
     validationOk = ValidatePlayerChatSend(world, player, targetNpc, selectedMode,
