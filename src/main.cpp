@@ -1599,6 +1599,7 @@ struct PendingItemImageSyncRequest {
 struct InventoryEventSnapshot {
   std::map<std::string, int> countsByKey;
   std::map<std::string, int> stolenByKey;
+  std::map<std::string, int> foodByKey;
   std::map<std::string, std::string> displayNameByKey;
   int totalCount;
 
@@ -1612,6 +1613,10 @@ struct NpcWorldEventState {
   bool enslaved;
   bool hasMoney;
   int money;
+  bool hasHunger;
+  float hunger;
+  float fed;
+  float satiety;
   bool carrying;
   unsigned int carryingTargetSerial;
   std::string carryingTargetName;
@@ -1635,7 +1640,8 @@ struct NpcWorldEventState {
 
   NpcWorldEventState()
       : initialized(false), dead(false), unconscious(false), enslaved(false),
-        hasMoney(false), money(0),
+        hasMoney(false), money(0), hasHunger(false), hunger(0.0f), fed(0.0f),
+        satiety(0.0f),
         carrying(false), carryingTargetSerial(0), carryingTargetName(""),
         speechActive(false), leftArmPresent(true), rightArmPresent(true),
         leftLegPresent(true), rightLegPresent(true),
@@ -4725,6 +4731,48 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
+static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
+                                    float &fedOut, float &satietyOut) {
+  hungerOut = 0.0f;
+  fedOut = 0.0f;
+  satietyOut = 0.0f;
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  MedicalSystem *med = nullptr;
+  try {
+    med = npc->getMedical();
+  } catch (...) {
+    med = nullptr;
+  }
+  if (!med || (uintptr_t)med < 0x1000) {
+    return false;
+  }
+
+  try {
+    hungerOut = med->hunger;
+    fedOut = med->fed;
+  } catch (...) {
+    hungerOut = 0.0f;
+    fedOut = 0.0f;
+    satietyOut = 0.0f;
+    return false;
+  }
+
+  if (hungerOut < 0.0f) {
+    hungerOut = 0.0f;
+  }
+  if (fedOut < 0.0f) {
+    fedOut = 0.0f;
+  }
+  satietyOut = (300.0f - hungerOut) + fedOut;
+  if (satietyOut < 0.0f) {
+    satietyOut = 0.0f;
+  }
+  return true;
+}
+
 static bool CollectInventoryEventSnapshot(Character *npc,
                                           InventoryEventSnapshot &out) {
   out = InventoryEventSnapshot();
@@ -4748,10 +4796,15 @@ static bool CollectInventoryEventSnapshot(Character *npc,
     std::string itemName;
     int count = 1;
     bool isStolen = false;
+    bool isFood = false;
     try {
       itemName = TrimCopy(item->getName());
       count = item->quantity;
       isStolen = item->isStolen(true);
+      GameData *itemData = item->getGameData();
+      if (itemData && (uintptr_t)itemData > 0x1000) {
+        isFood = Item::isFood(itemData);
+      }
     } catch (...) {
       continue;
     }
@@ -4768,6 +4821,9 @@ static bool CollectInventoryEventSnapshot(Character *npc,
     out.countsByKey[key] += count;
     if (isStolen) {
       out.stolenByKey[key] += count;
+    }
+    if (isFood) {
+      out.foodByKey[key] += count;
     }
     if (out.displayNameByKey.count(key) == 0) {
       out.displayNameByKey[key] = itemName;
@@ -5111,6 +5167,88 @@ static std::string BuildInventoryDeltaItemsText(
     itemsText += ToString(items[i].count) + "x " + itemName;
   }
   return itemsText;
+}
+
+static void SubtractInventoryDeltaByKey(
+    std::map<std::string, int> &deltaByKey,
+    const std::map<std::string, int> &subtractByKey) {
+  if (deltaByKey.empty() || subtractByKey.empty()) {
+    return;
+  }
+  for (std::map<std::string, int>::const_iterator it = subtractByKey.begin();
+       it != subtractByKey.end(); ++it) {
+    if (it->second <= 0) {
+      continue;
+    }
+    std::map<std::string, int>::iterator deltaIt = deltaByKey.find(it->first);
+    if (deltaIt == deltaByKey.end()) {
+      continue;
+    }
+    deltaIt->second -= it->second;
+    if (deltaIt->second <= 0) {
+      deltaByKey.erase(deltaIt);
+    }
+  }
+}
+
+static std::map<std::string, int> DetectFoodConsumptionLossByKey(
+    const std::map<std::string, int> &lossByKey,
+    const InventoryEventSnapshot &beforeSnapshot, bool hadHungerBefore,
+    float hungerBefore, float fedBefore, float satietyBefore, bool hasHungerAfter,
+    float hungerAfter, float fedAfter, float satietyAfter) {
+  std::map<std::string, int> consumedByKey;
+  if (lossByKey.empty() || !hadHungerBefore || !hasHungerAfter) {
+    return consumedByKey;
+  }
+
+  const float hungerDrop = hungerBefore - hungerAfter;
+  const float fedRise = fedAfter - fedBefore;
+  const float satietyRise = satietyAfter - satietyBefore;
+  const bool hasConsumptionSignal =
+      hungerDrop >= 0.10f || fedRise >= 0.10f || satietyRise >= 0.50f;
+  if (!hasConsumptionSignal) {
+    return consumedByKey;
+  }
+
+  for (std::map<std::string, int>::const_iterator it = lossByKey.begin();
+       it != lossByKey.end(); ++it) {
+    const std::string &key = it->first;
+    int lossQty = it->second;
+    if (key.empty() || lossQty <= 0) {
+      continue;
+    }
+    std::map<std::string, int>::const_iterator foodIt =
+        beforeSnapshot.foodByKey.find(key);
+    if (foodIt == beforeSnapshot.foodByKey.end() || foodIt->second <= 0) {
+      continue;
+    }
+    int consumedQty = lossQty < foodIt->second ? lossQty : foodIt->second;
+    if (consumedQty > 0) {
+      consumedByKey[key] = consumedQty;
+    }
+  }
+  return consumedByKey;
+}
+
+static void EmitEatEvent(Character *npc,
+                         const InventoryEventSnapshot &beforeSnapshot,
+                         const InventoryEventSnapshot &afterSnapshot,
+                         const std::map<std::string, int> &consumedByKey) {
+  if (consumedByKey.empty()) {
+    return;
+  }
+
+  std::string itemsText =
+      BuildInventoryDeltaItemsText(consumedByKey, beforeSnapshot, afterSnapshot);
+  if (itemsText.empty()) {
+    return;
+  }
+
+  std::string actorName = ResolveCharacterNameSafe(npc);
+  std::string actorFaction = SafeFaction(npc);
+  std::string message = "ate " + itemsText;
+  LogGameEvent("eat", actorName, actorFaction, "None", "None", message,
+               ResolveCharacterSerialForEvent(npc), 0);
 }
 
 static void ComputeInventoryDeltaByKey(
@@ -6394,6 +6532,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     bool enslavedNow = false;
     bool hasMoneyNow = false;
     int moneyNow = 0;
+    bool hasHungerNow = false;
+    float hungerNow = 0.0f;
+    float fedNow = 0.0f;
+    float satietyNow = 0.0f;
     int lockpickingNow = 0;
     try {
       deadNow = npc->isDead();
@@ -6404,6 +6546,7 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       continue;
     }
     hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
+    hasHungerNow = ResolveNpcHungerMetrics(npc, hungerNow, fedNow, satietyNow);
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -6496,6 +6639,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.enslaved = enslavedNow;
       state.hasMoney = hasMoneyNow;
       state.money = moneyNow;
+      state.hasHunger = hasHungerNow;
+      state.hunger = hungerNow;
+      state.fed = fedNow;
+      state.satiety = satietyNow;
       state.carrying = carryingNow;
       state.carryingTargetSerial = carryingTargetSerialNow;
       state.carryingTargetName = carryingTargetNameNow;
@@ -6580,6 +6727,18 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
                        message, serial, traderSerial);
           lossByKey.clear();
         }
+      }
+    }
+    if (!isPlayerActor && !lossByKey.empty()) {
+      std::map<std::string, int> consumedFoodByKey =
+          DetectFoodConsumptionLossByKey(
+              lossByKey, previousState.inventory, previousState.hasHunger,
+              previousState.hunger, previousState.fed, previousState.satiety,
+              hasHungerNow, hungerNow, fedNow, satietyNow);
+      if (!consumedFoodByKey.empty()) {
+        SubtractInventoryDeltaByKey(lossByKey, consumedFoodByKey);
+        EmitEatEvent(npc, previousState.inventory, inventorySnapshot,
+                     consumedFoodByKey);
       }
     }
     if (!gainByKey.empty() || !lossByKey.empty()) {
@@ -6719,6 +6878,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.enslaved = enslavedNow;
     state.hasMoney = hasMoneyNow;
     state.money = moneyNow;
+    state.hasHunger = hasHungerNow;
+    state.hunger = hungerNow;
+    state.fed = fedNow;
+    state.satiety = satietyNow;
     state.carrying = carryingNow;
     state.carryingTargetSerial = carryingTargetSerialNow;
     state.carryingTargetName = carryingTargetNameNow;

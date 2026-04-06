@@ -9,6 +9,8 @@ bool CharacterHasHacksaw(Character *npc);
 bool IsCharacterSkeletonRace(Character *npc);
 bool IsRemoveLimbTargetValid(GameWorld *world, Character *target,
                              std::string &reasonOut);
+bool IsTakeItemLootTargetValid(GameWorld *world, Character *target,
+                               std::string &reasonOut, bool &isDeadOut);
 bool ResolveCharacterDrinkItemMatch(Character *npc, const std::string &rawQuery,
                                     std::string &matchedNameOut);
 bool ResolveCharacterDrugItemMatch(Character *npc, const std::string &rawQuery,

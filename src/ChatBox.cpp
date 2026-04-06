@@ -2733,10 +2733,13 @@ void OnChatSendClick(MyGUI::Widget *sender) {
         return;
       }
       std::string invalidReason = "";
-      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+      bool targetIsDead = false;
+      if (!IsTakeItemLootTargetValid(world, targetNpc, invalidReason,
+                                     targetIsDead)) {
         if (invalidReason.empty()) {
           invalidReason =
-              "target must be knocked out, unconscious, imprisoned, or carried";
+              "target must be dead, knocked out, unconscious, imprisoned, or "
+              "carried";
         }
         if (world) {
           world->showPlayerAMessage_withLog(
@@ -2879,10 +2882,13 @@ void OnChatSendClick(MyGUI::Widget *sender) {
         return;
       }
       std::string invalidReason = "";
-      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+      bool targetIsDead = false;
+      if (!IsTakeItemLootTargetValid(world, targetNpc, invalidReason,
+                                     targetIsDead)) {
         if (invalidReason.empty()) {
           invalidReason =
-              "target must be knocked out, unconscious, imprisoned, or carried";
+              "target must be dead, knocked out, unconscious, imprisoned, or "
+              "carried";
         }
         if (world) {
           world->showPlayerAMessage_withLog(
