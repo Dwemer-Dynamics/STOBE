@@ -1652,6 +1652,21 @@ struct NpcWorldEventState {
         lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
 };
 
+struct PendingMedicalItemUseState {
+  std::map<std::string, int> pendingByKey;
+  DWORD lastUpdateTick;
+
+  PendingMedicalItemUseState() : lastUpdateTick(0) {}
+};
+
+struct HealingEventSessionState {
+  DWORD lastUpdateTick;
+  std::string targetKey;
+  std::string itemKey;
+
+  HealingEventSessionState() : lastUpdateTick(0), targetKey(""), itemKey("") {}
+};
+
 static std::map<unsigned int, InventorySyncState> g_inventorySyncStateBySerial;
 static std::map<std::string, PortraitSyncState> g_portraitSyncStateByStorageId;
 static std::map<unsigned int, DWORD> g_portraitSpeechTriggerBySerial;
@@ -1714,6 +1729,13 @@ static bool g_dynamicProfileIntervalSyncHasValue = false;
 static int g_dynamicProfileIntervalSyncLastValue = 0;
 static DWORD g_dynamicProfileIntervalSyncLastSentTick = 0;
 static const DWORD kDynamicProfileIntervalResendIntervalMs = 5 * 60 * 1000;
+static std::map<unsigned int, PendingMedicalItemUseState>
+    g_pendingMedicalItemUseBySerial;
+static const DWORD kPendingMedicalItemUseRetentionMs = 20 * 1000;
+static std::map<unsigned int, HealingEventSessionState>
+    g_healingEventSessionByHealerSerial;
+static const DWORD kHealingEventSessionGapMs = 3000;
+static const DWORD kHealingEventSessionRetentionMs = 60 * 1000;
 static bool g_playerSquadsSyncHasValue = false;
 static std::string g_playerSquadsSyncLastDigest = "";
 static DWORD g_playerSquadsSyncLastSentTick = 0;
@@ -4038,6 +4060,62 @@ static std::string NormalizeInventoryKey(const std::string &name) {
   return key;
 }
 
+static std::string BuildHealingSessionTargetKey(unsigned int targetSerial,
+                                                const std::string &targetName) {
+  if (targetSerial != 0) {
+    return "sid:" + ToString((int)targetSerial);
+  }
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(targetName));
+  if (!normalized.empty()) {
+    return "name:" + normalized;
+  }
+  return "unknown";
+}
+
+static bool ShouldEmitHealingEvent(unsigned int healerSerial,
+                                   unsigned int targetSerial,
+                                   const std::string &targetName,
+                                   const std::string &itemName,
+                                   DWORD nowTick) {
+  if (healerSerial == 0) {
+    return true;
+  }
+
+  std::string targetKey = BuildHealingSessionTargetKey(targetSerial, targetName);
+  std::string itemKey = NormalizeInventoryKey(itemName);
+  if (itemKey.empty()) {
+    itemKey = "medical item";
+  }
+
+  HealingEventSessionState &state =
+      g_healingEventSessionByHealerSerial[healerSerial];
+  bool activeSession =
+      state.lastUpdateTick != 0 &&
+      (nowTick - state.lastUpdateTick) <= kHealingEventSessionGapMs &&
+      state.targetKey == targetKey && state.itemKey == itemKey;
+
+  state.lastUpdateTick = nowTick;
+  state.targetKey = targetKey;
+  state.itemKey = itemKey;
+
+  return !activeSession;
+}
+
+static void PruneHealingEventSessionState(DWORD nowTick) {
+  for (std::map<unsigned int, HealingEventSessionState>::iterator it =
+           g_healingEventSessionByHealerSerial.begin();
+       it != g_healingEventSessionByHealerSerial.end();) {
+    const bool expired =
+        (it->second.lastUpdateTick == 0) ||
+        ((nowTick - it->second.lastUpdateTick) > kHealingEventSessionRetentionMs);
+    if (expired) {
+      it = g_healingEventSessionByHealerSerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static Character *ResolveCharacterFromHandSafe(const hand &h) {
   if (!h.isValid() || h.isNull()) {
     return nullptr;
@@ -5191,6 +5269,89 @@ static void SubtractInventoryDeltaByKey(
   }
 }
 
+static void RegisterPendingMedicalItemUse(unsigned int actorSerial,
+                                          const std::string &itemName,
+                                          int quantity) {
+  if (actorSerial == 0 || quantity <= 0) {
+    return;
+  }
+  std::string key = NormalizeInventoryKey(itemName);
+  if (key.empty()) {
+    return;
+  }
+
+  PendingMedicalItemUseState &state =
+      g_pendingMedicalItemUseBySerial[actorSerial];
+  state.pendingByKey[key] += quantity;
+  state.lastUpdateTick = GetTickCount();
+}
+
+static std::map<std::string, int> ConsumePendingMedicalItemLossByKey(
+    unsigned int actorSerial, const std::map<std::string, int> &lossByKey,
+    DWORD nowTick) {
+  std::map<std::string, int> consumedByKey;
+  if (actorSerial == 0 || lossByKey.empty()) {
+    return consumedByKey;
+  }
+
+  std::map<unsigned int, PendingMedicalItemUseState>::iterator stateIt =
+      g_pendingMedicalItemUseBySerial.find(actorSerial);
+  if (stateIt == g_pendingMedicalItemUseBySerial.end()) {
+    return consumedByKey;
+  }
+
+  PendingMedicalItemUseState &state = stateIt->second;
+  if (state.lastUpdateTick == 0 ||
+      (nowTick - state.lastUpdateTick) > kPendingMedicalItemUseRetentionMs) {
+    g_pendingMedicalItemUseBySerial.erase(stateIt);
+    return consumedByKey;
+  }
+
+  for (std::map<std::string, int>::const_iterator it = lossByKey.begin();
+       it != lossByKey.end(); ++it) {
+    const std::string &key = it->first;
+    int lossQty = it->second;
+    if (key.empty() || lossQty <= 0) {
+      continue;
+    }
+    std::map<std::string, int>::iterator pendingIt = state.pendingByKey.find(key);
+    if (pendingIt == state.pendingByKey.end() || pendingIt->second <= 0) {
+      continue;
+    }
+    int matchedQty = lossQty < pendingIt->second ? lossQty : pendingIt->second;
+    if (matchedQty <= 0) {
+      continue;
+    }
+    consumedByKey[key] += matchedQty;
+    pendingIt->second -= matchedQty;
+    if (pendingIt->second <= 0) {
+      state.pendingByKey.erase(pendingIt);
+    }
+  }
+
+  if (state.pendingByKey.empty()) {
+    g_pendingMedicalItemUseBySerial.erase(stateIt);
+  } else {
+    state.lastUpdateTick = nowTick;
+  }
+  return consumedByKey;
+}
+
+static void PrunePendingMedicalItemUseState(DWORD nowTick) {
+  for (std::map<unsigned int, PendingMedicalItemUseState>::iterator it =
+           g_pendingMedicalItemUseBySerial.begin();
+       it != g_pendingMedicalItemUseBySerial.end();) {
+    const bool expired =
+        (it->second.lastUpdateTick == 0) ||
+        ((nowTick - it->second.lastUpdateTick) > kPendingMedicalItemUseRetentionMs);
+    if (expired || it->second.pendingByKey.empty()) {
+      it = g_pendingMedicalItemUseBySerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static std::map<std::string, int> DetectFoodConsumptionLossByKey(
     const std::map<std::string, int> &lossByKey,
     const InventoryEventSnapshot &beforeSnapshot, bool hadHungerBefore,
@@ -5882,6 +6043,8 @@ static void PruneNpcWorldEventState() {
   if (pruned > 0) {
     Log("EVENT_SCAN: pruned npc event state entries=" + ToString(pruned));
   }
+  PrunePendingMedicalItemUseState(nowTick);
+  PruneHealingEventSessionState(nowTick);
 }
 
 static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
@@ -6739,6 +6902,13 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
         SubtractInventoryDeltaByKey(lossByKey, consumedFoodByKey);
         EmitEatEvent(npc, previousState.inventory, inventorySnapshot,
                      consumedFoodByKey);
+      }
+    }
+    if (!lossByKey.empty()) {
+      std::map<std::string, int> consumedMedicalByKey =
+          ConsumePendingMedicalItemLossByKey(serial, lossByKey, nowTick);
+      if (!consumedMedicalByKey.empty()) {
+        SubtractInventoryDeltaByKey(lossByKey, consumedMedicalByKey);
       }
     }
     if (!gainByKey.empty() || !lossByKey.empty()) {
@@ -10112,10 +10282,67 @@ bool applyFirstAid_hook(MedicalSystem *med, float skill, Item *equipment,
   if (applyFirstAid_orig)
     res = applyFirstAid_orig(med, skill, equipment, frameTIME, who);
   if (res && med && med->me && who) {
-    LogGameEvent("healing", who->getName(), SafeFaction(who),
-                 med->me->getName(), SafeFaction(med->me),
-                 "Applying first aid", ResolveCharacterSerialForEvent(who),
-                 ResolveCharacterSerialForEvent(med->me));
+    std::string itemName = "Medical item";
+    unsigned int itemOwnerSerial = 0;
+    Character *itemOwner = nullptr;
+    if (equipment) {
+      std::string resolvedItem = TrimCopy(equipment->getName());
+      if (!resolvedItem.empty()) {
+        itemName = resolvedItem;
+      }
+      try {
+        hand ownerHand = equipment->getInventoryWeAreIn();
+        itemOwner = ResolveCharacterFromHandSafe(ownerHand);
+      } catch (...) {
+        itemOwner = nullptr;
+      }
+      itemOwnerSerial = ResolveCharacterSerialForEvent(itemOwner);
+    }
+
+    unsigned int whoSerial = ResolveCharacterSerialForEvent(who);
+    unsigned int medSerial = ResolveCharacterSerialForEvent(med->me);
+    unsigned int healerSerial = itemOwnerSerial != 0 ? itemOwnerSerial : whoSerial;
+
+    auto registerPendingFor = [&](unsigned int serial) {
+      if (serial != 0) {
+        RegisterPendingMedicalItemUse(serial, itemName, 1);
+      }
+    };
+    if (itemOwnerSerial != 0) {
+      registerPendingFor(itemOwnerSerial);
+    } else {
+      registerPendingFor(whoSerial);
+      if (medSerial != 0 && medSerial != whoSerial) {
+        registerPendingFor(medSerial);
+      }
+    }
+
+    std::string actorName = itemOwner ? ResolveCharacterNameSafe(itemOwner)
+                                      : ResolveCharacterNameSafe(who);
+    std::string actorFaction = itemOwner ? SafeFaction(itemOwner) : SafeFaction(who);
+    std::string targetName = TrimCopy(med->me->getName());
+    if (targetName.empty()) {
+      targetName = "Unknown";
+    }
+    bool selfHeal =
+        (healerSerial != 0 && medSerial != 0 && healerSerial == medSerial);
+    if (!selfHeal) {
+      std::string normalizedActor = ToLowerAsciiCopy(TrimCopy(actorName));
+      std::string normalizedTarget = ToLowerAsciiCopy(TrimCopy(targetName));
+      selfHeal =
+          !normalizedActor.empty() && normalizedActor == normalizedTarget;
+    }
+    std::string healTargetText = selfHeal ? "themself" : targetName;
+    std::string healMsg =
+        "is using (" + itemName + ") to heal " + healTargetText;
+
+    DWORD nowTick = GetTickCount();
+    if (ShouldEmitHealingEvent(healerSerial, medSerial, targetName, itemName,
+                               nowTick)) {
+      LogGameEvent("healing", actorName, actorFaction,
+                   med->me->getName(), SafeFaction(med->me),
+                   healMsg, healerSerial, medSerial);
+    }
   }
   return res;
 }
@@ -11514,6 +11741,25 @@ __declspec(dllexport) void startPlugin() {
       Log("HOOK_DIAG: Inventory::buyItem AddHook status=" +
           ToString((int)buyItemStatus) + " orig=" +
           ToString((unsigned int)(uintptr_t)buyItem_orig));
+    }
+  }
+
+  void *thunkMedicalApplyFirstAid = (void *)GetProcAddress(
+      hLib, "?applyFirstAid@MedicalSystem@@QEAA_NMPEAVItem@@MPEAVCharacter@@@Z");
+  if (!thunkMedicalApplyFirstAid) {
+    Log("HOOK_WARN: MedicalSystem::applyFirstAid symbol not found.");
+  } else {
+    __int64 realMedicalApplyFirstAid =
+        KenshiLib::GetRealAddress(thunkMedicalApplyFirstAid);
+    if (!realMedicalApplyFirstAid) {
+      Log("HOOK_WARN: GetRealAddress failed for MedicalSystem::applyFirstAid.");
+    } else {
+      KenshiLib::HookStatus medicalFirstAidStatus = KenshiLib::AddHook(
+          (void *)realMedicalApplyFirstAid, (void *)applyFirstAid_hook,
+          (void **)&applyFirstAid_orig);
+      Log("HOOK_DIAG: MedicalSystem::applyFirstAid AddHook status=" +
+          ToString((int)medicalFirstAidStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)applyFirstAid_orig));
     }
   }
 

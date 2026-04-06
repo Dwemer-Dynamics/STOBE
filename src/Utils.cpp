@@ -1363,7 +1363,7 @@ static std::string BuildEventStreamData(const std::string &type,
   }
   if (!listener.empty() && listener != speaker &&
       normalizedType != "action" && normalizedType != "infoaction" &&
-      normalizedType != "trade") {
+      normalizedType != "trade" && normalizedType != "healing") {
     line += " (talking to: " + listener + ")";
   }
   return line;
