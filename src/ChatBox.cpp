@@ -44,15 +44,37 @@ MyGUI::ComboBox *g_chatActionCombo = nullptr;
 MyGUI::EditBox *g_chatActionArgInput = nullptr;
 MyGUI::Button *g_chatAutoChatToggle = nullptr;
 MyGUI::TextBox *g_chatLabel = nullptr;
+MyGUI::Window *g_renameWindow = nullptr;
+MyGUI::EditBox *g_renameInput = nullptr;
+MyGUI::TextBox *g_renameLabel = nullptr;
 std::string g_chatTargetHandleStr = "";
 std::string g_chatTargetNameStr = "";
 std::string g_chatPlayerNameStr = "";
+std::string g_renameTargetNameStr = "";
+std::string g_renameTargetHandleStr = "";
+std::string g_renameSpeakerNameStr = "";
 size_t g_lastChatModeIndex = 1;
 bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
+bool g_renamePausedGame = false;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
 std::string TrimChatLine(const std::string &value);
+Character *ResolveChatTargetCharacter(GameWorld *world,
+                                      const std::string &targetName,
+                                      const std::string &handleHint);
+bool EqualsIgnoreCase(const std::string &lhs, const std::string &rhs);
+void CloseRenameUI();
+void CreateRenameUI(const std::string &targetName,
+                    const std::string &speakerName,
+                    const std::string &targetHandle);
+void OnRenameClick(MyGUI::Widget *sender);
+void OnRenameInputChange(MyGUI::EditBox *sender);
+void OnRenameInputAccept(MyGUI::EditBox *sender);
+void OnRenameConfirmClick(MyGUI::Widget *sender);
+void OnRenameCancelClick(MyGUI::Widget *sender);
+void OnRenameWindowButtonPressed(MyGUI::Window *sender,
+                                 const std::string &name);
 
 bool TryReleaseUserPauseSafe(GameWorld *world) {
   if (!world) {
@@ -100,6 +122,110 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+}
+
+std::string BuildStorageIdForCharacter(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return "";
+  }
+  try {
+    unsigned int serial = character->getHandle().serial;
+    if (serial == 0) {
+      return "";
+    }
+    return "hand_" + ToString(serial);
+  } catch (...) {
+    return "";
+  }
+}
+
+int ResolveCurrentGameTsSafe(GameWorld *world) {
+  if (!world) {
+    return 0;
+  }
+  int gameTs = 0;
+  try {
+    TimeOfDay tod = world->getTimeStamp_inGameHours();
+    gameTs = (int)tod.getTotalSeconds();
+  } catch (...) {
+    gameTs = 0;
+  }
+  if (gameTs < 0) {
+    gameTs = 0;
+  }
+  return gameTs;
+}
+
+bool TryRenameCharacterAndSync(GameWorld *world, const std::string &targetNameHint,
+                               const std::string &targetHandleHint,
+                               const std::string &newNameRaw,
+                               std::string &statusMessage) {
+  statusMessage.clear();
+  if (!world) {
+    statusMessage = "Rename failed: world is unavailable.";
+    return false;
+  }
+
+  std::string newName = TrimChatLine(newNameRaw);
+  if (newName.empty()) {
+    statusMessage = "Rename failed: provide a name.";
+    return false;
+  }
+
+  Character *target = ResolveChatTargetCharacter(world, targetNameHint, targetHandleHint);
+  if (!target || (uintptr_t)target <= 0x1000) {
+    target = ResolveChatTargetCharacter(world, targetNameHint, "");
+  }
+  if (!target || (uintptr_t)target <= 0x1000) {
+    statusMessage = "Rename failed: target not found.";
+    return false;
+  }
+
+  std::string oldName = targetNameHint;
+  try {
+    std::string actualName = target->getName();
+    if (!actualName.empty()) {
+      oldName = actualName;
+    }
+  } catch (...) {
+  }
+  if (oldName.empty()) {
+    oldName = "Unknown NPC";
+  }
+
+  if (EqualsIgnoreCase(oldName, newName)) {
+    statusMessage = oldName + " already has that name.";
+    return false;
+  }
+
+  try {
+    target->setName(newName);
+  } catch (...) {
+    statusMessage = "Rename failed: unable to rename in-game target.";
+    return false;
+  }
+
+  std::string storageId = BuildStorageIdForCharacter(target);
+  std::string contextJson = BuildNpcContextEnvelope(target);
+  if (contextJson.empty()) {
+    contextJson = "{}";
+  }
+  int gameTs = ResolveCurrentGameTsSafe(world);
+
+  std::string renJson =
+      "{\"old_name\": \"" + EscapeJSON(oldName) + "\", "
+      "\"new_name\": \"" + EscapeJSON(newName) + "\", "
+      "\"storage_id\": \"" + EscapeJSON(storageId) + "\", "
+      "\"game_ts\": " + ToString(gameTs) + ", "
+      "\"context\": " + contextJson + "}";
+  AsyncPostToStobe(L"/rename", renJson);
+
+  g_chatPlayerNameStr = newName;
+  g_renameTargetNameStr = newName;
+  g_renameSpeakerNameStr = newName;
+  statusMessage = oldName + " has been renamed to " + newName;
+  Log("RENAME: " + statusMessage + " storage_id=" + storageId);
+  return true;
 }
 
 enum ManualChatActionType {
@@ -921,6 +1047,41 @@ Character *ResolveSelectedOrConfiguredPlayerSpeaker(GameWorld *world,
   return ResolveConfiguredPlayerSpeaker(world, target);
 }
 
+bool ResolveActiveChatSpeaker(GameWorld *world, const std::string &targetName,
+                              const std::string &targetHandle,
+                              std::string &speakerNameOut,
+                              std::string &speakerHandleOut) {
+  speakerNameOut.clear();
+  speakerHandleOut.clear();
+  if (!world) {
+    return false;
+  }
+
+  Character *targetNpc = ResolveChatTargetCharacter(world, targetName, targetHandle);
+  Character *speakerNpc = ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
+  if (!speakerNpc || (uintptr_t)speakerNpc <= 0x1000) {
+    std::string preferredSpeakerName = TrimChatLine(g_chatPlayerNameStr);
+    if (!preferredSpeakerName.empty() && !IsNarratorName(preferredSpeakerName)) {
+      speakerNpc = ResolveChatTargetCharacter(world, preferredSpeakerName, "");
+    }
+  }
+  if (!speakerNpc || (uintptr_t)speakerNpc <= 0x1000) {
+    return false;
+  }
+
+  try {
+    speakerNameOut = TrimChatLine(speakerNpc->getName());
+    speakerHandleOut = ToString(speakerNpc->getHandle().serial);
+  } catch (...) {
+    speakerNameOut.clear();
+    speakerHandleOut.clear();
+  }
+  if (speakerNameOut.empty() || IsNarratorName(speakerNameOut)) {
+    return false;
+  }
+  return true;
+}
+
 struct RechatResponderChoice {
   std::string name;
   std::string serial;
@@ -1195,6 +1356,29 @@ void CloseChatUI() {
   g_chatJustOpened = false;
 }
 
+void CloseRenameUI() {
+  if (g_renamePausedGame) {
+    GameWorld *world = GetWorldSafe();
+    if (!TryReleaseUserPauseSafe(world)) {
+      Log("UI_WARN: CloseRenameUI pause-release failed during world transition.");
+    }
+    g_renamePausedGame = false;
+  }
+
+  if (g_renameWindow) {
+    if (!TryDestroyWidgetSafe(g_renameWindow)) {
+      Log("UI_WARN: CloseRenameUI destroyWidget failed; clearing stale pointer.");
+    }
+    g_renameWindow = nullptr;
+    g_renameInput = nullptr;
+    g_renameLabel = nullptr;
+  }
+
+  g_renameTargetNameStr.clear();
+  g_renameTargetHandleStr.clear();
+  g_renameSpeakerNameStr.clear();
+}
+
 DWORD WINAPI DialogResponseWorker(LPVOID lpParam) {
   ChatTask *t = (ChatTask *)lpParam;
   Log("CHAT_THREAD: Sending chat request for " + t->npcName);
@@ -1296,6 +1480,7 @@ struct StreamChatTask {
   std::wstring endpoint;
   std::string npcName;
   std::string handleStr;
+  std::string localPlayerSpeech;
   std::string peopleJson;
   std::string previousSpeaker;
   std::string previousSpeakerHandle;
@@ -1343,6 +1528,73 @@ std::string TrimChatLine(const std::string &value) {
     return "";
   size_t end = value.find_last_not_of(" \t\r\n");
   return value.substr(start, end - start + 1);
+}
+
+static std::string NormalizeDialogueEchoKey(const std::string &value) {
+  std::string key = TrimChatLine(value);
+  if (key.empty()) {
+    return "";
+  }
+
+  std::string collapsed;
+  collapsed.reserve(key.length());
+  bool inSpace = false;
+  for (size_t i = 0; i < key.length(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(key[i]);
+    if (std::isspace(ch)) {
+      if (!inSpace) {
+        collapsed.push_back(' ');
+        inSpace = true;
+      }
+      continue;
+    }
+    inSpace = false;
+    collapsed.push_back(static_cast<char>(std::tolower(ch)));
+  }
+  key.swap(collapsed);
+  key = TrimChatLine(key);
+  if (key.empty()) {
+    return "";
+  }
+
+  while (!key.empty()) {
+    char tail = key[key.length() - 1];
+    if (tail == '.' || tail == '!' || tail == '?' || tail == ',' ||
+        tail == ';' || tail == ':' || tail == '"' || tail == '\'' ||
+        tail == ')' || tail == ']' || tail == '}') {
+      key.erase(key.length() - 1);
+      continue;
+    }
+    break;
+  }
+
+  return TrimChatLine(key);
+}
+
+static bool IsLikelyLocalSpeechEcho(const StreamChatParseState *state,
+                                    const std::string &actor,
+                                    const std::string &subtitle) {
+  if (!state || !state->task || !state->firstLine) {
+    return false;
+  }
+
+  const std::string localSpeech = TrimChatLine(state->task->localPlayerSpeech);
+  if (localSpeech.empty()) {
+    return false;
+  }
+
+  const std::string previousSpeaker =
+      TrimChatLine(state->task->previousSpeaker);
+  if (previousSpeaker.empty() || !EqualsIgnoreCase(actor, previousSpeaker)) {
+    return false;
+  }
+
+  std::string localKey = NormalizeDialogueEchoKey(localSpeech);
+  std::string streamKey = NormalizeDialogueEchoKey(subtitle);
+  if (localKey.empty() || streamKey.empty()) {
+    return false;
+  }
+  return localKey == streamKey;
 }
 
 std::string ShortHashForLog(const std::string &hash) {
@@ -2251,6 +2503,13 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   }
 
   if (!subtitle.empty()) {
+    if (IsLikelyLocalSpeechEcho(state, actor, subtitle)) {
+      Log("CHAT_TIMING: STREAM_LINE dropped local echo actor=" + actor +
+          " subtitle_len=" + ToString((int)subtitle.length()) +
+          " gen=" + ToString((int)state->generation));
+      state->firstLine = false;
+      return true;
+    }
     if (!IsChatInterruptGenerationCurrent(state->generation)) {
       return false;
     }
@@ -2459,57 +2718,37 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 
   // COMMAND SUPPORT: /name newName
   if (text.substr(0, 6) == "/name " && text.length() > 6) {
-    std::string newName = text.substr(6);
-    // Trim
-    newName.erase(0, newName.find_first_not_of(" \t\r\n"));
-    newName.erase(newName.find_last_not_of(" \t\r\n") + 1);
+    std::string newName = TrimChatLine(text.substr(6));
+    std::string renameSpeakerName = "";
+    std::string renameSpeakerHandle = "";
+    ResolveActiveChatSpeaker(world, npcName, handleStr, renameSpeakerName,
+                             renameSpeakerHandle);
 
-    if (!newName.empty()) {
-      if (world) {
-        Character *target = nullptr;
-        const auto &chars = world->getCharacterUpdateList();
-        for (auto it = chars.begin(); it != chars.end(); ++it) {
-          if (*it && (uintptr_t)(*it) > 0x1000) {
-            unsigned int serial = 0;
-            if (TryParseSerial(handleStr, serial) &&
-                (*it)->getHandle().serial == serial) {
-              target = *it;
-              break;
-            }
-          }
-        }
-
-        if (target) {
-          std::string oldName = npcName;
-          target->setName(newName);
-          Log("RENAME: " + npcName + " is now " + newName);
-          g_chatTargetNameStr = newName;
-
-          std::string renJson =
-              "{\"old_name\": \"" + EscapeJSON(oldName) + "\", ";
-          renJson += "\"new_name\": \"" + EscapeJSON(newName) + "\", ";
-          renJson += "\"context\": " + BuildNpcContextEnvelope(target) + "}";
-          AsyncPostToStobe(L"/rename", renJson);
-
-          if (g_chatWindow) {
-            g_chatWindow->setCaption(WideFromUtf8("Chat Box").c_str());
-          }
-          if (g_chatLabel) {
-            std::string speakerName = g_chatPlayerNameStr;
-            if (speakerName.empty()) {
-              speakerName = "Player";
-            }
-            std::string targetLabel =
-                BuildChatTargetLabel(world, newName, handleStr);
-            g_chatLabel->setCaption(
-                WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
-                    .c_str());
-          }
-
-          g_chatInput->setCaption("");
-          return;
-        }
+    std::string renameStatus = "";
+    bool renamed = TryRenameCharacterAndSync(world, renameSpeakerName,
+                                             renameSpeakerHandle, newName,
+                                             renameStatus);
+    if (world && !renameStatus.empty()) {
+      world->showPlayerAMessage_withLog(renameStatus, true);
+    }
+    if (renamed) {
+      if (g_chatWindow) {
+        g_chatWindow->setCaption(WideFromUtf8("Chat Box").c_str());
       }
+      if (g_chatLabel) {
+        std::string speakerName = g_chatPlayerNameStr;
+        if (speakerName.empty()) {
+          speakerName = "Player";
+        }
+        std::string targetLabel =
+            BuildChatTargetLabel(world, npcName, handleStr);
+        g_chatLabel->setCaption(
+            WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
+                .c_str());
+      }
+
+      g_chatInput->setCaption("");
+      return;
     }
   }
 
@@ -3099,6 +3338,7 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   streamTask->endpoint = endpoint;
   streamTask->npcName = profileName;
   streamTask->handleStr = resolvedTargetHandle;
+  streamTask->localPlayerSpeech = shouldQueueLocalPlayerSpeech ? text : "";
   streamTask->peopleJson = peopleJson;
   streamTask->previousSpeaker = playerName;
   streamTask->previousSpeakerHandle =
@@ -3123,6 +3363,155 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 }
 
 void OnChatCancelClick(MyGUI::Widget *sender) { CloseChatUI(); }
+
+void CreateRenameUI(const std::string &targetName, const std::string &speakerName,
+                    const std::string &targetHandle) {
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    return;
+  }
+
+  if (g_chatWindow) {
+    CloseChatUI();
+  }
+  if (g_renameWindow) {
+    CloseRenameUI();
+  }
+
+  g_renameTargetNameStr = targetName;
+  g_renameTargetHandleStr = targetHandle;
+  g_renameSpeakerNameStr = speakerName;
+  if (g_renameSpeakerNameStr.empty()) {
+    g_renameSpeakerNameStr = "Player";
+  }
+  g_renamePausedGame = false;
+
+  GameWorld *world = GetWorldSafe();
+  bool pausedByUs = false;
+  if (world && !TryRequestUserPauseSafe(world, &pausedByUs)) {
+    Log("UI_WARN: CreateRenameUI pause request failed.");
+  }
+  g_renamePausedGame = pausedByUs;
+
+  const float renameWindowW = 0.36f;
+  const float renameWindowH = 0.16f;
+  const float renameWindowX = (1.0f - renameWindowW) * 0.5f;
+  const float renameWindowY = (1.0f - renameWindowH) * 0.5f;
+  g_renameWindow = gui->createWidgetReal<MyGUI::Window>(
+      "Kenshi_WindowCX", renameWindowX, renameWindowY, renameWindowW,
+      renameWindowH, MyGUI::Align::Top | MyGUI::Align::Left, "Overlapped",
+      "Stobe_RenameWindow");
+  g_renameWindow->setCaption(WideFromUtf8("Rename NPC").c_str());
+  g_renameWindow->eventWindowButtonPressed +=
+      MyGUI::newDelegate(OnRenameWindowButtonPressed);
+
+  MyGUI::Widget *client = g_renameWindow->getClientWidget();
+  std::string labelText = "Rename " + targetName + " to:";
+  g_renameLabel = client->createWidgetReal<MyGUI::TextBox>(
+      "Kenshi_TextboxStandardText", 0.05f, 0.10f, 0.9f, 0.22f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_RenameLabel");
+  g_renameLabel->setCaption(WideFromUtf8(labelText).c_str());
+
+  g_renameInput = client->createWidgetReal<MyGUI::EditBox>(
+      "Kenshi_EditBox", 0.05f, 0.38f, 0.9f, 0.24f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_RenameInput");
+  g_renameInput->setEditMultiLine(false);
+  g_renameInput->setEditWordWrap(false);
+  g_renameInput->setVisibleVScroll(false);
+  g_renameInput->setTextAlign(MyGUI::Align::Default);
+  g_renameInput->setFontHeight(18);
+  g_renameInput->setCaption("");
+  g_renameInput->eventEditTextChange += MyGUI::newDelegate(OnRenameInputChange);
+  g_renameInput->eventEditSelectAccept +=
+      MyGUI::newDelegate(OnRenameInputAccept);
+
+  MyGUI::Button *renameBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.70f, 0.42f, 0.20f,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_RenameConfirmBtn");
+  renameBtn->setCaption(WideFromUtf8("Rename").c_str());
+  renameBtn->eventMouseButtonClick += MyGUI::newDelegate(OnRenameConfirmClick);
+
+  MyGUI::Button *cancelBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.53f, 0.70f, 0.42f, 0.20f,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_RenameCancelBtn");
+  cancelBtn->setCaption(WideFromUtf8("Cancel").c_str());
+  cancelBtn->eventMouseButtonClick += MyGUI::newDelegate(OnRenameCancelClick);
+
+  MyGUI::InputManager::getInstance().setKeyFocusWidget(g_renameInput);
+}
+
+void OnRenameClick(MyGUI::Widget *sender) {
+  GameWorld *world = GetWorldSafe();
+  std::string targetName = TrimChatLine(g_chatTargetNameStr);
+  std::string targetHandle = TrimChatLine(g_chatTargetHandleStr);
+  std::string speakerName = "";
+  std::string speakerHandle = "";
+  if (!ResolveActiveChatSpeaker(world, targetName, targetHandle, speakerName,
+                                speakerHandle)) {
+    if (world) {
+      world->showPlayerAMessage_withLog(
+          "Rename failed: no valid speaker selected.", true);
+    }
+    return;
+  }
+  g_chatPlayerNameStr = speakerName;
+  CreateRenameUI(speakerName, speakerName, speakerHandle);
+}
+
+void OnRenameInputChange(MyGUI::EditBox *sender) {
+  if (!sender) {
+    return;
+  }
+  std::string text = sender->getCaption().asUTF8();
+  if (!text.empty() && (text[text.length() - 1] == '\n' ||
+                        text[text.length() - 1] == '\r')) {
+    while (!text.empty() &&
+           (text[text.length() - 1] == '\n' || text[text.length() - 1] == '\r')) {
+      text.erase(text.length() - 1);
+    }
+    sender->setCaption(text);
+    OnRenameConfirmClick(sender);
+  }
+}
+
+void OnRenameInputAccept(MyGUI::EditBox *sender) { OnRenameConfirmClick(sender); }
+
+void OnRenameConfirmClick(MyGUI::Widget *sender) {
+  if (!g_renameInput) {
+    return;
+  }
+
+  std::string newName = TrimChatLine(g_renameInput->getCaption().asUTF8());
+  if (newName.empty()) {
+    GameWorld *world = GetWorldSafe();
+    if (world) {
+      world->showPlayerAMessage_withLog(
+          "Rename failed: provide a new name.", true);
+    }
+    return;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  std::string renameStatus = "";
+  bool renamed = TryRenameCharacterAndSync(
+      world, g_renameTargetNameStr, g_renameTargetHandleStr, newName, renameStatus);
+  if (world && !renameStatus.empty()) {
+    world->showPlayerAMessage_withLog(renameStatus, true);
+  }
+  if (renamed) {
+    CloseRenameUI();
+  }
+}
+
+void OnRenameCancelClick(MyGUI::Widget *sender) { CloseRenameUI(); }
+
+void OnRenameWindowButtonPressed(MyGUI::Window *sender,
+                                 const std::string &name) {
+  if (name == "close") {
+    CloseRenameUI();
+  }
+}
+
 void OnBoredEventClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
   std::string preferredSpeakerName = TrimChatLine(g_chatPlayerNameStr);
@@ -3613,6 +4002,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
   if (!gui)
     return;
+  if (g_renameWindow)
+    CloseRenameUI();
   if (g_chatWindow)
     CloseChatUI();
 
@@ -3684,6 +4075,13 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float rowH = 0.20f;
   const float topRowY = inputY + inputH + rowGap;
   const float bottomRowY = topRowY + rowH + rowGap;
+  const float topRowLeftX = 0.05f;
+  const float topRowGap = 0.03f;
+  const float topBtnW = 0.20f;
+  const float topAutoX = topRowLeftX;
+  const float topBoredX = topAutoX + topBtnW + topRowGap;
+  const float topDiaryX = topBoredX + topBtnW + topRowGap;
+  const float topRenameX = topDiaryX + topBtnW + topRowGap;
   const float bottomRowLeftX = 0.05f;
   const float bottomRowGap = 0.02f;
   const float modeWidth = 0.20f;
@@ -3732,7 +4130,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   OnChatActionChange(g_chatActionCombo, g_chatActionCombo->getIndexSelected());
 
   g_chatAutoChatToggle = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, topRowY, 0.28f, rowH,
+      "Kenshi_Button1", topAutoX, topRowY, topBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatAutoToggle");
   g_chatAutoChatToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnAutoChatToggleClick);
@@ -3746,18 +4144,24 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   sendBtn->eventMouseButtonClick += MyGUI::newDelegate(OnChatSendClick);
 
   MyGUI::Button *boredEventBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.36f, topRowY, 0.28f, rowH,
+      "Kenshi_Button1", topBoredX, topRowY, topBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatBoredBtn");
   boredEventBtn->setCaption(WideFromUtf8(T("Trigger Bored Event")).c_str());
   boredEventBtn->eventMouseButtonClick += MyGUI::newDelegate(OnBoredEventClick);
 
   MyGUI::Button *writeDiaryBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.67f, topRowY, 0.28f, rowH,
+      "Kenshi_Button1", topDiaryX, topRowY, topBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatDiaryBtn");
   writeDiaryBtn->setCaption(WideFromUtf8(T("Write Diary")).c_str());
   writeDiaryBtn->eventMouseButtonClick += MyGUI::newDelegate(OnWriteDiaryClick);
+
+  MyGUI::Button *renameBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", topRenameX, topRowY, topBtnW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatRenameBtn");
+  renameBtn->setCaption(WideFromUtf8("Rename").c_str());
+  renameBtn->eventMouseButtonClick += MyGUI::newDelegate(OnRenameClick);
 }
 
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
