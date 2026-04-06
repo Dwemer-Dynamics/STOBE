@@ -904,6 +904,23 @@ Character *ResolveConfiguredPlayerSpeaker(GameWorld *world, Character *target) {
   return primary;
 }
 
+Character *ResolveSelectedOrConfiguredPlayerSpeaker(GameWorld *world,
+                                                    Character *target) {
+  Character *selected = ResolveSelectedChatSpeaker(world);
+  if (selected && (uintptr_t)selected > 0x1000) {
+    bool isPlayerCharacter = false;
+    try {
+      isPlayerCharacter = selected->isPlayerCharacter();
+    } catch (...) {
+      isPlayerCharacter = false;
+    }
+    if (isPlayerCharacter && !IsCharacterUnavailableForConversation(selected)) {
+      return selected;
+    }
+  }
+  return ResolveConfiguredPlayerSpeaker(world, target);
+}
+
 struct RechatResponderChoice {
   std::string name;
   std::string serial;
@@ -2245,13 +2262,12 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       if (speakerHeader == actor) {
         GameWorld *worldForSpeaker = GetWorldSafe();
-        if (worldForSpeaker && worldForSpeaker->player &&
-            worldForSpeaker->player->playerCharacters.size() > 0) {
-          Character *playerSpeaker = worldForSpeaker->player->playerCharacters[0];
-          if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000 &&
-              EqualsIgnoreCase(playerSpeaker->getName(), actor)) {
+        if (worldForSpeaker) {
+          Character *resolvedSpeaker =
+              ResolveChatTargetCharacter(worldForSpeaker, actor, "");
+          if (resolvedSpeaker && (uintptr_t)resolvedSpeaker > 0x1000) {
             speakerHeader =
-                actor + "|" + ToString(playerSpeaker->getHandle().serial);
+                actor + "|" + ToString(resolvedSpeaker->getHandle().serial);
           }
         }
         queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
@@ -2607,7 +2623,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       g_chatPlayerNameStr = playerName;
     }
   } else {
-    Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+    Character *bestSpeaker =
+        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
     if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
       player = bestSpeaker;
       playerName = bestSpeaker->getName();
@@ -3110,7 +3127,8 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
   if (world) {
     Character *targetNpc =
         ResolveChatTargetCharacter(world, targetName, targetSerial);
-    Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+    Character *bestSpeaker =
+        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
     if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
       std::string resolvedName = TrimChatLine(bestSpeaker->getName());
       if (!resolvedName.empty()) {
@@ -3183,7 +3201,8 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   std::string targetHandle = TrimChatLine(g_chatTargetHandleStr);
   Character *targetNpc =
       ResolveChatTargetCharacter(world, targetNpcName, targetHandle);
-  Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+  Character *bestSpeaker =
+      ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
   if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
     player = bestSpeaker;
     playerName = bestSpeaker->getName();
@@ -3600,7 +3619,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   GameWorld *world = GetWorldSafe();
   if (world) {
     Character *targetNpc = ResolveChatTargetCharacter(world, npcName, handleStr);
-    Character *bestSpeaker = ResolveConfiguredPlayerSpeaker(world, targetNpc);
+    Character *bestSpeaker =
+        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
     if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
       g_chatPlayerNameStr = bestSpeaker->getName();
     }

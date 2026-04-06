@@ -4299,12 +4299,166 @@ static Character *ResolveNearestSquadmateTargetForSelection(GameWorld *world,
   return best;
 }
 
+static bool IsIndoorHandleValidForTargeting(const hand &indoorsHandle) {
+  return indoorsHandle.isValid() && !indoorsHandle.isNull();
+}
+
+static bool TryGetTargetSpatialState(Character *character, bool &hasBuilding,
+                                     unsigned int &buildingSerial,
+                                     int &floorValue) {
+  hasBuilding = false;
+  buildingSerial = 0;
+  floorValue = 0;
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    const hand &indoorsHandle = character->isIndoors();
+    hasBuilding = IsIndoorHandleValidForTargeting(indoorsHandle);
+    buildingSerial = hasBuilding ? indoorsHandle.serial : 0;
+    floorValue = character->getFloor();
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool IsTargetAreaCompatibleForSelection(Character *anchor,
+                                               Character *candidate) {
+  if (!anchor || !candidate || (uintptr_t)anchor <= 0x1000 ||
+      (uintptr_t)candidate <= 0x1000) {
+    return false;
+  }
+
+  bool anchorHasBuilding = false;
+  bool candidateHasBuilding = false;
+  unsigned int anchorBuildingSerial = 0;
+  unsigned int candidateBuildingSerial = 0;
+  int anchorFloor = 0;
+  int candidateFloor = 0;
+  if (!TryGetTargetSpatialState(anchor, anchorHasBuilding, anchorBuildingSerial,
+                                anchorFloor)) {
+    return false;
+  }
+  if (!TryGetTargetSpatialState(candidate, candidateHasBuilding,
+                                candidateBuildingSerial, candidateFloor)) {
+    return false;
+  }
+
+  if (anchorHasBuilding) {
+    if (!candidateHasBuilding) {
+      return false;
+    }
+    if (anchorBuildingSerial != 0 && candidateBuildingSerial != 0) {
+      if (anchorBuildingSerial != candidateBuildingSerial) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+    int floorDelta = anchorFloor - candidateFloor;
+    if (floorDelta < 0) {
+      floorDelta = -floorDelta;
+    }
+    return floorDelta <= 1;
+  }
+
+  if (candidateHasBuilding) {
+    return false;
+  }
+  if (candidateFloor > anchorFloor + 1) {
+    return false;
+  }
+  return true;
+}
+
+static Character *ResolveNearestNpcTargetForSelection(GameWorld *world,
+                                                      Character *selected) {
+  if (!world || !selected || (uintptr_t)selected < 0x1000) {
+    return nullptr;
+  }
+
+  Character *best = nullptr;
+  float bestDist = 1e30f;
+  try {
+    float searchRadius = g_proximityRadius;
+    if (searchRadius < 10.0f) {
+      searchRadius = 10.0f;
+    }
+    Ogre::Vector3 selectedPos = selected->getPosition();
+    lektor<RootObject *> nearby;
+    world->getCharactersWithinSphere(nearby, selectedPos, searchRadius, 0.0f,
+                                     0.0f, 0x10, 0, selected);
+
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      Character *candidate = (Character *)nearby.stuff[i];
+      if (!IsAliveConsciousCharacterForTargeting(candidate) ||
+          candidate == selected) {
+        continue;
+      }
+      if (!IsTargetAreaCompatibleForSelection(selected, candidate)) {
+        continue;
+      }
+      float dist = candidate->getPosition().distance(selectedPos);
+      if (!best || dist < bestDist) {
+        best = candidate;
+        bestDist = dist;
+      }
+    }
+  } catch (...) {
+    return nullptr;
+  }
+
+  return best;
+}
+
 static Character *ResolvePlayerSpeakerForCurrentTalk(GameWorld *world) {
   Character *target = ResolveCharacterFromHandSafe(g_talkTargetHand);
   if (!target) {
     target = ResolveCharacterFromHandSafe(g_lastSelectionHand);
   }
   return ResolveNearestPlayerSpeakerForTarget(world, target);
+}
+
+static Character *ResolveSelectedPlayerSpeakerForCurrentTalk(GameWorld *world) {
+  if (!world || !world->player) {
+    return nullptr;
+  }
+
+  hand selectedHand;
+  try {
+    selectedHand = world->player->selectedCharacter;
+  } catch (...) {
+    return nullptr;
+  }
+  if (!selectedHand.isValid()) {
+    return nullptr;
+  }
+
+  Character *selected = ResolveCharacterFromHandSafe(selectedHand);
+  if (!selected || (uintptr_t)selected < 0x1000) {
+    return nullptr;
+  }
+
+  bool isPlayerCharacter = false;
+  try {
+    isPlayerCharacter = selected->isPlayerCharacter();
+  } catch (...) {
+    isPlayerCharacter = false;
+  }
+  if (!isPlayerCharacter || !IsAliveConsciousCharacterForTargeting(selected)) {
+    return nullptr;
+  }
+
+  return selected;
+}
+
+static Character *ResolvePreferredPlayerSpeakerForCurrentTalk(GameWorld *world) {
+  Character *selectedSpeaker = ResolveSelectedPlayerSpeakerForCurrentTalk(world);
+  if (selectedSpeaker && (uintptr_t)selectedSpeaker >= 0x1000) {
+    return selectedSpeaker;
+  }
+  return ResolvePlayerSpeakerForCurrentTalk(world);
 }
 
 static unsigned int ResolveCharacterSerialForEvent(Character *npc) {
@@ -7285,7 +7439,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             " dur_ms=" + ToString(durationMs));
 
         if (validHash && thisptr->player && thisptr->player->playerCharacters.size() > 0) {
-          Character *playerSpeaker = ResolvePlayerSpeakerForCurrentTalk(thisptr);
+          Character *playerSpeaker = ResolvePreferredPlayerSpeakerForCurrentTalk(thisptr);
           if (!playerSpeaker || (uintptr_t)playerSpeaker < 0x1000) {
             playerSpeaker = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
           }
@@ -7317,7 +7471,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         // ???? FIX: For PLAYER_SAY, ensure the bubble appears over the player,
         // not the target NPC.
         if (isPlayerSay) {
-          Character *playerSpeaker = ResolvePlayerSpeakerForCurrentTalk(thisptr);
+          Character *playerSpeaker = ResolvePreferredPlayerSpeakerForCurrentTalk(thisptr);
           if (!playerSpeaker && thisptr->player &&
               thisptr->player->playerCharacters.size() > 0) {
             playerSpeaker = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
@@ -9652,7 +9806,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             tc = ResolveCharacterFromHandSafe(thisptr, g_lastSelectionHand);
           }
           if (!tc && isPlayerSay) {
-            tc = ResolvePlayerSpeakerForCurrentTalk(thisptr);
+            tc = ResolvePreferredPlayerSpeakerForCurrentTalk(thisptr);
             if (!tc && thisptr->player && thisptr->player->playerCharacters.size() > 0) {
               tc = ResolveFirstAliveConsciousPlayerCharacter(thisptr);
             }
@@ -10913,22 +11067,38 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       if (sel && (uintptr_t)sel > 0x1000) {
         Character *chatTarget = sel;
         if (sel->isPlayerCharacter()) {
-          Character *nearestSquadmate =
-              ResolveNearestSquadmateTargetForSelection(world, sel);
-          if (nearestSquadmate && (uintptr_t)nearestSquadmate > 0x1000) {
-            chatTarget = nearestSquadmate;
-            Log("CHAT_OPEN: selected squadmate '" + sel->getName() +
-                "' retargeted to nearest squadmate '" + chatTarget->getName() +
-                "'");
+          Character *resolvedTarget = nullptr;
+          if (g_useNearestPlayerSpeaker) {
+            resolvedTarget = ResolveNearestNpcTargetForSelection(world, sel);
+            if (resolvedTarget && (uintptr_t)resolvedTarget > 0x1000) {
+              chatTarget = resolvedTarget;
+              Log("CHAT_OPEN: selected player speaker '" + sel->getName() +
+                  "' targeted nearest NPC '" + chatTarget->getName() + "'");
+            } else {
+              EnterCriticalSection(&g_msgMutex);
+              g_messageQueue.push_back("NOTIFY:No nearby NPC target available.");
+              LeaveCriticalSection(&g_msgMutex);
+              Log("CHAT_OPEN: selected player speaker '" + sel->getName() +
+                  "' has no nearby NPC target; chat open blocked");
+              return;
+            }
           } else {
-            // No alternate squadmate to target from selected player actor.
-            EnterCriticalSection(&g_msgMutex);
-            g_messageQueue.push_back(
-                "NOTIFY:No nearby squadmate target available.");
-            LeaveCriticalSection(&g_msgMutex);
-            Log("CHAT_OPEN: selected squadmate '" + sel->getName() +
-                "' has no alternate squadmate target; chat open blocked");
-            return;
+            resolvedTarget = ResolveNearestSquadmateTargetForSelection(world, sel);
+            if (resolvedTarget && (uintptr_t)resolvedTarget > 0x1000) {
+              chatTarget = resolvedTarget;
+              Log("CHAT_OPEN: selected squadmate '" + sel->getName() +
+                  "' retargeted to nearest squadmate '" + chatTarget->getName() +
+                  "'");
+            } else {
+              // No alternate squadmate to target from selected player actor.
+              EnterCriticalSection(&g_msgMutex);
+              g_messageQueue.push_back(
+                  "NOTIFY:No nearby squadmate target available.");
+              LeaveCriticalSection(&g_msgMutex);
+              Log("CHAT_OPEN: selected squadmate '" + sel->getName() +
+                  "' has no alternate squadmate target; chat open blocked");
+              return;
+            }
           }
         }
 
