@@ -35,6 +35,44 @@ std::string TrimCopy(const std::string &value) {
   return value.substr(start, end - start + 1);
 }
 
+bool ShouldSuppressNoisyRuntimeLog(const std::string &msg) {
+  if (msg.empty()) {
+    return false;
+  }
+
+  static const char *kSuppressedPrefixes[] = {
+      "HOOK_FRAME:",
+      "GEO_DEBUG_CTX:",
+      "GEO_DEBUG_QUERY:",
+      "GEO_DEBUG_INFOLOC:",
+      "CONTEXT_NEARBY_ITEMS:",
+  };
+
+  for (size_t i = 0; i < sizeof(kSuppressedPrefixes) / sizeof(kSuppressedPrefixes[0]);
+       ++i) {
+    const std::string prefix = kSuppressedPrefixes[i];
+    if (msg.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+
+  // Suppress the high-frequency idle UI heartbeat while retaining other HOOK_UI
+  // diagnostics.
+  if (msg == "HOOK_UI: active, world stable, waiting for UI input.") {
+    return true;
+  }
+
+  // Legacy geo-debug fragments occasionally appear without a stable prefix.
+  if (msg.rfind("building=", 0) == 0 &&
+      msg.find(" town=") != std::string::npos &&
+      msg.find(" zone=") != std::string::npos &&
+      msg.find(" region=") != std::string::npos) {
+    return true;
+  }
+
+  return false;
+}
+
 std::string ToLowerAsciiCopy(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
@@ -316,6 +354,10 @@ std::wstring WideFromUtf8(const std::string &str) {
 }
 
 void Log(const std::string &msg) {
+  if (ShouldSuppressNoisyRuntimeLog(msg)) {
+    return;
+  }
+
   SYSTEMTIME st;
   GetLocalTime(&st);
   char timestamp[64];
