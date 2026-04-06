@@ -69,6 +69,7 @@ void (*applyDamage_orig)(MedicalSystem::HealthPartStatus *,
                          const Damages &) = nullptr;
 bool (*applyFirstAid_orig)(MedicalSystem *, float, Item *, float,
                            Character *) = nullptr;
+bool (*characterGettingEaten_orig)(Character *, float, Character *) = nullptr;
 Item *(*buyItem_orig)(Inventory *, Item *, RootObject *) = nullptr;
 
 // New World Event Hooks
@@ -1630,6 +1631,8 @@ struct NpcWorldEventState {
   int leftLegState;
   int rightLegState;
   int currentTask;
+  unsigned int currentTaskSubjectSerial;
+  std::string currentTaskSubjectName;
   int constructionAction;
   unsigned int constructionSubjectSerial;
   std::string constructionSubjectName;
@@ -1647,7 +1650,8 @@ struct NpcWorldEventState {
         leftLegPresent(true), rightLegPresent(true),
         leftArmState((int)LIMB_ORIGINAL), rightArmState((int)LIMB_ORIGINAL),
         leftLegState((int)LIMB_ORIGINAL), rightLegState((int)LIMB_ORIGINAL),
-        currentTask((int)NULL_TASK), constructionAction(0),
+        currentTask((int)NULL_TASK), currentTaskSubjectSerial(0),
+        currentTaskSubjectName(""), constructionAction(0),
         constructionSubjectSerial(0), constructionSubjectName(""),
         lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
 };
@@ -1665,6 +1669,13 @@ struct HealingEventSessionState {
   std::string itemKey;
 
   HealingEventSessionState() : lastUpdateTick(0), targetKey(""), itemKey("") {}
+};
+
+struct PredationEventSessionState {
+  DWORD lastUpdateTick;
+  std::string targetKey;
+
+  PredationEventSessionState() : lastUpdateTick(0), targetKey("") {}
 };
 
 static std::map<unsigned int, InventorySyncState> g_inventorySyncStateBySerial;
@@ -1732,10 +1743,16 @@ static const DWORD kDynamicProfileIntervalResendIntervalMs = 5 * 60 * 1000;
 static std::map<unsigned int, PendingMedicalItemUseState>
     g_pendingMedicalItemUseBySerial;
 static const DWORD kPendingMedicalItemUseRetentionMs = 20 * 1000;
-static std::map<unsigned int, HealingEventSessionState>
-    g_healingEventSessionByHealerSerial;
-static const DWORD kHealingEventSessionGapMs = 3000;
+static std::map<std::string, HealingEventSessionState>
+    g_healingEventSessionByActorKey;
+static std::map<std::string, DWORD> g_healingEventBurstByTargetKey;
+static const DWORD kHealingEventSessionGapMs = 12000;
+static const DWORD kHealingEventTargetBurstCooldownMs = 5000;
 static const DWORD kHealingEventSessionRetentionMs = 60 * 1000;
+static std::map<unsigned int, PredationEventSessionState>
+    g_predationEventSessionByEaterSerial;
+static const DWORD kPredationEventSessionGapMs = 4000;
+static const DWORD kPredationEventSessionRetentionMs = 60 * 1000;
 static bool g_playerSquadsSyncHasValue = false;
 static std::string g_playerSquadsSyncLastDigest = "";
 static DWORD g_playerSquadsSyncLastSentTick = 0;
@@ -4072,48 +4089,195 @@ static std::string BuildHealingSessionTargetKey(unsigned int targetSerial,
   return "unknown";
 }
 
+static std::string BuildHealingSessionActorKey(unsigned int healerSerial,
+                                               const std::string &healerName) {
+  if (healerSerial != 0) {
+    return "sid:" + ToString((int)healerSerial);
+  }
+  std::string normalized = ToLowerAsciiCopy(TrimCopy(healerName));
+  if (!normalized.empty()) {
+    return "name:" + normalized;
+  }
+  return "unknown_actor";
+}
+
 static bool ShouldEmitHealingEvent(unsigned int healerSerial,
+                                   const std::string &healerName,
                                    unsigned int targetSerial,
                                    const std::string &targetName,
                                    const std::string &itemName,
                                    DWORD nowTick) {
-  if (healerSerial == 0) {
-    return true;
-  }
-
+  std::string actorKey = BuildHealingSessionActorKey(healerSerial, healerName);
   std::string targetKey = BuildHealingSessionTargetKey(targetSerial, targetName);
   std::string itemKey = NormalizeInventoryKey(itemName);
   if (itemKey.empty()) {
     itemKey = "medical item";
   }
+  std::string burstKey = targetKey + "|" + itemKey;
 
   HealingEventSessionState &state =
-      g_healingEventSessionByHealerSerial[healerSerial];
+      g_healingEventSessionByActorKey[actorKey];
   bool activeSession =
       state.lastUpdateTick != 0 &&
       (nowTick - state.lastUpdateTick) <= kHealingEventSessionGapMs &&
       state.targetKey == targetKey && state.itemKey == itemKey;
+  bool targetBurstActive = false;
+  std::map<std::string, DWORD>::const_iterator burstIt =
+      g_healingEventBurstByTargetKey.find(burstKey);
+  if (burstIt != g_healingEventBurstByTargetKey.end() && burstIt->second != 0) {
+    targetBurstActive =
+        (nowTick - burstIt->second) <= kHealingEventTargetBurstCooldownMs;
+  }
 
   state.lastUpdateTick = nowTick;
   state.targetKey = targetKey;
   state.itemKey = itemKey;
+  if (!activeSession && !targetBurstActive) {
+    g_healingEventBurstByTargetKey[burstKey] = nowTick;
+  }
 
-  return !activeSession;
+  return !activeSession && !targetBurstActive;
 }
 
 static void PruneHealingEventSessionState(DWORD nowTick) {
-  for (std::map<unsigned int, HealingEventSessionState>::iterator it =
-           g_healingEventSessionByHealerSerial.begin();
-       it != g_healingEventSessionByHealerSerial.end();) {
+  for (std::map<std::string, HealingEventSessionState>::iterator it =
+           g_healingEventSessionByActorKey.begin();
+       it != g_healingEventSessionByActorKey.end();) {
     const bool expired =
         (it->second.lastUpdateTick == 0) ||
         ((nowTick - it->second.lastUpdateTick) > kHealingEventSessionRetentionMs);
     if (expired) {
-      it = g_healingEventSessionByHealerSerial.erase(it);
+      it = g_healingEventSessionByActorKey.erase(it);
     } else {
       ++it;
     }
   }
+
+  for (std::map<std::string, DWORD>::iterator it =
+           g_healingEventBurstByTargetKey.begin();
+       it != g_healingEventBurstByTargetKey.end();) {
+    const bool expired =
+        (it->second == 0) ||
+        ((nowTick - it->second) > kHealingEventSessionRetentionMs);
+    if (expired) {
+      it = g_healingEventBurstByTargetKey.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+static bool ShouldEmitPredationEvent(unsigned int eaterSerial,
+                                     unsigned int victimSerial,
+                                     const std::string &victimName,
+                                     DWORD nowTick) {
+  unsigned int sessionKeySerial =
+      eaterSerial != 0 ? eaterSerial : victimSerial;
+  if (sessionKeySerial == 0) {
+    return true;
+  }
+
+  std::string targetKey =
+      BuildHealingSessionTargetKey(victimSerial, victimName);
+
+  PredationEventSessionState &state =
+      g_predationEventSessionByEaterSerial[sessionKeySerial];
+  bool activeSession =
+      state.lastUpdateTick != 0 &&
+      (nowTick - state.lastUpdateTick) <= kPredationEventSessionGapMs &&
+      state.targetKey == targetKey;
+
+  state.lastUpdateTick = nowTick;
+  state.targetKey = targetKey;
+  return !activeSession;
+}
+
+static void PrunePredationEventSessionState(DWORD nowTick) {
+  for (std::map<unsigned int, PredationEventSessionState>::iterator it =
+           g_predationEventSessionByEaterSerial.begin();
+       it != g_predationEventSessionByEaterSerial.end();) {
+    const bool expired =
+        (it->second.lastUpdateTick == 0) ||
+        ((nowTick - it->second.lastUpdateTick) >
+         kPredationEventSessionRetentionMs);
+    if (expired) {
+      it = g_predationEventSessionByEaterSerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+static unsigned int ResolveCharacterSerialForEvent(Character *npc);
+static std::string ResolveCharacterNameSafe(Character *npc);
+static Character *ResolveCharacterFromHandSafe(const hand &h);
+static std::string ResolveConstructionSubjectName(const hand &subjectHand);
+static bool IsAnyPredationTask(TaskType taskType);
+static bool IsCorpsePredationTask(TaskType taskType);
+
+static void EmitPredationEvent(Character *eater, Character *victim,
+                               const std::string &victimNameHint,
+                               DWORD nowTick, bool corpseContext = false) {
+  if (!eater || (uintptr_t)eater < 0x1000) {
+    return;
+  }
+
+  unsigned int eaterSerial = ResolveCharacterSerialForEvent(eater);
+  unsigned int victimSerial = ResolveCharacterSerialForEvent(victim);
+  if (eaterSerial != 0 && victimSerial != 0 && eaterSerial == victimSerial) {
+    return;
+  }
+
+  bool victimAlive = true;
+  bool victimDead = false;
+  if (victim && (uintptr_t)victim >= 0x1000) {
+    try {
+      victimAlive = !victim->isDead();
+      victimDead = !victimAlive;
+    } catch (...) {
+      victimAlive = false;
+      victimDead = false;
+    }
+  }
+  if (!victimAlive && !corpseContext) {
+    return;
+  }
+
+  std::string victimName =
+      victim ? ResolveCharacterNameSafe(victim) : TrimCopy(victimNameHint);
+  if (victimName.empty()) {
+    victimName = "someone";
+  }
+
+  if (!ShouldEmitPredationEvent(eaterSerial, victimSerial, victimName, nowTick)) {
+    return;
+  }
+
+  std::string eaterName = ResolveCharacterNameSafe(eater);
+  if (eaterName.empty()) {
+    eaterName = "Unknown";
+  }
+
+  std::string message = "";
+  if (victimDead) {
+    message = "is eating " + victimName + "'s corpse.";
+  } else if (corpseContext) {
+    message = "is eating " + victimName + " while they are down.";
+  } else {
+    message = "is eating " + victimName + " alive!";
+  }
+  // Keep stream text clean (no talking-to suffix), but still include victim
+  // in people-present via target serial.
+  LogGameEvent("predation", eaterName, SafeFaction(eater), "", "None", message,
+               eaterSerial, victimSerial);
+}
+
+static void EmitPredationEventFromTask(Character *eater, const hand &subjectHand,
+                                       DWORD nowTick, TaskType taskType) {
+  Character *victim = ResolveCharacterFromHandSafe(subjectHand);
+  std::string victimNameHint = ResolveConstructionSubjectName(subjectHand);
+  EmitPredationEvent(eater, victim, victimNameHint, nowTick,
+                     IsCorpsePredationTask(taskType));
 }
 
 static Character *ResolveCharacterFromHandSafe(const hand &h) {
@@ -4707,6 +4871,78 @@ struct CombatAttribution {
         actorSerial(0) {}
 };
 
+static Character *ResolveCharacterFromHandSafe(const hand &h);
+static std::string ResolveConstructionSubjectName(const hand &subjectHand);
+static unsigned int ResolveCharacterSerialForEvent(Character *npc);
+static std::string ResolveCharacterNameSafe(Character *npc);
+static TaskType ResolveCurrentNpcTaskSafe(Character *npc, hand &subjectOut);
+
+static bool IsPredationTaskAgainstVictim(Character *attacker,
+                                         Character *victim) {
+  if (!attacker || !victim || (uintptr_t)attacker < 0x1000 ||
+      (uintptr_t)victim < 0x1000 || attacker == victim) {
+    return false;
+  }
+  hand subject;
+  TaskType task = ResolveCurrentNpcTaskSafe(attacker, subject);
+  if (!IsAnyPredationTask(task)) {
+    return false;
+  }
+
+  unsigned int victimSerial = ResolveCharacterSerialForEvent(victim);
+  if (victimSerial != 0 && subject.isValid() && !subject.isNull() &&
+      subject.serial == victimSerial) {
+    return true;
+  }
+
+  Character *subjectCharacter = ResolveCharacterFromHandSafe(subject);
+  return subjectCharacter && subjectCharacter == victim;
+}
+
+static Character *ResolvePredationAttackerForVictim(Character *victim) {
+  if (!victim || (uintptr_t)victim < 0x1000) {
+    return nullptr;
+  }
+  unsigned int victimSerial = ResolveCharacterSerialForEvent(victim);
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world < 0x1000) {
+    return nullptr;
+  }
+  try {
+    const auto &chars = world->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it) {
+      Character *candidate = *it;
+      if (!candidate || (uintptr_t)candidate < 0x1000 || candidate == victim) {
+        continue;
+      }
+      hand subject;
+      TaskType task = ResolveCurrentNpcTaskSafe(candidate, subject);
+      if (!IsAnyPredationTask(task)) {
+        continue;
+      }
+      if (victimSerial != 0 && subject.isValid() && !subject.isNull() &&
+          subject.serial == victimSerial) {
+        return candidate;
+      }
+      Character *subjectCharacter = ResolveCharacterFromHandSafe(subject);
+      if (subjectCharacter && subjectCharacter == victim) {
+        return candidate;
+      }
+    }
+  } catch (...) {
+  }
+  return nullptr;
+}
+
+static bool IsAnyPredationTask(TaskType taskType) {
+  return taskType == EAT_TARGET_ALIVE || taskType == EAT_A_RANDOM_DEAD_BODY ||
+         taskType == EAT_A_RANDOM_KO_BODY;
+}
+
+static bool IsCorpsePredationTask(TaskType taskType) {
+  return taskType == EAT_A_RANDOM_DEAD_BODY || taskType == EAT_A_RANDOM_KO_BODY;
+}
+
 static CombatAttribution ResolveCombatAttribution(Character *target) {
   CombatAttribution out;
   if (!target || (uintptr_t)target < 0x1000) {
@@ -4714,6 +4950,7 @@ static CombatAttribution ResolveCombatAttribution(Character *target) {
   }
 
   Character *attacker = nullptr;
+  bool predationAttribution = false;
   try {
     attacker = ResolveCharacterFromHandSafe(target->lastGuyWhoDefeatedMe);
   } catch (...) {
@@ -4737,7 +4974,18 @@ static CombatAttribution ResolveCombatAttribution(Character *target) {
   }
 
   if (!attacker) {
+    attacker = ResolvePredationAttackerForVictim(target);
+    if (attacker) {
+      predationAttribution = true;
+    }
+  }
+
+  if (!attacker) {
     return out;
+  }
+
+  if (!predationAttribution && IsPredationTaskAgainstVictim(attacker, target)) {
+    predationAttribution = true;
   }
 
   try {
@@ -4749,13 +4997,15 @@ static CombatAttribution ResolveCombatAttribution(Character *target) {
     out.actorName = "Unknown";
   }
   out.actorFaction = SafeFaction(attacker);
-  out.weaponName = ResolvePrimaryWeaponName(attacker);
-  if ((out.weaponName.empty() || out.weaponName == "Unknown") &&
+  out.weaponName =
+      predationAttribution ? "Teeth" : ResolvePrimaryWeaponName(attacker);
+  if (!predationAttribution &&
+      (out.weaponName.empty() || out.weaponName == "Unknown") &&
       CharacterHasHacksaw(attacker)) {
     out.weaponName = "Hacksaw";
   }
   if (out.weaponName.empty() || out.weaponName == "Unknown") {
-    out.weaponName = "Unarmed";
+    out.weaponName = predationAttribution ? "Teeth" : "Unarmed";
   }
   out.actorSerial = ResolveCharacterSerialForEvent(attacker);
   return out;
@@ -6045,6 +6295,7 @@ static void PruneNpcWorldEventState() {
   }
   PrunePendingMedicalItemUseState(nowTick);
   PruneHealingEventSessionState(nowTick);
+  PrunePredationEventSessionState(nowTick);
 }
 
 static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
@@ -6768,6 +7019,12 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     }
     hand currentTaskSubject;
     TaskType currentTaskNow = ResolveCurrentNpcTaskSafe(npc, currentTaskSubject);
+    unsigned int currentTaskSubjectSerialNow = 0;
+    std::string currentTaskSubjectNameNow = "";
+    if (currentTaskSubject.isValid() && !currentTaskSubject.isNull()) {
+      currentTaskSubjectSerialNow = currentTaskSubject.serial;
+      currentTaskSubjectNameNow = ResolveConstructionSubjectName(currentTaskSubject);
+    }
     ConstructionActionEventType constructionActionNow =
         ResolveConstructionActionType(currentTaskNow);
     unsigned int constructionSubjectSerialNow = 0;
@@ -6819,6 +7076,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.leftLegState = leftLegState;
       state.rightLegState = rightLegState;
       state.currentTask = (int)currentTaskNow;
+      state.currentTaskSubjectSerial = currentTaskSubjectSerialNow;
+      state.currentTaskSubjectName = currentTaskSubjectNameNow;
       state.constructionAction = (int)constructionActionNow;
       state.constructionSubjectSerial = constructionSubjectSerialNow;
       state.constructionSubjectName = constructionSubjectNameNow;
@@ -6826,6 +7085,10 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       state.lastSpeechLine = normalizedSpeechLine;
       state.inventory = inventorySnapshot;
       state.lastSeenTick = nowTick;
+      if (!isPlayerActor && IsAnyPredationTask(currentTaskNow)) {
+        EmitPredationEventFromTask(npc, currentTaskSubject, nowTick,
+                                   currentTaskNow);
+      }
       if (IsLimbLostState(leftArmState) || !leftArmPresent ||
           IsLimbLostState(rightArmState) || !rightArmPresent ||
           IsLimbLostState(leftLegState) || !leftLegPresent ||
@@ -6961,6 +7224,24 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
         EmitCarryPickupEvent(npc, carryingTargetSerialNow, carryingTargetNameNow);
       }
 
+      bool predationTaskNow = IsAnyPredationTask(currentTaskNow);
+      bool predationTaskPrevious = IsAnyPredationTask((TaskType)state.currentTask);
+      bool predationTargetChanged = false;
+      if (predationTaskNow && predationTaskPrevious) {
+        if (currentTaskSubjectSerialNow != 0 && state.currentTaskSubjectSerial != 0) {
+          predationTargetChanged =
+              (currentTaskSubjectSerialNow != state.currentTaskSubjectSerial);
+        } else {
+          predationTargetChanged =
+              ToLowerAsciiCopy(currentTaskSubjectNameNow) !=
+              ToLowerAsciiCopy(state.currentTaskSubjectName);
+        }
+      }
+      if (predationTaskNow && (!predationTaskPrevious || predationTargetChanged)) {
+        EmitPredationEventFromTask(npc, currentTaskSubject, nowTick,
+                                   currentTaskNow);
+      }
+
       if (!IsLimbLostState(state.leftArmState) && IsLimbLostState(leftArmState)) {
         Log("EVENT_SCAN: limb loss transition serial=" + ToString(serial) +
             " limb=left_arm state " + ToString(state.leftArmState) + "->" +
@@ -7065,6 +7346,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.leftLegState = leftLegState;
     state.rightLegState = rightLegState;
     state.currentTask = (int)currentTaskNow;
+    state.currentTaskSubjectSerial = currentTaskSubjectSerialNow;
+    state.currentTaskSubjectName = currentTaskSubjectNameNow;
     state.constructionAction = (int)constructionActionNow;
     state.constructionSubjectSerial = constructionSubjectSerialNow;
     state.constructionSubjectName = constructionSubjectNameNow;
@@ -10337,13 +10620,28 @@ bool applyFirstAid_hook(MedicalSystem *med, float skill, Item *equipment,
         "is using (" + itemName + ") to heal " + healTargetText;
 
     DWORD nowTick = GetTickCount();
-    if (ShouldEmitHealingEvent(healerSerial, medSerial, targetName, itemName,
-                               nowTick)) {
+    if (ShouldEmitHealingEvent(healerSerial, actorName, medSerial, targetName,
+                               itemName, nowTick)) {
       LogGameEvent("healing", actorName, actorFaction,
                    med->me->getName(), SafeFaction(med->me),
                    healMsg, healerSerial, medSerial);
     }
   }
+  return res;
+}
+
+bool characterGettingEaten_hook(Character *victim, float amount,
+                                Character *eater) {
+  bool res = false;
+  if (characterGettingEaten_orig) {
+    res = characterGettingEaten_orig(victim, amount, eater);
+  }
+
+  if (!victim || !eater) {
+    return res;
+  }
+
+  EmitPredationEvent(eater, victim, "", GetTickCount());
   return res;
 }
 
@@ -11760,6 +12058,29 @@ __declspec(dllexport) void startPlugin() {
       Log("HOOK_DIAG: MedicalSystem::applyFirstAid AddHook status=" +
           ToString((int)medicalFirstAidStatus) + " orig=" +
           ToString((unsigned int)(uintptr_t)applyFirstAid_orig));
+    }
+  }
+
+  void *thunkCharacterGettingEaten = (void *)GetProcAddress(
+      hLib, "?gettingEaten@Character@@UEAA_NMPEAV1@@Z");
+  if (!thunkCharacterGettingEaten) {
+    thunkCharacterGettingEaten = (void *)GetProcAddress(
+        hLib, "?gettingEaten@Character@@QEAA_NMPEAV1@@Z");
+  }
+  if (!thunkCharacterGettingEaten) {
+    Log("HOOK_WARN: Character::gettingEaten symbol not found.");
+  } else {
+    __int64 realCharacterGettingEaten =
+        KenshiLib::GetRealAddress(thunkCharacterGettingEaten);
+    if (!realCharacterGettingEaten) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::gettingEaten.");
+    } else {
+      KenshiLib::HookStatus characterGettingEatenStatus = KenshiLib::AddHook(
+          (void *)realCharacterGettingEaten, (void *)characterGettingEaten_hook,
+          (void **)&characterGettingEaten_orig);
+      Log("HOOK_DIAG: Character::gettingEaten AddHook status=" +
+          ToString((int)characterGettingEatenStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)characterGettingEaten_orig));
     }
   }
 
