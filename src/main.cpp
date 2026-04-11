@@ -1702,12 +1702,14 @@ static DWORD g_portraitLastSehTick = 0;
 static DWORD g_portraitLastSehCode = 0;
 static bool g_portraitSyncDisabledForSession = false;
 static bool g_portraitDisableLogged = false;
+static DWORD g_portraitSyncDisabledUntilTick = 0;
 static DWORD g_lastPortraitSweepTick = 0;
 static const DWORD kPortraitSweepIntervalMs = 15000;
 static const DWORD kPortraitMinResendMs = 30 * 60 * 1000;
 static const size_t kPortraitSweepCandidateLimit = 48;
 static const DWORD kPortraitStateRetentionMs = 30 * 60 * 1000;
 static const DWORD kPortraitSpeechTriggerCooldownMs = 2 * 60 * 1000;
+static const DWORD kPortraitSyncBackoffMs = 2 * 60 * 1000;
 static std::map<unsigned int, NpcWorldEventState> g_npcWorldEventStateBySerial;
 static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
@@ -1969,19 +1971,38 @@ static int PortraitSehFilter(unsigned int code) {
 }
 
 static void MaybeDisablePortraitSyncAfterSeh() {
-  if (g_portraitSyncDisabledForSession) {
+  DWORD nowTick = GetTickCount();
+  if (g_portraitSyncDisabledForSession && nowTick < g_portraitSyncDisabledUntilTick) {
     return;
   }
   LONG sehCount = InterlockedCompareExchange(&g_portraitSehCount, 0, 0);
   if (sehCount >= 3) {
     g_portraitSyncDisabledForSession = true;
+    g_portraitSyncDisabledUntilTick = nowTick + kPortraitSyncBackoffMs;
+    InterlockedExchange(&g_portraitSehCount, 0);
     if (!g_portraitDisableLogged) {
       g_portraitDisableLogged = true;
-      Log("PORTRAIT_SYNC: disabled for this session after repeated engine SEH faults code=" +
+      Log("PORTRAIT_SYNC: temporarily disabled after repeated engine SEH faults code=" +
           ToString((int)g_portraitLastSehCode) + " count=" +
           ToString((int)sehCount) + " last_tick=" +
-          ToString((int)g_portraitLastSehTick));
+          ToString((int)g_portraitLastSehTick) + " resume_in_ms=" +
+          ToString((int)kPortraitSyncBackoffMs));
     }
+  }
+}
+
+static void RefreshPortraitSyncBackoffState() {
+  if (!g_portraitSyncDisabledForSession) {
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  if (g_portraitSyncDisabledUntilTick != 0 && nowTick >= g_portraitSyncDisabledUntilTick) {
+    g_portraitSyncDisabledForSession = false;
+    g_portraitSyncDisabledUntilTick = 0;
+    g_portraitDisableLogged = false;
+    InterlockedExchange(&g_portraitSehCount, 0);
+    Log("PORTRAIT_SYNC: re-enabled after backoff.");
   }
 }
 
@@ -2139,6 +2160,7 @@ static bool TryCapturePortraitBmp(Character *npc, std::string &bmpDataOut,
                                   int &widthOut, int &heightOut,
                                   std::string &imageHashOut,
                                   std::string *diagReasonOut = nullptr) {
+  RefreshPortraitSyncBackoffState();
   if (g_portraitSyncDisabledForSession) {
     if (diagReasonOut) {
       *diagReasonOut = "portrait_sync_disabled_for_session";
@@ -2294,6 +2316,7 @@ static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
 
 static bool SyncPortraitForCharacter(Character *npc, bool force,
                                      const std::string &reason) {
+  RefreshPortraitSyncBackoffState();
   if (g_portraitSyncDisabledForSession) {
     return false;
   }
@@ -2401,6 +2424,20 @@ static void PrunePortraitSyncState() {
   if (pruned > 0) {
     Log("PORTRAIT_SYNC: pruned stale state entries=" + ToString(pruned));
   }
+}
+
+static void ResetPortraitSyncState() {
+  EnterCriticalSection(&g_stateMutex);
+  g_portraitSyncStateByStorageId.clear();
+  g_portraitSpeechTriggerBySerial.clear();
+  LeaveCriticalSection(&g_stateMutex);
+  g_portraitSyncDisabledForSession = false;
+  g_portraitDisableLogged = false;
+  g_portraitSyncDisabledUntilTick = 0;
+  g_portraitLastSehTick = 0;
+  g_portraitLastSehCode = 0;
+  g_lastPortraitSweepTick = 0;
+  InterlockedExchange(&g_portraitSehCount, 0);
 }
 
 static bool IsWorldStableForUI(GameWorld *world);
@@ -11412,6 +11449,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInfoLocTelemetryCheckTick = 0;
       g_lastInfoLocTelemetrySentTick = 0;
       g_lastInfoLocTelemetryDigest = "";
+      ResetPortraitSyncState();
       ResetPlayerCatsSyncState();
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
@@ -11423,6 +11461,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       motdAutoOpenDeadlineTick = 0;
       loadInitEventDispatched = false;
       Log("INV_SYNC: state reset on world transition.");
+      Log("PORTRAIT_SYNC: state reset on world transition.");
     }
     if (g_settingsWindow)
       CloseSettingsUI();
