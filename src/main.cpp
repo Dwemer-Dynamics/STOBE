@@ -5987,6 +5987,87 @@ static std::string BuildTransferPairKey(unsigned int fromSerial,
   return ToString(fromSerial) + "->" + ToString(toSerial);
 }
 
+static Character *ResolveCharacterBySerialForInventoryEvent(unsigned int serial) {
+  if (serial == 0) {
+    return nullptr;
+  }
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world < 0x1000) {
+    return nullptr;
+  }
+  try {
+    const auto &chars = world->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it) {
+      Character *candidate = *it;
+      if (!candidate || (uintptr_t)candidate < 0x1000) {
+        continue;
+      }
+      unsigned int candidateSerial = 0;
+      try {
+        candidateSerial = candidate->getHandle().serial;
+      } catch (...) {
+        candidateSerial = 0;
+      }
+      if (candidateSerial == serial) {
+        return candidate;
+      }
+    }
+  } catch (...) {
+  }
+  return nullptr;
+}
+
+static Character *ResolveLikelyInventoryTransferCounterparty(Character *actor) {
+  if (!actor || (uintptr_t)actor < 0x1000) {
+    return nullptr;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  if (!world || (uintptr_t)world < 0x1000) {
+    return nullptr;
+  }
+
+  Character *talkTarget = ResolveCharacterFromHandSafe(g_talkTargetHand);
+  if (talkTarget && (uintptr_t)talkTarget > 0x1000) {
+    if (talkTarget == actor) {
+      Character *playerSpeaker = ResolveNearestPlayerSpeakerForTarget(world, actor);
+      if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000 &&
+          playerSpeaker != actor) {
+        return playerSpeaker;
+      }
+    } else {
+      bool actorIsPlayer = false;
+      try {
+        actorIsPlayer = actor->isPlayerCharacter();
+      } catch (...) {
+        actorIsPlayer = false;
+      }
+      if (actorIsPlayer) {
+        return talkTarget;
+      }
+    }
+  }
+
+  std::string listenerSource = "";
+  Character *listener =
+      ResolveDialogueListenerForSpeech(actor, nullptr, listenerSource);
+  if (listener && (uintptr_t)listener > 0x1000 && listener != actor) {
+    return listener;
+  }
+
+  Character *selectionTarget = ResolveCharacterFromHandSafe(g_lastSelectionHand);
+  if (selectionTarget && (uintptr_t)selectionTarget > 0x1000 &&
+      selectionTarget == actor) {
+    Character *playerSpeaker = ResolveNearestPlayerSpeakerForTarget(world, actor);
+    if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000 &&
+        playerSpeaker != actor) {
+      return playerSpeaker;
+    }
+  }
+
+  return nullptr;
+}
+
 static void EmitInventoryTransferEventsFromDeltas(
     const std::vector<PendingInventoryTransferDelta> &deltas,
     std::map<unsigned int, std::map<std::string, int> > &matchedGainBySerialOut) {
@@ -6043,9 +6124,21 @@ static void EmitInventoryTransferEventsFromDeltas(
     bool empty = it->qty <= 0 || it->itemKey.empty() || it->fromSerial == 0;
     if (expired || empty) {
       if (!empty && expired) {
-        appendAggregation(agedOutByPair, it->fromSerial, it->fromName,
-                          it->fromFaction, 0, "Ground", "None", it->itemKey,
-                          it->itemName, it->qty);
+        Character *fromActor =
+            ResolveCharacterBySerialForInventoryEvent(it->fromSerial);
+        Character *counterparty =
+            ResolveLikelyInventoryTransferCounterparty(fromActor);
+        if (counterparty && (uintptr_t)counterparty > 0x1000) {
+          appendAggregation(
+              agedOutByPair, it->fromSerial, it->fromName, it->fromFaction,
+              ResolveCharacterSerialForEvent(counterparty),
+              ResolveCharacterNameSafe(counterparty), SafeFaction(counterparty),
+              it->itemKey, it->itemName, it->qty);
+        } else {
+          appendAggregation(agedOutByPair, it->fromSerial, it->fromName,
+                            it->fromFaction, 0, "Ground", "None", it->itemKey,
+                            it->itemName, it->qty);
+        }
       }
       it = pendingLosses.erase(it);
     } else {
@@ -6186,9 +6279,21 @@ static void EmitInventoryTransferEventsFromDeltas(
   while (pendingLosses.size() > kPendingLossMaxEntries) {
     const PendingTransferLoss &overflow = pendingLosses.front();
     if (overflow.qty > 0 && overflow.fromSerial != 0 && !overflow.itemKey.empty()) {
-      appendAggregation(agedOutByPair, overflow.fromSerial, overflow.fromName,
-                        overflow.fromFaction, 0, "Ground", "None",
-                        overflow.itemKey, overflow.itemName, overflow.qty);
+      Character *fromActor =
+          ResolveCharacterBySerialForInventoryEvent(overflow.fromSerial);
+      Character *counterparty =
+          ResolveLikelyInventoryTransferCounterparty(fromActor);
+      if (counterparty && (uintptr_t)counterparty > 0x1000) {
+        appendAggregation(
+            agedOutByPair, overflow.fromSerial, overflow.fromName,
+            overflow.fromFaction, ResolveCharacterSerialForEvent(counterparty),
+            ResolveCharacterNameSafe(counterparty), SafeFaction(counterparty),
+            overflow.itemKey, overflow.itemName, overflow.qty);
+      } else {
+        appendAggregation(agedOutByPair, overflow.fromSerial, overflow.fromName,
+                          overflow.fromFaction, 0, "Ground", "None",
+                          overflow.itemKey, overflow.itemName, overflow.qty);
+      }
     }
     pendingLosses.pop_front();
   }
@@ -6248,33 +6353,7 @@ static void EmitInventoryTransferEventsFromDeltas(
 }
 
 static Character *ResolveCharacterBySerialForCarryEvent(unsigned int serial) {
-  if (serial == 0) {
-    return nullptr;
-  }
-  GameWorld *world = GetWorldSafe();
-  if (!world || (uintptr_t)world < 0x1000) {
-    return nullptr;
-  }
-  try {
-    const auto &chars = world->getCharacterUpdateList();
-    for (auto it = chars.begin(); it != chars.end(); ++it) {
-      Character *candidate = *it;
-      if (!candidate || (uintptr_t)candidate < 0x1000) {
-        continue;
-      }
-      unsigned int candidateSerial = 0;
-      try {
-        candidateSerial = candidate->getHandle().serial;
-      } catch (...) {
-        candidateSerial = 0;
-      }
-      if (candidateSerial == serial) {
-        return candidate;
-      }
-    }
-  } catch (...) {
-  }
-  return nullptr;
+  return ResolveCharacterBySerialForInventoryEvent(serial);
 }
 
 static void EmitCarryPickupEvent(Character *carrier, unsigned int targetSerial,
@@ -7154,15 +7233,20 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
       bool hasMoneyDelta = previousState.hasMoney && hasMoneyNow;
       int moneyDelta = hasMoneyDelta ? (moneyNow - previousState.money) : 0;
       Character *tradeCounterparty = nullptr;
-      if (isPlayerActor && hasMoneyDelta && moneyDelta != 0) {
-        tradeCounterparty = ResolveLikelyTraderForActor(world, npc);
+      if (hasMoneyDelta && moneyDelta != 0) {
+        tradeCounterparty = ResolveLikelyInventoryTransferCounterparty(npc);
+        if ((!tradeCounterparty || (uintptr_t)tradeCounterparty <= 0x1000) &&
+            isPlayerActor) {
+          tradeCounterparty = ResolveLikelyTraderForActor(world, npc);
+        }
       }
       if (tradeCounterparty && (uintptr_t)tradeCounterparty > 0x1000) {
         std::string actorName = ResolveCharacterNameSafe(npc);
         std::string actorFaction = SafeFaction(npc);
         std::string traderName = ResolveCharacterNameSafe(tradeCounterparty);
         std::string traderFaction = SafeFaction(tradeCounterparty);
-        unsigned int traderSerial = ResolveCharacterSerialForEvent(tradeCounterparty);
+        unsigned int traderSerial =
+            ResolveCharacterSerialForEvent(tradeCounterparty);
 
         if (moneyDelta < 0 && !gainByKey.empty()) {
           std::string itemsText = BuildInventoryDeltaItemsText(
