@@ -38,17 +38,17 @@ MyGUI::EditBox *g_dynamicProfileIntervalEdit = nullptr;
 MyGUI::Button *g_autoChatToggle = nullptr;
 MyGUI::Button *g_boredEventsToggle = nullptr;
 MyGUI::Button *g_animalTalksToggle = nullptr;
-MyGUI::Button *g_motdToggle = nullptr;
 MyGUI::Button *g_ttsToggle = nullptr;
 MyGUI::Button *g_speedDialogueToggle = nullptr;
+MyGUI::Button *g_regularDialogueToggle = nullptr;
 
 bool g_pendingAutoChat = false;
 bool g_pendingBoredEvents = true;
 bool g_pendingAnimalTalks = false;
 bool g_pendingNearestSpeaker = true;
-bool g_pendingMOTD = true;
 bool g_pendingTtsEnabled = true;
 bool g_pendingSpeedDialogue = true;
+bool g_pendingRegularDialogueCapture = true;
 
 int ClampInt(int value, int minValue, int maxValue) {
   if (value < minValue)
@@ -236,9 +236,9 @@ void LoadPendingFromRuntime() {
   g_pendingBoredEvents = g_enableBoredEvents;
   g_pendingAnimalTalks = g_enableAnimalTalks;
   g_pendingNearestSpeaker = g_useNearestPlayerSpeaker;
-  g_pendingMOTD = g_enableWelcome;
   g_pendingTtsEnabled = g_ttsEnabled;
   g_pendingSpeedDialogue = g_speedDialogue;
+  g_pendingRegularDialogueCapture = g_enableRegularDialogueCapture;
 }
 
 void RefreshPluginSettingsUI() {
@@ -274,10 +274,11 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_autoChatToggle, "Auto Chat", g_pendingAutoChat);
   SetToggleCaption(g_boredEventsToggle, "Bored Events", g_pendingBoredEvents);
   SetToggleCaption(g_animalTalksToggle, "Animal Talks", g_pendingAnimalTalks);
-  SetToggleCaption(g_motdToggle, "MOTD", g_pendingMOTD);
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
                    g_pendingSpeedDialogue);
+  SetToggleCaption(g_regularDialogueToggle, "Regular Dialogue",
+                   g_pendingRegularDialogueCapture);
 }
 
 void OnSettingsSaveClick(MyGUI::Widget *sender) {
@@ -316,10 +317,10 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   g_enableBoredEvents = g_pendingBoredEvents;
   g_enableAnimalTalks = g_pendingAnimalTalks;
   g_useNearestPlayerSpeaker = g_pendingNearestSpeaker;
-  g_enableWelcome = g_pendingMOTD;
   bool previousTtsEnabled = g_ttsEnabled;
   g_ttsEnabled = g_pendingTtsEnabled;
   g_speedDialogue = g_pendingSpeedDialogue;
+  g_enableRegularDialogueCapture = g_pendingRegularDialogueCapture;
 
   int talkRadius = ParseIntOrDefault(
       g_talkRadiusEdit ? g_talkRadiusEdit->getCaption() : "", (int)g_proximityRadius);
@@ -368,11 +369,6 @@ void OnPluginBoredEventsToggleClick(MyGUI::Widget *sender) {
   SetToggleCaption(g_boredEventsToggle, "Bored Events", g_pendingBoredEvents);
 }
 
-void OnPluginMOTDToggleClick(MyGUI::Widget *sender) {
-  g_pendingMOTD = !g_pendingMOTD;
-  SetToggleCaption(g_motdToggle, "MOTD", g_pendingMOTD);
-}
-
 void OnPluginAnimalTalksToggleClick(MyGUI::Widget *sender) {
   g_pendingAnimalTalks = !g_pendingAnimalTalks;
   g_enableAnimalTalks = g_pendingAnimalTalks;
@@ -391,6 +387,12 @@ void OnPluginSpeedDialogueToggleClick(MyGUI::Widget *sender) {
   g_pendingSpeedDialogue = !g_pendingSpeedDialogue;
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
                    g_pendingSpeedDialogue);
+}
+
+void OnPluginRegularDialogueToggleClick(MyGUI::Widget *sender) {
+  g_pendingRegularDialogueCapture = !g_pendingRegularDialogueCapture;
+  SetToggleCaption(g_regularDialogueToggle, "Regular Dialogue",
+                   g_pendingRegularDialogueCapture);
 }
 
 void OnSettingsOpenConfigClick(MyGUI::Widget *sender) {
@@ -456,9 +458,9 @@ void CloseSettingsUI() {
   g_autoChatToggle = nullptr;
   g_boredEventsToggle = nullptr;
   g_animalTalksToggle = nullptr;
-  g_motdToggle = nullptr;
   g_ttsToggle = nullptr;
   g_speedDialogueToggle = nullptr;
+  g_regularDialogueToggle = nullptr;
 }
 
 void OnSettingsWindowButtonPressed(MyGUI::Window *sender,
@@ -600,11 +602,12 @@ void CreateSettingsUI() {
   g_boredEventsToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginBoredEventsToggleClick);
 
-  g_motdToggle = client->createWidgetReal<MyGUI::Button>(
+  g_regularDialogueToggle = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", 0.67f, y, 0.28f, toggleH,
-      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_MOTDToggle");
-  g_motdToggle->eventMouseButtonClick +=
-      MyGUI::newDelegate(OnPluginMOTDToggleClick);
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_RegularDialogueToggle");
+  g_regularDialogueToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginRegularDialogueToggleClick);
   y += toggleRowGap;
 
   g_animalTalksToggle = client->createWidgetReal<MyGUI::Button>(

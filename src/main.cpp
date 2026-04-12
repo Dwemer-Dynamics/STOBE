@@ -1334,6 +1334,22 @@ static bool ShouldDropDuplicateNonAiDialogue(unsigned int actorSerial,
   return false;
 }
 
+static bool ShouldEmitRegularDialogueProbeLog(unsigned int actorSerial) {
+  static std::map<unsigned int, DWORD> s_lastProbeLogTickBySerial;
+  const DWORD nowTick = GetTickCount();
+  const DWORD minIntervalMs = 1200;
+
+  std::map<unsigned int, DWORD>::iterator existing =
+      s_lastProbeLogTickBySerial.find(actorSerial);
+  if (existing != s_lastProbeLogTickBySerial.end() &&
+      (nowTick - existing->second) < minIntervalMs) {
+    return false;
+  }
+
+  s_lastProbeLogTickBySerial[actorSerial] = nowTick;
+  return true;
+}
+
 static std::string ExtractInlineMetadataToken(std::string &message,
                                               const std::string &marker) {
   std::string trimmed = TrimCopy(message);
@@ -7091,40 +7107,38 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     CollectInventoryEventSnapshot(npc, inventorySnapshot);
     lockpickingNow = ResolveLockpickingSkillLevel(npc);
     bool speechActiveNow = HasActiveSpeechBubbleSafe(npc);
-    std::string speechLine = "";
+    std::string rawSpeechLine = ReadNpcSpeechLineSafe(npc);
+    std::string speechLine = rawSpeechLine;
     bool speechHadTtsMetadata = false;
-    if (speechActiveNow) {
-      speechLine = ReadNpcSpeechLineSafe(npc);
-        if (!speechLine.empty()) {
-          std::string structuredSpeech =
-              ExtractDialogueMessageFromStructuredText(speechLine);
-          if (!structuredSpeech.empty()) {
-            speechLine = structuredSpeech;
-        }
-        int speechTtsDurationMs = ExtractTrailingTtsDurationMs(speechLine);
-        std::string speechTtsHash = ExtractTrailingTtsHash(speechLine);
-        speechHadTtsMetadata = !speechTtsHash.empty() || speechTtsDurationMs > 0;
-        if (!speechHadTtsMetadata && LooksLikeDialogueTemplateToken(speechLine)) {
-          std::string resolvedSpeech = ReadNpcSpeechLineSafe(npc);
-          if (!resolvedSpeech.empty()) {
-            std::string structuredResolved =
-                ExtractDialogueMessageFromStructuredText(resolvedSpeech);
-            if (!structuredResolved.empty()) {
-              resolvedSpeech = structuredResolved;
-            }
-            int resolvedTtsDurationMs = ExtractTrailingTtsDurationMs(resolvedSpeech);
-            std::string resolvedTtsHash = ExtractTrailingTtsHash(resolvedSpeech);
-            resolvedSpeech = TrimCopy(resolvedSpeech);
-            if (resolvedTtsHash.empty() && resolvedTtsDurationMs <= 0 &&
-                !resolvedSpeech.empty() &&
-                !LooksLikeDialogueTemplateToken(resolvedSpeech)) {
-              speechLine = resolvedSpeech;
-            } else {
-              speechLine.clear();
-            }
+    if (!speechLine.empty()) {
+      std::string structuredSpeech =
+          ExtractDialogueMessageFromStructuredText(speechLine);
+      if (!structuredSpeech.empty()) {
+        speechLine = structuredSpeech;
+      }
+      int speechTtsDurationMs = ExtractTrailingTtsDurationMs(speechLine);
+      std::string speechTtsHash = ExtractTrailingTtsHash(speechLine);
+      speechHadTtsMetadata = !speechTtsHash.empty() || speechTtsDurationMs > 0;
+      if (!speechHadTtsMetadata && LooksLikeDialogueTemplateToken(speechLine)) {
+        std::string resolvedSpeech = ReadNpcSpeechLineSafe(npc);
+        if (!resolvedSpeech.empty()) {
+          std::string structuredResolved =
+              ExtractDialogueMessageFromStructuredText(resolvedSpeech);
+          if (!structuredResolved.empty()) {
+            resolvedSpeech = structuredResolved;
+          }
+          int resolvedTtsDurationMs = ExtractTrailingTtsDurationMs(resolvedSpeech);
+          std::string resolvedTtsHash = ExtractTrailingTtsHash(resolvedSpeech);
+          resolvedSpeech = TrimCopy(resolvedSpeech);
+          if (resolvedTtsHash.empty() && resolvedTtsDurationMs <= 0 &&
+              !resolvedSpeech.empty() &&
+              !LooksLikeDialogueTemplateToken(resolvedSpeech)) {
+            speechLine = resolvedSpeech;
           } else {
             speechLine.clear();
           }
+        } else {
+          speechLine.clear();
         }
       }
       speechLine = SanitizeCapturedDialogueLine(speechLine);
@@ -7132,6 +7146,15 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     std::string normalizedSpeechLine = ToLowerAsciiCopy(TrimCopy(speechLine));
     if (normalizedSpeechLine.length() > 240) {
       normalizedSpeechLine = normalizedSpeechLine.substr(0, 240);
+    }
+    bool dialogueConversationActiveNow = false;
+    if (npc->dialogue && (uintptr_t)npc->dialogue > 0x1000) {
+      try {
+        dialogueConversationActiveNow =
+            !npc->dialogue->conversationHasEndedPrettyMuch();
+      } catch (...) {
+        dialogueConversationActiveNow = false;
+      }
     }
     hand currentTaskSubject;
     TaskType currentTaskNow = ResolveCurrentNpcTaskSafe(npc, currentTaskSubject);
@@ -7426,22 +7449,41 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
         EmitDismantleEvent(npc, constructionSubjectNameNow);
       }
 
-      bool hasAmbientSpeech = speechActiveNow && !normalizedSpeechLine.empty();
+      bool hasAmbientSpeech = !normalizedSpeechLine.empty();
       bool speechChanged =
-          hasAmbientSpeech &&
-          (!state.speechActive || normalizedSpeechLine != state.lastSpeechLine);
-      if (speechChanged && !speechHadTtsMetadata &&
-          !IsNpcInSpeechFlowBySerial(serial) &&
-          !ShouldDropDuplicateNonAiDialogue(serial, false, speechLine)) {
-        // Ambient sweep capture stores base dialogue with no explicit target.
+          hasAmbientSpeech && normalizedSpeechLine != state.lastSpeechLine;
+      bool inSpeechFlow = false;
+      bool duplicateDialogue = false;
+      if (g_enableRegularDialogueCapture &&
+          (hasAmbientSpeech || speechActiveNow || dialogueConversationActiveNow)) {
+        inSpeechFlow = IsNpcInSpeechFlowBySerial(serial);
+        if (hasAmbientSpeech && speechChanged && !speechHadTtsMetadata &&
+            !inSpeechFlow) {
+          duplicateDialogue =
+              ShouldDropDuplicateNonAiDialogue(serial, false, speechLine);
+        }
+      }
+      if (g_enableRegularDialogueCapture && speechChanged &&
+          !speechHadTtsMetadata && !inSpeechFlow && !duplicateDialogue) {
         unsigned int listenerSerial = 0;
         std::string listenerName = "None";
         std::string listenerFaction = "None";
+        Character *listener = nullptr;
+        std::string listenerSource = "";
+        try {
+          listener =
+              ResolveDialogueListenerForSpeech(npc, npc->dialogue, listenerSource);
+        } catch (...) {
+          listener = nullptr;
+        }
+        if (listener && (uintptr_t)listener > 0x1000 && listener != npc) {
+          listenerName = ResolveCharacterNameSafe(listener);
+          listenerFaction = SafeFaction(listener);
+          listenerSerial = ResolveCharacterSerialForEvent(listener);
+        }
         LogGameEvent("chat", ResolveCharacterNameSafe(npc), SafeFaction(npc),
                      listenerName, listenerFaction, speechLine, serial,
                      listenerSerial);
-        Log("EVENT_SCAN: ambient speech captured serial=" + ToString(serial) +
-            " speaker=" + ResolveCharacterNameSafe(npc));
       }
     }
 
@@ -7473,7 +7515,7 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
     state.constructionSubjectSerial = constructionSubjectSerialNow;
     state.constructionSubjectName = constructionSubjectNameNow;
     state.lockpickingSkill = lockpickingNow;
-    state.lastSpeechLine = speechActiveNow ? normalizedSpeechLine : "";
+    state.lastSpeechLine = normalizedSpeechLine;
     state.inventory = inventorySnapshot;
     state.lastSeenTick = nowTick;
   }
@@ -10597,11 +10639,33 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               ShouldDropDuplicateNonAiDialogue(speakerSerial, isPlayerSay,
                                                dedupeLine);
 
-          if (trackAsNonAiDialogue && !duplicateDialogueLine) {
-            // Non-AI/ambient dialogue should be stored as base speech with no target.
+          if (g_enableRegularDialogueCapture && trackAsNonAiDialogue &&
+              !duplicateDialogueLine) {
             std::string listenerName = "None";
             std::string listenerFaction = "None";
             unsigned int listenerSerial = 0;
+            Character *listener = nullptr;
+            if (tc && (uintptr_t)tc > 0x1000) {
+              if (isPlayerSay) {
+                listener = ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
+                if ((!listener || (uintptr_t)listener <= 0x1000 || listener == tc) &&
+                    targetHand.isValid()) {
+                  listener = ResolveCharacterFromHandSafe(thisptr, targetHand);
+                }
+              } else {
+                std::string listenerSource = "";
+                listener = ResolveDialogueListenerForSpeech(tc, nullptr, listenerSource);
+                if ((!listener || (uintptr_t)listener <= 0x1000 || listener == tc) &&
+                    targetHand.isValid()) {
+                  listener = ResolveCharacterFromHandSafe(thisptr, targetHand);
+                }
+              }
+            }
+            if (listener && (uintptr_t)listener > 0x1000 && listener != tc) {
+              listenerName = ResolveCharacterNameSafe(listener);
+              listenerFaction = SafeFaction(listener);
+              listenerSerial = ResolveCharacterSerialForEvent(listener);
+            }
 
             std::string speakerName = (tc && (uintptr_t)tc > 0x1000)
                                           ? ResolveCharacterNameSafe(tc)
@@ -10612,6 +10676,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LogGameEvent("chat", speakerName, speakerFaction, listenerName,
                          listenerFaction, nonAiDialogueLine, speakerSerial,
                          listenerSerial);
+            Log("REGULAR_DIALOGUE: bubble captured speaker=" + speakerName +
+                " listener=" + listenerName + " player_line=" +
+                std::string(isPlayerSay ? "1" : "0"));
           }
 
           hand sayTargetHand = targetHand;
@@ -10885,7 +10952,58 @@ static std::string ReadNpcSpeechLineSafe(Character *npc) {
     if (!npc->dialogue || (uintptr_t)npc->dialogue <= 0x1000) {
       return "";
     }
-    return TrimCopy(npc->dialogue->npcReplyText);
+    std::string line = TrimCopy(npc->dialogue->npcReplyText);
+    if (!line.empty()) {
+      return line;
+    }
+    if (npc->dialogue->speechBubblePanel &&
+        (uintptr_t)npc->dialogue->speechBubblePanel > 0x1000 &&
+        npc->dialogue->speechBubblePanel->textBox &&
+        (uintptr_t)npc->dialogue->speechBubblePanel->textBox > 0x1000) {
+      try {
+        line = TrimCopy(npc->dialogue->speechBubblePanel->textBox->getOnlyText());
+      } catch (...) {
+        line.clear();
+      }
+      if (!line.empty()) {
+        return line;
+      }
+      try {
+        line = TrimCopy(npc->dialogue->speechBubblePanel->textBox->getCaption());
+      } catch (...) {
+        line.clear();
+      }
+      if (!line.empty()) {
+        return line;
+      }
+    }
+    try {
+      line = TrimCopy(npc->dialogue->sayMsg);
+    } catch (...) {
+      line.clear();
+    }
+    if (!line.empty()) {
+      return line;
+    }
+    if (npc->dialogue->currentLine &&
+        (uintptr_t)npc->dialogue->currentLine > 0x1000) {
+      try {
+        line = TrimCopy(npc->dialogue->currentLine->getText(false));
+      } catch (...) {
+        line.clear();
+      }
+      if (!line.empty()) {
+        return line;
+      }
+      try {
+        std::string currentLineText;
+        npc->dialogue->currentLine->getText(currentLineText, false);
+        line = TrimCopy(currentLineText);
+      } catch (...) {
+        line.clear();
+      }
+    }
+    return TrimCopy(line);
   } catch (...) {
     return "";
   }
@@ -11030,6 +11148,11 @@ static std::string ResolveDialogueReplyTextByTokenSafe(Dialogue *dialogue,
 static void CapturePlayerDialogueReplyFromUi(Dialogue *dialogue,
                                              const std::string &rawReplyText,
                                              const char *sourceTag) {
+  if (!g_enableRegularDialogueCapture) {
+    Log("SPEECH_HOOK: skipped player reply capture; regular dialogue disabled.");
+    return;
+  }
+
   std::string line = TrimCopy(rawReplyText);
   if (line.empty() || line.find("[DEBUG]") == 0) {
     return;
@@ -11133,11 +11256,6 @@ static void CapturePlayerDialogueReplyFromUi(Dialogue *dialogue,
 
   LogGameEvent("chat", ResolveCharacterNameSafe(speaker), SafeFaction(speaker),
                listenerName, listenerFaction, line, speakerSerial, listenerSerial);
-  Log("SPEECH_HOOK: player reply captured source=" + std::string(sourceTag) +
-      " speaker=" + ResolveCharacterNameSafe(speaker) +
-      " speaker_serial=" + ToString(speakerSerial) + " listener=" + listenerName +
-      " listener_serial=" + ToString(listenerSerial) +
-      " listener_src=" + listenerSource);
 }
 
 static void TryCaptureAmbientSpeechFromNative(Character *speaker,
@@ -11145,6 +11263,9 @@ static void TryCaptureAmbientSpeechFromNative(Character *speaker,
                                               bool force,
                                               const char *sourceTag,
                                               Dialogue *dialogueHint) {
+  if (!g_enableRegularDialogueCapture) {
+    return;
+  }
   if (!speaker || (uintptr_t)speaker <= 0x1000) {
     return;
   }
@@ -12208,6 +12329,7 @@ __declspec(dllexport) void startPlugin() {
   }
 
   const bool kEnableSpeechCaptureHooks = false;
+  const bool kEnableDialogueReplyHooks = true;
   if (!kEnableSpeechCaptureHooks) {
     Log("HOOK: speech/dialogue capture hooks disabled for stability.");
   } else {
@@ -12285,7 +12407,11 @@ __declspec(dllexport) void startPlugin() {
             ToString((unsigned int)(uintptr_t)dialogueSayText_orig));
       }
     }
+  }
 
+  if (!kEnableDialogueReplyHooks) {
+    Log("HOOK: dialogue reply hooks disabled.");
+  } else {
     void *thunkDialogueReplyClickedInt =
         (void *)GetProcAddress(hLib, "?replyClicked@Dialogue@@QEAAXH@Z");
     if (!thunkDialogueReplyClickedInt) {

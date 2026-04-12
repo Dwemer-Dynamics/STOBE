@@ -32,6 +32,7 @@ int g_rechatDispatchCooldownMs = 350;
 int g_ttsVolumePercent = 100;
 bool g_ttsEnabled = true;
 bool g_speedDialogue = true;
+bool g_enableRegularDialogueCapture = false;
 int g_dynamicProfileIntervalHours = 24;
 
 std::string g_activeInventoryJson = "[]";

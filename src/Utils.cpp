@@ -665,6 +665,9 @@ void LoadStobeRuntimeConfig() {
       0;
   g_speedDialogue = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                                       "Speed Dialogue", 1) != 0;
+  g_enableRegularDialogueCapture =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableRegularDialogueCapture", 1) != 0;
   int boredEventIntervalHours = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
   if (boredEventIntervalHours < 1) {
@@ -724,6 +727,8 @@ void LoadStobeRuntimeConfig() {
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
+      ", RegularDialogueCapture=" +
+      (g_enableRegularDialogueCapture ? "true" : "false") +
       ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
       ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
       "h" +
@@ -771,6 +776,9 @@ void SaveStobeRuntimeConfig() {
                              g_ttsEnabled ? "1" : "0", iniPath.c_str());
   WritePrivateProfileStringA("Settings", "Speed Dialogue",
                              g_speedDialogue ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableRegularDialogueCapture",
+                             g_enableRegularDialogueCapture ? "1" : "0",
+                             iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
                              ToString(g_boredEventIntervalHours).c_str(),
                              iniPath.c_str());
@@ -1245,7 +1253,37 @@ static void CollectEventPeopleFromAnchor(
   }
 }
 
+static bool IsPlayerDialogueScopedEvent(GameWorld *world,
+                                        const std::string &eventType,
+                                        Character *actorNpc,
+                                        Character *targetNpc) {
+  if (!world || !actorNpc || !targetNpc) {
+    return false;
+  }
+
+  std::string normalizedType = ToLowerAsciiCopy(TrimCopy(eventType));
+  if (!IsDialogueLikeEventType(normalizedType)) {
+    return false;
+  }
+
+  bool actorIsPlayerCharacter = false;
+  bool targetIsPlayerCharacter = false;
+  try {
+    actorIsPlayerCharacter = actorNpc->isPlayerCharacter();
+  } catch (...) {
+    actorIsPlayerCharacter = false;
+  }
+  try {
+    targetIsPlayerCharacter = targetNpc->isPlayerCharacter();
+  } catch (...) {
+    targetIsPlayerCharacter = false;
+  }
+
+  return actorIsPlayerCharacter != targetIsPlayerCharacter;
+}
+
 static std::string BuildEventPeopleJson(GameWorld *world,
+                                        const std::string &eventType,
                                         const std::string &actor,
                                         const std::string &target,
                                         unsigned int actorSerial,
@@ -1291,6 +1329,11 @@ static std::string BuildEventPeopleJson(GameWorld *world,
                                kTotalPeopleCap, droppedByCapOut);
   TryAppendEventPersonBySerial(people, seenSerials, resolvedTargetSerial,
                                targetName, kTotalPeopleCap, droppedByCapOut);
+
+  if (IsPlayerDialogueScopedEvent(world, eventType, actorNpc, targetNpc)) {
+    peopleCountOut = static_cast<int>(people.size());
+    return BuildEventPeopleJsonArray(people);
+  }
 
   Character *anchorA = targetNpc ? targetNpc : actorNpc;
   Character *anchorB = nullptr;
@@ -1426,7 +1469,7 @@ void LogGameEvent(const std::string &type, const std::string &actor,
   bool usedSecondAnchor = false;
   std::string peopleJson = "[]";
   if (normalizedType != "init") {
-    peopleJson = BuildEventPeopleJson(GetWorldSafe(), actor, target, actorSerial,
+    peopleJson = BuildEventPeopleJson(GetWorldSafe(), eventType, actor, target, actorSerial,
                                       targetSerial, peopleCount, anchorACount,
                                       anchorBCount, droppedByCap,
                                       usedSecondAnchor);
