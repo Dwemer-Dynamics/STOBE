@@ -565,6 +565,408 @@ bool TryResolveGameDataNumber(GameData *data, const char *key, float &valueOut) 
   return false;
 }
 
+struct HornSliderSnapshot {
+  bool hasAny;
+  bool hasBody;
+  bool hasUpper;
+  bool hasLower;
+  float body;
+  float upper;
+  float lower;
+  std::string bodyKey;
+  std::string upperKey;
+  std::string lowerKey;
+
+  HornSliderSnapshot()
+      : hasAny(false), hasBody(false), hasUpper(false), hasLower(false),
+        body(0.0f), upper(0.0f), lower(0.0f) {}
+};
+
+std::string CanonicalizeAppearanceSliderKey(const std::string &value) {
+  std::string canonical;
+  canonical.reserve(value.size());
+  for (size_t i = 0; i < value.size(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(value[i]);
+    if (std::isalnum(ch)) {
+      canonical.push_back((char)std::tolower(ch));
+    }
+  }
+  return canonical;
+}
+
+bool TryParseGameDataNumberString(const std::string &rawValue, float &valueOut) {
+  const std::string value = TrimCopy(rawValue);
+  if (value.empty()) {
+    return false;
+  }
+
+  char *endPtr = nullptr;
+  valueOut = (float)strtod(value.c_str(), &endPtr);
+  if (endPtr == value.c_str()) {
+    return false;
+  }
+  while (endPtr && *endPtr != '\0') {
+    if (!std::isspace((unsigned char)*endPtr)) {
+      return false;
+    }
+    ++endPtr;
+  }
+  return true;
+}
+
+bool TryResolveGameDataNumberByAliases(GameData *data, const char *const *aliases,
+                                       size_t aliasCount, float &valueOut,
+                                       std::string &matchedKeyOut) {
+  matchedKeyOut.clear();
+  if (!data || !aliases || aliasCount == 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < aliasCount; ++i) {
+    if (!aliases[i]) {
+      continue;
+    }
+    if (TryResolveGameDataNumber(data, aliases[i], valueOut)) {
+      matchedKeyOut = aliases[i];
+      return true;
+    }
+  }
+
+  std::vector<std::string> canonicalAliases;
+  canonicalAliases.reserve(aliasCount);
+  for (size_t i = 0; i < aliasCount; ++i) {
+    if (aliases[i]) {
+      canonicalAliases.push_back(CanonicalizeAppearanceSliderKey(aliases[i]));
+    }
+  }
+
+  auto matchesExact = [&](const std::string &candidate) -> bool {
+    for (size_t i = 0; i < canonicalAliases.size(); ++i) {
+      if (candidate == canonicalAliases[i]) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto matchesLoose = [&](const std::string &candidate) -> bool {
+    for (size_t i = 0; i < canonicalAliases.size(); ++i) {
+      if (candidate.find(canonicalAliases[i]) != std::string::npos ||
+          canonicalAliases[i].find(candidate) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto tryMatchCanonical = [&](bool allowLoose) -> bool {
+    for (auto it = data->fdata.begin(); it != data->fdata.end(); ++it) {
+      const std::string candidate =
+          CanonicalizeAppearanceSliderKey(it->first);
+      const bool matches =
+          allowLoose ? matchesLoose(candidate) : matchesExact(candidate);
+      if (matches) {
+        valueOut = it->second;
+        matchedKeyOut = it->first;
+        return true;
+      }
+    }
+
+    for (auto it = data->idata.begin(); it != data->idata.end(); ++it) {
+      const std::string candidate =
+          CanonicalizeAppearanceSliderKey(it->first);
+      const bool matches =
+          allowLoose ? matchesLoose(candidate) : matchesExact(candidate);
+      if (matches) {
+        valueOut = (float)it->second;
+        matchedKeyOut = it->first;
+        return true;
+      }
+    }
+
+    for (auto it = data->sdata.begin(); it != data->sdata.end(); ++it) {
+      const std::string candidate =
+          CanonicalizeAppearanceSliderKey(it->first);
+      const bool matches =
+          allowLoose ? matchesLoose(candidate) : matchesExact(candidate);
+      if (!matches) {
+        continue;
+      }
+      float parsedValue = 0.0f;
+      if (TryParseGameDataNumberString(it->second, parsedValue)) {
+        valueOut = parsedValue;
+        matchedKeyOut = it->first;
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  return tryMatchCanonical(false) || tryMatchCanonical(true);
+}
+
+float NormalizeHornLargeValue(float sliderValue) {
+  if (sliderValue >= 0.0f && sliderValue <= 1.0f) {
+    sliderValue *= 100.0f;
+  }
+  float normalized = (100.0f - sliderValue) / 100.0f;
+  if (normalized < 0.0f) {
+    return 0.0f;
+  }
+  if (normalized > 1.0f) {
+    return 1.0f;
+  }
+  return normalized;
+}
+
+float NormalizeHornSliderForOutput(float sliderValue) {
+  if (sliderValue >= 0.0f && sliderValue <= 1.0f) {
+    return sliderValue * 100.0f;
+  }
+  return sliderValue;
+}
+
+std::string BuildHornSliderPayload(const HornSliderSnapshot &snapshot) {
+  if (!snapshot.hasAny) {
+    return "{}";
+  }
+
+  int sliderCount = 0;
+  float sliderSum = 0.0f;
+  float largeSum = 0.0f;
+  std::string json = "{";
+  std::string matchedKeysJson = "{";
+
+  auto appendSlider = [&](const char *name, float sliderValue,
+                          const std::string &matchedKey) {
+    const float outputValue = NormalizeHornSliderForOutput(sliderValue);
+    const float largeNorm = NormalizeHornLargeValue(sliderValue);
+    json += "\"" + std::string(name) + "\":" + ToString(outputValue) + ",";
+    json += "\"" + std::string(name) + "_large_norm\":" + ToString(largeNorm) +
+            ",";
+    matchedKeysJson += "\"" + std::string(name) + "\":\"" +
+                       EscapeJSON(matchedKey) + "\",";
+    sliderSum += outputValue;
+    largeSum += largeNorm;
+    ++sliderCount;
+  };
+
+  if (snapshot.hasBody) {
+    appendSlider("body", snapshot.body, snapshot.bodyKey);
+  }
+  if (snapshot.hasUpper) {
+    appendSlider("upper", snapshot.upper, snapshot.upperKey);
+  }
+  if (snapshot.hasLower) {
+    appendSlider("lower", snapshot.lower, snapshot.lowerKey);
+  }
+
+  if (sliderCount > 0) {
+    json += "\"average\":" + ToString(sliderSum / (float)sliderCount) + ",";
+    json += "\"average_large_norm\":" +
+            ToString(largeSum / (float)sliderCount) + ",";
+  }
+  if (matchedKeysJson.back() == ',') {
+    matchedKeysJson.pop_back();
+  }
+  matchedKeysJson += "}";
+  json += "\"matched_keys\":" + matchedKeysJson;
+  if (json.back() == ',') {
+    json.pop_back();
+  }
+  json += "}";
+  return json;
+}
+
+std::string DescribeHornSliderForLog(bool present, float value,
+                                     const std::string &matchedKey) {
+  if (!present) {
+    return "n/a";
+  }
+  std::string description = ToString(NormalizeHornSliderForOutput(value));
+  if (!matchedKey.empty()) {
+    description += "@" + matchedKey;
+  }
+  return description;
+}
+
+std::string BuildGameDataIntDebugString(GameData *data) {
+  if (!data) {
+    return "";
+  }
+  std::string out;
+  for (auto it = data->idata.begin(); it != data->idata.end(); ++it) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += it->first + "=" + ToString(it->second);
+  }
+  return out;
+}
+
+std::string BuildGameDataFloatDebugString(GameData *data) {
+  if (!data) {
+    return "";
+  }
+  std::string out;
+  for (auto it = data->fdata.begin(); it != data->fdata.end(); ++it) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += it->first + "=" + ToString(it->second);
+  }
+  return out;
+}
+
+std::string BuildGameDataStringDebugString(GameData *data) {
+  if (!data) {
+    return "";
+  }
+  std::string out;
+  for (auto it = data->sdata.begin(); it != data->sdata.end(); ++it) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += it->first + "=" + EscapeJSON(it->second);
+  }
+  return out;
+}
+
+std::string BuildGameDataBoolDebugString(GameData *data) {
+  if (!data) {
+    return "";
+  }
+  std::string out;
+  for (auto it = data->bdata.begin(); it != data->bdata.end(); ++it) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += it->first + "=" + std::string(it->second ? "true" : "false");
+  }
+  return out;
+}
+
+std::string BuildGameDataRefDebugString(GameData *data) {
+  if (!data) {
+    return "";
+  }
+  std::string out;
+  for (auto it = data->objectReferences.begin(); it != data->objectReferences.end();
+       ++it) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += it->first + "=" + ToString((int)it->second.size());
+  }
+  return out;
+}
+
+bool RaceLooksLikeShek(const std::string &raceName) {
+  const std::string canonical = CanonicalizeAppearanceSliderKey(raceName);
+  return canonical.find("shek") != std::string::npos;
+}
+
+void LogHornAliasMissDebug(Character *character, const std::string &npcName,
+                           const std::string &raceName) {
+  if (!character || (uintptr_t)character <= 0x1000 || !RaceLooksLikeShek(raceName)) {
+    return;
+  }
+
+  static std::map<std::string, bool> loggedByNpcName;
+  if (loggedByNpcName[npcName]) {
+    return;
+  }
+
+  AppearanceBase *appearance = nullptr;
+  try {
+    appearance = character->getAppearance();
+  } catch (...) {
+    appearance = nullptr;
+  }
+  if (!appearance || (uintptr_t)appearance <= 0x1000) {
+    Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
+        " appearance=null");
+    loggedByNpcName[npcName] = true;
+    return;
+  }
+
+  GameData *appearanceData = nullptr;
+  try {
+    appearanceData = appearance->getAppearanceData();
+  } catch (...) {
+    appearanceData = nullptr;
+  }
+  if (!appearanceData || (uintptr_t)appearanceData <= 0x1000) {
+    Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
+        " appearance_data=null");
+    loggedByNpcName[npcName] = true;
+    return;
+  }
+
+  Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
+      " idata=[" + BuildGameDataIntDebugString(appearanceData) + "]" +
+      " fdata=[" + BuildGameDataFloatDebugString(appearanceData) + "]" +
+      " sdata=[" + BuildGameDataStringDebugString(appearanceData) + "]" +
+      " bdata=[" + BuildGameDataBoolDebugString(appearanceData) + "]" +
+      " refs=[" + BuildGameDataRefDebugString(appearanceData) + "]");
+  loggedByNpcName[npcName] = true;
+}
+
+void CaptureHornSliderSnapshot(Character *character, HornSliderSnapshot &out) {
+  out = HornSliderSnapshot();
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return;
+  }
+
+  AppearanceBase *appearance = nullptr;
+  try {
+    appearance = character->getAppearance();
+  } catch (...) {
+    appearance = nullptr;
+  }
+  if (!appearance || (uintptr_t)appearance <= 0x1000) {
+    return;
+  }
+
+  GameData *appearanceData = nullptr;
+  try {
+    appearanceData = appearance->getAppearanceData();
+  } catch (...) {
+    appearanceData = nullptr;
+  }
+  if (!appearanceData || (uintptr_t)appearanceData <= 0x1000) {
+    return;
+  }
+
+  static const char *kHornBodyAliases[] = {
+      "horn body",           "body horn",           "horn_body",
+      "body_horn",           "hornbody",            "bodyhorn",
+      "bone_horns_body_short"};
+  static const char *kHornUpperAliases[] = {
+      "horn upper",          "upper horn",          "horn_upper",
+      "upper_horn",          "hornupper",           "upperhorn",
+      "bone_horns_top_short"};
+  static const char *kHornLowerAliases[] = {
+      "horn lower",          "lower horn",          "horn_lower",
+      "lower_horn",          "hornlower",           "lowerhorn",
+      "bone_horns_bottom_short"};
+
+  out.hasBody = TryResolveGameDataNumberByAliases(
+      appearanceData, kHornBodyAliases,
+      sizeof(kHornBodyAliases) / sizeof(kHornBodyAliases[0]), out.body,
+      out.bodyKey);
+  out.hasUpper = TryResolveGameDataNumberByAliases(
+      appearanceData, kHornUpperAliases,
+      sizeof(kHornUpperAliases) / sizeof(kHornUpperAliases[0]), out.upper,
+      out.upperKey);
+  out.hasLower = TryResolveGameDataNumberByAliases(
+      appearanceData, kHornLowerAliases,
+      sizeof(kHornLowerAliases) / sizeof(kHornLowerAliases[0]), out.lower,
+      out.lowerKey);
+  out.hasAny = out.hasBody || out.hasUpper || out.hasLower;
+}
+
 std::string ResolveGameDataRefName(GameData *data, const char *key) {
   if (!data || !key) {
     return "";
@@ -2215,6 +2617,15 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   float ageNorm = 0.5f;
   CaptureAppearanceSnapshot(npc, hasBeard, isShaved, isFlayed, heightNorm,
                             ageNorm);
+  HornSliderSnapshot hornSnapshot;
+  CaptureHornSliderSnapshot(npc, hornSnapshot);
+  if (RaceLooksLikeShek(raceName)) {
+    Log("HORN_DEBUG_ENTER: bootstrap npc=" + npcName + " race=" + raceName +
+        " hasAny=" + std::string(hornSnapshot.hasAny ? "true" : "false") +
+        " hasBody=" + std::string(hornSnapshot.hasBody ? "true" : "false") +
+        " hasUpper=" + std::string(hornSnapshot.hasUpper ? "true" : "false") +
+        " hasLower=" + std::string(hornSnapshot.hasLower ? "true" : "false"));
+  }
   std::string identityFaction = GetIdentityFaction(npc);
   std::string storageId = GetStorageIDFor(npc, npcName, identityFaction);
   std::string stats = BuildStatsPayload(npc);
@@ -2283,6 +2694,21 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   json += "\"is_flayed\": " + std::string(isFlayed ? "true" : "false") + ",";
   json += "\"height_norm\": " + ToString(heightNorm) + ",";
   json += "\"age_norm\": " + ToString(ageNorm) + ",";
+  if (hornSnapshot.hasAny) {
+    json += "\"horn_sliders\":" + BuildHornSliderPayload(hornSnapshot) + ",";
+    Log("HORN_DETECT: bootstrap npc=" + npcName + " race=" + raceName +
+        " body=" + DescribeHornSliderForLog(hornSnapshot.hasBody,
+                                            hornSnapshot.body,
+                                            hornSnapshot.bodyKey) +
+        " upper=" + DescribeHornSliderForLog(hornSnapshot.hasUpper,
+                                             hornSnapshot.upper,
+                                             hornSnapshot.upperKey) +
+        " lower=" + DescribeHornSliderForLog(hornSnapshot.hasLower,
+                                             hornSnapshot.lower,
+                                             hornSnapshot.lowerKey));
+  } else {
+    LogHornAliasMissDebug(npc, npcName, raceName);
+  }
   if (!equipment.empty()) {
     json += "\"equipment\":\"" + EscapeJSON(equipment) + "\",";
   }
@@ -3455,11 +3881,16 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   float ageNorm = 0.5f;
   CaptureAppearanceSnapshot(npc, hasBeard, isShaved, isFlayed, heightNorm,
                             ageNorm);
+  HornSliderSnapshot hornSnapshot;
+  CaptureHornSliderSnapshot(npc, hornSnapshot);
   json += "\"has_beard\": " + std::string(hasBeard ? "true" : "false") + ",";
   json += "\"is_shaved\": " + std::string(isShaved ? "true" : "false") + ",";
   json += "\"is_flayed\": " + std::string(isFlayed ? "true" : "false") + ",";
   json += "\"height_norm\": " + ToString(heightNorm) + ",";
   json += "\"age_norm\": " + ToString(ageNorm) + ",";
+  if (hornSnapshot.hasAny) {
+    json += "\"horn_sliders\":" + BuildHornSliderPayload(hornSnapshot) + ",";
+  }
 
   // Robust Faction Name
   Faction *faction = nullptr;
@@ -3668,6 +4099,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         float o_ageNorm = 0.5f;
         CaptureAppearanceSnapshot(other, o_hasBeard, o_isShaved, o_isFlayed,
                                   o_heightNorm, o_ageNorm);
+        HornSliderSnapshot o_hornSnapshot;
+        CaptureHornSliderSnapshot(other, o_hornSnapshot);
         float dist = npc->getPosition().distance(other->getPosition());
         const hand &otherIndoorsHandle = other->isIndoors();
         bool otherIsIndoors = IsIndoorsHandleValid(otherIndoorsHandle);
@@ -3788,6 +4221,10 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
                 std::string(o_isFlayed ? "true" : "false") + ",";
         json += "\"height_norm\": " + ToString(o_heightNorm) + ",";
         json += "\"age_norm\": " + ToString(o_ageNorm) + ",";
+        if (o_hornSnapshot.hasAny) {
+          json += "\"horn_sliders\":" + BuildHornSliderPayload(o_hornSnapshot) +
+                  ",";
+        }
         json += "\"health\":\"" + EscapeJSON(o_health) + "\",";
         json += "\"medical\":" + o_medical + ",";
         json += "\"has_robotic_limbs\": " +

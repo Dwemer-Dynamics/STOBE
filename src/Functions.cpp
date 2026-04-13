@@ -1,5 +1,6 @@
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "Comm.h"
 #include "Context.h"
 #include "Globals.h"
 #include "KenshiBuildingCompat.h"
@@ -8,6 +9,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <core/Functions.h>
+#include <kenshi/Appearance.h>
 #include <kenshi/Character.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/CharStats.h>
@@ -52,6 +54,198 @@ const float kDrugHungerMultiplier = 1.5f;
 const float kDrugExtraHungerMultiplier = kDrugHungerMultiplier - 1.0f;
 const float kNpcCloseActionRangeUnits = 25.0f;
 const DWORD kNpcCloseActionApproachTimeoutMs = 10000;
+
+namespace {
+const char *kShekHornBodyKey = "bone_horns_body_short";
+const char *kShekHornUpperKey = "bone_horns_top_short";
+const char *kShekHornLowerKey = "bone_horns_bottom_short";
+const float kHornCutOffThreshold = 0.999f;
+
+float ClampHornSlider01(float value) {
+  if (value < 0.0f) {
+    return 0.0f;
+  }
+  if (value > 1.0f) {
+    if (value <= 100.0f) {
+      value /= 100.0f;
+    } else {
+      value = 1.0f;
+    }
+  }
+  if (value < 0.0f) {
+    return 0.0f;
+  }
+  if (value > 1.0f) {
+    return 1.0f;
+  }
+  return value;
+}
+
+bool TryReadGameDataNumberExact(GameData *data, const char *key, float &valueOut) {
+  if (!data || !key) {
+    return false;
+  }
+
+  auto fit = data->fdata.find(key);
+  if (fit != data->fdata.end()) {
+    valueOut = fit->second;
+    return true;
+  }
+
+  auto iit = data->idata.find(key);
+  if (iit != data->idata.end()) {
+    valueOut = (float)iit->second;
+    return true;
+  }
+
+  auto sit = data->sdata.find(key);
+  if (sit != data->sdata.end()) {
+    valueOut = (float)atof(sit->second.c_str());
+    return true;
+  }
+
+  return false;
+}
+
+bool TryGetCharacterAppearanceData(Character *npc, AppearanceBase *&appearanceOut,
+                                   GameData *&appearanceDataOut,
+                                   std::string &reasonOut) {
+  appearanceOut = nullptr;
+  appearanceDataOut = nullptr;
+  reasonOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "target not found";
+    return false;
+  }
+
+  try {
+    appearanceOut = npc->getAppearance();
+  } catch (...) {
+    appearanceOut = nullptr;
+  }
+  if (!appearanceOut || (uintptr_t)appearanceOut <= 0x1000) {
+    reasonOut = "target has no appearance data";
+    return false;
+  }
+
+  try {
+    appearanceDataOut = appearanceOut->getAppearanceData();
+  } catch (...) {
+    appearanceDataOut = nullptr;
+  }
+  if (!appearanceDataOut || (uintptr_t)appearanceDataOut <= 0x1000) {
+    reasonOut = "target has no appearance sliders";
+    return false;
+  }
+
+  return true;
+}
+
+bool TryGetCharacterHornAverageInternal(Character *npc, float &averageOut,
+                                        std::string &reasonOut) {
+  averageOut = 0.0f;
+  reasonOut.clear();
+  if (!IsCharacterShekRace(npc)) {
+    reasonOut = "target is not Shek";
+    return false;
+  }
+
+  AppearanceBase *appearance = nullptr;
+  GameData *appearanceData = nullptr;
+  if (!TryGetCharacterAppearanceData(npc, appearance, appearanceData, reasonOut)) {
+    return false;
+  }
+
+  const char *kHornKeys[] = {
+      kShekHornBodyKey,
+      kShekHornUpperKey,
+      kShekHornLowerKey,
+  };
+
+  float sum = 0.0f;
+  int count = 0;
+  for (size_t i = 0; i < sizeof(kHornKeys) / sizeof(kHornKeys[0]); ++i) {
+    float value = 0.0f;
+    if (!TryReadGameDataNumberExact(appearanceData, kHornKeys[i], value)) {
+      continue;
+    }
+    sum += ClampHornSlider01(value);
+    ++count;
+  }
+
+  if (count <= 0) {
+    reasonOut = "target horn sliders are unavailable";
+    return false;
+  }
+
+  averageOut = sum / (float)count;
+  return true;
+}
+
+bool RefreshCharacterAppearance(Character *npc) {
+  AppearanceBase *appearance = nullptr;
+  try {
+    appearance = npc ? npc->getAppearance() : nullptr;
+  } catch (...) {
+    appearance = nullptr;
+  }
+  if (!appearance || (uintptr_t)appearance <= 0x1000) {
+    return false;
+  }
+
+  bool refreshed = false;
+  try {
+    appearance->notifyDirty();
+    refreshed = true;
+  } catch (...) {
+  }
+  try {
+    appearance->reload();
+    refreshed = true;
+  } catch (...) {
+  }
+  try {
+    appearance->updateAppearance();
+    refreshed = true;
+  } catch (...) {
+  }
+  try {
+    appearance->updatePortrait();
+    refreshed = true;
+  } catch (...) {
+  }
+  return refreshed;
+}
+
+void PushImmediateHornContextSnapshot(Character *npc, const std::string &reason) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return;
+  }
+
+  std::string contextType = "npc";
+  std::string npcName = "Unknown";
+  try {
+    if (npc->isPlayerCharacter()) {
+      contextType = "player";
+    }
+    npcName = npc->getName();
+  } catch (...) {
+  }
+
+  std::string contextJson = BuildNpcContextEnvelope(npc, contextType);
+  if (contextJson.empty() || contextJson.front() != '{' ||
+      contextJson.back() != '}') {
+    Log("CONTEXT_PUSH: skipped immediate horn snapshot reason=" + reason +
+        " name=" + npcName);
+    return;
+  }
+
+  AsyncPostToStobe(L"/context", contextJson);
+  Log("CONTEXT_PUSH: sent immediate horn snapshot reason=" + reason +
+      " name=" + npcName + " type=" + contextType +
+      " len=" + ToString((int)contextJson.length()));
+}
+} // namespace
 
 struct NpcDrunkState {
   int level;
@@ -2823,6 +3017,20 @@ bool IsCharacterSkeletonRace(Character *npc) {
   }
   std::string token = NormalizeInventoryMatchToken(raceName);
   return token.find("skeleton") != std::string::npos;
+}
+
+bool IsCharacterShekRace(Character *npc) {
+  std::string raceName = "";
+  if (!ResolveRaceNameSafe(npc, raceName)) {
+    return false;
+  }
+  std::string token = NormalizeInventoryMatchToken(raceName);
+  return token.find("shek") != std::string::npos;
+}
+
+bool TryGetCharacterHornAverage(Character *npc, float &averageOut) {
+  std::string reason = "";
+  return TryGetCharacterHornAverageInternal(npc, averageOut, reason);
 }
 
 bool ResolveCharacterDrinkItemMatch(Character *npc, const std::string &rawQuery,
@@ -6621,6 +6829,213 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                 "'s " + limbName + ".",
                             true);
                       }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else if (act.type == ACT_CUT_HORNS) {
+          const std::string actorName = SafeCharacterName(npc);
+          std::string targetName =
+              target ? SafeCharacterName(target) : TrimCopySimple(act.message);
+          if (targetName.empty()) {
+            targetName = "target";
+          }
+          if (!CharacterHasHacksaw(npc)) {
+            Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                " reason=missing_hacksaw");
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot cut horns without a hacksaw.", true);
+          } else if (!target || (uintptr_t)target <= 0x1000) {
+            Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                " reason=target_not_found target_token='" + act.message +
+                "' explicit_target_token='" + TrimCopySimple(act.targetToken) +
+                "' requested_serial=" + ToString((unsigned int)act.target.serial));
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid horn-cutting target.", true);
+          } else {
+            float actionDistance = -1.0f;
+            std::string rangeReason = "";
+            if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
+                                             actionDistance, rangeReason)) {
+              CloseActionApproachResult approachResult =
+                  TryDeferCloseActionUntilInRange(
+                      thisptr, npc, target, act, "cut the horns off",
+                      targetName, actionDistance, rangeReason,
+                      kNpcCloseActionRangeUnits);
+              if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                queueDeferredAction = true;
+                deferActionQueue = true;
+                deferredAction = act;
+              } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " could not reach " + targetName +
+                        " in time to cut off their horns (" + userReason + ").",
+                    true);
+                Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                    " target=" + targetName +
+                    " reason=approach_timeout last_reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits) +
+                    " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+              } else {
+                Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot cut off " + targetName +
+                        "'s horns because they are " + userReason + ".",
+                    true);
+              }
+            } else {
+              ResetCloseActionApproachState(npc, act);
+              std::string invalidReason = "";
+              bool targetIsDead = false;
+              if (!IsTakeItemLootTargetValid(thisptr, target, invalidReason,
+                                             targetIsDead)) {
+                if (invalidReason.empty()) {
+                  invalidReason =
+                      "target must be dead, knocked out, unconscious, imprisoned, "
+                      "or carried";
+                }
+                Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + invalidReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot cut off " + targetName +
+                        "'s horns: " + invalidReason + ".",
+                    true);
+              } else if (!IsCharacterShekRace(target)) {
+                Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                    " target=" + targetName + " reason=target_not_shek");
+                thisptr->showPlayerAMessage_withLog(
+                    targetName + " is not Shek and has no Shek horns to cut off.",
+                    true);
+              } else {
+                float previousAverage = 0.0f;
+                std::string hornReason = "";
+                if (!TryGetCharacterHornAverageInternal(target, previousAverage,
+                                                        hornReason)) {
+                  Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                      " target=" + targetName + " reason=" +
+                      (hornReason.empty() ? std::string("horn_data_unavailable")
+                                          : hornReason));
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " could not inspect " + targetName +
+                          "'s horn length.",
+                      true);
+                } else if (previousAverage >= kHornCutOffThreshold) {
+                  Log("ACTION_EXEC: CUT_HORNS skipped actor=" + actorName +
+                      " target=" + targetName + " reason=already_cut average=" +
+                      ToString(previousAverage));
+                  thisptr->showPlayerAMessage_withLog(
+                      targetName + "'s horns have already been cut off.", true);
+                } else {
+                  AppearanceBase *appearance = nullptr;
+                  GameData *appearanceData = nullptr;
+                  std::string appearanceReason = "";
+                  if (!TryGetCharacterAppearanceData(target, appearance,
+                                                     appearanceData,
+                                                     appearanceReason)) {
+                    Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                        " target=" + targetName + " reason=" +
+                        (appearanceReason.empty()
+                             ? std::string("appearance_unavailable")
+                             : appearanceReason));
+                    thisptr->showPlayerAMessage_withLog(
+                        actorName + " could not access " + targetName +
+                            "'s appearance data.",
+                        true);
+                  } else {
+                    bool hornSet = false;
+                    try {
+                      appearanceData->fdata[kShekHornBodyKey] = 1.0f;
+                      appearanceData->fdata[kShekHornUpperKey] = 1.0f;
+                      appearanceData->fdata[kShekHornLowerKey] = 1.0f;
+                      hornSet = true;
+                    } catch (...) {
+                      hornSet = false;
+                    }
+
+                    if (!hornSet) {
+                      Log("ACTION_EXEC: CUT_HORNS failed actor=" + actorName +
+                          " target=" + targetName +
+                          " reason=appearance_write_failed");
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " failed to cut off " + targetName +
+                              "'s horns.",
+                          true);
+                    } else {
+                      bool refreshed = RefreshCharacterAppearance(target);
+                      unsigned int actorSerial = 0;
+                      unsigned int targetSerial = 0;
+                      try {
+                        actorSerial = npc->getHandle().serial;
+                      } catch (...) {
+                        actorSerial = 0;
+                      }
+                      try {
+                        targetSerial = target->getHandle().serial;
+                      } catch (...) {
+                        targetSerial = 0;
+                      }
+                      auto resolveFactionNameSafe = [](Character *character)
+                          -> std::string {
+                        if (!character || (uintptr_t)character <= 0x1000) {
+                          return "None";
+                        }
+                        try {
+                          Faction *faction =
+                              character->getFaction()
+                                  ? character->getFaction()
+                                  : character->owner;
+                          if (faction && (uintptr_t)faction > 0x1000) {
+                            std::string factionName = faction->getName();
+                            if (!factionName.empty()) {
+                              return factionName;
+                            }
+                            if (faction->data) {
+                              std::string fallback = faction->data->name;
+                              if (fallback.empty()) {
+                                fallback = faction->data->stringID;
+                              }
+                              if (!fallback.empty()) {
+                                return fallback;
+                              }
+                            }
+                          }
+                        } catch (...) {
+                        }
+                        return "None";
+                      };
+                      LogGameEvent(
+                          "horn_cut", actorName, resolveFactionNameSafe(npc),
+                          targetName, resolveFactionNameSafe(target),
+                          "cut off the horns of " + targetName +
+                              " with a hacksaw",
+                          actorSerial, targetSerial);
+                      PushImmediateHornContextSnapshot(target, "horn_cut");
+                      try {
+                        target->reThinkCurrentAIAction();
+                      } catch (...) {
+                      }
+                      try {
+                        npc->reThinkCurrentAIAction();
+                      } catch (...) {
+                      }
+                      Log("ACTION_EXEC: CUT_HORNS success actor=" + actorName +
+                          " target=" + targetName +
+                          " previous_average=" + ToString(previousAverage) +
+                          " refreshed=" + std::string(refreshed ? "1" : "0"));
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " cut off " + targetName +
+                              "'s horns with a hacksaw.",
+                          true);
                     }
                   }
                 }

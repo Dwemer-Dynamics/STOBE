@@ -7,6 +7,8 @@ class GameWorld;
 
 bool CharacterHasHacksaw(Character *npc);
 bool IsCharacterSkeletonRace(Character *npc);
+bool IsCharacterShekRace(Character *npc);
+bool TryGetCharacterHornAverage(Character *npc, float &averageOut);
 bool IsRemoveLimbTargetValid(GameWorld *world, Character *target,
                              std::string &reasonOut);
 bool IsTakeItemLootTargetValid(GameWorld *world, Character *target,

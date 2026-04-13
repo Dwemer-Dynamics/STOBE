@@ -8508,6 +8508,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             actionCommand = "FORCE_DRINK";
           } else if (actionCommand == "REMOVELIMB") {
             actionCommand = "REMOVE_LIMB";
+          } else if (actionCommand == "CUTHORNS" ||
+                     actionCommand == "CUT-HORNS") {
+            actionCommand = "CUT_HORNS";
           } else if (actionCommand == "KILLTARGET" ||
                      actionCommand == "EXECUTE" ||
                      actionCommand == "MURDER") {
@@ -8559,7 +8562,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } catch (...) {
             actionActorIsPlayerFaction = false;
           }
-          bool logAsInfoAction = (actionCommand != "REMOVE_LIMB");
+          bool logAsInfoAction =
+              (actionCommand != "REMOVE_LIMB" && actionCommand != "CUT_HORNS");
           if (logAsInfoAction) {
             std::string actionEventMessage =
                 "action command received: " + actionCommand + "@";
@@ -8655,6 +8659,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             targetOut = targetToken;
             limbOut = parsedLimb;
             return true;
+          };
+          auto parseSingleTargetPayload =
+              [](const std::string &rawPayload,
+                 std::string &targetOut) -> bool {
+            targetOut = TrimCopy(rawPayload);
+            return !targetOut.empty();
           };
           auto parseForceDrinkPayload =
               [](const std::string &rawPayload, std::string &targetOut,
@@ -10324,6 +10334,36 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 targetToken + "' target_serial=" +
                 ToString((unsigned int)limbTarget.serial) + " limb_code=" +
                 ToString(limbCode));
+          } else if (actionCommand == "CUT_HORNS") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string targetToken = "";
+            if (!parseSingleTargetPayload(actionArgument, targetToken)) {
+              Log("HOOK_MSG_PROC: CUT_HORNS ignored; invalid payload '" +
+                  actionArgument + "'");
+              continue;
+            }
+            hand hornTarget = resolveActionTargetHand(targetToken, targetHand);
+            if (!hornTarget.isValid()) {
+              Log("HOOK_MSG_PROC: CUT_HORNS target unresolved at parse-time '" +
+                  targetToken +
+                  "'; deferring to runtime token resolution");
+              hornTarget = hand();
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_CUT_HORNS;
+            act.actor = targetHand;
+            act.target = hornTarget;
+            act.message = targetToken;
+            act.targetToken = targetToken;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: CUT_HORNS queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)hornTarget.serial));
           } else if (actionCommand == "KILL") {
             if (shouldSkipSpeakerBoundAction(actionCommand)) {
               continue;

@@ -231,13 +231,14 @@ bool TryRenameCharacterAndSync(GameWorld *world, const std::string &targetNameHi
 enum ManualChatActionType {
   MANUAL_CHAT_ACTION_NONE = 0,
   MANUAL_CHAT_ACTION_REMOVE_LIMB = 1,
-  MANUAL_CHAT_ACTION_GIVE_CATS = 2,
-  MANUAL_CHAT_ACTION_GIVE_ITEM = 3,
-  MANUAL_CHAT_ACTION_ROLEPLAY_ACTION = 4,
-  MANUAL_CHAT_ACTION_DRINK_ITEM = 5,
-  MANUAL_CHAT_ACTION_USE_DRUGS = 6,
-  MANUAL_CHAT_ACTION_KILL = 7,
-  MANUAL_CHAT_ACTION_FORCE_DRINK = 8
+  MANUAL_CHAT_ACTION_CUT_HORNS = 2,
+  MANUAL_CHAT_ACTION_GIVE_CATS = 3,
+  MANUAL_CHAT_ACTION_GIVE_ITEM = 4,
+  MANUAL_CHAT_ACTION_ROLEPLAY_ACTION = 5,
+  MANUAL_CHAT_ACTION_DRINK_ITEM = 6,
+  MANUAL_CHAT_ACTION_USE_DRUGS = 7,
+  MANUAL_CHAT_ACTION_KILL = 8,
+  MANUAL_CHAT_ACTION_FORCE_DRINK = 9
 };
 
 struct ManualChatActionChoice {
@@ -264,6 +265,8 @@ const ManualChatActionChoice kManualChatActionChoices[] = {
      "remove_limb_left_leg", "LEFT_LEG", false},
     {MANUAL_CHAT_ACTION_REMOVE_LIMB, "remove right leg (hacksaw)",
      "remove_limb_right_leg", "RIGHT_LEG", false},
+    {MANUAL_CHAT_ACTION_CUT_HORNS, "cut horns (hacksaw)", "cut_horns", "",
+     false},
     {MANUAL_CHAT_ACTION_KILL, "kill", "kill", "", false},
 };
 
@@ -310,6 +313,19 @@ std::string BuildManualRemoveLimbActionToken(const std::string &targetName,
     targetToken += "|" + targetHandle;
   }
   return "REMOVE_LIMB@" + targetToken + "@" + normalizedLimbToken;
+}
+
+std::string BuildManualCutHornsActionToken(const std::string &targetName,
+                                           const std::string &targetHandle) {
+  std::string normalizedTargetName = targetName;
+  if (normalizedTargetName.empty()) {
+    return "";
+  }
+  std::string targetToken = normalizedTargetName;
+  if (!targetHandle.empty()) {
+    targetToken += "|" + targetHandle;
+  }
+  return "CUT_HORNS@" + targetToken;
 }
 
 std::string BuildManualGiveCatsActionToken(const std::string &targetName,
@@ -2986,6 +3002,75 @@ void OnChatSendClick(MyGUI::Widget *sender) {
         }
         Log("CHAT_GATE: blocked manual remove limb reason='" + invalidReason +
             "' actor='" + playerName + "' target='" + targetName + "'");
+        return;
+      }
+      manualActionPromptEligible = true;
+    } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_CUT_HORNS) {
+      manualActionCommand =
+          BuildManualCutHornsActionToken(targetName, resolvedTargetHandle);
+      if (manualActionCommand.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not build cut-horns action.", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns invalid_action_token target='" +
+            targetName + "' handle='" + resolvedTargetHandle + "'");
+        return;
+      }
+      if (!CharacterHasHacksaw(player)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Speaker needs a hacksaw to cut horns.", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns missing_hacksaw actor='" +
+            playerName + "'");
+        return;
+      }
+      std::string invalidReason = "";
+      bool targetIsDead = false;
+      if (!IsTakeItemLootTargetValid(world, targetNpc, invalidReason,
+                                     targetIsDead)) {
+        if (invalidReason.empty()) {
+          invalidReason =
+              "target must be dead, knocked out, unconscious, imprisoned, or "
+              "carried";
+        }
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: " + invalidReason + ".", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns reason='" + invalidReason +
+            "' actor='" + playerName + "' target='" + targetName + "'");
+        return;
+      }
+      if (!IsCharacterShekRace(targetNpc)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Only Shek have horns to cut.", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns reason=target_not_shek actor='" +
+            playerName + "' target='" + targetName + "'");
+        return;
+      }
+      float hornAverage = 0.0f;
+      if (!TryGetCharacterHornAverage(targetNpc, hornAverage)) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not inspect target horn sliders.", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns reason=horn_data_unavailable "
+            "actor='" +
+            playerName + "' target='" + targetName + "'");
+        return;
+      }
+      if (hornAverage >= 0.999f) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Their horns are already cut off.", true);
+        }
+        Log("CHAT_GATE: blocked manual cut horns reason=already_cut actor='" +
+            playerName + "' target='" + targetName +
+            "' average=" + ToString(hornAverage));
         return;
       }
       manualActionPromptEligible = true;
