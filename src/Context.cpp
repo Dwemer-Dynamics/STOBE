@@ -570,6 +570,8 @@ struct HornSliderSnapshot {
   bool hasBody;
   bool hasUpper;
   bool hasLower;
+  unsigned int liveDataPtr;
+  unsigned int sourceDataPtr;
   float body;
   float upper;
   float lower;
@@ -579,7 +581,8 @@ struct HornSliderSnapshot {
 
   HornSliderSnapshot()
       : hasAny(false), hasBody(false), hasUpper(false), hasLower(false),
-        body(0.0f), upper(0.0f), lower(0.0f) {}
+        liveDataPtr(0), sourceDataPtr(0), body(0.0f), upper(0.0f),
+        lower(0.0f) {}
 };
 
 std::string CanonicalizeAppearanceSliderKey(const std::string &value) {
@@ -779,140 +782,6 @@ std::string BuildHornSliderPayload(const HornSliderSnapshot &snapshot) {
   return json;
 }
 
-std::string DescribeHornSliderForLog(bool present, float value,
-                                     const std::string &matchedKey) {
-  if (!present) {
-    return "n/a";
-  }
-  std::string description = ToString(NormalizeHornSliderForOutput(value));
-  if (!matchedKey.empty()) {
-    description += "@" + matchedKey;
-  }
-  return description;
-}
-
-std::string BuildGameDataIntDebugString(GameData *data) {
-  if (!data) {
-    return "";
-  }
-  std::string out;
-  for (auto it = data->idata.begin(); it != data->idata.end(); ++it) {
-    if (!out.empty()) {
-      out += "; ";
-    }
-    out += it->first + "=" + ToString(it->second);
-  }
-  return out;
-}
-
-std::string BuildGameDataFloatDebugString(GameData *data) {
-  if (!data) {
-    return "";
-  }
-  std::string out;
-  for (auto it = data->fdata.begin(); it != data->fdata.end(); ++it) {
-    if (!out.empty()) {
-      out += "; ";
-    }
-    out += it->first + "=" + ToString(it->second);
-  }
-  return out;
-}
-
-std::string BuildGameDataStringDebugString(GameData *data) {
-  if (!data) {
-    return "";
-  }
-  std::string out;
-  for (auto it = data->sdata.begin(); it != data->sdata.end(); ++it) {
-    if (!out.empty()) {
-      out += "; ";
-    }
-    out += it->first + "=" + EscapeJSON(it->second);
-  }
-  return out;
-}
-
-std::string BuildGameDataBoolDebugString(GameData *data) {
-  if (!data) {
-    return "";
-  }
-  std::string out;
-  for (auto it = data->bdata.begin(); it != data->bdata.end(); ++it) {
-    if (!out.empty()) {
-      out += "; ";
-    }
-    out += it->first + "=" + std::string(it->second ? "true" : "false");
-  }
-  return out;
-}
-
-std::string BuildGameDataRefDebugString(GameData *data) {
-  if (!data) {
-    return "";
-  }
-  std::string out;
-  for (auto it = data->objectReferences.begin(); it != data->objectReferences.end();
-       ++it) {
-    if (!out.empty()) {
-      out += "; ";
-    }
-    out += it->first + "=" + ToString((int)it->second.size());
-  }
-  return out;
-}
-
-bool RaceLooksLikeShek(const std::string &raceName) {
-  const std::string canonical = CanonicalizeAppearanceSliderKey(raceName);
-  return canonical.find("shek") != std::string::npos;
-}
-
-void LogHornAliasMissDebug(Character *character, const std::string &npcName,
-                           const std::string &raceName) {
-  if (!character || (uintptr_t)character <= 0x1000 || !RaceLooksLikeShek(raceName)) {
-    return;
-  }
-
-  static std::map<std::string, bool> loggedByNpcName;
-  if (loggedByNpcName[npcName]) {
-    return;
-  }
-
-  AppearanceBase *appearance = nullptr;
-  try {
-    appearance = character->getAppearance();
-  } catch (...) {
-    appearance = nullptr;
-  }
-  if (!appearance || (uintptr_t)appearance <= 0x1000) {
-    Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
-        " appearance=null");
-    loggedByNpcName[npcName] = true;
-    return;
-  }
-
-  GameData *appearanceData = nullptr;
-  try {
-    appearanceData = appearance->getAppearanceData();
-  } catch (...) {
-    appearanceData = nullptr;
-  }
-  if (!appearanceData || (uintptr_t)appearanceData <= 0x1000) {
-    Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
-        " appearance_data=null");
-    loggedByNpcName[npcName] = true;
-    return;
-  }
-
-  Log("HORN_DEBUG_MISS: npc=" + npcName + " race=" + raceName +
-      " idata=[" + BuildGameDataIntDebugString(appearanceData) + "]" +
-      " fdata=[" + BuildGameDataFloatDebugString(appearanceData) + "]" +
-      " sdata=[" + BuildGameDataStringDebugString(appearanceData) + "]" +
-      " bdata=[" + BuildGameDataBoolDebugString(appearanceData) + "]" +
-      " refs=[" + BuildGameDataRefDebugString(appearanceData) + "]");
-  loggedByNpcName[npcName] = true;
-}
-
 void CaptureHornSliderSnapshot(Character *character, HornSliderSnapshot &out) {
   out = HornSliderSnapshot();
   if (!character || (uintptr_t)character <= 0x1000) {
@@ -937,6 +806,16 @@ void CaptureHornSliderSnapshot(Character *character, HornSliderSnapshot &out) {
   }
   if (!appearanceData || (uintptr_t)appearanceData <= 0x1000) {
     return;
+  }
+  out.liveDataPtr = (unsigned int)(uintptr_t)appearanceData;
+
+  try {
+    GameDataCopyStandalone *sourceAppearanceData = character->getAppearanceData();
+    if (sourceAppearanceData && (uintptr_t)sourceAppearanceData > 0x1000) {
+      out.sourceDataPtr = (unsigned int)(uintptr_t)sourceAppearanceData;
+    }
+  } catch (...) {
+    out.sourceDataPtr = 0;
   }
 
   static const char *kHornBodyAliases[] = {
@@ -2619,13 +2498,6 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
                             ageNorm);
   HornSliderSnapshot hornSnapshot;
   CaptureHornSliderSnapshot(npc, hornSnapshot);
-  if (RaceLooksLikeShek(raceName)) {
-    Log("HORN_DEBUG_ENTER: bootstrap npc=" + npcName + " race=" + raceName +
-        " hasAny=" + std::string(hornSnapshot.hasAny ? "true" : "false") +
-        " hasBody=" + std::string(hornSnapshot.hasBody ? "true" : "false") +
-        " hasUpper=" + std::string(hornSnapshot.hasUpper ? "true" : "false") +
-        " hasLower=" + std::string(hornSnapshot.hasLower ? "true" : "false"));
-  }
   std::string identityFaction = GetIdentityFaction(npc);
   std::string storageId = GetStorageIDFor(npc, npcName, identityFaction);
   std::string stats = BuildStatsPayload(npc);
@@ -2696,18 +2568,6 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   json += "\"age_norm\": " + ToString(ageNorm) + ",";
   if (hornSnapshot.hasAny) {
     json += "\"horn_sliders\":" + BuildHornSliderPayload(hornSnapshot) + ",";
-    Log("HORN_DETECT: bootstrap npc=" + npcName + " race=" + raceName +
-        " body=" + DescribeHornSliderForLog(hornSnapshot.hasBody,
-                                            hornSnapshot.body,
-                                            hornSnapshot.bodyKey) +
-        " upper=" + DescribeHornSliderForLog(hornSnapshot.hasUpper,
-                                             hornSnapshot.upper,
-                                             hornSnapshot.upperKey) +
-        " lower=" + DescribeHornSliderForLog(hornSnapshot.hasLower,
-                                             hornSnapshot.lower,
-                                             hornSnapshot.lowerKey));
-  } else {
-    LogHornAliasMissDebug(npc, npcName, raceName);
   }
   if (!equipment.empty()) {
     json += "\"equipment\":\"" + EscapeJSON(equipment) + "\",";

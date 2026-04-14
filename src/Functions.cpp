@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <core/Functions.h>
 #include <kenshi/Appearance.h>
+#include <kenshi/AppearanceManager.h>
 #include <kenshi/Character.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/CharStats.h>
@@ -38,6 +39,7 @@
 #include <mygui/MyGUI_TextBox.h>
 #include <ogre/OgreColourValue.h>
 #include <map>
+#include <sstream>
 #include <vector>
 
 std::string TrimCopySimple(const std::string &value);
@@ -59,6 +61,9 @@ namespace {
 const char *kShekHornBodyKey = "bone_horns_body_short";
 const char *kShekHornUpperKey = "bone_horns_top_short";
 const char *kShekHornLowerKey = "bone_horns_bottom_short";
+const char *kShekHornCurvedKey = "bone_horns_curved";
+const char *kShekHornThinKey = "bone_horns_thin";
+const char *kShekHornThickKey = "bone_horns_thick";
 const float kHornCutOffThreshold = 0.999f;
 
 float ClampHornSlider01(float value) {
@@ -141,6 +146,17 @@ bool TryGetCharacterAppearanceData(Character *npc, AppearanceBase *&appearanceOu
   return true;
 }
 
+GameDataCopyStandalone *TryGetCharacterAppearanceSourceData(Character *npc) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return nullptr;
+  }
+  try {
+    return npc->getAppearanceData();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 bool TryGetCharacterHornAverageInternal(Character *npc, float &averageOut,
                                         std::string &reasonOut) {
   averageOut = 0.0f;
@@ -200,6 +216,36 @@ bool RefreshCharacterAppearance(Character *npc) {
   } catch (...) {
   }
   try {
+    appearance->updateAppearance();
+    refreshed = true;
+  } catch (...) {
+  }
+  try {
+    appearance->updatePortrait();
+    refreshed = true;
+  } catch (...) {
+  }
+  return refreshed;
+}
+
+bool HardReloadCharacterAppearance(Character *npc) {
+  AppearanceBase *appearance = nullptr;
+  try {
+    appearance = npc ? npc->getAppearance() : nullptr;
+  } catch (...) {
+    appearance = nullptr;
+  }
+  if (!appearance || (uintptr_t)appearance <= 0x1000) {
+    return false;
+  }
+
+  bool refreshed = false;
+  try {
+    appearance->notifyDirty();
+    refreshed = true;
+  } catch (...) {
+  }
+  try {
     appearance->reload();
     refreshed = true;
   } catch (...) {
@@ -215,6 +261,315 @@ bool RefreshCharacterAppearance(Character *npc) {
   } catch (...) {
   }
   return refreshed;
+}
+
+std::string DescribeHornPersistenceState(Character *npc) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return "npc=invalid";
+  }
+
+  bool isPlayerCharacter = false;
+  bool withPlayer = false;
+  bool persistentPlatoon = false;
+  ActivePlatoon *activePlatoon = nullptr;
+  Platoon *platoon = nullptr;
+  bool persistentSquad = false;
+
+  try {
+    isPlayerCharacter = npc->isPlayerCharacter();
+  } catch (...) {
+  }
+  try {
+    withPlayer = npc->isWithThePlayer();
+  } catch (...) {
+  }
+  try {
+    persistentPlatoon = npc->isInAPersistentPlatoon();
+  } catch (...) {
+  }
+  try {
+    activePlatoon = npc->getPlatoon();
+  } catch (...) {
+    activePlatoon = nullptr;
+  }
+  if (activePlatoon && (uintptr_t)activePlatoon > 0x1000) {
+    try {
+      platoon = activePlatoon->me;
+    } catch (...) {
+      platoon = nullptr;
+    }
+  }
+  if (platoon && (uintptr_t)platoon > 0x1000) {
+    try {
+      persistentSquad = platoon->isPersistentSquad();
+    } catch (...) {
+      persistentSquad = false;
+    }
+  }
+
+  return "player=" + std::string(isPlayerCharacter ? "1" : "0") +
+         " with_player=" + std::string(withPlayer ? "1" : "0") +
+         " persistent_platoon=" + std::string(persistentPlatoon ? "1" : "0") +
+         " active_platoon=" +
+         std::string((activePlatoon && (uintptr_t)activePlatoon > 0x1000) ? "1"
+                                                                           : "0") +
+         " platoon=" +
+         std::string((platoon && (uintptr_t)platoon > 0x1000) ? "1" : "0") +
+         " persistent_squad=" + std::string(persistentSquad ? "1" : "0");
+}
+
+bool PromoteCharacterHornPersistence(Character *npc, std::string &reasonOut) {
+  reasonOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "target_invalid";
+    return false;
+  }
+
+  bool alreadyPersistent = false;
+  try {
+    alreadyPersistent = npc->isInAPersistentPlatoon();
+  } catch (...) {
+    alreadyPersistent = false;
+  }
+
+  ActivePlatoon *activePlatoon = nullptr;
+  Platoon *platoon = nullptr;
+  try {
+    activePlatoon = npc->getPlatoon();
+  } catch (...) {
+    activePlatoon = nullptr;
+  }
+  if (activePlatoon && (uintptr_t)activePlatoon > 0x1000) {
+    try {
+      platoon = activePlatoon->me;
+    } catch (...) {
+      platoon = nullptr;
+    }
+  }
+
+  if (!platoon || (uintptr_t)platoon <= 0x1000) {
+    reasonOut = "platoon_unavailable";
+    return false;
+  }
+
+  bool persistentSquad = false;
+  try {
+    persistentSquad = platoon->isPersistentSquad();
+  } catch (...) {
+    persistentSquad = false;
+  }
+
+  if (!persistentSquad) {
+    try {
+      platoon->setPersistentSquad(true);
+      persistentSquad = true;
+    } catch (...) {
+      reasonOut = "set_persistent_failed";
+      return false;
+    }
+  }
+
+  bool saved = false;
+  if (activePlatoon && (uintptr_t)activePlatoon > 0x1000) {
+    try {
+      activePlatoon->serialiseEverythingToDisk(false);
+      saved = true;
+    } catch (...) {
+      saved = false;
+    }
+  }
+
+  bool persistentAfter = false;
+  try {
+    persistentAfter = npc->isInAPersistentPlatoon();
+  } catch (...) {
+    persistentAfter = false;
+  }
+
+  if (persistentAfter || persistentSquad) {
+    reasonOut = alreadyPersistent ? "already_persistent"
+                                  : (saved ? "promoted_and_saved"
+                                           : "promoted_unsaved");
+    return true;
+  }
+
+  reasonOut = saved ? "saved_without_persistence" : "promotion_unconfirmed";
+  return false;
+}
+
+GameDataCopyStandalone *CloneAppearanceDataForCharacter(Character *npc,
+                                                        GameData *sourceData,
+                                                        std::string &reasonOut) {
+  reasonOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "target_invalid";
+    return nullptr;
+  }
+  if (!sourceData || (uintptr_t)sourceData <= 0x1000) {
+    reasonOut = "source_invalid";
+    return nullptr;
+  }
+
+  GameData *raceData = nullptr;
+  try {
+    raceData = (GameData *)npc->getRace();
+  } catch (...) {
+    raceData = nullptr;
+  }
+  if (!raceData || (uintptr_t)raceData <= 0x1000) {
+    reasonOut = "race_invalid";
+    return nullptr;
+  }
+
+  AppearanceManager *appearanceManager = nullptr;
+  try {
+    appearanceManager = AppearanceManager::getInstance();
+  } catch (...) {
+    appearanceManager = nullptr;
+  }
+  if (!appearanceManager || (uintptr_t)appearanceManager <= 0x1000) {
+    reasonOut = "manager_invalid";
+    return nullptr;
+  }
+
+  GameDataCopyStandalone *clone = nullptr;
+  try {
+    clone = appearanceManager->createAppearanceData(raceData);
+  } catch (...) {
+    clone = nullptr;
+  }
+  if (!clone || (uintptr_t)clone <= 0x1000) {
+    try {
+      clone = new GameDataCopyStandalone();
+      if (clone) {
+        clone->initialise(CHARACTER_APPEARANCE, false);
+      }
+    } catch (...) {
+      clone = nullptr;
+    }
+    if (!clone || (uintptr_t)clone <= 0x1000) {
+      reasonOut = "create_failed";
+      return nullptr;
+    }
+    reasonOut = "fallback_constructed";
+  }
+
+  try {
+    clone->updateFrom(sourceData, false);
+    clone->readOnly = false;
+    clone->isStandalone = true;
+    clone->type = CHARACTER_APPEARANCE;
+    clone->validity = sourceData->validity;
+    clone->name = sourceData->name;
+    clone->stringID = sourceData->stringID;
+  } catch (...) {
+    reasonOut = "copy_failed";
+    return nullptr;
+  }
+
+  if (reasonOut.empty()) {
+    reasonOut = "ok";
+  }
+  return clone;
+}
+
+GameDataCopyStandalone *AssignClonedAppearanceData(Character *npc,
+                                                   AppearanceBase *appearance,
+                                                   GameData *sourceData,
+                                                   std::string &reasonOut) {
+  reasonOut.clear();
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "target_invalid";
+    return nullptr;
+  }
+  if (!appearance || (uintptr_t)appearance <= 0x1000) {
+    reasonOut = "appearance_invalid";
+    return nullptr;
+  }
+
+  GameDataCopyStandalone *clone =
+      CloneAppearanceDataForCharacter(npc, sourceData, reasonOut);
+  if (!clone || (uintptr_t)clone <= 0x1000) {
+    return nullptr;
+  }
+
+  try {
+    npc->setAppearanceData(clone);
+    appearance->setAppearanceData(clone);
+    appearance->updatedAppearanceData = true;
+    appearance->updateBody = true;
+    appearance->notifyDirty();
+  } catch (...) {
+    reasonOut = "assign_failed";
+    return nullptr;
+  }
+
+  reasonOut = "ok";
+  return clone;
+}
+
+void ApplyHornCutOffValues(GameData *data) {
+  if (!data) {
+    return;
+  }
+  data->fdata[kShekHornBodyKey] = 1.0f;
+  data->fdata[kShekHornUpperKey] = 1.0f;
+  data->fdata[kShekHornLowerKey] = 1.0f;
+  data->fdata[kShekHornCurvedKey] = 0.0f;
+  data->fdata[kShekHornThinKey] = 0.0f;
+  data->fdata[kShekHornThickKey] = 0.0f;
+  data->sdata[kShekHornBodyKey] = "1";
+  data->sdata[kShekHornUpperKey] = "1";
+  data->sdata[kShekHornLowerKey] = "1";
+  data->sdata[kShekHornCurvedKey] = "0";
+  data->sdata[kShekHornThinKey] = "0";
+  data->sdata[kShekHornThickKey] = "0";
+  data->activeValues[kShekHornBodyKey] = true;
+  data->activeValues[kShekHornUpperKey] = true;
+  data->activeValues[kShekHornLowerKey] = true;
+  data->activeValues[kShekHornCurvedKey] = true;
+  data->activeValues[kShekHornThinKey] = true;
+  data->activeValues[kShekHornThickKey] = true;
+}
+
+void ValidateAppearanceDataForCharacter(GameData *data, Character *npc,
+                                        AppearanceBase *appearance) {
+  if (!data || !npc || (uintptr_t)npc <= 0x1000) {
+    return;
+  }
+
+  AppearanceManager *manager = nullptr;
+  try {
+    manager = AppearanceManager::getInstance();
+  } catch (...) {
+    manager = nullptr;
+  }
+  if (!manager || (uintptr_t)manager <= 0x1000) {
+    return;
+  }
+
+  try {
+    manager->cleanValidateAppearanceData(data);
+  } catch (...) {
+  }
+
+  GameData *raceData = nullptr;
+  if (appearance) {
+    try {
+      raceData = appearance->getRace();
+    } catch (...) {
+      raceData = nullptr;
+    }
+  }
+  if (!raceData || (uintptr_t)raceData <= 0x1000) {
+    return;
+  }
+
+  try {
+    AppearanceManager::Gender gender(data);
+    manager->updateModifiers(data, raceData, gender);
+  } catch (...) {
+  }
 }
 
 void PushImmediateHornContextSnapshot(Character *npc, const std::string &reason) {
@@ -271,6 +626,30 @@ struct NpcDrugState {
 
 static std::map<unsigned int, NpcDrunkState> g_npcDrunkStates;
 static std::map<unsigned int, NpcDrugState> g_npcDrugStates;
+struct PendingHornCutReapplyState {
+  hand target;
+  unsigned int serial;
+  DWORD nextReapplyTick;
+  DWORD expireTick;
+  int remainingAttempts;
+
+  PendingHornCutReapplyState()
+      : serial(0), nextReapplyTick(0), expireTick(0), remainingAttempts(0) {}
+};
+static std::map<unsigned int, PendingHornCutReapplyState> g_pendingHornCutReapplies;
+struct PendingHornCutDismissState {
+  hand target;
+  unsigned int serial;
+  std::string originFactionToken;
+  DWORD nextCheckTick;
+  DWORD expireTick;
+  int remainingChecks;
+
+  PendingHornCutDismissState()
+      : serial(0), nextCheckTick(0), expireTick(0), remainingChecks(0) {}
+};
+static std::map<unsigned int, PendingHornCutDismissState>
+    g_pendingHornCutDismissals;
 static MyGUI::EditBox *g_narratorTimedPopupBackdrop = nullptr;
 static MyGUI::TextBox *g_narratorTimedPopupText = nullptr;
 static bool g_narratorTimedPopupVisible = false;
@@ -1992,6 +2371,175 @@ bool ForceJoinPlayerSquad(GameWorld *world, Character *npc) {
       std::string(joinedFaction ? "1" : "0") + " joined_roster=" +
       std::string(joinedRoster ? "1" : "0"));
   return joinedFaction && joinedRoster;
+}
+
+std::string BuildFactionPlatoonOriginToken(Character *npc) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return "";
+  }
+
+  std::string factionName = "";
+  std::string platoonName = "";
+  try {
+    Faction *faction = npc->getFaction();
+    if (faction && (uintptr_t)faction > 0x1000 && !faction->isThePlayer()) {
+      factionName = faction->getName();
+      if (factionName.empty() && faction->data) {
+        factionName = faction->data->name;
+        if (factionName.empty()) {
+          factionName = faction->data->stringID;
+        }
+      }
+    }
+  } catch (...) {
+  }
+  if (factionName.empty()) {
+    try {
+      unsigned int serial = npc->getHandle().serial;
+      auto it = g_originFactions.find(serial);
+      if (it != g_originFactions.end()) {
+        factionName = it->second;
+      }
+    } catch (...) {
+    }
+  }
+
+  try {
+    ActivePlatoon *activePlatoon = npc->getPlatoon();
+    if (activePlatoon && (uintptr_t)activePlatoon > 0x1000 && activePlatoon->me &&
+        (uintptr_t)activePlatoon->me > 0x1000) {
+      Platoon *platoon = activePlatoon->me;
+      platoonName = platoon->stringID;
+      if (platoonName.empty()) {
+        platoonName = platoon->getPlatoonStringID();
+      }
+    }
+  } catch (...) {
+  }
+
+  if (factionName.empty()) {
+    return "";
+  }
+  if (platoonName.empty()) {
+    return factionName;
+  }
+  return factionName + "|" + platoonName;
+}
+
+bool TryInternalJoinPlayerSquad(GameWorld *world, Character *npc,
+                                std::string &reasonOut) {
+  reasonOut.clear();
+  if (!world || !world->player || !npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "invalid_join_target";
+    return false;
+  }
+
+  bool recruitNormalOk = false;
+  try {
+    recruitNormalOk = world->player->recruit(npc, false);
+  } catch (...) {
+    recruitNormalOk = false;
+  }
+
+  bool joinedFaction = IsInPlayerFactionSafe(npc);
+  bool joinedRoster = IsInPlayerRoster(world, npc);
+  bool fallbackJoinOk = false;
+  if (!(joinedFaction && joinedRoster)) {
+    fallbackJoinOk = ForceJoinPlayerSquad(world, npc);
+    joinedFaction = IsInPlayerFactionSafe(npc);
+    joinedRoster = IsInPlayerRoster(world, npc);
+  }
+
+  bool canTakeOrdersAfter = false;
+  try {
+    canTakeOrdersAfter = npc->canTakePlayerOrdersAtThisTime();
+  } catch (...) {
+    canTakeOrdersAfter = false;
+  }
+
+  bool joined = joinedFaction || joinedRoster || canTakeOrdersAfter;
+  if (joined && !joinedRoster) {
+    try {
+      world->player->recruit(npc, false);
+    } catch (...) {
+    }
+    joinedRoster = IsInPlayerRoster(world, npc);
+    joined = joinedFaction || joinedRoster || canTakeOrdersAfter;
+  }
+  try {
+    world->player->setCharacterEditMode(false);
+  } catch (...) {
+  }
+
+  reasonOut = "recruit_normal=" + std::string(recruitNormalOk ? "1" : "0") +
+              " fallback=" + std::string(fallbackJoinOk ? "1" : "0") +
+              " joined_faction=" + std::string(joinedFaction ? "1" : "0") +
+              " joined_roster=" + std::string(joinedRoster ? "1" : "0") +
+              " can_take_orders=" +
+              std::string(canTakeOrdersAfter ? "1" : "0");
+  return joined;
+}
+
+void PostLeaveSquadCleanup(Character *npc) {
+  if (!npc || (uintptr_t)npc <= 0x1000) {
+    return;
+  }
+  try {
+    if (npc->dialogue && (uintptr_t)npc->dialogue > 0x1000) {
+      npc->dialogue->endDialogue(true);
+      npc->dialogue->setInDialog(false);
+    }
+  } catch (...) {
+  }
+  try {
+    npc->clearPermajobs();
+    npc->clearAllAIGoals();
+  } catch (...) {
+  }
+  try {
+    npc->setStandingOrder((MessageForB::StandingOrder)13, false);
+    npc->setStandingOrder((MessageForB::StandingOrder)12, false);
+  } catch (...) {
+  }
+}
+
+bool TryDismissCharacterToOrigin(GameWorld *world, Character *npc,
+                                 const std::string &originFactionToken,
+                                 std::string &reasonOut) {
+  reasonOut.clear();
+  if (!world || !npc || (uintptr_t)npc <= 0x1000) {
+    reasonOut = "invalid_dismiss_target";
+    return false;
+  }
+
+  PostLeaveSquadCleanup(npc);
+  PerformLeaveSquad(npc, world, originFactionToken);
+
+  try {
+    if (npc->getPermajobCount() == 0) {
+      TownBase *town = npc->getCurrentTownLocation();
+      if (town) {
+        npc->addJob(WANDER_TOWN, (RootObject *)town, false, false,
+                    npc->getPosition());
+        npc->addGoal(WANDER_TOWN, (RootObjectBase *)town);
+      } else {
+        npc->addJob(WANDERER, NULL, false, false, npc->getPosition());
+        npc->addGoal(WANDERER, NULL);
+      }
+    }
+  } catch (...) {
+  }
+  try {
+    npc->reThinkCurrentAIAction();
+  } catch (...) {
+  }
+
+  const bool stillInPlayerFaction = IsInPlayerFactionSafe(npc);
+  const bool stillInRoster = IsInPlayerRoster(world, npc);
+  reasonOut = "in_player_faction=" +
+              std::string(stillInPlayerFaction ? "1" : "0") +
+              " in_player_roster=" + std::string(stillInRoster ? "1" : "0");
+  return !stillInPlayerFaction && !stillInRoster;
 }
 
 std::string ToLowerCopy(const std::string &value) {
@@ -4316,6 +4864,231 @@ void SetMedicMode(Character *npc, bool enabled) {
   EnsureIdleFallbackJob(npc);
 }
 
+Character *ResolveCharacterBySerialFromWorld(GameWorld *world,
+                                             unsigned int serial) {
+  if (!world || serial == 0) {
+    return nullptr;
+  }
+  try {
+    const auto &chars = world->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it) {
+      Character *candidate = *it;
+      if (!candidate || (uintptr_t)candidate <= 0x1000) {
+        continue;
+      }
+      unsigned int candidateSerial = 0;
+      try {
+        candidateSerial = candidate->getHandle().serial;
+      } catch (...) {
+        candidateSerial = 0;
+      }
+      if (candidateSerial == serial) {
+        return candidate;
+      }
+    }
+  } catch (...) {
+  }
+  return nullptr;
+}
+
+void QueueHornCutReapply(Character *target) {
+  if (!target || (uintptr_t)target <= 0x1000) {
+    return;
+  }
+
+  unsigned int serial = 0;
+  hand targetHand;
+  try {
+    targetHand = target->getHandle();
+    serial = targetHand.serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  PendingHornCutReapplyState state;
+  state.target = targetHand;
+  state.serial = serial;
+  state.nextReapplyTick = nowTick + 250;
+  state.expireTick = nowTick + 8000;
+  state.remainingAttempts = 24;
+  g_pendingHornCutReapplies[serial] = state;
+}
+
+void QueueHornCutDismiss(Character *target, const std::string &originFactionToken) {
+  if (!target || (uintptr_t)target <= 0x1000 || originFactionToken.empty()) {
+    return;
+  }
+
+  unsigned int serial = 0;
+  hand targetHand;
+  try {
+    targetHand = target->getHandle();
+    serial = targetHand.serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  PendingHornCutDismissState state;
+  state.target = targetHand;
+  state.serial = serial;
+  state.originFactionToken = originFactionToken;
+  state.nextCheckTick = nowTick + 1200;
+  state.expireTick = nowTick + 12000;
+  state.remainingChecks = 20;
+  g_pendingHornCutDismissals[serial] = state;
+}
+
+void UpdatePendingHornCutReapplies(GameWorld *world) {
+  DWORD nowTick = GetTickCount();
+  for (auto it = g_pendingHornCutReapplies.begin();
+       it != g_pendingHornCutReapplies.end();) {
+    PendingHornCutReapplyState &state = it->second;
+    if (state.serial == 0 || state.remainingAttempts <= 0 ||
+        (state.expireTick != 0 && nowTick >= state.expireTick)) {
+      it = g_pendingHornCutReapplies.erase(it);
+      continue;
+    }
+    if (state.nextReapplyTick != 0 && nowTick < state.nextReapplyTick) {
+      ++it;
+      continue;
+    }
+
+    Character *target = nullptr;
+    try {
+      if (state.target.isValid()) {
+        target = state.target.getCharacter();
+      }
+    } catch (...) {
+      target = nullptr;
+    }
+    if ((!target || (uintptr_t)target <= 0x1000) && world) {
+      target = ResolveCharacterBySerialFromWorld(world, state.serial);
+    }
+    if (!target || (uintptr_t)target <= 0x1000) {
+      state.remainingAttempts = 0;
+      it = g_pendingHornCutReapplies.erase(it);
+      continue;
+    }
+
+    float average = 0.0f;
+    std::string reason = "";
+    if (TryGetCharacterHornAverageInternal(target, average, reason) &&
+        average >= kHornCutOffThreshold) {
+      it = g_pendingHornCutReapplies.erase(it);
+      continue;
+    }
+
+    AppearanceBase *appearance = nullptr;
+    GameData *appearanceData = nullptr;
+    std::string appearanceReason = "";
+    if (!TryGetCharacterAppearanceData(target, appearance, appearanceData,
+                                       appearanceReason)) {
+      state.nextReapplyTick = nowTick + 500;
+      --state.remainingAttempts;
+      ++it;
+      continue;
+    }
+
+    std::string persistenceReason = "";
+    const bool persistenceReady =
+        PromoteCharacterHornPersistence(target, persistenceReason);
+    try {
+      std::string cloneReason = "";
+      GameDataCopyStandalone *sourceData =
+          AssignClonedAppearanceData(target, appearance, appearanceData,
+                                     cloneReason);
+      GameData *mutableData =
+          (sourceData && (uintptr_t)sourceData > 0x1000)
+              ? static_cast<GameData *>(sourceData)
+              : appearanceData;
+      ApplyHornCutOffValues(mutableData);
+      ValidateAppearanceDataForCharacter(mutableData, target, appearance);
+      appearance->updatedAppearanceData = true;
+      appearance->updateBody = true;
+      RefreshCharacterAppearance(target);
+      if (persistenceReady) {
+        std::string commitReason = "";
+        PromoteCharacterHornPersistence(target, commitReason);
+      }
+    } catch (...) {
+    }
+
+    state.nextReapplyTick = nowTick + 350;
+    --state.remainingAttempts;
+    ++it;
+  }
+}
+
+void UpdatePendingHornCutDismissals(GameWorld *world) {
+  DWORD nowTick = GetTickCount();
+  for (auto it = g_pendingHornCutDismissals.begin();
+       it != g_pendingHornCutDismissals.end();) {
+    PendingHornCutDismissState &state = it->second;
+    if (state.serial == 0 || state.remainingChecks <= 0 ||
+        (state.expireTick != 0 && nowTick >= state.expireTick)) {
+      it = g_pendingHornCutDismissals.erase(it);
+      continue;
+    }
+    if (state.nextCheckTick != 0 && nowTick < state.nextCheckTick) {
+      ++it;
+      continue;
+    }
+
+    Character *target = nullptr;
+    try {
+      if (state.target.isValid()) {
+        target = state.target.getCharacter();
+      }
+    } catch (...) {
+      target = nullptr;
+    }
+    if ((!target || (uintptr_t)target <= 0x1000) && world) {
+      target = ResolveCharacterBySerialFromWorld(world, state.serial);
+    }
+    if (!target || (uintptr_t)target <= 0x1000) {
+      it = g_pendingHornCutDismissals.erase(it);
+      continue;
+    }
+
+    if (!IsInPlayerFactionSafe(target) && !IsInPlayerRoster(world, target)) {
+      it = g_pendingHornCutDismissals.erase(it);
+      continue;
+    }
+
+    float average = 0.0f;
+    std::string averageReason = "";
+    if (!TryGetCharacterHornAverageInternal(target, average, averageReason) ||
+        average < kHornCutOffThreshold) {
+      state.nextCheckTick = nowTick + 400;
+      --state.remainingChecks;
+      ++it;
+      continue;
+    }
+
+    std::string dismissReason = "";
+    const bool dismissed =
+        TryDismissCharacterToOrigin(world, target, state.originFactionToken,
+                                    dismissReason);
+    if (dismissed) {
+      PushImmediateHornContextSnapshot(target, "horn_cut_leave");
+      it = g_pendingHornCutDismissals.erase(it);
+      continue;
+    }
+
+    state.nextCheckTick = nowTick + 500;
+    --state.remainingChecks;
+    ++it;
+  }
+}
+
 std::string ToggleActionLabel(const std::string &command) {
   if (command == "SET_BLOCK") {
     return "block";
@@ -4360,6 +5133,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
   UpdateNpcDrunkStates(thisptr);
   UpdateNpcDrugStates(thisptr);
+  UpdatePendingHornCutReapplies(thisptr);
+  UpdatePendingHornCutDismissals(thisptr);
 
   if (TryEnterCriticalSection(&g_uiMutex)) {
     bool gamePaused = false;
@@ -6936,27 +7711,92 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                   thisptr->showPlayerAMessage_withLog(
                       targetName + "'s horns have already been cut off.", true);
                 } else {
+                  bool tempJoinedForCut = false;
+                  std::string hornCutOriginToken = "";
+                  const bool targetAlreadyInPlayerSquad =
+                      IsInPlayerFactionSafe(target) && IsInPlayerRoster(thisptr, target);
+                  if (!targetAlreadyInPlayerSquad) {
+                    hornCutOriginToken = BuildFactionPlatoonOriginToken(target);
+                    if (hornCutOriginToken.empty()) {
+                      Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                          " target=" + targetName +
+                          " reason=origin_capture_failed");
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " could not preserve " + targetName +
+                              "'s original squad before cutting their horns.",
+                          true);
+                    } else {
+                      std::string joinReason = "";
+                      const bool joinedForCut =
+                          TryInternalJoinPlayerSquad(thisptr, target, joinReason);
+                      Log("ACTION_EXEC: CUT_HORNS temp_join actor=" + actorName +
+                          " target=" + targetName + " ok=" +
+                          std::string(joinedForCut ? "1" : "0") + " origin='" +
+                          hornCutOriginToken + "' " + joinReason);
+                      if (!joinedForCut) {
+                        thisptr->showPlayerAMessage_withLog(
+                            actorName + " could not temporarily recruit " +
+                                targetName + " to cut off their horns.",
+                            true);
+                      } else {
+                        tempJoinedForCut = true;
+                      }
+                    }
+                  }
+
                   AppearanceBase *appearance = nullptr;
                   GameData *appearanceData = nullptr;
                   std::string appearanceReason = "";
-                  if (!TryGetCharacterAppearanceData(target, appearance,
+                  if ((!targetAlreadyInPlayerSquad && !tempJoinedForCut) ||
+                      !TryGetCharacterAppearanceData(target, appearance,
                                                      appearanceData,
                                                      appearanceReason)) {
-                    Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
-                        " target=" + targetName + " reason=" +
-                        (appearanceReason.empty()
-                             ? std::string("appearance_unavailable")
-                             : appearanceReason));
-                    thisptr->showPlayerAMessage_withLog(
-                        actorName + " could not access " + targetName +
-                            "'s appearance data.",
-                        true);
+                    if (targetAlreadyInPlayerSquad || tempJoinedForCut) {
+                      Log("ACTION_EXEC: CUT_HORNS blocked actor=" + actorName +
+                          " target=" + targetName + " reason=" +
+                          (appearanceReason.empty()
+                               ? std::string("appearance_unavailable")
+                               : appearanceReason));
+                      thisptr->showPlayerAMessage_withLog(
+                          actorName + " could not access " + targetName +
+                              "'s appearance data.",
+                          true);
+                    }
                   } else {
+                    std::string persistenceReason = "";
+                    const bool persistenceReady =
+                        PromoteCharacterHornPersistence(target, persistenceReason);
                     bool hornSet = false;
+                    std::string cloneReason = "";
+                    GameDataCopyStandalone *characterAppearanceData =
+                        AssignClonedAppearanceData(target, appearance,
+                                                   appearanceData, cloneReason);
+                    const bool haveCharacterAppearanceData =
+                        characterAppearanceData &&
+                        (uintptr_t)characterAppearanceData > 0x1000;
+                    if (haveCharacterAppearanceData) {
+                      appearanceData = characterAppearanceData;
+                    } else {
+                      characterAppearanceData =
+                          TryGetCharacterAppearanceSourceData(target);
+                    }
                     try {
-                      appearanceData->fdata[kShekHornBodyKey] = 1.0f;
-                      appearanceData->fdata[kShekHornUpperKey] = 1.0f;
-                      appearanceData->fdata[kShekHornLowerKey] = 1.0f;
+                      ApplyHornCutOffValues(appearanceData);
+                      ValidateAppearanceDataForCharacter(appearanceData, target,
+                                                         appearance);
+                      appearance->updatedAppearanceData = true;
+                      appearance->updateBody = true;
+                      if (haveCharacterAppearanceData) {
+                        target->setAppearanceData(characterAppearanceData);
+                        appearance->setAppearanceData(characterAppearanceData);
+                        appearance->updatedAppearanceData = true;
+                        appearance->updateBody = true;
+                      } else {
+                        appearance->setAppearanceData(
+                            (GameDataCopyStandalone *)appearanceData);
+                        appearance->updatedAppearanceData = true;
+                        appearance->updateBody = true;
+                      }
                       hornSet = true;
                     } catch (...) {
                       hornSet = false;
@@ -6971,7 +7811,46 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                               "'s horns.",
                           true);
                     } else {
+                      std::string persistenceCommitReason = "";
+                      const bool persistenceCommitted =
+                          PromoteCharacterHornPersistence(
+                              target, persistenceCommitReason);
                       bool refreshed = RefreshCharacterAppearance(target);
+                      AppearanceBase *postAppearance = nullptr;
+                      GameData *postAppearanceData = nullptr;
+                      std::string postAppearanceReason = "";
+                      if (TryGetCharacterAppearanceData(
+                              target, postAppearance, postAppearanceData,
+                              postAppearanceReason)) {
+                        float postAverage = 0.0f;
+                        std::string postAverageReason = "";
+                        if (!TryGetCharacterHornAverageInternal(
+                                target, postAverage, postAverageReason) ||
+                            postAverage < kHornCutOffThreshold) {
+                          ApplyHornCutOffValues(postAppearanceData);
+                          ValidateAppearanceDataForCharacter(
+                              postAppearanceData, target, postAppearance);
+                          if (haveCharacterAppearanceData &&
+                              characterAppearanceData != postAppearanceData) {
+                            ApplyHornCutOffValues(characterAppearanceData);
+                            ValidateAppearanceDataForCharacter(
+                                characterAppearanceData, target, postAppearance);
+                            target->setAppearanceData(characterAppearanceData);
+                            postAppearance->setAppearanceData(
+                                characterAppearanceData);
+                          } else {
+                            postAppearance->setAppearanceData(
+                                (GameDataCopyStandalone *)postAppearanceData);
+                          }
+                          refreshed = RefreshCharacterAppearance(target) || refreshed;
+                          if ((!TryGetCharacterHornAverageInternal(
+                                   target, postAverage, postAverageReason) ||
+                               postAverage < kHornCutOffThreshold) &&
+                              HardReloadCharacterAppearance(target)) {
+                            refreshed = true;
+                          }
+                        }
+                      }
                       unsigned int actorSerial = 0;
                       unsigned int targetSerial = 0;
                       try {
@@ -7019,6 +7898,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                           "cut off the horns of " + targetName +
                               " with a hacksaw",
                           actorSerial, targetSerial);
+                      QueueHornCutReapply(target);
+                      if (tempJoinedForCut && !hornCutOriginToken.empty()) {
+                        QueueHornCutDismiss(target, hornCutOriginToken);
+                      }
                       PushImmediateHornContextSnapshot(target, "horn_cut");
                       try {
                         target->reThinkCurrentAIAction();
@@ -7031,6 +7914,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                       Log("ACTION_EXEC: CUT_HORNS success actor=" + actorName +
                           " target=" + targetName +
                           " previous_average=" + ToString(previousAverage) +
+                          " persistence_ok=" +
+                          std::string((persistenceReady || persistenceCommitted)
+                                          ? "1"
+                                          : "0") +
                           " refreshed=" + std::string(refreshed ? "1" : "0"));
                       thisptr->showPlayerAMessage_withLog(
                           actorName + " cut off " + targetName +
