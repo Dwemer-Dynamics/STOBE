@@ -10,6 +10,7 @@ namespace UI {
 extern MyGUI::Window *g_chatWindow;
 extern MyGUI::EditBox *g_chatInput;
 extern MyGUI::ComboBox *g_chatModeCombo;
+extern MyGUI::ComboBox *g_chatTargetCombo;
 extern MyGUI::ComboBox *g_chatActionCombo;
 extern MyGUI::EditBox *g_chatActionArgInput;
 extern MyGUI::Button *g_chatAutoChatToggle;
@@ -34,6 +35,7 @@ void OnChatInputAccept(MyGUI::EditBox *sender);
 void OnChatSendClick(MyGUI::Widget *sender);
 void OnChatCancelClick(MyGUI::Widget *sender);
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index);
+void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
 void RefreshChatModeControls();

@@ -25,6 +25,7 @@
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_InputManager.h>
+#include <mygui/MyGUI_RenderManager.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
@@ -33,6 +34,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <set>
+#include <vector>
 
 namespace Stobe {
 namespace UI {
@@ -40,6 +42,7 @@ namespace UI {
 MyGUI::Window *g_chatWindow = nullptr;
 MyGUI::EditBox *g_chatInput = nullptr;
 MyGUI::ComboBox *g_chatModeCombo = nullptr;
+MyGUI::ComboBox *g_chatTargetCombo = nullptr;
 MyGUI::ComboBox *g_chatActionCombo = nullptr;
 MyGUI::EditBox *g_chatActionArgInput = nullptr;
 MyGUI::Button *g_chatAutoChatToggle = nullptr;
@@ -49,6 +52,8 @@ MyGUI::EditBox *g_renameInput = nullptr;
 MyGUI::TextBox *g_renameLabel = nullptr;
 std::string g_chatTargetHandleStr = "";
 std::string g_chatTargetNameStr = "";
+std::string g_chatLastRealTargetHandleStr = "";
+std::string g_chatLastRealTargetNameStr = "";
 std::string g_chatPlayerNameStr = "";
 std::string g_renameTargetNameStr = "";
 std::string g_renameTargetHandleStr = "";
@@ -57,8 +62,20 @@ size_t g_lastChatModeIndex = 1;
 bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
+bool g_chatTargetRefreshInProgress = false;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
+
+struct ChatTargetOption {
+  std::string name;
+  std::string handle;
+  std::string label;
+  float distance;
+  bool isNarrator;
+};
+
+std::vector<ChatTargetOption> g_chatTargetOptions;
+
 std::string TrimChatLine(const std::string &value);
 Character *ResolveChatTargetCharacter(GameWorld *world,
                                       const std::string &targetName,
@@ -122,6 +139,33 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+}
+
+float ScreenPixelsToRealHeight(int pixels) {
+  MyGUI::RenderManager *renderManager = MyGUI::RenderManager::getInstancePtr();
+  if (!renderManager || pixels <= 0) {
+    return 0.0f;
+  }
+
+  const MyGUI::IntSize &viewSize = renderManager->getViewSize();
+  if (viewSize.height <= 0) {
+    return 0.0f;
+  }
+
+  return (float)pixels / (float)viewSize.height;
+}
+
+float ParentPixelsToRealHeight(MyGUI::Widget *parent, int pixels) {
+  if (!parent || pixels <= 0) {
+    return 0.0f;
+  }
+
+  int parentHeight = parent->getHeight();
+  if (parentHeight <= 0) {
+    return 0.0f;
+  }
+
+  return (float)pixels / (float)parentHeight;
 }
 
 std::string BuildStorageIdForCharacter(Character *character) {
@@ -1345,6 +1389,291 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   return true;
 }
 
+std::string BuildChatTargetDistanceSuffix(float distance) {
+  if (distance < 0.0f) {
+    return "";
+  }
+  int roundedDistance = (int)(distance + 0.5f);
+  if (roundedDistance < 0) {
+    roundedDistance = 0;
+  }
+  return " (" + ToString(roundedDistance) + "m)";
+}
+
+void SetActiveChatTarget(const std::string &targetName,
+                         const std::string &targetHandle,
+                         bool rememberRealTarget) {
+  g_chatTargetNameStr = TrimChatLine(targetName);
+  g_chatTargetHandleStr = TrimChatLine(targetHandle);
+
+  if (rememberRealTarget && !g_chatTargetNameStr.empty() &&
+      !IsNarratorName(g_chatTargetNameStr)) {
+    g_chatLastRealTargetNameStr = g_chatTargetNameStr;
+    g_chatLastRealTargetHandleStr = g_chatTargetHandleStr;
+  }
+
+  if (g_chatTargetNameStr.empty() || IsNarratorName(g_chatTargetNameStr)) {
+    g_talkTargetHand = hand();
+    return;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  Character *target =
+      ResolveChatTargetCharacter(world, g_chatTargetNameStr, g_chatTargetHandleStr);
+  if (target && (uintptr_t)target > 0x1000) {
+    try {
+      g_talkTargetHand = target->getHandle();
+      return;
+    } catch (...) {
+    }
+  }
+
+  g_talkTargetHand = hand();
+}
+
+bool DoesChatTargetOptionMatch(const ChatTargetOption &option,
+                               const std::string &targetName,
+                               const std::string &targetHandle) {
+  if (option.isNarrator) {
+    return IsNarratorName(targetName);
+  }
+  if (!targetHandle.empty() && option.handle == targetHandle) {
+    return true;
+  }
+  if (!targetName.empty() && EqualsIgnoreCase(option.name, targetName)) {
+    return true;
+  }
+  return false;
+}
+
+bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
+                              Character *target,
+                              const std::string &selectedMode,
+                              float &distanceOut) {
+  distanceOut = -1.0f;
+  if (!world || !speaker || !target || (uintptr_t)speaker <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return false;
+  }
+
+  if (IsCharacterUnavailableForConversation(speaker)) {
+    return false;
+  }
+
+  if (target == speaker) {
+    return false;
+  }
+
+  unsigned int targetAnimalSerial = 0;
+  bool targetIsAnimal = IsAnimalCharacterSafe(target, &targetAnimalSerial);
+  if (targetIsAnimal && !g_enableAnimalTalks) {
+    return false;
+  }
+
+  try {
+    distanceOut = speaker->getPosition().distance(target->getPosition());
+  } catch (...) {
+    distanceOut = -1.0f;
+    return false;
+  }
+
+  if (selectedMode == "cheat") {
+    return true;
+  }
+
+  if (!IsConversationAreaCompatible(speaker, target)) {
+    return false;
+  }
+
+  float allowedRange = GetSearchRadiusForMode(selectedMode);
+  if (allowedRange < 1.0f) {
+    allowedRange = 1.0f;
+  }
+  if (distanceOut > allowedRange) {
+    return false;
+  }
+
+  return true;
+}
+
+bool TryBuildChatTargetOption(GameWorld *world, Character *candidate,
+                              const std::string &selectedMode,
+                              ChatTargetOption &optionOut) {
+  if (!world || !candidate || (uintptr_t)candidate <= 0x1000) {
+    return false;
+  }
+
+  std::string candidateName = "";
+  try {
+    candidateName = TrimChatLine(candidate->getName());
+  } catch (...) {
+    candidateName.clear();
+  }
+  if (candidateName.empty()) {
+    return false;
+  }
+
+  Character *speaker = ResolveSelectedOrConfiguredPlayerSpeaker(world, candidate);
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return false;
+  }
+
+  float distance = -1.0f;
+  if (!IsDropdownTargetEligible(world, speaker, candidate, selectedMode,
+                                distance)) {
+    return false;
+  }
+
+  optionOut.name = candidateName;
+  optionOut.handle = ResolveCharacterSerialToken(candidate);
+  optionOut.distance = distance;
+  optionOut.isNarrator = false;
+  optionOut.label =
+      candidateName + ResolveConversationStateSuffix(candidate) +
+      BuildChatTargetDistanceSuffix(distance);
+  return true;
+}
+
+void RefreshChatHeaderLabel() {
+  if (!g_chatLabel) {
+    return;
+  }
+
+  GameWorld *world = GetWorldSafe();
+  std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
+  std::string selectedMode = NormalizeChatMode(g_chatMode);
+
+  if (selectedMode == "narrator") {
+    Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
+    if (selectedSpeakerNpc && (uintptr_t)selectedSpeakerNpc > 0x1000) {
+      try {
+        std::string selectedSpeakerName =
+            TrimChatLine(selectedSpeakerNpc->getName());
+        if (!selectedSpeakerName.empty()) {
+          speakerName = selectedSpeakerName;
+          g_chatPlayerNameStr = selectedSpeakerName;
+        }
+      } catch (...) {
+      }
+    }
+  } else {
+    Character *targetNpc = ResolveChatTargetCharacter(
+        world, g_chatTargetNameStr, g_chatTargetHandleStr);
+    Character *bestSpeaker =
+        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
+    if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
+      try {
+        std::string resolvedSpeakerName = TrimChatLine(bestSpeaker->getName());
+        if (!resolvedSpeakerName.empty()) {
+          speakerName = resolvedSpeakerName;
+          g_chatPlayerNameStr = resolvedSpeakerName;
+        }
+      } catch (...) {
+      }
+    }
+  }
+
+  g_chatLabel->setCaption(WideFromUtf8("Speaker: " + speakerName).c_str());
+}
+
+void RefreshAvailableChatTargets(bool preserveSelection) {
+  if (!g_chatTargetCombo) {
+    return;
+  }
+
+  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string preferredName = TrimChatLine(g_chatTargetNameStr);
+  std::string preferredHandle = TrimChatLine(g_chatTargetHandleStr);
+
+  if (selectedMode == "narrator") {
+    preferredName = kNarratorName;
+    preferredHandle.clear();
+  } else if (preferredName.empty() || IsNarratorName(preferredName)) {
+    preferredName = TrimChatLine(g_chatLastRealTargetNameStr);
+    preferredHandle = TrimChatLine(g_chatLastRealTargetHandleStr);
+  }
+
+  std::vector<ChatTargetOption> options;
+  if (selectedMode == "narrator") {
+    ChatTargetOption narratorOption;
+    narratorOption.name = kNarratorName;
+    narratorOption.handle.clear();
+    narratorOption.label = kNarratorName;
+    narratorOption.distance = -1.0f;
+    narratorOption.isNarrator = true;
+    options.push_back(narratorOption);
+  } else {
+    GameWorld *world = GetWorldSafe();
+    if (world) {
+      std::set<std::string> seenTargets;
+      const ogre_unordered_set<Character *>::type &chars =
+          world->getCharacterUpdateList();
+      for (auto it = chars.begin(); it != chars.end(); ++it) {
+        ChatTargetOption option;
+        if (!TryBuildChatTargetOption(world, *it, selectedMode, option)) {
+          continue;
+        }
+        std::string targetKey =
+            option.handle.empty() ? option.name : option.handle;
+        if (targetKey.empty() || seenTargets.count(targetKey) > 0) {
+          continue;
+        }
+        seenTargets.insert(targetKey);
+        options.push_back(option);
+      }
+    }
+
+    std::sort(options.begin(), options.end(),
+              [](const ChatTargetOption &lhs,
+                 const ChatTargetOption &rhs) -> bool {
+                if (lhs.distance != rhs.distance) {
+                  return lhs.distance < rhs.distance;
+                }
+                if (lhs.name != rhs.name) {
+                  return lhs.name < rhs.name;
+                }
+                return lhs.handle < rhs.handle;
+              });
+  }
+
+  g_chatTargetRefreshInProgress = true;
+  g_chatTargetCombo->removeAllItems();
+  g_chatTargetOptions = options;
+
+  if (g_chatTargetOptions.empty()) {
+    g_chatTargetCombo->addItem(
+        WideFromUtf8("No valid targets for " + selectedMode).c_str());
+    g_chatTargetCombo->setIndexSelected(0);
+    g_chatTargetNameStr.clear();
+    g_chatTargetHandleStr.clear();
+    g_talkTargetHand = hand();
+    g_chatTargetRefreshInProgress = false;
+    return;
+  }
+
+  for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
+    g_chatTargetCombo->addItem(
+        WideFromUtf8(g_chatTargetOptions[i].label).c_str());
+  }
+
+  size_t selectedIndex = 0;
+  if (preserveSelection) {
+    for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
+      if (DoesChatTargetOptionMatch(g_chatTargetOptions[i], preferredName,
+                                    preferredHandle)) {
+        selectedIndex = i;
+        break;
+      }
+    }
+  }
+
+  g_chatTargetCombo->setIndexSelected(selectedIndex);
+  const ChatTargetOption &selectedOption = g_chatTargetOptions[selectedIndex];
+  SetActiveChatTarget(selectedOption.name, selectedOption.handle,
+                      !selectedOption.isNarrator);
+  g_chatTargetRefreshInProgress = false;
+}
+
 void CloseChatUI() {
   if (g_chatPausedGame) {
     GameWorld *world = GetWorldSafe();
@@ -1361,13 +1690,18 @@ void CloseChatUI() {
     g_chatWindow = nullptr;
     g_chatInput = nullptr;
     g_chatModeCombo = nullptr;
+    g_chatTargetCombo = nullptr;
     g_chatActionCombo = nullptr;
     g_chatActionArgInput = nullptr;
     g_chatAutoChatToggle = nullptr;
     g_chatLabel = nullptr;
   }
+  g_chatTargetOptions.clear();
+  g_chatTargetRefreshInProgress = false;
   g_chatTargetHandleStr.clear();
   g_chatTargetNameStr.clear();
+  g_chatLastRealTargetHandleStr.clear();
+  g_chatLastRealTargetNameStr.clear();
   g_chatPlayerNameStr.clear();
   g_chatJustOpened = false;
 }
@@ -2751,17 +3085,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       if (g_chatWindow) {
         g_chatWindow->setCaption(WideFromUtf8("Chat Box").c_str());
       }
-      if (g_chatLabel) {
-        std::string speakerName = g_chatPlayerNameStr;
-        if (speakerName.empty()) {
-          speakerName = "Player";
-        }
-        std::string targetLabel =
-            BuildChatTargetLabel(world, npcName, handleStr);
-        g_chatLabel->setCaption(
-            WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
-                .c_str());
-      }
+      RefreshAvailableChatTargets(true);
+      RefreshChatHeaderLabel();
 
       g_chatInput->setCaption("");
       return;
@@ -4092,9 +4417,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   if (g_chatWindow)
     CloseChatUI();
 
-  g_chatTargetNameStr = npcName;
   g_chatPlayerNameStr = playerName;
-  g_chatTargetHandleStr = handleStr;
+  SetActiveChatTarget(npcName, handleStr, true);
   g_chatJustOpened = true;
   g_chatPausedGame = false;
 
@@ -4116,15 +4440,12 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
     g_chatPlayerNameStr = playerName.empty() ? "Player" : playerName;
   }
 
-  std::string actualNpcName = npcName;
   // Identity renames are queued and handled asynchronously by
   // RenameWorker, so CreateChatUI never blocks on HTTP.
   const float chatWindowW = 0.42f;
-  const float chatWindowH = 0.18f;
+  const float chatWindowH = 0.18f + ScreenPixelsToRealHeight(20);
   const float chatWindowX = (1.0f - chatWindowW) * 0.5f;
   const float chatWindowY = (1.0f - chatWindowH) * 0.5f;
-  std::string initialTargetLabel =
-      BuildChatTargetLabel(world, actualNpcName, handleStr);
   g_chatWindow = gui->createWidgetReal<MyGUI::Window>(
       "Kenshi_WindowCX", chatWindowX, chatWindowY, chatWindowW, chatWindowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
@@ -4134,11 +4455,17 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatWindowButtonPressed);
   MyGUI::Widget *client = g_chatWindow->getClientWidget();
   g_chatLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.08f, 0.9f, 0.16f,
-      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatLabel");
-  g_chatLabel->setCaption(
-      WideFromUtf8("Speaker: " + g_chatPlayerNameStr + " -> Target: " + initialTargetLabel)
-          .c_str());
+      "Kenshi_TextboxStandardText", 0.05f, 0.08f, 0.44f, 0.16f,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatLabel");
+  g_chatLabel->setCaption(WideFromUtf8("Speaker: " + g_chatPlayerNameStr).c_str());
+  const float targetComboHeight = 0.16f + ParentPixelsToRealHeight(client, 20);
+  g_chatTargetCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", 0.53f, 0.08f, 0.42f, targetComboHeight,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatTargetCombo");
+  g_chatTargetCombo->setComboModeDrop(true);
+  g_chatTargetCombo->eventComboAccept += MyGUI::newDelegate(OnChatTargetChange);
+  g_chatTargetCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnChatTargetChange);
   g_chatInput = client->createWidgetReal<MyGUI::EditBox>(
       "Kenshi_EditBox", 0.05f, 0.28f, 0.9f, 0.211f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatInput");
@@ -4232,7 +4559,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       "Kenshi_Button1", topBoredX, topRowY, topBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatBoredBtn");
-  boredEventBtn->setCaption(WideFromUtf8(T("Trigger Bored Event")).c_str());
+  boredEventBtn->setCaption(WideFromUtf8(T("Continue Chat")).c_str());
   boredEventBtn->eventMouseButtonClick += MyGUI::newDelegate(OnBoredEventClick);
 
   MyGUI::Button *writeDiaryBtn = client->createWidgetReal<MyGUI::Button>(
@@ -4258,6 +4585,20 @@ void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
   g_lastChatModeIndex = ChatModeToIndex(g_chatMode);
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
+}
+
+void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index) {
+  if (g_chatTargetRefreshInProgress || !sender || index == MyGUI::ITEM_NONE) {
+    return;
+  }
+  if (index >= g_chatTargetOptions.size()) {
+    return;
+  }
+
+  const ChatTargetOption &selectedOption = g_chatTargetOptions[index];
+  SetActiveChatTarget(selectedOption.name, selectedOption.handle,
+                      !selectedOption.isNarrator);
+  RefreshChatHeaderLabel();
 }
 
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index) {
@@ -4307,27 +4648,8 @@ void RefreshChatModeControls() {
                    (g_autoChatEnabled ? "[ON]" : "[OFF]"))
             .c_str());
   }
-
-  if (g_chatLabel) {
-    GameWorld *world = GetWorldSafe();
-    std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
-    std::string targetLabel =
-        BuildChatTargetLabel(world, g_chatTargetNameStr, g_chatTargetHandleStr);
-    if (g_chatMode == "narrator") {
-      Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
-      if (selectedSpeakerNpc && (uintptr_t)selectedSpeakerNpc > 0x1000) {
-        std::string selectedSpeakerName = selectedSpeakerNpc->getName();
-        if (!selectedSpeakerName.empty()) {
-          speakerName = selectedSpeakerName;
-          g_chatPlayerNameStr = selectedSpeakerName;
-        }
-      }
-      targetLabel = kNarratorName;
-    }
-    g_chatLabel->setCaption(
-        WideFromUtf8("Speaker: " + speakerName + " -> Target: " + targetLabel)
-            .c_str());
-  }
+  RefreshAvailableChatTargets(true);
+  RefreshChatHeaderLabel();
 }
 
 void SendChatToStobeServer(GameWorld *world, Character *sel,
