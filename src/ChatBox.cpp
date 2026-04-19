@@ -3924,40 +3924,88 @@ void OnRenameWindowButtonPressed(MyGUI::Window *sender,
 
 void OnBoredEventClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
-  std::string preferredSpeakerName = TrimChatLine(g_chatPlayerNameStr);
-  std::string preferredSpeakerSerial = "";
   std::string targetName = TrimChatLine(g_chatTargetNameStr);
   std::string targetSerial = TrimChatLine(g_chatTargetHandleStr);
+  std::string preferredSpeakerName = targetName;
+  std::string preferredSpeakerSerial = targetSerial;
+  std::string preferredListenerName = TrimChatLine(g_chatPlayerNameStr);
+  std::string preferredListenerSerial = "";
+
+  auto sameIdentity = [&](const std::string &lhsName, const std::string &lhsSerial,
+                          const std::string &rhsName,
+                          const std::string &rhsSerial) -> bool {
+    if (!lhsSerial.empty() && !rhsSerial.empty()) {
+      return lhsSerial == rhsSerial;
+    }
+    if (!lhsName.empty() && !rhsName.empty()) {
+      return EqualsIgnoreCase(lhsName, rhsName);
+    }
+    return false;
+  };
 
   if (world) {
     Character *targetNpc =
-        ResolveChatTargetCharacter(world, targetName, targetSerial);
-    Character *bestSpeaker =
-        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
-    if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
-      std::string resolvedName = TrimChatLine(bestSpeaker->getName());
-      if (!resolvedName.empty()) {
-        preferredSpeakerName = resolvedName;
-        g_chatPlayerNameStr = resolvedName;
+        ResolveChatTargetCharacter(world, preferredSpeakerName, preferredSpeakerSerial);
+    if (targetNpc && (uintptr_t)targetNpc > 0x1000) {
+      std::string resolvedTargetName = TrimChatLine(targetNpc->getName());
+      if (!resolvedTargetName.empty()) {
+        preferredSpeakerName = resolvedTargetName;
       }
-      preferredSpeakerSerial = ResolveCharacterSerialToken(bestSpeaker);
-    } else if (!preferredSpeakerName.empty()) {
-      Character *resolvedSpeaker =
-          ResolveChatTargetCharacter(world, preferredSpeakerName, "");
-      if (resolvedSpeaker && (uintptr_t)resolvedSpeaker > 0x1000) {
-        preferredSpeakerSerial = ResolveCharacterSerialToken(resolvedSpeaker);
+      preferredSpeakerSerial = ResolveCharacterSerialToken(targetNpc);
+    }
+
+    Character *bestListener =
+        ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
+    if (bestListener && (uintptr_t)bestListener > 0x1000) {
+      std::string resolvedListenerName = TrimChatLine(bestListener->getName());
+      std::string resolvedListenerSerial = ResolveCharacterSerialToken(bestListener);
+      if (!sameIdentity(resolvedListenerName, resolvedListenerSerial,
+                        preferredSpeakerName, preferredSpeakerSerial)) {
+        preferredListenerName = resolvedListenerName;
+        preferredListenerSerial = resolvedListenerSerial;
+      }
+    }
+
+    if (!preferredListenerName.empty() && preferredListenerSerial.empty() &&
+        !sameIdentity(preferredListenerName, "", preferredSpeakerName,
+                      preferredSpeakerSerial)) {
+      Character *resolvedListener =
+          ResolveChatTargetCharacter(world, preferredListenerName, "");
+      if (resolvedListener && (uintptr_t)resolvedListener > 0x1000) {
+        preferredListenerSerial = ResolveCharacterSerialToken(resolvedListener);
+      }
+    }
+
+    if ((preferredListenerName.empty() || sameIdentity(preferredListenerName,
+                                                       preferredListenerSerial,
+                                                       preferredSpeakerName,
+                                                       preferredSpeakerSerial)) &&
+        world->player && world->player->playerCharacters.size() > 0) {
+      Character *fallbackListener = world->player->playerCharacters[0];
+      if (fallbackListener && (uintptr_t)fallbackListener > 0x1000) {
+        std::string fallbackName = TrimChatLine(fallbackListener->getName());
+        std::string fallbackSerial =
+            ResolveCharacterSerialToken(fallbackListener);
+        if (!sameIdentity(fallbackName, fallbackSerial, preferredSpeakerName,
+                          preferredSpeakerSerial)) {
+          preferredListenerName = fallbackName;
+          preferredListenerSerial = fallbackSerial;
+        }
       }
     }
   }
 
-  if (preferredSpeakerName.empty()) {
-    preferredSpeakerName = targetName;
-    preferredSpeakerSerial = targetSerial;
+  if (sameIdentity(preferredListenerName, preferredListenerSerial,
+                   preferredSpeakerName, preferredSpeakerSerial)) {
+    preferredListenerName.clear();
+    preferredListenerSerial.clear();
   }
 
-  Log("BORED_EVENT: manual trigger requested speaker=" + preferredSpeakerName +
-      " speaker_serial=" + preferredSpeakerSerial + " target=" + targetName +
-      " target_serial=" + targetSerial);
+  Log("BORED_EVENT: manual continue requested target_speaker=" +
+      preferredSpeakerName + " speaker_serial=" + preferredSpeakerSerial +
+      " preferred_listener=" + preferredListenerName +
+      " preferred_listener_serial=" + preferredListenerSerial +
+      " target=" + targetName + " target_serial=" + targetSerial);
   LONG generation = BeginChatInterruptGeneration();
 
   EnterCriticalSection(&g_stateMutex);
@@ -3977,7 +4025,8 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
 
   bool dispatched =
       TriggerBoredEvent(world, true, preferredSpeakerName, preferredSpeakerSerial,
-                        generation);
+                        generation, preferredListenerName,
+                        preferredListenerSerial);
   if (!dispatched) {
     Log("BORED_EVENT: button trigger failed for selected NPC '" +
         preferredSpeakerName + "' serial=" + preferredSpeakerSerial);
@@ -4056,7 +4105,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
 bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName,
                        const std::string &preferredSpeakerSerial,
-                       LONG generationOverride) {
+                       LONG generationOverride,
+                       const std::string &preferredListenerName,
+                       const std::string &preferredListenerSerial) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return false;
   }
@@ -4080,6 +4131,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   std::string preferredName = TrimChatLine(preferredSpeakerName);
   std::string preferredSerial = TrimChatLine(preferredSpeakerSerial);
   bool hasPreferred = !preferredName.empty() || !preferredSerial.empty();
+  const bool targetLockedSpeaker = forceDirectorMode && hasPreferred;
   Character *preferredCharacter = nullptr;
   if (hasPreferred) {
     preferredCharacter =
@@ -4138,7 +4190,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     }
 
     try {
-      if (other->isDead() || other->isUnconcious()) {
+      if ((other->isDead() || other->isUnconcious()) &&
+          !(targetLockedSpeaker && preferredMatch)) {
         continue;
       }
     } catch (...) {
@@ -4180,7 +4233,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
 
   if (hasPreferred && !preferredPresent && preferredCharacter &&
       (uintptr_t)preferredCharacter > 0x1000 &&
-      !IsCharacterUnavailableForConversation(preferredCharacter) &&
+      (targetLockedSpeaker ||
+       !IsCharacterUnavailableForConversation(preferredCharacter)) &&
       ShouldIncludeAnimalForTalk(preferredCharacter)) {
     try {
       CandidateNpc c;
@@ -4239,7 +4293,25 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   }
   CandidateNpc speaker = candidates[speakerIndex];
 
+  auto sameIdentity = [&](const std::string &lhsName, const std::string &lhsSerial,
+                          const std::string &rhsName,
+                          const std::string &rhsSerial) -> bool {
+    if (!lhsSerial.empty() && !rhsSerial.empty()) {
+      return lhsSerial == rhsSerial;
+    }
+    if (!lhsName.empty() && !rhsName.empty()) {
+      return EqualsIgnoreCase(lhsName, rhsName);
+    }
+    return false;
+  };
+
   std::string listener = "";
+  std::string listenerSerial = "";
+  std::string playerName = player->getName();
+  std::string playerSerial = ToString(player->getHandle().serial);
+  std::string preferredListenerNameTrim = TrimChatLine(preferredListenerName);
+  std::string preferredListenerSerialTrim =
+      TrimChatLine(preferredListenerSerial);
   std::vector<size_t> listenerIndices;
   listenerIndices.reserve(candidates.size());
   for (size_t i = 0; i < candidates.size(); ++i) {
@@ -4249,22 +4321,93 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     listenerIndices.push_back(i);
   }
   if (listenerIndices.empty()) {
-    Log("BORED_EVENT: skipped (no eligible NPC listener) speaker=" +
-        speaker.name + " candidate_count=" + ToString((int)candidates.size()));
+    if (!targetLockedSpeaker) {
+      Log("BORED_EVENT: skipped (no eligible NPC listener) speaker=" +
+          speaker.name + " candidate_count=" + ToString((int)candidates.size()));
+      return false;
+    }
+  }
+
+  if (targetLockedSpeaker) {
+    if (!preferredListenerNameTrim.empty() || !preferredListenerSerialTrim.empty()) {
+      if (!sameIdentity(preferredListenerNameTrim, preferredListenerSerialTrim,
+                        speaker.name, speaker.serial) &&
+          !playerName.empty() &&
+          sameIdentity(preferredListenerNameTrim, preferredListenerSerialTrim,
+                       playerName, playerSerial)) {
+        listener = playerName;
+        listenerSerial = playerSerial;
+      }
+
+      if (listener.empty()) {
+        for (size_t i = 0; i < listenerIndices.size(); ++i) {
+          size_t candidateIndex = listenerIndices[i];
+          if (candidateIndex >= candidates.size()) {
+            continue;
+          }
+          const CandidateNpc &candidate = candidates[candidateIndex];
+          if (sameIdentity(preferredListenerNameTrim, preferredListenerSerialTrim,
+                           candidate.name, candidate.serial)) {
+            listener = candidate.name;
+            listenerSerial = candidate.serial;
+            break;
+          }
+        }
+      }
+    }
+
+    if (listener.empty() && !playerName.empty() &&
+        !sameIdentity(playerName, playerSerial, speaker.name, speaker.serial)) {
+      listener = playerName;
+      listenerSerial = playerSerial;
+    }
+
+    if (listener.empty() && !listenerIndices.empty()) {
+      size_t bestListenerIndex = listenerIndices[0];
+      float bestListenerDistance = 1e30f;
+      for (size_t i = 0; i < listenerIndices.size(); ++i) {
+        size_t candidateIndex = listenerIndices[i];
+        if (candidateIndex >= candidates.size()) {
+          continue;
+        }
+        if (candidates[candidateIndex].distance < bestListenerDistance) {
+          bestListenerDistance = candidates[candidateIndex].distance;
+          bestListenerIndex = candidateIndex;
+        }
+      }
+      if (bestListenerIndex < candidates.size()) {
+        listener = candidates[bestListenerIndex].name;
+        listenerSerial = candidates[bestListenerIndex].serial;
+      }
+    }
+  } else {
+    size_t listenerIndex =
+        listenerIndices[(size_t)(rand() % listenerIndices.size())];
+    if (listenerIndex >= candidates.size()) {
+      Log("BORED_EVENT: skipped (listener index out of bounds) speaker=" +
+          speaker.name + " candidate_count=" + ToString((int)candidates.size()));
+      return false;
+    }
+    listener = candidates[listenerIndex].name;
+    listenerSerial = candidates[listenerIndex].serial;
+  }
+
+  if (listener.empty()) {
+    Log("BORED_EVENT: skipped (no resolved listener) speaker=" + speaker.name +
+        " candidate_count=" + ToString((int)candidates.size()) +
+        " director_mode=" + std::string(forceDirectorMode ? "1" : "0"));
     return false;
   }
-  size_t listenerIndex =
-      listenerIndices[(size_t)(rand() % listenerIndices.size())];
-  if (listenerIndex >= candidates.size()) {
-    Log("BORED_EVENT: skipped (listener index out of bounds) speaker=" +
-        speaker.name + " candidate_count=" + ToString((int)candidates.size()));
-    return false;
-  }
-  listener = candidates[listenerIndex].name;
 
   std::vector<std::string> people;
-  std::string playerName = player->getName();
-  std::string playerSerial = ToString(player->getHandle().serial);
+  AppendUniquePerson(people, speaker.name + "|" + speaker.serial);
+  if (!listener.empty()) {
+    if (!listenerSerial.empty()) {
+      AppendUniquePerson(people, listener + "|" + listenerSerial);
+    } else {
+      AppendUniquePerson(people, listener);
+    }
+  }
   if (!playerName.empty() && !playerSerial.empty()) {
     AppendUniquePerson(people, playerName + "|" + playerSerial);
   }
@@ -4299,10 +4442,12 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   task->handleStr = speaker.serial;
   task->peopleJson = peopleJson;
   task->previousSpeaker = listener;
-  if (listener == playerName && !playerSerial.empty()) {
+  task->previousSpeakerHandle = listenerSerial;
+  if (task->previousSpeakerHandle.empty() && listener == playerName &&
+      !playerSerial.empty()) {
     task->previousSpeakerHandle = playerSerial;
-  } else {
-    task->previousSpeakerHandle = "";
+  }
+  if (task->previousSpeakerHandle.empty()) {
     for (size_t i = 0; i < candidates.size(); ++i) {
       if (EqualsIgnoreCase(candidates[i].name, listener)) {
         task->previousSpeakerHandle = candidates[i].serial;
@@ -4330,7 +4475,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       ToString((int)people.size()) + " speaker_indoors=" +
       std::string(speaker.indoors ? "true" : "false") + " speaker_building=" +
       ToString((int)speaker.buildingSerial) + " speaker_floor=" +
-      ToString(speaker.floor) + " gen=" +
+      ToString(speaker.floor) + " listener_serial=" +
+      task->previousSpeakerHandle + " gen=" +
       ToString((int)task->generation));
   return true;
 }

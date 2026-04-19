@@ -44,7 +44,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender);
 bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName = "",
                        const std::string &preferredSpeakerSerial = "",
-                       LONG generationOverride = 0);
+                       LONG generationOverride = 0,
+                       const std::string &preferredListenerName = "",
+                       const std::string &preferredListenerSerial = "");
 bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);
