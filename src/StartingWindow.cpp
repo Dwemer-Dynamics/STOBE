@@ -116,7 +116,7 @@ void CreateStartingUI() {
   g_startingPausedGame = pausedByUs;
 
   g_startingWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.03f, 0.1f, 0.20f, 0.66f,
+      "Kenshi_WindowCX", 0.03f, 0.1f, 0.20f, 0.64f,
       MyGUI::Align::Left | MyGUI::Align::Top, "Popup", "Stobe_AIHub");
 
   if (!g_startingWindow) {

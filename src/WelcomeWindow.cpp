@@ -21,7 +21,10 @@ MyGUI::ComboBox *g_welcomeGeneralHotkeyCombo = nullptr;
 
 namespace {
 std::string BuildWelcomeInfoText() {
-  return "Welcome to Stobe.\n\nSTOBE Settings Key: [" + g_generalHotkeyStr +
+  const std::string pluginVersion =
+      GetStobePluginVersion() ? GetStobePluginVersion() : "";
+  return "Welcome to Stobe.\nPlugin Version: " + pluginVersion +
+         "\n\nSTOBE Settings Key: [" + g_generalHotkeyStr +
          "]\nChat Key: [" + g_chatHotkeyStr +
          "]\nUse Settings for plugin options.";
 }

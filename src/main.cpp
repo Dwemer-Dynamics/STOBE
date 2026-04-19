@@ -1745,7 +1745,7 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.8.2";
+static const char *kStobePluginVersion = "0.8.4";
 static const char *kStobePluginReleaseDate = "2026-04-11";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
@@ -1781,6 +1781,10 @@ static std::map<std::string, FactionRelationSnapshotEntry>
 static DWORD g_lastFactionRelationSyncTick = 0;
 static const DWORD kFactionRelationSyncIntervalMs = 30 * 1000;
 static const size_t kFactionRelationSyncHardCap = 262144;
+
+const char *GetStobePluginVersion() {
+  return kStobePluginVersion ? kStobePluginVersion : "";
+}
 
 static std::string ShortInventoryHashForLog(const std::string &hash) {
   if (hash.length() <= 12) {

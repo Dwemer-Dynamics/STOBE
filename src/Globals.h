@@ -180,3 +180,6 @@ void SetTravelTarget(unsigned int actorSerial, float x, float y, float z,
 void ClearTravelTarget(unsigned int actorSerial);
 void ClearAllTravelTargets();
 std::map<unsigned int, TravelTarget> SnapshotTravelTargets();
+
+// Returns the current Stobe plugin version string compiled into the DLL.
+const char *GetStobePluginVersion();

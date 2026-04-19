@@ -481,7 +481,7 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.17f, 0.06f, 0.66f, 0.74f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.225f, 0.08f, 0.55f, 0.62f, MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
