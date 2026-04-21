@@ -44,13 +44,15 @@
 
 std::string TrimCopySimple(const std::string &value);
 std::string ToLowerCopy(const std::string &value);
-void ApplyDrunkKnockoutPulse(Character *npc);
+void ApplyKnockoutPulse(Character *npc);
 int ResolveCurrentGameTimestampSeconds(GameWorld *world);
 std::string SafeBuildingName(Building *building);
 
 const int kDrunkLevelDurationSeconds = 5 * 60 * 60;
 const int kDrunkPassoutDurationSeconds = 2 * 60 * 60;
 const DWORD kDrunkKnockoutPulseMs = 1000;
+const int kSustainedKnockoutDurationSeconds = kDrunkPassoutDurationSeconds;
+const DWORD kSustainedKnockoutPulseMs = kDrunkKnockoutPulseMs;
 const int kDrugHighDurationSeconds = 5 * 60 * 60;
 const float kDrugHungerMultiplier = 1.5f;
 const float kDrugExtraHungerMultiplier = kDrugHungerMultiplier - 1.0f;
@@ -613,6 +615,13 @@ struct NpcDrunkState {
         nextKnockoutPulseTick(0) {}
 };
 
+struct NpcSustainedKnockoutState {
+  int untilGameTs;
+  DWORD nextPulseTick;
+
+  NpcSustainedKnockoutState() : untilGameTs(0), nextPulseTick(0) {}
+};
+
 struct NpcDrugState {
   int highUntilGameTs;
   int lastObservedGameTs;
@@ -625,6 +634,8 @@ struct NpcDrugState {
 };
 
 static std::map<unsigned int, NpcDrunkState> g_npcDrunkStates;
+static std::map<unsigned int, NpcSustainedKnockoutState>
+    g_npcSustainedKnockoutStates;
 static std::map<unsigned int, NpcDrugState> g_npcDrugStates;
 struct PendingHornCutReapplyState {
   hand target;
@@ -1675,7 +1686,56 @@ void UpdateNpcDrunkStates(GameWorld *world) {
     if (dead) {
       continue;
     }
-    ApplyDrunkKnockoutPulse(target);
+    ApplyKnockoutPulse(target);
+  }
+}
+
+void UpdateNpcSustainedKnockoutStates(GameWorld *world) {
+  if (!world) {
+    return;
+  }
+
+  int gameTs = ResolveCurrentGameTimestampSeconds(world);
+  DWORD nowTick = GetTickCount();
+  std::vector<unsigned int> knockoutSerials;
+
+  EnterCriticalSection(&g_stateMutex);
+  for (auto it = g_npcSustainedKnockoutStates.begin();
+       it != g_npcSustainedKnockoutStates.end();) {
+    NpcSustainedKnockoutState &state = it->second;
+    if (state.untilGameTs > 0) {
+      if (gameTs >= state.untilGameTs) {
+        state.untilGameTs = 0;
+        state.nextPulseTick = 0;
+      } else if (state.nextPulseTick == 0 || nowTick >= state.nextPulseTick) {
+        knockoutSerials.push_back(it->first);
+        state.nextPulseTick = nowTick + kSustainedKnockoutPulseMs;
+      }
+    }
+
+    if (state.untilGameTs <= 0) {
+      it = g_npcSustainedKnockoutStates.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  LeaveCriticalSection(&g_stateMutex);
+
+  for (size_t i = 0; i < knockoutSerials.size(); ++i) {
+    Character *target = ResolveLiveCharacterBySerial(world, knockoutSerials[i]);
+    if (!target || (uintptr_t)target <= 0x1000) {
+      continue;
+    }
+    bool dead = false;
+    try {
+      dead = target->isDead();
+    } catch (...) {
+      dead = false;
+    }
+    if (dead) {
+      continue;
+    }
+    ApplyKnockoutPulse(target);
   }
 }
 
@@ -3443,7 +3503,7 @@ bool ActivateNpcDrugHighState(GameWorld *world, Character *npc,
   return true;
 }
 
-void ApplyDrunkKnockoutPulse(Character *npc) {
+void ApplyKnockoutPulse(Character *npc) {
   if (!npc || (uintptr_t)npc <= 0x1000) {
     return;
   }
@@ -3457,7 +3517,7 @@ void ApplyDrunkKnockoutPulse(Character *npc) {
     return;
   }
   try {
-    // Force an immediate KO state for drunken pass-out.
+    // Force an immediate KO state and let the caller decide whether to sustain it.
     medical->knockout(100.0f);
   } catch (...) {
   }
@@ -3525,8 +3585,45 @@ bool AdvanceNpcDrunkLevel(GameWorld *world, Character *npc, int &newLevelOut,
   LeaveCriticalSection(&g_stateMutex);
 
   if (passedOutOut) {
-    ApplyDrunkKnockoutPulse(npc);
+    ApplyKnockoutPulse(npc);
   }
+  return true;
+}
+
+bool BeginNpcSustainedKnockout(GameWorld *world, Character *npc,
+                               int durationSeconds,
+                               int &secondsRemainingOut) {
+  secondsRemainingOut = 0;
+  if (!world || !npc || (uintptr_t)npc <= 0x1000 || durationSeconds <= 0) {
+    return false;
+  }
+
+  unsigned int serial = 0;
+  try {
+    serial = npc->getHandle().serial;
+  } catch (...) {
+    serial = 0;
+  }
+  if (serial == 0) {
+    return false;
+  }
+
+  int gameTs = ResolveCurrentGameTimestampSeconds(world);
+  int desiredUntilGameTs = gameTs + durationSeconds;
+  EnterCriticalSection(&g_stateMutex);
+  NpcSustainedKnockoutState &state = g_npcSustainedKnockoutStates[serial];
+  if (desiredUntilGameTs > state.untilGameTs) {
+    state.untilGameTs = desiredUntilGameTs;
+  }
+  state.nextPulseTick = 0;
+  secondsRemainingOut = state.untilGameTs - gameTs;
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (secondsRemainingOut < 0) {
+    secondsRemainingOut = 0;
+  }
+
+  ApplyKnockoutPulse(npc);
   return true;
 }
 
@@ -3806,6 +3903,86 @@ void ForcePostAmputationKnockout(MedicalSystem *medical, RobotLimbs::Limb limb,
       knockoutForcedOut = false;
     }
   }
+}
+
+static bool ForceImmediateCharacterKnockout(Character *target,
+                                            bool &alreadyKnockedOutOut,
+                                            bool &knockoutAppliedOut,
+                                            bool &forceTimerAppliedOut,
+                                            bool &medicalValidatedOut) {
+  alreadyKnockedOutOut = false;
+  knockoutAppliedOut = false;
+  forceTimerAppliedOut = false;
+  medicalValidatedOut = false;
+  if (!target || (uintptr_t)target <= 0x1000) {
+    return false;
+  }
+
+  bool isUnconscious = false;
+  try {
+    isUnconscious = target->isUnconcious();
+  } catch (...) {
+    isUnconscious = false;
+  }
+  bool isKnockedOut = false;
+  try {
+    isKnockedOut = target->isDown();
+  } catch (...) {
+    isKnockedOut = false;
+  }
+  alreadyKnockedOutOut = isUnconscious || isKnockedOut;
+
+  MedicalSystem *medical = nullptr;
+  try {
+    medical = target->getMedical();
+  } catch (...) {
+    medical = nullptr;
+  }
+  if (medical && (uintptr_t)medical > 0x1000) {
+    try {
+      medical->knockout(100.0f);
+      knockoutAppliedOut = true;
+    } catch (...) {
+      knockoutAppliedOut = false;
+    }
+    try {
+      medical->knockoutForceTimer(8.0f);
+      forceTimerAppliedOut = true;
+    } catch (...) {
+      forceTimerAppliedOut = false;
+    }
+    if (!forceTimerAppliedOut) {
+      try {
+        medical->startKnockoutTimer();
+        forceTimerAppliedOut = true;
+      } catch (...) {
+        forceTimerAppliedOut = false;
+      }
+    }
+    try {
+      medical->validateHealthValues();
+      medicalValidatedOut = true;
+    } catch (...) {
+      medicalValidatedOut = false;
+    }
+  }
+
+  bool nowUnconscious = false;
+  try {
+    nowUnconscious = target->isUnconcious();
+  } catch (...) {
+    nowUnconscious = false;
+  }
+  bool nowKnockedOut = false;
+  try {
+    nowKnockedOut = target->isDown();
+  } catch (...) {
+    nowKnockedOut = false;
+  }
+  // Kenshi can apply the prone/KO state a short moment after the medical calls
+  // succeed, so treat accepted knockout scheduling as success too.
+  return alreadyKnockedOutOut || nowUnconscious || nowKnockedOut ||
+         knockoutAppliedOut || forceTimerAppliedOut;
 }
 
 bool IsCharacterPrisoned(Character *target) {
@@ -5132,6 +5309,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   UpdateNarratorTimedPopupLifecycle();
 
   UpdateNpcDrunkStates(thisptr);
+  UpdateNpcSustainedKnockoutStates(thisptr);
   UpdateNpcDrugStates(thisptr);
   UpdatePendingHornCutReapplies(thisptr);
   UpdatePendingHornCutDismissals(thisptr);
@@ -7925,6 +8103,134 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                           true);
                     }
                   }
+                }
+              }
+            }
+          }
+        } else if (act.type == ACT_KNOCKOUT) {
+          const std::string actorName = SafeCharacterName(npc);
+          std::string targetName =
+              target ? SafeCharacterName(target) : TrimCopySimple(act.message);
+          if (targetName.empty()) {
+            targetName = "target";
+          }
+          if (!target || (uintptr_t)target <= 0x1000) {
+            Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
+                " reason=target_not_found target_token='" + act.message + "'");
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " could not find a valid knockout target.", true);
+          } else if (target == npc) {
+            Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
+                " reason=self_target");
+            thisptr->showPlayerAMessage_withLog(
+                actorName + " cannot use KNOCKOUT on themselves.", true);
+          } else {
+            float actionDistance = -1.0f;
+            std::string rangeReason = "";
+            if (!ValidateNpcCloseActionRange(npc, target, kNpcCloseActionRangeUnits,
+                                             actionDistance, rangeReason)) {
+              CloseActionApproachResult approachResult =
+                  TryDeferCloseActionUntilInRange(
+                      thisptr, npc, target, act, "knock out", targetName,
+                      actionDistance, rangeReason, kNpcCloseActionRangeUnits);
+              if (approachResult == CLOSE_ACTION_APPROACH_DEFERRED) {
+                queueDeferredAction = true;
+                deferActionQueue = true;
+                deferredAction = act;
+              } else if (approachResult == CLOSE_ACTION_APPROACH_TIMED_OUT) {
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " could not reach " + targetName +
+                        " in time to knock them out (" + userReason + ").",
+                    true);
+                Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
+                    " target=" + targetName +
+                    " reason=approach_timeout last_reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits) +
+                    " timeout_ms=" + ToString((int)kNpcCloseActionApproachTimeoutMs));
+              } else {
+                Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + rangeReason +
+                    " dist=" + ToString(actionDistance) + " max_dist=" +
+                    ToString(kNpcCloseActionRangeUnits));
+                const std::string userReason =
+                    DescribeCloseActionRangeReasonForUser(rangeReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot knock out " + targetName +
+                        " because they are " + userReason + ".",
+                    true);
+              }
+            } else {
+              ResetCloseActionApproachState(npc, act);
+              std::string invalidReason = "";
+              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+                if (invalidReason.empty()) {
+                  invalidReason = "target is not in a valid state";
+                }
+                Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
+                    " target=" + targetName + " reason=" + invalidReason);
+                thisptr->showPlayerAMessage_withLog(
+                    actorName + " cannot knock out " + targetName + ": " +
+                        invalidReason + ".",
+                    true);
+              } else {
+                ClearCharacterSpeechBubble(target);
+
+                bool alreadyKnockedOut = false;
+                bool knockoutApplied = false;
+                bool forceTimerApplied = false;
+                bool medicalValidated = false;
+                bool sustainedKnockoutScheduled = false;
+                int sustainedKnockoutSeconds = 0;
+                bool knockoutSucceeded = ForceImmediateCharacterKnockout(
+                    target, alreadyKnockedOut, knockoutApplied, forceTimerApplied,
+                    medicalValidated);
+                if (knockoutSucceeded) {
+                  sustainedKnockoutScheduled = BeginNpcSustainedKnockout(
+                      thisptr, target, kSustainedKnockoutDurationSeconds,
+                      sustainedKnockoutSeconds);
+                }
+
+                try {
+                  target->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+                try {
+                  npc->reThinkCurrentAIAction();
+                } catch (...) {
+                }
+
+                if (knockoutSucceeded) {
+                  Log("ACTION_EXEC: KNOCKOUT success actor=" + actorName +
+                      " target=" + targetName +
+                      " already_ko=" +
+                      std::string(alreadyKnockedOut ? "1" : "0") +
+                      " knockout_applied=" +
+                      std::string(knockoutApplied ? "1" : "0") +
+                      " force_timer_applied=" +
+                      std::string(forceTimerApplied ? "1" : "0") +
+                      " sustained_knockout=" +
+                      std::string(sustainedKnockoutScheduled ? "1" : "0") +
+                      " sustained_seconds=" +
+                      ToString(sustainedKnockoutSeconds) +
+                      " medical_validated=" +
+                      std::string(medicalValidated ? "1" : "0"));
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " knocked out " + targetName + ".", true);
+                } else {
+                  Log("ACTION_EXEC: KNOCKOUT failed actor=" + actorName +
+                      " target=" + targetName +
+                      " knockout_applied=" +
+                      std::string(knockoutApplied ? "1" : "0") +
+                      " force_timer_applied=" +
+                      std::string(forceTimerApplied ? "1" : "0") +
+                      " medical_validated=" +
+                      std::string(medicalValidated ? "1" : "0"));
+                  thisptr->showPlayerAMessage_withLog(
+                      actorName + " failed to knock out " + targetName + ".",
+                      true);
                 }
               }
             }

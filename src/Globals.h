@@ -94,6 +94,7 @@ enum ActionType {
   ACT_REMOVE_LIMB,
   ACT_CUT_HORNS,
   ACT_USE_OBJECT,
+  ACT_KNOCKOUT,
   ACT_KILL
 };
 

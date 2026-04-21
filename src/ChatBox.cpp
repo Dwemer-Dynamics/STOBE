@@ -282,7 +282,8 @@ enum ManualChatActionType {
   MANUAL_CHAT_ACTION_DRINK_ITEM = 6,
   MANUAL_CHAT_ACTION_USE_DRUGS = 7,
   MANUAL_CHAT_ACTION_KILL = 8,
-  MANUAL_CHAT_ACTION_FORCE_DRINK = 9
+  MANUAL_CHAT_ACTION_FORCE_DRINK = 9,
+  MANUAL_CHAT_ACTION_KNOCKOUT = 10
 };
 
 struct ManualChatActionChoice {
@@ -311,6 +312,7 @@ const ManualChatActionChoice kManualChatActionChoices[] = {
      "remove_limb_right_leg", "RIGHT_LEG", false},
     {MANUAL_CHAT_ACTION_CUT_HORNS, "cut horns (hacksaw)", "cut_horns", "",
      false},
+    {MANUAL_CHAT_ACTION_KNOCKOUT, "knockout", "knockout", "", false},
     {MANUAL_CHAT_ACTION_KILL, "kill", "kill", "", false},
 };
 
@@ -464,6 +466,19 @@ std::string BuildManualKillActionToken(const std::string &targetName,
     targetToken += "|" + targetHandle;
   }
   return "KILL@" + targetToken;
+}
+
+std::string BuildManualKnockoutActionToken(const std::string &targetName,
+                                           const std::string &targetHandle) {
+  std::string normalizedTargetName = TrimManualActionArg(targetName);
+  if (normalizedTargetName.empty()) {
+    return "";
+  }
+  std::string targetToken = normalizedTargetName;
+  if (!targetHandle.empty()) {
+    targetToken += "|" + targetHandle;
+  }
+  return "KNOCKOUT@" + targetToken;
 }
 
 bool TryParseActionAmount(const std::string &rawValue, int &amountOut) {
@@ -2599,7 +2614,9 @@ void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
       "ROLEPLAY_ACTION",  "ROLEPLAYACTION","ROLEPLAY-ACTION",
       "NOTIFY",           "FACTION_RELATIONS","TRAVEL_LOCATION",
       "TRAVELLOCATION",   "USE_OBJECT",    "USEOBJECT",
-      "USE-OBJECT",       "KILL",          "KILLTARGET",
+      "USE-OBJECT",       "KNOCKOUT",      "KNOCK_OUT",
+      "KNOCK-OUT",        "KO",            "KILL",
+      "KILLTARGET",
       "SPAWN_ITEM",
       "TASK",             "SET_BLOCK",     "SET_HOLD",         "SET_PASSIVE",
       "SET_JOBS",         "SET_RANGED",    "SET_TAUNT",        "SET_SNEAK",
@@ -3396,6 +3413,33 @@ void OnChatSendClick(MyGUI::Widget *sender) {
         Log("CHAT_GATE: blocked manual cut horns reason=already_cut actor='" +
             playerName + "' target='" + targetName +
             "' average=" + ToString(hornAverage));
+        return;
+      }
+      manualActionPromptEligible = true;
+    } else if (manualActionChoice.type == MANUAL_CHAT_ACTION_KNOCKOUT) {
+      manualActionCommand =
+          BuildManualKnockoutActionToken(targetName, resolvedTargetHandle);
+      if (manualActionCommand.empty()) {
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: Could not build knockout action.", true);
+        }
+        Log("CHAT_GATE: blocked manual knockout invalid_action_token target='" +
+            targetName + "' handle='" + resolvedTargetHandle + "'");
+        return;
+      }
+      std::string invalidReason = "";
+      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+        if (invalidReason.empty()) {
+          invalidReason =
+              "target must be knocked out, unconscious, imprisoned, or carried";
+        }
+        if (world) {
+          world->showPlayerAMessage_withLog(
+              "Chat blocked: " + invalidReason + ".", true);
+        }
+        Log("CHAT_GATE: blocked manual knockout reason='" + invalidReason +
+            "' actor='" + playerName + "' target='" + targetName + "'");
         return;
       }
       manualActionPromptEligible = true;

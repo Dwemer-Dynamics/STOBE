@@ -8515,6 +8515,10 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           } else if (actionCommand == "CUTHORNS" ||
                      actionCommand == "CUT-HORNS") {
             actionCommand = "CUT_HORNS";
+          } else if (actionCommand == "KO" ||
+                     actionCommand == "KNOCK_OUT" ||
+                     actionCommand == "KNOCK-OUT") {
+            actionCommand = "KNOCKOUT";
           } else if (actionCommand == "KILLTARGET" ||
                      actionCommand == "EXECUTE" ||
                      actionCommand == "MURDER") {
@@ -10368,6 +10372,33 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 ToString((unsigned int)targetHand.serial) + " target='" +
                 targetToken + "' target_serial=" +
                 ToString((unsigned int)hornTarget.serial));
+          } else if (actionCommand == "KNOCKOUT") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            std::string targetToken = TrimCopy(actionArgument);
+            if (targetToken.empty()) {
+              Log("HOOK_MSG_PROC: KNOCKOUT ignored; empty target payload");
+              continue;
+            }
+            hand knockoutTarget = resolveActionTargetHand(targetToken, targetHand);
+            if (!knockoutTarget.isValid()) {
+              Log("HOOK_MSG_PROC: KNOCKOUT ignored; target unresolved '" +
+                  targetToken + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_KNOCKOUT;
+            act.actor = targetHand;
+            act.target = knockoutTarget;
+            act.message = targetToken;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: KNOCKOUT queued actor_serial=" +
+                ToString((unsigned int)targetHand.serial) + " target='" +
+                targetToken + "' target_serial=" +
+                ToString((unsigned int)knockoutTarget.serial));
           } else if (actionCommand == "KILL") {
             if (shouldSkipSpeakerBoundAction(actionCommand)) {
               continue;
