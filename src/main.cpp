@@ -10256,11 +10256,6 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 ToString(catsAmount) + " target='" + catsTargetToken +
                 "' target_serial=" + ToString((unsigned int)catsTarget.serial));
           } else if (actionCommand == "GIVE_CATS") {
-            if (!actionActorIsPlayerFaction) {
-              Log("HOOK_MSG_PROC: GIVE_CATS ignored; non-player-faction actor '" +
-                  actionActorName + "' serial=" + ToString(actionActorSerial));
-              continue;
-            }
             std::string catsTargetToken = "";
             int catsAmount = 0;
             if (!parseCatsPayload(actionArgument, catsTargetToken, catsAmount)) {
