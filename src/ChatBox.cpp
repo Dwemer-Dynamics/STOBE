@@ -3428,8 +3428,9 @@ void OnChatSendClick(MyGUI::Widget *sender) {
             targetName + "' handle='" + resolvedTargetHandle + "'");
         return;
       }
+      const bool selfTarget = (targetNpc == player);
       std::string invalidReason = "";
-      if (!IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
+      if (!selfTarget && !IsRemoveLimbTargetValid(world, targetNpc, invalidReason)) {
         if (invalidReason.empty()) {
           invalidReason =
               "target must be knocked out, unconscious, imprisoned, or carried";

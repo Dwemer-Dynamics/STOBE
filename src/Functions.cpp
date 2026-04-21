@@ -441,19 +441,8 @@ GameDataCopyStandalone *CloneAppearanceDataForCharacter(Character *npc,
     clone = nullptr;
   }
   if (!clone || (uintptr_t)clone <= 0x1000) {
-    try {
-      clone = new GameDataCopyStandalone();
-      if (clone) {
-        clone->initialise(CHARACTER_APPEARANCE, false);
-      }
-    } catch (...) {
-      clone = nullptr;
-    }
-    if (!clone || (uintptr_t)clone <= 0x1000) {
-      reasonOut = "create_failed";
-      return nullptr;
-    }
-    reasonOut = "fallback_constructed";
+    reasonOut = "create_failed";
+    return nullptr;
   }
 
   try {
@@ -8114,16 +8103,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           if (targetName.empty()) {
             targetName = "target";
           }
+          const bool selfTarget = (target == npc);
           if (!target || (uintptr_t)target <= 0x1000) {
             Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
                 " reason=target_not_found target_token='" + act.message + "'");
             thisptr->showPlayerAMessage_withLog(
                 actorName + " could not find a valid knockout target.", true);
-          } else if (target == npc) {
-            Log("ACTION_EXEC: KNOCKOUT blocked actor=" + actorName +
-                " reason=self_target");
-            thisptr->showPlayerAMessage_withLog(
-                actorName + " cannot use KNOCKOUT on themselves.", true);
           } else {
             float actionDistance = -1.0f;
             std::string rangeReason = "";
@@ -8165,7 +8150,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             } else {
               ResetCloseActionApproachState(npc, act);
               std::string invalidReason = "";
-              if (!IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
+              if (!selfTarget &&
+                  !IsRemoveLimbTargetValid(thisptr, target, invalidReason)) {
                 if (invalidReason.empty()) {
                   invalidReason = "target is not in a valid state";
                 }

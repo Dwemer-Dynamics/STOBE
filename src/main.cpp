@@ -8606,6 +8606,37 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                   ToString(actionActorSerial));
               return true;
             }
+              return false;
+            };
+          auto knockoutTargetMatchesActorName =
+              [&](const std::string &rawTargetToken) -> bool {
+            if (!targetHand.isValid() || targetHand.serial == 0 ||
+                !actionActorResolved || actionActorSerial == 0 ||
+                actionActorSerial != targetHand.serial || !actionActor ||
+                (uintptr_t)actionActor <= 0x1000) {
+              return false;
+            }
+
+            std::string tokenLow = ToLowerAsciiCopy(TrimCopy(rawTargetToken));
+            if (tokenLow.empty()) {
+              return false;
+            }
+
+            std::string actorNameLow = ToLowerAsciiCopy(TrimCopy(actionActorName));
+            if (!actorNameLow.empty() &&
+                (actorNameLow == tokenLow ||
+                 actorNameLow.find(tokenLow) == 0)) {
+              return true;
+            }
+
+            std::string displayNameLow =
+                ToLowerAsciiCopy(TrimCopy(actionActor->displayName));
+            if (!displayNameLow.empty() &&
+                (displayNameLow == tokenLow ||
+                 displayNameLow.find(tokenLow) == 0)) {
+              return true;
+            }
+
             return false;
           };
 
@@ -10381,7 +10412,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               Log("HOOK_MSG_PROC: KNOCKOUT ignored; empty target payload");
               continue;
             }
-            hand knockoutTarget = resolveActionTargetHand(targetToken, targetHand);
+            hand knockoutTarget = hand();
+            if (knockoutTargetMatchesActorName(targetToken)) {
+              knockoutTarget = targetHand;
+              Log("HOOK_MSG_PROC: KNOCKOUT self-target resolved from actor name '" +
+                  targetToken + "' actor_serial=" +
+                  ToString((unsigned int)targetHand.serial));
+            } else {
+              knockoutTarget = resolveActionTargetHand(targetToken, targetHand);
+            }
             if (!knockoutTarget.isValid()) {
               Log("HOOK_MSG_PROC: KNOCKOUT ignored; target unresolved '" +
                   targetToken + "'");
