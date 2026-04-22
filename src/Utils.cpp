@@ -621,6 +621,18 @@ void LoadStobeRuntimeConfig() {
   std::string customIniPath = GetStobeCustomIniPath(true);
   EnsureCustomIniSeeded(baseIniPath, customIniPath);
 
+  g_serverHost = TrimCopy(ReadLayeredIniString(baseIniPath, customIniPath,
+                                               "Settings", "ServerHost",
+                                               "127.0.0.1"));
+  if (g_serverHost.empty()) {
+    g_serverHost = "127.0.0.1";
+  }
+  g_serverPort =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "ServerPort", 8083);
+  if (g_serverPort < 1 || g_serverPort > 65535) {
+    g_serverPort = 8083;
+  }
+
   SetGeneralHotkeyFromString(ReadLayeredIniString(
       baseIniPath, customIniPath, "Settings", "GeneralHotkey", "="));
   SetHotkeyFromString(ReadLayeredIniString(baseIniPath, customIniPath,
@@ -725,6 +737,8 @@ void LoadStobeRuntimeConfig() {
   Log("CONFIG: Loaded ProximityRadius=" + ToString(g_proximityRadius) +
       ", BoredEventRange=" + ToString(g_boredEventRange) +
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
+      ", ServerHost=" + g_serverHost +
+      ", ServerPort=" + ToString(g_serverPort) +
       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
       ", RegularDialogueCapture=" +
@@ -746,6 +760,10 @@ void LoadStobeRuntimeConfig() {
 void SaveStobeRuntimeConfig() {
   std::string iniPath = GetStobeCustomIniPath(true);
 
+  WritePrivateProfileStringA("Settings", "ServerHost", g_serverHost.c_str(),
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "ServerPort",
+                             ToString(g_serverPort).c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "GeneralHotkey",
                              g_generalHotkeyStr.c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatHotkey", g_chatHotkeyStr.c_str(),

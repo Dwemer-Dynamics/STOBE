@@ -1,6 +1,7 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "Utils.h"
+#include <cctype>
 #include <ctime>
 #include <deque>
 #include <sstream>
@@ -52,6 +53,14 @@ std::string Trim(const std::string &value) {
     return "";
   size_t end = value.find_last_not_of(" \t\r\n");
   return value.substr(start, end - start + 1);
+}
+
+std::string ToLowerAscii(std::string value) {
+  for (size_t i = 0; i < value.length(); ++i) {
+    value[i] = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(value[i])));
+  }
+  return value;
 }
 
 std::string ToUtf8(const std::wstring &value) {
@@ -322,6 +331,32 @@ bool TryParseHostPort(const std::string &rawValue, std::wstring &host,
   return true;
 }
 
+bool IsLoopbackHost(const std::string &rawHost) {
+  std::string host = ToLowerAscii(Trim(rawHost));
+  return host.empty() || host == "127.0.0.1" || host == "localhost" ||
+         host == "::1";
+}
+
+bool TryApplyConfiguredServerTarget() {
+  std::string configuredHost = Trim(g_serverHost);
+  INTERNET_PORT configuredPort =
+      (g_serverPort >= 1 && g_serverPort <= 65535)
+          ? static_cast<INTERNET_PORT>(g_serverPort)
+          : kDefaultServerPort;
+
+  if (!IsLoopbackHost(configuredHost) || configuredPort != kDefaultServerPort) {
+    g_stobeHost = ToWide(configuredHost.empty() ? "127.0.0.1" : configuredHost);
+    g_stobePort = configuredPort;
+    Log("DISCOVERY: Using configured Stobe server " + ToUtf8(g_stobeHost) + ":" +
+        ToString((int)g_stobePort) + " from Stobe.ini.");
+    return true;
+  }
+
+  g_stobeHost = ToWide(configuredHost.empty() ? "127.0.0.1" : configuredHost);
+  g_stobePort = configuredPort;
+  return false;
+}
+
 bool SendRawHttp(const RequestPlan &request, bool expectResponse,
                  std::string *responseOut,
                  StobeStreamLineCallback lineCallback, void *lineUserData) {
@@ -431,6 +466,10 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
 }
 
 void DiscoverStobeServer() {
+  if (TryApplyConfiguredServerTarget()) {
+    return;
+  }
+
   RequestPlan discoverRequest;
   discoverRequest.method = L"GET";
   discoverRequest.path = L"/discover?game=kenshi";

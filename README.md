@@ -22,6 +22,7 @@ Load and save behavior:
 - Load order is `Stobe.ini` first, then `StobeCustom.ini` overrides.
 - Runtime/UI saves write to `StobeCustom.ini` only.
 - On first run, if `StobeCustom.ini` does not exist, Stobe seeds it from `Stobe.ini` (or creates a minimal `[Settings]` file).
+- `ServerHost`/`ServerPort` can be overridden in the INI to point Stobe at a different machine; local defaults continue to use launcher discovery/fallback.
 
 This preserves user settings while still allowing newly added defaults to flow in from updated `Stobe.ini`.
 

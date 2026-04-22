@@ -59,6 +59,8 @@ std::string g_chatMode = "chat";
 bool g_autoChatEnabled = false;
 bool g_useNearestPlayerSpeaker = true;
 bool g_enableAnimalTalks = false;
+std::string g_serverHost = "127.0.0.1";
+int g_serverPort = 8083;
 std::map<std::string, std::string> g_uiTranslation;
 
 std::string T(const std::string &key) {

@@ -62,6 +62,8 @@ extern std::string g_chatMode;
 extern bool g_autoChatEnabled;
 extern bool g_useNearestPlayerSpeaker;
 extern bool g_enableAnimalTalks;
+extern std::string g_serverHost;
+extern int g_serverPort;
 extern std::map<std::string, std::string> g_uiTranslation;
 std::string T(const std::string &key);
 
