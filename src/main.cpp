@@ -1589,20 +1589,30 @@ struct PortraitSyncState {
   std::string lastHash;
   DWORD lastSentTick;
   DWORD lastSeenTick;
+  DWORD lastAttemptTick;
   bool hasSent;
 
   PortraitSyncState()
-      : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
+      : lastHash(""),
+        lastSentTick(0),
+        lastSeenTick(0),
+        lastAttemptTick(0),
+        hasSent(false) {}
 };
 
 struct ItemImageSyncState {
   std::string lastHash;
   DWORD lastSentTick;
   DWORD lastSeenTick;
+  DWORD lastAttemptTick;
   bool hasSent;
 
   ItemImageSyncState()
-      : lastHash(""), lastSentTick(0), lastSeenTick(0), hasSent(false) {}
+      : lastHash(""),
+        lastSentTick(0),
+        lastSeenTick(0),
+        lastAttemptTick(0),
+        hasSent(false) {}
 };
 
 struct PendingItemImageSyncRequest {
@@ -1699,17 +1709,21 @@ static std::map<std::string, PortraitSyncState> g_portraitSyncStateByStorageId;
 static std::map<unsigned int, DWORD> g_portraitSpeechTriggerBySerial;
 static std::map<std::string, ItemImageSyncState> g_itemImageSyncStateByItemId;
 static std::deque<PendingItemImageSyncRequest> g_itemImageSyncRequestQueue;
+static hand g_pendingSelectionContextHand;
+static DWORD g_pendingSelectionContextQueuedTick = 0;
+static DWORD g_lastSelectionContextPushedTick = 0;
 static DWORD g_lastInventorySweepTick = 0;
 static const DWORD kInventorySweepIntervalMs = 6000;
 static const DWORD kInventoryMinResendMs = 1200;
 static const size_t kInventorySweepCandidateLimit = 8;
 static const DWORD kInventoryStateRetentionMs = 15 * 60 * 1000;
-static const size_t kItemImageBatchLimit = 12;
+static const size_t kItemImageBatchLimit = 4;
 static const size_t kItemImageConsiderMultiplier = 12;
 static const DWORD kItemImageMinResendMs = 10 * 60 * 1000;
 static const DWORD kItemImageStateRetentionMs = 60 * 60 * 1000;
 static const DWORD kItemImageRunCooldownMs = 3 * 1000;
 static const DWORD kItemImageStartupDelayMs = 5 * 1000;
+static const DWORD kItemImageAttemptCooldownMs = 60 * 1000;
 static const size_t kItemImageRequestQueueMax = 64;
 static DWORD g_itemImageLastRunTick = 0;
 static DWORD g_worldStableSinceTick = 0;
@@ -1723,9 +1737,13 @@ static DWORD g_lastPortraitSweepTick = 0;
 static const DWORD kPortraitSweepIntervalMs = 15000;
 static const DWORD kPortraitMinResendMs = 30 * 60 * 1000;
 static const size_t kPortraitSweepCandidateLimit = 48;
+static const size_t kPortraitSweepBudgetPerPass = 4;
 static const DWORD kPortraitStateRetentionMs = 30 * 60 * 1000;
 static const DWORD kPortraitSpeechTriggerCooldownMs = 2 * 60 * 1000;
 static const DWORD kPortraitSyncBackoffMs = 2 * 60 * 1000;
+static const DWORD kPortraitAttemptCooldownMs = 2 * 60 * 1000;
+static const DWORD kRecentServerSuccessGraceMs = 10 * 1000;
+static size_t g_portraitSweepCursor = 0;
 static std::map<unsigned int, NpcWorldEventState> g_npcWorldEventStateBySerial;
 static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
@@ -1758,6 +1776,8 @@ static bool g_dynamicProfileIntervalSyncHasValue = false;
 static int g_dynamicProfileIntervalSyncLastValue = 0;
 static DWORD g_dynamicProfileIntervalSyncLastSentTick = 0;
 static const DWORD kDynamicProfileIntervalResendIntervalMs = 5 * 60 * 1000;
+static const DWORD kSelectionContextDebounceMs = 1500;
+static const DWORD kSelectionContextMinIntervalMs = 8000;
 static std::map<unsigned int, PendingMedicalItemUseState>
     g_pendingMedicalItemUseBySerial;
 static const DWORD kPendingMedicalItemUseRetentionMs = 20 * 1000;
@@ -1988,6 +2008,55 @@ static int PortraitSehFilter(unsigned int code) {
   g_portraitLastSehTick = GetTickCount();
   InterlockedIncrement(&g_portraitSehCount);
   return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static bool HasRecentDwemerDistroConnection(DWORD maxSuccessAgeMs) {
+  if (IsDwemerDistroConnected()) {
+    return true;
+  }
+
+  DWORD ageMs = GetDwemerDistroLastSuccessAgeMs();
+  return ageMs != 0xFFFFFFFF && ageMs <= maxSuccessAgeMs;
+}
+
+static bool ShouldAttemptPortraitCapture(const std::string &storageId,
+                                         DWORD nowTick, bool force,
+                                         const std::string &reason,
+                                         std::string *skipReasonOut = nullptr) {
+  (void)reason;
+  if (skipReasonOut) {
+    skipReasonOut->clear();
+  }
+  if (storageId.empty()) {
+    if (skipReasonOut) {
+      *skipReasonOut = "empty_storage";
+    }
+    return false;
+  }
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    if (skipReasonOut) {
+      *skipReasonOut = "offline";
+    }
+    return false;
+  }
+
+  bool allow = false;
+  EnterCriticalSection(&g_stateMutex);
+  PortraitSyncState &state = g_portraitSyncStateByStorageId[storageId];
+  state.lastSeenTick = nowTick;
+  DWORD sinceLastAttempt =
+      state.lastAttemptTick == 0 ? 0 : (nowTick - state.lastAttemptTick);
+  if (force || state.lastAttemptTick == 0 ||
+      sinceLastAttempt >= kPortraitAttemptCooldownMs) {
+    state.lastAttemptTick = nowTick;
+    allow = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (!allow && skipReasonOut) {
+    *skipReasonOut = "attempt_cooldown";
+  }
+  return allow;
 }
 
 static void MaybeDisablePortraitSyncAfterSeh() {
@@ -2251,6 +2320,13 @@ static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
     storageId = "hand_" + ToString((int)serial);
   }
 
+  DWORD nowTick = GetTickCount();
+  std::string skipReason = "";
+  if (!ShouldAttemptPortraitCapture(storageId, nowTick, force, reason,
+                                    &skipReason)) {
+    return false;
+  }
+
   std::string bmpData = "";
   std::string imageHash = "";
   std::string captureReason = "";
@@ -2281,7 +2357,6 @@ static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
     return false;
   }
 
-  DWORD nowTick = GetTickCount();
   DWORD sinceLastSent = 0;
   bool changed = false;
   bool firstSync = false;
@@ -2457,6 +2532,7 @@ static void ResetPortraitSyncState() {
   g_portraitLastSehTick = 0;
   g_portraitLastSehCode = 0;
   g_lastPortraitSweepTick = 0;
+  g_portraitSweepCursor = 0;
   InterlockedExchange(&g_portraitSehCount, 0);
 }
 
@@ -2479,10 +2555,33 @@ static void RunPlayerFactionPortraitSweep(GameWorld *world) {
   }
   g_lastPortraitSweepTick = nowTick;
 
+  const size_t rosterSize = world->player->playerCharacters.size();
+  if (rosterSize == 0) {
+    g_portraitSweepCursor = 0;
+    return;
+  }
+  if (g_portraitSweepCursor >= rosterSize) {
+    g_portraitSweepCursor = 0;
+  }
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    static DWORD lastOfflineLogTick = 0;
+    if (nowTick - lastOfflineLogTick >= 30000) {
+      lastOfflineLogTick = nowTick;
+      Log("PORTRAIT_SYNC: sweep deferred while server connection is unavailable.");
+    }
+    return;
+  }
+
   size_t candidates = 0;
   size_t sent = 0;
-  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-    Character *member = world->player->playerCharacters[i];
+  size_t inspectedSlots = 0;
+  const size_t maxInspect =
+      std::min(static_cast<size_t>(kPortraitSweepCandidateLimit), rosterSize);
+  const size_t budget =
+      std::min(static_cast<size_t>(kPortraitSweepBudgetPerPass), maxInspect);
+  for (; inspectedSlots < maxInspect && candidates < budget; ++inspectedSlots) {
+    size_t rosterIndex = (g_portraitSweepCursor + inspectedSlots) % rosterSize;
+    Character *member = world->player->playerCharacters[rosterIndex];
     if (!member || (uintptr_t)member < 0x1000) {
       continue;
     }
@@ -2490,10 +2589,11 @@ static void RunPlayerFactionPortraitSweep(GameWorld *world) {
     if (SyncPortraitForCharacter(member, false, "player_faction_sweep")) {
       ++sent;
     }
-    if (candidates >= kPortraitSweepCandidateLimit) {
-      break;
-    }
   }
+  if (inspectedSlots == 0) {
+    inspectedSlots = 1;
+  }
+  g_portraitSweepCursor = (g_portraitSweepCursor + inspectedSlots) % rosterSize;
 
   static DWORD lastPruneTick = 0;
   if (nowTick - lastPruneTick >= 60000) {
@@ -2503,13 +2603,15 @@ static void RunPlayerFactionPortraitSweep(GameWorld *world) {
 
   if (sent > 0) {
     Log("PORTRAIT_SYNC: sweep complete candidates=" + ToString((int)candidates) +
-        " sent=" + ToString((int)sent));
+        " sent=" + ToString((int)sent) +
+        " inspected=" + ToString((int)inspectedSlots));
   } else {
     static DWORD lastNoSendLogTick = 0;
     if (nowTick - lastNoSendLogTick >= 60000) {
       lastNoSendLogTick = nowTick;
       Log("PORTRAIT_SYNC: sweep no-send candidates=" +
-          ToString((int)candidates));
+          ToString((int)candidates) +
+          " inspected=" + ToString((int)inspectedSlots));
     }
   }
 }
@@ -2983,13 +3085,50 @@ static bool IsItemImageSyncReasonAllowed(const std::string &reason) {
   return false;
 }
 
-static bool ShouldRunItemImageSyncNow(const std::string &reason, bool force) {
-  (void)force;
+static bool ShouldQueueItemImageSyncForInventorySync(const std::string &reason,
+                                                     bool firstSync,
+                                                     bool hashChanged) {
+  std::string key = ToLowerAsciiCopy(TrimCopy(reason));
+  if (!IsItemImageSyncReasonAllowed(key)) {
+    return false;
+  }
+  if (key == "selection_change") {
+    return firstSync || hashChanged;
+  }
+  return true;
+}
+
+static bool ShouldAllowItemImageSyncWork(const std::string &reason,
+                                         std::string *blockReasonOut = nullptr) {
+  if (blockReasonOut) {
+    *blockReasonOut = "";
+  }
   if (g_itemImageSyncDisabledForSession) {
+    if (blockReasonOut) {
+      *blockReasonOut = "session_disabled";
+    }
     return false;
   }
   std::string reasonKey = ToLowerAsciiCopy(TrimCopy(reason));
   if (!IsItemImageSyncReasonAllowed(reasonKey)) {
+    if (blockReasonOut) {
+      *blockReasonOut = "reason_not_allowed";
+    }
+    return false;
+  }
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    if (blockReasonOut) {
+      *blockReasonOut = "offline";
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool ShouldRunItemImageSyncNow(const std::string &reason, bool force,
+                                      std::string *blockReasonOut = nullptr) {
+  (void)force;
+  if (!ShouldAllowItemImageSyncWork(reason, blockReasonOut)) {
     return false;
   }
 
@@ -3007,6 +3146,42 @@ static bool ShouldRunItemImageSyncNow(const std::string &reason, bool force) {
     allow = true;
   }
   LeaveCriticalSection(&g_stateMutex);
+  if (!allow && blockReasonOut) {
+    *blockReasonOut = startupDelayPassed ? "run_cooldown" : "startup_delay";
+  }
+  return allow;
+}
+
+static bool ShouldAttemptItemImageCapture(const std::string &itemId, DWORD nowTick,
+                                          bool force,
+                                          std::string *skipReasonOut = nullptr) {
+  if (skipReasonOut) {
+    *skipReasonOut = "";
+  }
+  std::string stateKey = NormalizeItemImageStateKey(itemId);
+  if (stateKey.empty()) {
+    if (skipReasonOut) {
+      *skipReasonOut = "invalid_item_id";
+    }
+    return false;
+  }
+
+  bool allow = false;
+  EnterCriticalSection(&g_stateMutex);
+  ItemImageSyncState &state = g_itemImageSyncStateByItemId[stateKey];
+  state.lastSeenTick = nowTick;
+  DWORD sinceLastAttempt =
+      state.lastAttemptTick == 0 ? 0 : (nowTick - state.lastAttemptTick);
+  if (force || state.lastAttemptTick == 0 ||
+      sinceLastAttempt >= kItemImageAttemptCooldownMs) {
+    state.lastAttemptTick = nowTick;
+    allow = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (!allow && skipReasonOut) {
+    *skipReasonOut = "attempt_cooldown";
+  }
   return allow;
 }
 
@@ -3673,6 +3848,9 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
   if (g_itemImageSyncDisabledForSession) {
     return 0;
   }
+  if (!ShouldAllowItemImageSyncWork(reason, nullptr)) {
+    return 0;
+  }
 
   DWORD nowTick = GetTickCount();
   EnterCriticalSection(&g_stateMutex);
@@ -3739,17 +3917,22 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
       truncatedByBatchOrConsiderLimit = true;
       break;
     }
-    if (considered >= kItemImageBatchLimit * kItemImageConsiderMultiplier) {
-      truncatedByBatchOrConsiderLimit = true;
-      break;
-    }
-    ++considered;
 
     const std::string itemId = sourceItemIdByKey[it->first];
     Item *item = it->second;
     if (!item || (uintptr_t)item < 0x1000 || itemId.empty()) {
       continue;
     }
+    std::string attemptSkipReason = "";
+    if (!ShouldAttemptItemImageCapture(itemId, nowTick, force,
+                                       &attemptSkipReason)) {
+      continue;
+    }
+    if (considered >= kItemImageBatchLimit * kItemImageConsiderMultiplier) {
+      truncatedByBatchOrConsiderLimit = true;
+      break;
+    }
+    ++considered;
 
     std::string bmpData = "";
     std::string imageHash = "";
@@ -3888,19 +4071,27 @@ static void RunQueuedItemImageSync() {
     return;
   }
 
+  PendingItemImageSyncRequest peekReq;
+  bool hasPending = false;
+  EnterCriticalSection(&g_stateMutex);
+  if (!g_itemImageSyncRequestQueue.empty()) {
+    peekReq = g_itemImageSyncRequestQueue.front();
+    hasPending = true;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  if (!hasPending) {
+    return;
+  }
+
+  if (!ShouldRunItemImageSyncNow(peekReq.reason, false, nullptr)) {
+    return;
+  }
+
   PendingItemImageSyncRequest req;
   bool hasRequest = false;
   DWORD nowTick = GetTickCount();
   EnterCriticalSection(&g_stateMutex);
-  DWORD stableTick = g_worldStableSinceTick;
-  DWORD sinceLastRun =
-      g_itemImageLastRunTick == 0 ? 0 : (nowTick - g_itemImageLastRunTick);
-  bool startupDelayPassed =
-      stableTick != 0 && (nowTick - stableTick) >= kItemImageStartupDelayMs;
-  bool cooldownPassed =
-      g_itemImageLastRunTick == 0 || sinceLastRun >= kItemImageRunCooldownMs;
-
-  if (startupDelayPassed && cooldownPassed && !g_itemImageSyncRequestQueue.empty()) {
+  if (!g_itemImageSyncRequestQueue.empty()) {
     req = g_itemImageSyncRequestQueue.front();
     g_itemImageSyncRequestQueue.pop_front();
     g_itemImageLastRunTick = nowTick;
@@ -4023,7 +4214,7 @@ static bool SyncInventoryForCharacterUnsafe(Character *npc, bool force,
     return false;
   }
 
-  if (IsItemImageSyncReasonAllowed(reason)) {
+  if (ShouldQueueItemImageSyncForInventorySync(reason, firstSync, hashChanged)) {
     QueueItemImageSyncRequest(npc, reason);
   }
 
@@ -6804,6 +6995,16 @@ static void RunFactionRelationSync(GameWorld *world) {
   if (g_lastFactionRelationSyncTick != 0 &&
       (nowTick - g_lastFactionRelationSyncTick) < kFactionRelationSyncIntervalMs) {
     LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    g_lastFactionRelationSyncTick = nowTick;
+    LeaveCriticalSection(&g_stateMutex);
+    static DWORD lastOfflineLogTick = 0;
+    if (nowTick - lastOfflineLogTick >= 30000) {
+      lastOfflineLogTick = nowTick;
+      Log("FACTION_REL_SYNC: deferred while server connection is unavailable.");
+    }
     return;
   }
   previousState = g_factionRelationStateByKey;
@@ -11680,6 +11881,88 @@ static Character *ResolveSelectedCharacterSehSafe(PlayerInterface *thisptr) {
   return nullptr;
 }
 
+static void ClearPendingSelectionContextPush() {
+  EnterCriticalSection(&g_stateMutex);
+  g_pendingSelectionContextHand = hand();
+  g_pendingSelectionContextQueuedTick = 0;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void QueueSelectionContextPush(const hand &selectionHand) {
+  if (!selectionHand.isValid() || selectionHand.serial == 0) {
+    ClearPendingSelectionContextPush();
+    return;
+  }
+  EnterCriticalSection(&g_stateMutex);
+  g_pendingSelectionContextHand = selectionHand;
+  g_pendingSelectionContextQueuedTick = GetTickCount();
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void RunPendingSelectionContextPush(Character *sel,
+                                           DWORD worldBecameStableTick) {
+  if (!sel || reinterpret_cast<uintptr_t>(sel) < 0x1000) {
+    ClearPendingSelectionContextPush();
+    return;
+  }
+
+  hand selectionHand;
+  if (!TryGetCharacterHandleSafe(sel, selectionHand)) {
+    ClearPendingSelectionContextPush();
+    return;
+  }
+
+  DWORD nowTick = GetTickCount();
+  if ((nowTick - worldBecameStableTick) < kSelectionContextStartupDelayMs) {
+    return;
+  }
+
+  hand pendingHand;
+  DWORD queuedTick = 0;
+  DWORD lastPushedTick = 0;
+  EnterCriticalSection(&g_stateMutex);
+  pendingHand = g_pendingSelectionContextHand;
+  queuedTick = g_pendingSelectionContextQueuedTick;
+  lastPushedTick = g_lastSelectionContextPushedTick;
+  LeaveCriticalSection(&g_stateMutex);
+
+  if (!pendingHand.isValid() || pendingHand != selectionHand || queuedTick == 0) {
+    return;
+  }
+  if (nowTick - queuedTick < kSelectionContextDebounceMs) {
+    return;
+  }
+  if (lastPushedTick != 0 &&
+      (nowTick - lastPushedTick) < kSelectionContextMinIntervalMs) {
+    return;
+  }
+
+  std::string contextType = "npc";
+  std::string selectedName = "Unknown";
+  try {
+    if (sel->isPlayerCharacter()) {
+      contextType = "player";
+    }
+    selectedName = sel->getName();
+  } catch (...) {
+  }
+
+  std::string selectedContext = BuildNpcContextEnvelope(sel, contextType);
+  AsyncPostToStobe(L"/context", selectedContext);
+  std::string selectedGameData =
+      "{\"type\":\"" + contextType + "\",\"name\":\"" +
+      EscapeJSON(selectedName) + "\",\"data\":" + selectedContext + "}";
+  AsyncPostToStobe(L"/gamedata", selectedGameData);
+
+  EnterCriticalSection(&g_stateMutex);
+  if (g_pendingSelectionContextHand == selectionHand) {
+    g_pendingSelectionContextHand = hand();
+    g_pendingSelectionContextQueuedTick = 0;
+    g_lastSelectionContextPushedTick = nowTick;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+}
+
 static bool IsSpeechSystemBusyForMOTD() {
   if (IsTtsPlaybackActive()) {
     return true;
@@ -11719,7 +12002,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static bool worldWasStable = false;
   static DWORD worldBecameStableTick = 0;
   static bool heavySweepPrimed = false;
-  static DWORD lastHeavySyncGuardLogTick = 0;
   static bool motdAutoOpenQueued = false;
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
@@ -11748,6 +12030,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_itemImageSyncRequestQueue.clear();
       g_itemImageLastRunTick = 0;
       g_worldStableSinceTick = 0;
+      g_pendingSelectionContextHand = hand();
+      g_pendingSelectionContextQueuedTick = 0;
+      g_lastSelectionContextPushedTick = 0;
       g_activeInventoryJson = "[]";
       g_playerInventoryJson = "[]";
       g_lastInventoryHand = hand();
@@ -11769,7 +12054,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       heavySweepPrimed = false;
-      lastHeavySyncGuardLogTick = 0;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
@@ -11797,9 +12081,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     worldBecameStableTick = GetTickCount();
     EnterCriticalSection(&g_stateMutex);
     g_worldStableSinceTick = worldBecameStableTick;
+    g_pendingSelectionContextHand = hand();
+    g_pendingSelectionContextQueuedTick = 0;
+    g_lastSelectionContextPushedTick = 0;
     LeaveCriticalSection(&g_stateMutex);
     heavySweepPrimed = false;
-    lastHeavySyncGuardLogTick = 0;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
@@ -11811,13 +12097,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   // Save loads can expose unstable pointers for several seconds after world appears.
   if (GetTickCount() - worldBecameStableTick < 10000) {
     return;
-  }
-
-  static DWORD lastUiHeartbeatTick = 0;
-  DWORD heartbeatNow = GetTickCount();
-  if (heartbeatNow - lastUiHeartbeatTick > 5000) {
-    lastUiHeartbeatTick = heartbeatNow;
-    Log("HOOK_UI: active, world stable, waiting for UI input.");
   }
 
   if (!g_enableWelcome) {
@@ -11878,18 +12157,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   // 1. Core Selection Tracking
-  static DWORD lastFrameLogTick = 0;
-  bool logThisFrame = false;
-  {
-    DWORD ft = GetTickCount();
-    if (ft - lastFrameLogTick > 1000) {
-      lastFrameLogTick = ft;
-      logThisFrame = true;
-    }
-  }
-  if (logThisFrame) Log("HOOK_FRAME: selection tracking.");
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
-  if (logThisFrame) Log("HOOK_FRAME: selection done.");
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
@@ -11914,44 +12182,19 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     selectionChanged = true;
   }
   LeaveCriticalSection(&g_stateMutex);
-  if (logThisFrame) Log("HOOK_FRAME: selection change check done.");
 
   if (selectionChanged && hasSelectionHandle && sel &&
       (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
       SyncInventoryForCharacter(sel, true, "selection_change");
-      SyncPortraitForCharacter(sel, true, "selection_change");
-      static DWORD lastSelectionContextPushTick = 0;
-      static DWORD lastSelectionContextDelayLogTick = 0;
-      DWORD nowSel = GetTickCount();
-      bool selectionContextReady =
-          (nowSel - worldBecameStableTick) >= kSelectionContextStartupDelayMs;
-      if (selectionContextReady && nowSel - lastSelectionContextPushTick > 1000) {
-        std::string contextType = "npc";
-        std::string selectedName = "Unknown";
-        try {
-          if (sel->isPlayerCharacter()) {
-            contextType = "player";
-          }
-          selectedName = sel->getName();
-        } catch (...) {
-        }
-        std::string selectedContext = BuildNpcContextEnvelope(sel, contextType);
-        AsyncPostToStobe(L"/context", selectedContext);
-        std::string selectedGameData =
-            "{\"type\":\"" + contextType + "\",\"name\":\"" +
-            EscapeJSON(selectedName) + "\",\"data\":" + selectedContext + "}";
-        AsyncPostToStobe(L"/gamedata", selectedGameData);
-        lastSelectionContextPushTick = nowSel;
-        Log("CONTEXT_PUSH: sent selected character snapshot.");
-      } else if (!selectionContextReady &&
-                 nowSel - lastSelectionContextDelayLogTick >= 10000) {
-        lastSelectionContextDelayLogTick = nowSel;
-        Log("CONTEXT_PUSH: delayed selected character snapshot until startup window passes.");
-      }
+      SyncPortraitForCharacter(sel, false, "selection_change");
+      QueueSelectionContextPush(currentSelectionHand);
     } else {
+      ClearPendingSelectionContextPush();
       Log("ANIMAL_TALKS: ignoring selection context sync for inactive animal.");
     }
+  } else if (selectionChanged) {
+    ClearPendingSelectionContextPush();
   }
 
   // 2. Message queue + queued actions
@@ -11993,6 +12236,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
+    RunPendingSelectionContextPush(sel, worldBecameStableTick);
 
     DWORD nowTick = GetTickCount();
     if (!heavySweepPrimed) {
@@ -12002,7 +12246,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInfoNpcTelemetryCheckTick = nowTick;
       g_lastInfoLocTelemetryCheckTick = nowTick;
       heavySweepPrimed = true;
-      Log("SYNC_GUARD: primed heavy periodic sweep timers.");
     }
 
     bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
@@ -12016,9 +12259,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       RunPlayerFactionPortraitSweep(world);
       RunInfoTelemetrySweep(world, sel);
       RunFactionRelationSync(world);
-    } else if (nowTick - lastHeavySyncGuardLogTick >= 10000) {
-      lastHeavySyncGuardLogTick = nowTick;
-      Log("SYNC_GUARD: heavy periodic sweeps delayed until world warmup completes.");
     }
   }
 
@@ -12097,8 +12337,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   // Rename checks are now queued only for dialogue-tagged NPCs.
-
-  if (logThisFrame) Log("HOOK_FRAME: input check.");
   // 4. Input Handling ??? Chat window hotkey
   if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow &&
       !g_aiNpcInfoWindow) {

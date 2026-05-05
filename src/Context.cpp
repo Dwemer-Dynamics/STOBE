@@ -73,19 +73,6 @@ std::string SlotToString(AttachSlot slot) {
 }
 
 namespace {
-std::string GeoDebugToken(const std::string &value) {
-  size_t first = value.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) {
-    return "(empty)";
-  }
-  size_t last = value.find_last_not_of(" \t\r\n");
-  std::string trimmed = value.substr(first, last - first + 1);
-  if (trimmed.empty()) {
-    return "(empty)";
-  }
-  return trimmed;
-}
-
 bool IsIndoorsHandleValid(const hand &indoorsHandle) {
   return indoorsHandle.isValid() && !indoorsHandle.isNull();
 }
@@ -1536,23 +1523,12 @@ void ResolveNearbyTownAndZoneFallback(GameWorld *world, Character *npc,
   if (!world || !npc || (uintptr_t)npc <= 0x1000) {
     return;
   }
-  const std::string initialTownName = townNameInOut;
-  const std::string initialZoneName = zoneNameInOut;
-  std::string npcName = ResolveCharacterDisplayNameSafe(npc);
-  if (npcName.empty()) {
-    npcName = "Unknown";
-  }
   bool inTownContext = IsNpcInsideTownContext(npc, currentTown);
   if (!inTownContext) {
     // Avoid stale labels when actor has moved outside town walls.
     // Re-resolve zone from nearby world context below.
     townNameInOut.clear();
     zoneNameInOut.clear();
-    if (!initialTownName.empty() || !initialZoneName.empty()) {
-      Log("GEO_DEBUG_CTX: cleared stale town context npc=" + npcName +
-          " initial_town=" + GeoDebugToken(initialTownName) +
-          " initial_zone=" + GeoDebugToken(initialZoneName));
-    }
   }
 
   if (!townNameInOut.empty() && !zoneNameInOut.empty()) {
@@ -1673,28 +1649,9 @@ void ResolveNearbyTownAndZoneFallback(GameWorld *world, Character *npc,
       if (!nearestTownZone.empty()) {
         zoneNameInOut = nearestTownZone;
       }
-      Log("GEO_DEBUG_CTX: adopted nearest town npc=" + npcName +
-          " from_town=" + GeoDebugToken(initialTownName) +
-          " to_town=" + GeoDebugToken(townNameInOut) +
-          " nearest_town_distance=" + ToString(nearestTownDistance) +
-          " current_town_distance=" + ToString(currentTownDistance) +
-          " nearest_town_zone=" + GeoDebugToken(nearestTownZone));
     } else if (zoneNameInOut.empty() && !nearestTownZone.empty()) {
       zoneNameInOut = nearestTownZone;
-    } else if (!nearestTownName.empty() && !nearestTownZone.empty()) {
-      Log("GEO_DEBUG_CTX: nearest town ignored npc=" + npcName +
-          " current_town=" + GeoDebugToken(townNameInOut) +
-          " candidate_town=" + GeoDebugToken(nearestTownName) +
-          " nearest_town_distance=" + ToString(nearestTownDistance) +
-          " current_town_distance=" + ToString(currentTownDistance));
     }
-  }
-
-  if (initialTownName != townNameInOut || initialZoneName != zoneNameInOut) {
-    Log("GEO_DEBUG_CTX: fallback_result npc=" + npcName +
-        " in_town=" + std::string(inTownContext ? "1" : "0") +
-        " town=" + GeoDebugToken(townNameInOut) +
-        " zone=" + GeoDebugToken(zoneNameInOut));
   }
 }
 
@@ -3856,23 +3813,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   if (regionPromptName.empty()) {
     regionPromptName = ResolveNearestWorldZoneName(world, npc);
   }
-  unsigned int geoNpcSerial = 0;
-  try {
-    geoNpcSerial = npc->getHandle().serial;
-  } catch (...) {
-    geoNpcSerial = 0;
-  }
-  Log("GEO_DEBUG_CTX: envelope npc=" + name +
-      " serial=" + ToString((int)geoNpcSerial) +
-      " in_town_walls=" + std::string(inTownWalls ? "1" : "0") +
-      " indoors=" + std::string(npcIsIndoors ? "1" : "0") +
-      " building=" + GeoDebugToken(npcBuildingName) +
-      " town_raw=" + GeoDebugToken(townName) +
-      " zone_raw=" + GeoDebugToken(zoneName) +
-      " town_region_raw=" + GeoDebugToken(townRegionName) +
-      " zone_prompt=" + GeoDebugToken(zonePromptName) +
-      " region_prompt=" + GeoDebugToken(regionPromptName));
-
   std::string cachedTraderInventoryJson = "[]";
   int cachedTraderInventoryCount = 0;
   int cachedTraderInventoryAgeSeconds = -1;
