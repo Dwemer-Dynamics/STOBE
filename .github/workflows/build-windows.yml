@@ -1,0 +1,127 @@
+name: Build Stobe Plugin
+
+on:
+  push:
+    branches: [stobe]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'scripts/**'
+      - 'vendor/**'
+  pull_request:
+    branches: [stobe]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'scripts/**'
+      - 'vendor/**'
+  workflow_dispatch:
+    inputs:
+      diag_profile:
+        description: 'Diagnostic profile'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - no_hook
+          - ui_only
+          - no_context
+          - no_hook_no_context
+          - hook_no_orig
+
+jobs:
+  build:
+    name: Build (v100 / ${{ github.event.inputs.diag_profile || 'normal' }})
+    # Requires a self-hosted runner with MSVC v100 toolset installed.
+    # Set up using: scripts/setup-runner.ps1
+    # Runner must have label: stobe-v100
+    runs-on: [self-hosted, Windows, X64, stobe-v100]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate MSVC v100 toolset
+        shell: pwsh
+        run: |
+          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
+          if (-not (Test-Path $cl)) {
+            Write-Error "MSVC v100 not found at: $cl"
+            Write-Error "Run scripts/setup-runner.ps1 to install prerequisites."
+            exit 1
+          }
+          Write-Host "OK: MSVC v100 found at $cl"
+
+      - name: Validate CMake
+        shell: pwsh
+        run: |
+          cmake --version
+          $ver = (cmake --version 2>&1 | Select-String "(\d+\.\d+\.\d+)").Matches[0].Value
+          $parts = $ver.Split('.')
+          if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 20)) {
+            Write-Error "CMake 3.20+ required, found $ver"
+            exit 1
+          }
+          Write-Host "OK: CMake $ver"
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          $profile = "${{ github.event.inputs.diag_profile || 'normal' }}"
+          Write-Host "Building with profile: $profile"
+          if ($profile -eq 'normal') {
+            .\scripts\build-stobe-sdk.ps1
+          } else {
+            .\scripts\build-stobe-sdk.ps1 -DiagProfile $profile
+          }
+
+      - name: Locate build output
+        id: find_dll
+        shell: pwsh
+        run: |
+          # Search for Stobe.dll in common CMake output locations
+          $candidates = @(
+            "build\Release\Stobe.dll",
+            "build\Stobe.dll",
+            "out\Release\Stobe.dll"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
+          }
+          if (-not $found) {
+            $found = (Get-ChildItem -Recurse -Filter "Stobe.dll" | Select-Object -First 1).FullName
+          }
+          if (-not $found) {
+            Write-Error "Stobe.dll not found after build"
+            exit 1
+          }
+          Write-Host "DLL found: $found"
+          $dir = Split-Path $found -Parent
+          echo "dll_dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $src  = "${{ steps.find_dll.outputs.dll_dir }}"
+          $dest = "artifacts"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Copy-Item "$src\Stobe.dll" $dest -ErrorAction SilentlyContinue
+          Copy-Item "$src\Stobe.pdb" $dest -ErrorAction SilentlyContinue
+          # Include mod/ folder
+          if (Test-Path "mod") {
+            Copy-Item "mod" "$dest\mod" -Recurse -Force
+          }
+          Write-Host "Artifacts collected:"
+          Get-ChildItem $dest -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stobe-${{ github.sha }}-${{ github.event.inputs.diag_profile || 'normal' }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error

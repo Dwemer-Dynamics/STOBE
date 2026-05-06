@@ -1,0 +1,140 @@
+name: Release Stobe Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 0.8.8)'
+        required: true
+      diag_profile:
+        description: 'Diagnostic profile'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - no_hook
+          - ui_only
+          - no_context
+          - no_hook_no_context
+          - hook_no_orig
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  release:
+    name: Release v${{ github.event.inputs.version }}
+    runs-on: [self-hosted, Windows, X64, stobe-v100]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        shell: pwsh
+        run: |
+          $v = "${{ github.event.inputs.version }}"
+          if ($v -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Version must be in format X.Y.Z (e.g. 0.8.8), got: $v"
+            exit 1
+          }
+          Write-Host "OK: Version format valid: $v"
+
+      - name: Validate MSVC v100 toolset
+        shell: pwsh
+        run: |
+          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
+          if (-not (Test-Path $cl)) {
+            Write-Error "MSVC v100 not found. Run scripts/setup-runner.ps1 first."
+            exit 1
+          }
+          Write-Host "OK: MSVC v100 found"
+
+      - name: Build release
+        shell: pwsh
+        run: |
+          $profile = "${{ github.event.inputs.diag_profile }}"
+          Write-Host "Building release v${{ github.event.inputs.version }} (profile: $profile)"
+          if ($profile -eq 'normal') {
+            .\scripts\build-stobe-sdk.ps1
+          } else {
+            .\scripts\build-stobe-sdk.ps1 -DiagProfile $profile
+          }
+
+      - name: Locate build output
+        id: find_dll
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "build\Release\Stobe.dll",
+            "build\Stobe.dll",
+            "out\Release\Stobe.dll"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
+          }
+          if (-not $found) {
+            $found = (Get-ChildItem -Recurse -Filter "Stobe.dll" | Select-Object -First 1).FullName
+          }
+          if (-not $found) {
+            Write-Error "Stobe.dll not found after build"
+            exit 1
+          }
+          $dir = Split-Path $found -Parent
+          echo "dll_dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: Package release ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          $pkgDir  = "stobe-v$version"
+          $src     = "${{ steps.find_dll.outputs.dll_dir }}"
+
+          New-Item -ItemType Directory -Path "$pkgDir\mod" -Force | Out-Null
+
+          # DLL and PDB
+          Copy-Item "$src\Stobe.dll" "$pkgDir\" -ErrorAction Stop
+          Copy-Item "$src\Stobe.pdb" "$pkgDir\" -ErrorAction SilentlyContinue
+
+          # Mod files (INI, resources, etc.)
+          if (Test-Path "mod") {
+            Copy-Item "mod\*" "$pkgDir\mod\" -Recurse -Force
+          }
+
+          # Create ZIP
+          Compress-Archive -Path "$pkgDir\*" -DestinationPath "stobe-v$version.zip" -Force
+
+          Write-Host "Package contents:"
+          Get-ChildItem "$pkgDir" -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "ZIP: stobe-v$version.zip ($('{0:N2}' -f ((Get-Item "stobe-v$version.zip").Length / 1MB)) MB)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version }}
+          name: Stobe v${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          files: stobe-v${{ github.event.inputs.version }}.zip
+          body: |
+            ## Stobe v${{ github.event.inputs.version }}
+
+            ### Install
+            1. Extract `stobe-v${{ github.event.inputs.version }}.zip` contents into your Kenshi `mods/Stobe/` folder.
+            2. Overwrite `Stobe.dll` and `mod/` files.
+            3. Keep your existing `StobeCustom.ini` — it is not included in the release package.
+
+            ### Build info
+            - Commit: ${{ github.sha }}
+            - Profile: ${{ github.event.inputs.diag_profile }}
+            - Toolset: MSVC v100 (VS 2010 x64)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
