@@ -153,13 +153,15 @@ jobs:
         shell: pwsh
         run: |
           # Set up MSVC v100 environment manually (needed for Ninja generator)
+          $vs  = "C:\Program Files (x86)\Microsoft Visual Studio 10.0"
           $vc  = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC"
           $sdk = "C:\Program Files\Microsoft SDKs\Windows\v7.1"
-          $env:PATH    = "$vc\bin\amd64;$vc\bin;$env:PATH"
+          $env:PATH    = "$vc\redist\x64\Microsoft.VC100.CRT;$vs\Common7\IDE;$vc\bin\amd64;$vc\bin;$sdk\Bin;$env:PATH"
           $env:INCLUDE = "$vc\include;$sdk\Include"
           $env:LIB     = "$vc\lib\amd64;$sdk\Lib\x64"
           Write-Host "INCLUDE=$env:INCLUDE"
           Write-Host "LIB=$env:LIB"
+          Write-Host "PATH(head)=$($env:PATH.Split(';')[0..5] -join ';')"
 
           $profile = "${{ github.event.inputs.diag_profile || 'normal' }}"
           Write-Host "Building with profile: $profile (generator: Ninja)"
