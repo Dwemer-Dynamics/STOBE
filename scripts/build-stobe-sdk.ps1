@@ -62,7 +62,6 @@ if (-not (Test-Path $buildPath)) {
 }
 
 $cmakeArgs = @(
-$cmakeArgs = @(
   '-G', $Generator
 )
 if ($Generator -like 'Visual Studio*') {
