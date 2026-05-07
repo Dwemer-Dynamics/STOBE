@@ -168,24 +168,7 @@ jobs:
       - name: Prepare locked SDK snapshot
         shell: pwsh
         run: |
-          # Detect pre-installed Boost on GitHub-hosted runner (C:\local\boost_*)
-          $boostDir = ''
-          $candidates = @($env:BOOST_ROOT_1_83_0, $env:BOOST_ROOT_1_82_0, $env:BOOST_ROOT_1_81_0, $env:BOOST_ROOT)
-          $candidates += (Get-ChildItem 'C:\local' -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'boost*' } | ForEach-Object { $_.FullName })
-          $boostDir = $candidates | Where-Object { $_ -and (Test-Path "$_\boost\version.hpp") } | Select-Object -First 1
-          if ($boostDir) {
-            Write-Host "Pre-installed Boost found: $boostDir"
-          } else {
-            Write-Host "No pre-installed Boost found; setup-sdk.ps1 will download it"
-          }
-
-          if ($boostDir) {
-            .\scripts\setup-sdk.ps1 -BoostDir $boostDir
-          } else {
-            .\scripts\setup-sdk.ps1
-          }
-
+          .\scripts\setup-sdk.ps1
           if (-not (Test-Path ".\vendor\stobe-sdk\Include")) {
             Write-Error "vendor/stobe-sdk was not prepared correctly"
             exit 1
