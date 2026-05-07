@@ -26,6 +26,7 @@
 param(
     [string]$KenshiLibVersion = 'v0.2.1',
     [string]$KenshiDir        = '',
+    [string]$BoostDir         = '',   # Si se indica, se usa directamente sin descargar
     [switch]$Force
 )
 
@@ -120,28 +121,55 @@ if (Test-Path $includeDst) { Remove-Item $includeDst -Recurse -Force }
 Copy-Item $includeSrc -Destination $includeDst -Recurse -Force
 Write-OK "Headers copiados a: $includeDst"
 
-# ── 2b. Descargar Boost 1.60 headers (requerido por kenshi/GameData.h y otros) ─
-Write-Step "Descargando Boost 1.60.0 headers..."
+# ── 2b. Resolver Boost headers ───────────────────────────────────────────────
+Write-Step "Resolviendo Boost headers..."
 $boostDst = Join-Path $sdkRoot 'boost_1_60_0'
-$boostZip = Join-Path $tmpDir 'boost_1_60_0.zip'
-$boostUrl = 'https://sourceforge.net/projects/boost/files/boost/1.60.0/boost_1_60_0.zip/download'
 
-if (-not (Test-Path $boostZip)) {
-    Write-Host "  -> $boostUrl"
-    Invoke-WebRequest -Uri $boostUrl -OutFile $boostZip -UseBasicParsing
+if ($BoostDir -ne '' -and (Test-Path $BoostDir)) {
+    # Usar directorio indicado explicitamente (p.ej. preinstalado en CI)
+    Write-Host "  Usando Boost desde: $BoostDir"
+    if (Test-Path $boostDst) { Remove-Item $boostDst -Recurse -Force }
+    New-Item -ItemType Junction -Path $boostDst -Target $BoostDir | Out-Null
+    Write-OK "Boost vinculado: $boostDst -> $BoostDir"
+} elseif (Test-Path $boostDst) {
+    Write-OK "Boost ya presente en: $boostDst"
+} else {
+    # Buscar Boost preinstalado en ubicaciones comunes (GitHub Actions, chocolatey)
+    $candidates = @(
+        $env:BOOST_ROOT,
+        $env:BOOST_ROOT_1_83_0,
+        $env:BOOST_ROOT_1_82_0,
+        $env:BOOST_ROOT_1_81_0,
+        $env:BOOST_ROOT_1_80_0,
+        'C:\local\boost',
+        'C:\tools\boost'
+    )
+    $candidates += (Get-ChildItem 'C:\local' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'boost*' } | ForEach-Object { $_.FullName })
+
+    $found = $candidates | Where-Object { $_ -and (Test-Path "$_\boost\version.hpp") } | Select-Object -First 1
+    if ($found) {
+        Write-Host "  Boost preinstalado encontrado: $found"
+        if (Test-Path $boostDst) { Remove-Item $boostDst -Recurse -Force }
+        New-Item -ItemType Junction -Path $boostDst -Target $found | Out-Null
+        Write-OK "Boost vinculado: $boostDst -> $found"
+    } else {
+        # Fallback: descargar desde archives.boost.io (CDN oficial, no SourceForge)
+        Write-Host "  Boost no encontrado localmente. Descargando desde archives.boost.io..."
+        $boostZip = Join-Path $tmpDir 'boost_1_83_0.7z'
+        $boostUrl = 'https://archives.boost.io/release/1.83.0/source/boost_1_83_0.zip'
+        Write-Host "  -> $boostUrl"
+        Invoke-WebRequest -Uri $boostUrl -OutFile (Join-Path $tmpDir 'boost_1_83_0.zip') -UseBasicParsing
+        $boostExtract = Join-Path $tmpDir 'boost_extract'
+        if (Test-Path $boostExtract) { Remove-Item $boostExtract -Recurse -Force }
+        Expand-Archive -Path (Join-Path $tmpDir 'boost_1_83_0.zip') -DestinationPath $boostExtract -Force
+        $boostInner = Get-ChildItem $boostExtract -Directory | Select-Object -First 1
+        if (-not $boostInner) { Fail 'No se encontro directorio raiz de Boost despues de extraer' }
+        if (Test-Path $boostDst) { Remove-Item $boostDst -Recurse -Force }
+        Move-Item $boostInner.FullName $boostDst -Force
+        Write-OK "Boost descargado en: $boostDst"
+    }
 }
-
-$boostExtract = Join-Path $tmpDir 'boost_extract'
-if (Test-Path $boostExtract) { Remove-Item $boostExtract -Recurse -Force }
-Write-Host "  Extrayendo Boost (puede tardar)..."
-Expand-Archive -Path $boostZip -DestinationPath $boostExtract -Force
-
-$boostInner = Get-ChildItem $boostExtract -Directory | Select-Object -First 1
-if (-not $boostInner) { Fail "No se encontro directorio raiz de Boost despues de extraer" }
-
-if (Test-Path $boostDst) { Remove-Item $boostDst -Recurse -Force }
-Move-Item $boostInner.FullName $boostDst -Force
-Write-OK "Boost headers en: $boostDst"
 
 # ── 3. Descargar MyGUIEngine_x64.lib y OgreMain_x64.lib del repo ──────────────
 Write-Step "Descargando MyGUIEngine_x64.lib desde repo KenshiLib..."
