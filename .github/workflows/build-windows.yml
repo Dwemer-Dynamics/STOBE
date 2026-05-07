@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\Program Files (x86)\Microsoft Visual Studio 10.0
-          key: msvc-v100-winsdk71-kb2519277
+          key: msvc-v100-winsdk71-v3
 
       - name: Install MSVC v100 (Windows SDK 7.1 + KB2519277)
         if: steps.cache-v100.outputs.cache-hit != 'true'
@@ -121,6 +121,14 @@ jobs:
             Write-Host "  WARN: directorio SDK 'v7.1' no encontrado"
           }
 
+          # Install VS2010 Redist x64 to ensure msvcr100.dll is in System32
+          Write-Host "[+] Instalando VS2010 Redistributable x64..."
+          $redistExe = "$tmp\vcredist_x64.exe"
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x64.exe" `
+            -OutFile $redistExe -UseBasicParsing
+          Start-Process $redistExe -ArgumentList "/quiet", "/norestart" -Wait
+          Write-Host "[+] Redist instalado."
+
           # Diagnostic: show all cl.exe found and key DLLs
           Write-Host "=== cl.exe encontrados en el sistema ==="
           Get-ChildItem "C:\Program Files (x86)\" -Recurse -Filter "cl.exe" -ErrorAction SilentlyContinue |
@@ -133,6 +141,13 @@ jobs:
           Write-Host "=== DLLs en VC\bin\amd64 ==="
           Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\" -Filter "*.dll" -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "  $($_.Name)" }
+
+          Write-Host "=== msvcr100.dll en System32 ==="
+          if (Test-Path "C:\Windows\System32\msvcr100.dll") {
+            Write-Host "  FOUND: C:\Windows\System32\msvcr100.dll"
+          } else {
+            Write-Host "  NOT FOUND"
+          }
 
           if (-not (Test-Path $cl)) {
             Write-Error "cl.exe NO encontrado en: $cl"
