@@ -163,9 +163,11 @@ jobs:
 
           $profile = "${{ github.event.inputs.diag_profile || 'normal' }}"
           Write-Host "Building with profile: $profile (generator: Ninja)"
-          $buildArgs = @('-Generator', 'Ninja')
-          if ($profile -ne 'normal') { $buildArgs += @('-DiagProfile', $profile) }
-          .\scripts\build-stobe-sdk.ps1 @buildArgs
+          if ($profile -eq 'normal') {
+            .\scripts\build-stobe-sdk.ps1 -Generator Ninja
+          } else {
+            .\scripts\build-stobe-sdk.ps1 -Generator Ninja -DiagProfile $profile
+          }
 
       - name: Locate build output
         id: find_dll
