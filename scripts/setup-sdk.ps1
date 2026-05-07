@@ -94,9 +94,11 @@ Copy-Item $dllSrc -Destination (Join-Path $sdkRoot 'Runtime\KenshiLib.dll') -For
 Write-OK "KenshiLib.lib y KenshiLib.dll copiados"
 
 # ── 2. Descargar headers del repo KenshiLib ───────────────────────────────────
-Write-Step "Descargando headers de KenshiLib (rama default)..."
+# ── 2. Descargar headers del fork BFrizzleFoShizzle/KenshiLib (rama RE_Kenshi_mods)
+#       Este fork tiene los headers completos: kenshi/Enums.h, RootObject.h, etc.
+Write-Step "Descargando headers de KenshiLib (BFrizzleFoShizzle/RE_Kenshi_mods)..."
 $repoZip     = Join-Path $tmpDir 'KenshiLib_repo.zip'
-$repoUrl     = 'https://github.com/KenshiReclaimer/KenshiLib/archive/refs/heads/master.zip'
+$repoUrl     = 'https://github.com/BFrizzleFoShizzle/KenshiLib/archive/refs/heads/RE_Kenshi_mods.zip'
 $repoExtract = Join-Path $tmpDir 'KenshiLib_repo'
 
 if (-not (Test-Path $repoZip)) {
@@ -107,7 +109,7 @@ if (-not (Test-Path $repoZip)) {
 if (Test-Path $repoExtract) { Remove-Item $repoExtract -Recurse -Force }
 Expand-Archive -Path $repoZip -DestinationPath $repoExtract -Force
 
-# El ZIP extrae como KenshiLib-master/
+# El ZIP extrae como KenshiLib-RE_Kenshi_mods/
 $repoInner = Get-ChildItem $repoExtract -Directory | Select-Object -First 1
 
 $includeSrc = Join-Path $repoInner.FullName 'Include'
@@ -117,6 +119,29 @@ $includeDst = Join-Path $sdkRoot 'Include'
 if (Test-Path $includeDst) { Remove-Item $includeDst -Recurse -Force }
 Copy-Item $includeSrc -Destination $includeDst -Recurse -Force
 Write-OK "Headers copiados a: $includeDst"
+
+# ── 2b. Descargar Boost 1.60 headers (requerido por kenshi/GameData.h y otros) ─
+Write-Step "Descargando Boost 1.60.0 headers..."
+$boostDst = Join-Path $sdkRoot 'boost_1_60_0'
+$boostZip = Join-Path $tmpDir 'boost_1_60_0.zip'
+$boostUrl = 'https://sourceforge.net/projects/boost/files/boost/1.60.0/boost_1_60_0.zip/download'
+
+if (-not (Test-Path $boostZip)) {
+    Write-Host "  -> $boostUrl"
+    Invoke-WebRequest -Uri $boostUrl -OutFile $boostZip -UseBasicParsing
+}
+
+$boostExtract = Join-Path $tmpDir 'boost_extract'
+if (Test-Path $boostExtract) { Remove-Item $boostExtract -Recurse -Force }
+Write-Host "  Extrayendo Boost (puede tardar)..."
+Expand-Archive -Path $boostZip -DestinationPath $boostExtract -Force
+
+$boostInner = Get-ChildItem $boostExtract -Directory | Select-Object -First 1
+if (-not $boostInner) { Fail "No se encontro directorio raiz de Boost despues de extraer" }
+
+if (Test-Path $boostDst) { Remove-Item $boostDst -Recurse -Force }
+Move-Item $boostInner.FullName $boostDst -Force
+Write-OK "Boost headers en: $boostDst"
 
 # ── 3. Descargar MyGUIEngine_x64.lib y OgreMain_x64.lib del repo ──────────────
 Write-Step "Descargando MyGUIEngine_x64.lib desde repo KenshiLib..."
@@ -166,6 +191,7 @@ $required = @{
     'Include/'                             = Join-Path $sdkRoot 'Include'
     'Libraries\mygui\MyGUIEngine_x64.lib'  = Join-Path $sdkRoot 'Libraries\mygui\MyGUIEngine_x64.lib'
     'Libraries\ogre\OgreMain_x64.lib'      = Join-Path $sdkRoot 'Libraries\ogre\OgreMain_x64.lib'
+    'boost_1_60_0/'                        = Join-Path $sdkRoot 'boost_1_60_0'
 }
 
 $allOk = $true

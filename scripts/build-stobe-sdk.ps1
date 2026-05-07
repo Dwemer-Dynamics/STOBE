@@ -42,6 +42,7 @@ $kenshiLib = Join-Path $sdkRoot 'KenshiLib.lib'
 $myguiLib = Join-Path $sdkRoot 'Libraries\mygui\MyGUIEngine_x64.lib'
 $ogreLib = Join-Path $sdkRoot 'Libraries\ogre\OgreMain_x64.lib'
 $runtimeDll = Join-Path $sdkRoot 'Runtime\KenshiLib.dll'
+$boostDir = Join-Path $sdkRoot 'boost_1_60_0'
 
 Require-Path $sdkRoot 'SDK root'
 Require-Path $includeDir 'SDK include dir'
@@ -49,6 +50,7 @@ Require-Path $kenshiLib 'KenshiLib.lib'
 Require-Path $myguiLib 'MyGUIEngine_x64.lib'
 Require-Path $ogreLib 'OgreMain_x64.lib'
 Require-Path $runtimeDll 'KenshiLib.dll runtime'
+Require-Path $boostDir 'Boost headers'
 
 Write-Host "[OK] Locked SDK snapshot detected"
 
@@ -77,7 +79,7 @@ $cmakeArgs += @(
   '-B', $buildPath,
   "-DKENSHI_LIB_INCLUDE_DIR=$includeDir",
   "-DKENSHI_LIB_LIBRARY=$kenshiLib",
-  "-DBOOST_INCLUDE_DIR=$includeDir",
+  "-DBOOST_INCLUDE_DIR=$boostDir",
   "-DSTOBE_DIAG_PROFILE=$DiagProfile"
 )
 
