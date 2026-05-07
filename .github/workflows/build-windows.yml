@@ -53,44 +53,75 @@ jobs:
         shell: pwsh
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          $tmp = "C:\stobe-install-tmp"
-          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $cl       = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
+          $tmp      = "C:\stobe-install-tmp"
+          $extract  = "C:\sdk71-extract"
+          New-Item -ItemType Directory -Path $tmp     -Force | Out-Null
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
 
-          # ── Fix: crear clave de registro que SDK 7.1 requiere ────────────
-          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" /v "Install" /t REG_DWORD /d 1 /f
-          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" /v "Version" /t REG_SZ /d "4.0.30319" /f
-          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Client" /v "Install" /t REG_DWORD /d 1 /f
-
-          # ── Windows SDK 7.1 ISO ──────────────────────────────────────────
-          Write-Host "[1/3] Descargando Windows SDK 7.1 ISO..."
+          # ── Download SDK 7.1 ISO ─────────────────────────────────────────
           $iso = "$tmp\GRMSDKX_EN_DVD.iso"
+          Write-Host "[1/4] Descargando Windows SDK 7.1 ISO (~570 MB)..."
           Invoke-WebRequest -Uri "https://download.microsoft.com/download/F/1/0/F10113F5-B750-4969-A255-274341AC6BCE/GRMSDKX_EN_DVD.iso" `
             -OutFile $iso -UseBasicParsing
-          Write-Host "[1/3] Montando ISO..."
+
+          # ── Mount ISO ────────────────────────────────────────────────────
+          Write-Host "[2/4] Montando ISO..."
           $mount = Mount-DiskImage -ImagePath $iso -PassThru
           $drive = ($mount | Get-Volume).DriveLetter + ":"
-          Write-Host "[1/3] Instalando desde $drive\Setup\SdkSetup.exe..."
-          $p = Start-Process "$drive\Setup\SdkSetup.exe" `
-            -ArgumentList '/q','/norestart','/features','OptionId.WindowsSDKFor64BitTools,OptionId.WindowsSDKHeadersLibsForDesktop' `
-            -Wait -PassThru
-          Write-Host "[1/3] SDK 7.1 ExitCode: $($p.ExitCode)"
-          Dismount-DiskImage -ImagePath $iso
+          Write-Host "ISO montado en: $drive"
+          Write-Host "Contenido de Setup/:"
+          Get-ChildItem "$drive\Setup\" | ForEach-Object { Write-Host "  $($_.Name)" }
 
-          # ── KB2519277 (patch compilador x64) ────────────────────────────
-          Write-Host "[2/3] Descargando KB2519277..."
-          Invoke-WebRequest -Uri "https://download.microsoft.com/download/7/5/0/75045CAB-F9AF-4B7A-A40D-74C4B264E9E0/VC-Compiler-KB2519277.exe" `
-            -OutFile "$tmp\KB2519277.exe" -UseBasicParsing
-          Write-Host "[2/3] Instalando KB2519277..."
-          $p2 = Start-Process "$tmp\KB2519277.exe" -ArgumentList '/q','/norestart' -Wait -PassThru
-          Write-Host "[2/3] KB2519277 ExitCode: $($p2.ExitCode)"
+          # ── Extract all MSIs via msiexec /a (no prerequisites needed) ───
+          Write-Host "[3/4] Extrayendo MSIs (sin prerequisitos)..."
+          Get-ChildItem "$drive\Setup\" -Filter "*.msi" | ForEach-Object {
+            $dest = "$extract\$($_.BaseName)"
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Write-Host "  msiexec /a $($_.Name)..."
+            $r = Start-Process "msiexec.exe" `
+              -ArgumentList "/a", "`"$($_.FullName)`"", "/qb", "TARGETDIR=`"$dest`"" `
+              -Wait -PassThru
+            Write-Host "  ExitCode: $($r.ExitCode)"
+          }
+          Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
 
-          # ── Validar ──────────────────────────────────────────────────────
-          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
+          # ── Copy extracted VS 10.0 + SDK 7.1 dirs to expected locations ─
+          Write-Host "[4/4] Copiando toolchain a ubicaciones esperadas..."
+
+          # Find and copy Microsoft Visual Studio 10.0
+          $vs10 = Get-ChildItem $extract -Recurse -Directory -Filter "Microsoft Visual Studio 10.0" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($vs10) {
+            Write-Host "  Copiando VS 10.0 desde: $($vs10.FullName)"
+            New-Item -ItemType Directory -Path "C:\Program Files (x86)\Microsoft Visual Studio 10.0" -Force | Out-Null
+            Copy-Item "$($vs10.FullName)\*" "C:\Program Files (x86)\Microsoft Visual Studio 10.0\" -Recurse -Force
+          } else {
+            Write-Host "  WARN: directorio 'Microsoft Visual Studio 10.0' no encontrado en MSIs"
+          }
+
+          # Find and copy SDK v7.1
+          $sdk71 = Get-ChildItem $extract -Recurse -Directory | Where-Object { $_.Name -eq 'v7.1' } |
+            Select-Object -First 1
+          if ($sdk71) {
+            $sdkDest = "C:\Program Files\Microsoft SDKs\Windows\v7.1"
+            New-Item -ItemType Directory -Path $sdkDest -Force | Out-Null
+            Write-Host "  Copiando SDK 7.1 desde: $($sdk71.FullName)"
+            Copy-Item "$($sdk71.FullName)\*" $sdkDest -Recurse -Force
+          } else {
+            Write-Host "  WARN: directorio SDK 'v7.1' no encontrado"
+          }
+
+          # Diagnostic: show all cl.exe found
+          Write-Host "=== cl.exe encontrados en el sistema ==="
+          Get-ChildItem "C:\Program Files (x86)\" -Recurse -Filter "cl.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+
           if (-not (Test-Path $cl)) {
-            Write-Error "[3/3] cl.exe no encontrado en: $cl"
+            Write-Error "cl.exe NO encontrado en: $cl"
             exit 1
           }
-          Write-Host "[3/3] OK: cl.exe instalado en $cl"
+          Write-Host "OK: cl.exe en $cl"
 
       - name: Validate MSVC v100 toolset
         shell: pwsh
@@ -105,13 +136,20 @@ jobs:
       - name: Build plugin
         shell: pwsh
         run: |
+          # Set up MSVC v100 environment manually (needed for Ninja generator)
+          $vc  = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC"
+          $sdk = "C:\Program Files\Microsoft SDKs\Windows\v7.1"
+          $env:PATH    = "$vc\bin\amd64;$vc\bin;$env:PATH"
+          $env:INCLUDE = "$vc\include;$sdk\Include"
+          $env:LIB     = "$vc\lib\amd64;$sdk\Lib\x64"
+          Write-Host "INCLUDE=$env:INCLUDE"
+          Write-Host "LIB=$env:LIB"
+
           $profile = "${{ github.event.inputs.diag_profile || 'normal' }}"
-          Write-Host "Building with profile: $profile"
-          if ($profile -eq 'normal') {
-            .\scripts\build-stobe-sdk.ps1
-          } else {
-            .\scripts\build-stobe-sdk.ps1 -DiagProfile $profile
-          }
+          Write-Host "Building with profile: $profile (generator: Ninja)"
+          $args = @('-Generator', 'Ninja')
+          if ($profile -ne 'normal') { $args += @('-DiagProfile', $profile) }
+          .\scripts\build-stobe-sdk.ps1 @args
 
       - name: Locate build output
         id: find_dll

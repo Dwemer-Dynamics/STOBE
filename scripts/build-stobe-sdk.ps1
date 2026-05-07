@@ -2,6 +2,7 @@ param(
   [ValidateSet('normal','ui_only','no_hook','hook_no_orig','no_context','no_hook_no_context')]
   [string]$DiagProfile = 'normal',
   [string]$Toolset = 'v100',
+  [string]$Generator = 'Visual Studio 17 2022',
   [switch]$Deploy,
   [string]$BuildDir = 'build',
   [string]$KenshiModDir = ''
@@ -61,11 +62,20 @@ if (-not (Test-Path $buildPath)) {
 }
 
 $cmakeArgs = @(
+$cmakeArgs = @(
+  '-G', $Generator
+)
+if ($Generator -like 'Visual Studio*') {
+  $cmakeArgs += @('-A', 'x64', '-T', $Toolset)
+} elseif ($Generator -eq 'Ninja') {
+  $cmakeArgs += @(
+    '-DCMAKE_BUILD_TYPE=Release',
+    "-DCMAKE_CXX_COMPILER=$clPath"
+  )
+}
+$cmakeArgs += @(
   '-S', $repoRoot,
   '-B', $buildPath,
-  '-G', 'Visual Studio 17 2022',
-  '-A', 'x64',
-  '-T', $Toolset,
   "-DKENSHI_LIB_INCLUDE_DIR=$includeDir",
   "-DKENSHI_LIB_LIBRARY=$kenshiLib",
   "-DBOOST_INCLUDE_DIR=$includeDir",
