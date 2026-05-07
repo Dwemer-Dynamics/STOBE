@@ -139,6 +139,16 @@ jobs:
           }
           Write-Host "OK: MSVC v100 found at $cl"
 
+      - name: Prepare locked SDK snapshot
+        shell: pwsh
+        run: |
+          .\scripts\setup-sdk.ps1
+          if (-not (Test-Path ".\vendor\stobe-sdk\Include")) {
+            Write-Error "vendor/stobe-sdk was not prepared correctly"
+            exit 1
+          }
+          Write-Host "OK: vendor/stobe-sdk ready"
+
       - name: Build plugin
         shell: pwsh
         run: |
@@ -153,9 +163,9 @@ jobs:
 
           $profile = "${{ github.event.inputs.diag_profile || 'normal' }}"
           Write-Host "Building with profile: $profile (generator: Ninja)"
-          $args = @('-Generator', 'Ninja')
-          if ($profile -ne 'normal') { $args += @('-DiagProfile', $profile) }
-          .\scripts\build-stobe-sdk.ps1 @args
+          $buildArgs = @('-Generator', 'Ninja')
+          if ($profile -ne 'normal') { $buildArgs += @('-DiagProfile', $profile) }
+          .\scripts\build-stobe-sdk.ps1 @buildArgs
 
       - name: Locate build output
         id: find_dll
