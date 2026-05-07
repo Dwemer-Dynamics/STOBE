@@ -4426,15 +4426,38 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       }
     }
   } else {
-    size_t listenerIndex =
-        listenerIndices[(size_t)(rand() % listenerIndices.size())];
-    if (listenerIndex >= candidates.size()) {
-      Log("BORED_EVENT: skipped (listener index out of bounds) speaker=" +
+    struct ListenerChoice {
+      std::string name;
+      std::string serial;
+    };
+    std::vector<ListenerChoice> listenerChoices;
+    listenerChoices.reserve(listenerIndices.size() + 1);
+    for (size_t i = 0; i < listenerIndices.size(); ++i) {
+      size_t candidateIndex = listenerIndices[i];
+      if (candidateIndex >= candidates.size()) {
+        continue;
+      }
+      ListenerChoice choice;
+      choice.name = candidates[candidateIndex].name;
+      choice.serial = candidates[candidateIndex].serial;
+      listenerChoices.push_back(choice);
+    }
+    if (!playerName.empty() &&
+        !sameIdentity(playerName, playerSerial, speaker.name, speaker.serial)) {
+      ListenerChoice playerChoice;
+      playerChoice.name = playerName;
+      playerChoice.serial = playerSerial;
+      listenerChoices.push_back(playerChoice);
+    }
+    if (listenerChoices.empty()) {
+      Log("BORED_EVENT: skipped (no eligible auto listener choices) speaker=" +
           speaker.name + " candidate_count=" + ToString((int)candidates.size()));
       return false;
     }
-    listener = candidates[listenerIndex].name;
-    listenerSerial = candidates[listenerIndex].serial;
+    const ListenerChoice &selectedChoice =
+        listenerChoices[(size_t)(rand() % listenerChoices.size())];
+    listener = selectedChoice.name;
+    listenerSerial = selectedChoice.serial;
   }
 
   if (listener.empty()) {
