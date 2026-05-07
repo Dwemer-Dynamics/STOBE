@@ -40,30 +40,30 @@ Write-Step "Windows SDK 7.1..."
 if ((Test-Path $v100Compiler) -and -not $Force) {
     Write-OK "cl.exe ya presente, saltando instalacion del SDK."
 } else {
-    $sdkInstaller = Join-Path $tmpDir 'winsdk_web.exe'
-    $sdkUrl = 'https://download.microsoft.com/download/A/6/A/A6AC035D-DA3F-4F0C-ADA4-37C8E5D34E3D/winsdk_web.exe'
+    # Usar ISO en lugar de web installer: mas confiable en Windows Server 2022
+    # El web installer (winsdk_web.exe) se cuelga en Server porque requiere UI interactiva
+    $sdkIso = Join-Path $tmpDir 'winsdk71.iso'
+    $sdkIsoUrl = 'https://download.microsoft.com/download/A/6/A/A6AC035D-DA3F-4F0C-ADA4-37C8E5D34E3D/GRMSDKX_EN_DVD.iso'
 
-    Write-Host "  Descargando Windows SDK 7.1..."
+    Write-Host "  Descargando Windows SDK 7.1 ISO (~570 MB)..."
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkInstaller -UseBasicParsing
-    Write-OK "Descargado: $sdkInstaller"
+    Invoke-WebRequest -Uri $sdkIsoUrl -OutFile $sdkIso -UseBasicParsing
+    Write-OK "ISO descargada: $sdkIso"
 
-    Write-Host "  Instalando (puede tardar 5-15 min)..."
-    # /q = silencioso, /norestart, instalar solo componentes de compilacion x64
-    $proc = Start-Process -FilePath $sdkInstaller `
+    Write-Host "  Montando ISO..."
+    $mount = Mount-DiskImage -ImagePath $sdkIso -PassThru
+    $driveLetter = ($mount | Get-Volume).DriveLetter
+    Write-OK "ISO montada en: ${driveLetter}:"
+
+    Write-Host "  Instalando SDK 7.1 (silencioso)..."
+    $proc = Start-Process -FilePath "${driveLetter}:\Setup\SDKSetup.exe" `
         -ArgumentList '/q', '/norestart', `
                       '/features', 'OptionId.WindowsSDKFor64BitTools,OptionId.WindowsSDKHeadersLibsForDesktop' `
         -Wait -PassThru
-    if ($proc.ExitCode -notin @(0, 3010)) {
-        # 3010 = exito, requiere reinicio (no critico para compilacion)
-        # Algunos instaladores devuelven 5638 en Server Core (package ya presente)
-        if ($proc.ExitCode -eq 5638) {
-            Write-Warn "ExitCode 5638 (componente ya instalado). Continuando."
-        } else {
-            Write-Warn "ExitCode inesperado: $($proc.ExitCode). Puede ser normal en Server 2022."
-        }
-    }
-    Write-OK "Windows SDK 7.1 instalado (ExitCode: $($proc.ExitCode))"
+    Write-OK "SDK 7.1 instalado (ExitCode: $($proc.ExitCode))"
+
+    Dismount-DiskImage -ImagePath $sdkIso | Out-Null
+    Write-OK "ISO desmontada"
 }
 
 # ── 2. VS 2010 SP1 Compiler Update (KB2519277) ───────────────────────────────
