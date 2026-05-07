@@ -1,0 +1,62 @@
+name: Quick Validate Stobe (fast)
+
+on:
+  push:
+    branches: [stobe]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'scripts/**'
+      - '.github/workflows/build-quick.yml'
+  pull_request:
+    branches: [stobe]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'scripts/**'
+      - '.github/workflows/build-quick.yml'
+  workflow_dispatch:
+
+jobs:
+  quick-build:
+    name: Quick build (v143, no release artifact)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare locked SDK snapshot
+        shell: pwsh
+        run: |
+          .\scripts\setup-sdk.ps1
+          if (-not (Test-Path ".\vendor\stobe-sdk\Include")) {
+            Write-Error "vendor/stobe-sdk was not prepared correctly"
+            exit 1
+          }
+          if (-not (Test-Path ".\vendor\stobe-sdk\boost_1_60_0")) {
+            Write-Error "Boost headers were not prepared correctly"
+            exit 1
+          }
+          Write-Host "OK: vendor/stobe-sdk ready"
+
+      - name: Configure CMake (quick)
+        shell: pwsh
+        run: |
+          $repoRoot = Resolve-Path .
+          $sdkRoot = Join-Path $repoRoot 'vendor\stobe-sdk'
+          $includeDir = Join-Path $sdkRoot 'Include'
+          $kenshiLib = Join-Path $sdkRoot 'KenshiLib.lib'
+          $boostDir = Join-Path $sdkRoot 'boost_1_60_0'
+
+          cmake -G "Visual Studio 17 2022" -A x64 `
+            -S $repoRoot -B build-quick `
+            "-DKENSHI_LIB_INCLUDE_DIR=$includeDir" `
+            "-DKENSHI_LIB_LIBRARY=$kenshiLib" `
+            "-DBOOST_INCLUDE_DIR=$boostDir" `
+            "-DSTOBE_DIAG_PROFILE=normal"
+
+      - name: Build (quick)
+        shell: pwsh
+        run: |
+          cmake --build build-quick --config Release -- /m

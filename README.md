@@ -36,6 +36,15 @@ This preserves user settings while still allowing newly added defaults to flow i
 
 From repo root, use the locked SDK wrapper:
 
+Practical guide for day-to-day improvements, CI build, version control and rollback:
+
+- [docs/GUIA_MEJORAS_Y_RELEASE.md](docs/GUIA_MEJORAS_Y_RELEASE.md)
+
+CI workflows:
+
+- Official release-compatible build: [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml)
+- Fast validation build: [.github/workflows/build-quick.yml](.github/workflows/build-quick.yml)
+
 ```powershell
 .\scripts\build-stobe-sdk.ps1
 ```
