@@ -33,10 +33,7 @@ on:
 jobs:
   build:
     name: Build (v100 / ${{ github.event.inputs.diag_profile || 'normal' }})
-    # Requires a self-hosted runner with MSVC v100 toolset installed.
-    # Set up using: scripts/setup-runner.ps1
-    # Runner must have label: stobe-v100
-    runs-on: [self-hosted, Windows, X64, stobe-v100]
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -44,28 +41,66 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache MSVC v100 toolset
+        id: cache-v100
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files (x86)\Microsoft Visual Studio 10.0
+          key: msvc-v100-winsdk71-kb2519277
+
+      - name: Install MSVC v100 (Windows SDK 7.1 + KB2519277)
+        if: steps.cache-v100.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $tmp = "C:\stobe-install-tmp"
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+          # ── Fix: crear clave de registro que SDK 7.1 requiere ────────────
+          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" /v "Install" /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" /v "Version" /t REG_SZ /d "4.0.30319" /f
+          reg add "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Client" /v "Install" /t REG_DWORD /d 1 /f
+
+          # ── Windows SDK 7.1 ISO ──────────────────────────────────────────
+          Write-Host "[1/3] Descargando Windows SDK 7.1 ISO..."
+          $iso = "$tmp\GRMSDKX_EN_DVD.iso"
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/F/1/0/F10113F5-B750-4969-A255-274341AC6BCE/GRMSDKX_EN_DVD.iso" `
+            -OutFile $iso -UseBasicParsing
+          Write-Host "[1/3] Montando ISO..."
+          $mount = Mount-DiskImage -ImagePath $iso -PassThru
+          $drive = ($mount | Get-Volume).DriveLetter + ":"
+          Write-Host "[1/3] Instalando desde $drive\Setup\SdkSetup.exe..."
+          $p = Start-Process "$drive\Setup\SdkSetup.exe" `
+            -ArgumentList '/q','/norestart','/features','OptionId.WindowsSDKFor64BitTools,OptionId.WindowsSDKHeadersLibsForDesktop' `
+            -Wait -PassThru
+          Write-Host "[1/3] SDK 7.1 ExitCode: $($p.ExitCode)"
+          Dismount-DiskImage -ImagePath $iso
+
+          # ── KB2519277 (patch compilador x64) ────────────────────────────
+          Write-Host "[2/3] Descargando KB2519277..."
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/7/5/0/75045CAB-F9AF-4B7A-A40D-74C4B264E9E0/VC-Compiler-KB2519277.exe" `
+            -OutFile "$tmp\KB2519277.exe" -UseBasicParsing
+          Write-Host "[2/3] Instalando KB2519277..."
+          $p2 = Start-Process "$tmp\KB2519277.exe" -ArgumentList '/q','/norestart' -Wait -PassThru
+          Write-Host "[2/3] KB2519277 ExitCode: $($p2.ExitCode)"
+
+          # ── Validar ──────────────────────────────────────────────────────
+          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
+          if (-not (Test-Path $cl)) {
+            Write-Error "[3/3] cl.exe no encontrado en: $cl"
+            exit 1
+          }
+          Write-Host "[3/3] OK: cl.exe instalado en $cl"
+
       - name: Validate MSVC v100 toolset
         shell: pwsh
         run: |
           $cl = "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\cl.exe"
           if (-not (Test-Path $cl)) {
             Write-Error "MSVC v100 not found at: $cl"
-            Write-Error "Run scripts/setup-runner.ps1 to install prerequisites."
             exit 1
           }
           Write-Host "OK: MSVC v100 found at $cl"
-
-      - name: Validate CMake
-        shell: pwsh
-        run: |
-          cmake --version
-          $ver = (cmake --version 2>&1 | Select-String "(\d+\.\d+\.\d+)").Matches[0].Value
-          $parts = $ver.Split('.')
-          if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 20)) {
-            Write-Error "CMake 3.20+ required, found $ver"
-            exit 1
-          }
-          Write-Host "OK: CMake $ver"
 
       - name: Build plugin
         shell: pwsh
