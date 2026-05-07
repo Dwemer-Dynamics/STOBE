@@ -75,7 +75,13 @@ jobs:
 
           # ── Extract all MSIs via msiexec /a (no prerequisites needed) ───
           Write-Host "[3/4] Extrayendo MSIs (sin prerequisitos)..."
-          Get-ChildItem "$drive\Setup\" -Filter "*.msi" | ForEach-Object {
+          $msiFiles = Get-ChildItem "$drive\Setup\" -Recurse -File -Filter "*.msi" -ErrorAction SilentlyContinue
+          Write-Host "MSIs encontrados: $($msiFiles.Count)"
+          if ($msiFiles.Count -eq 0) {
+            Write-Error "No se encontraron archivos .msi dentro de $drive\Setup"
+            exit 1
+          }
+          $msiFiles | ForEach-Object {
             $dest = "$extract\$($_.BaseName)"
             New-Item -ItemType Directory -Path $dest -Force | Out-Null
             Write-Host "  msiexec /a $($_.Name)..."
