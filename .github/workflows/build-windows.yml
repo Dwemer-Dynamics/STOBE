@@ -95,33 +95,44 @@ jobs:
           # ── Copy extracted VS 10.0 + SDK 7.1 dirs to expected locations ─
           Write-Host "[4/4] Copiando toolchain a ubicaciones esperadas..."
 
-          # Find and copy Microsoft Visual Studio 10.0
-          $vs10 = Get-ChildItem $extract -Recurse -Directory -Filter "Microsoft Visual Studio 10.0" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($vs10) {
-            Write-Host "  Copiando VS 10.0 desde: $($vs10.FullName)"
-            New-Item -ItemType Directory -Path "C:\Program Files (x86)\Microsoft Visual Studio 10.0" -Force | Out-Null
-            Copy-Item "$($vs10.FullName)\*" "C:\Program Files (x86)\Microsoft Visual Studio 10.0\" -Recurse -Force
+          # Find and copy ALL Microsoft Visual Studio 10.0 dirs (one per MSI)
+          $vsDest = "C:\Program Files (x86)\Microsoft Visual Studio 10.0"
+          New-Item -ItemType Directory -Path $vsDest -Force | Out-Null
+          $vs10Dirs = Get-ChildItem $extract -Recurse -Directory -Filter "Microsoft Visual Studio 10.0" -ErrorAction SilentlyContinue
+          if ($vs10Dirs) {
+            foreach ($d in $vs10Dirs) {
+              Write-Host "  Copiando VS 10.0 desde: $($d.FullName)"
+              Copy-Item "$($d.FullName)\*" $vsDest -Recurse -Force
+            }
           } else {
             Write-Host "  WARN: directorio 'Microsoft Visual Studio 10.0' no encontrado en MSIs"
           }
 
-          # Find and copy SDK v7.1
-          $sdk71 = Get-ChildItem $extract -Recurse -Directory | Where-Object { $_.Name -eq 'v7.1' } |
-            Select-Object -First 1
-          if ($sdk71) {
-            $sdkDest = "C:\Program Files\Microsoft SDKs\Windows\v7.1"
-            New-Item -ItemType Directory -Path $sdkDest -Force | Out-Null
-            Write-Host "  Copiando SDK 7.1 desde: $($sdk71.FullName)"
-            Copy-Item "$($sdk71.FullName)\*" $sdkDest -Recurse -Force
+          # Find and copy ALL SDK v7.1 dirs (one per MSI)
+          $sdkDest = "C:\Program Files\Microsoft SDKs\Windows\v7.1"
+          New-Item -ItemType Directory -Path $sdkDest -Force | Out-Null
+          $sdk71Dirs = Get-ChildItem $extract -Recurse -Directory | Where-Object { $_.Name -eq 'v7.1' }
+          if ($sdk71Dirs) {
+            foreach ($d in $sdk71Dirs) {
+              Write-Host "  Copiando SDK 7.1 desde: $($d.FullName)"
+              Copy-Item "$($d.FullName)\*" $sdkDest -Recurse -Force
+            }
           } else {
             Write-Host "  WARN: directorio SDK 'v7.1' no encontrado"
           }
 
-          # Diagnostic: show all cl.exe found
+          # Diagnostic: show all cl.exe found and key DLLs
           Write-Host "=== cl.exe encontrados en el sistema ==="
           Get-ChildItem "C:\Program Files (x86)\" -Recurse -Filter "cl.exe" -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          Write-Host "=== DLLs en Common7\IDE ==="
+          Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 10.0\Common7\IDE\" -Filter "*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.Name)" }
+
+          Write-Host "=== DLLs en VC\bin\amd64 ==="
+          Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\" -Filter "*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.Name)" }
 
           if (-not (Test-Path $cl)) {
             Write-Error "cl.exe NO encontrado en: $cl"
