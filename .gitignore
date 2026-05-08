@@ -1,5 +1,6 @@
 build/
 build-map/
+build-tests/
 *.dll
 !mod/Stobe.dll
 !mod/Stobe.ini

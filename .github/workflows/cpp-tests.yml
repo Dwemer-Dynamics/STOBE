@@ -1,0 +1,41 @@
+name: C++ Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "Optional ctest regex. Leave blank to run all portable C++ tests."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  portable-tests:
+    name: Portable C++ Tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure portable tests
+        run: cmake -S tests/cpp -B build-tests -G "Visual Studio 17 2022" -A x64
+
+      - name: Build portable tests
+        run: cmake --build build-tests --config Release --parallel
+
+      - name: Run portable tests
+        env:
+          TEST_FILTER: ${{ github.event.inputs.test_filter || '' }}
+        shell: pwsh
+        run: |
+          if ($env:TEST_FILTER) {
+            ctest --test-dir build-tests -C Release --output-on-failure -R "$env:TEST_FILTER"
+          } else {
+            ctest --test-dir build-tests -C Release --output-on-failure
+          }

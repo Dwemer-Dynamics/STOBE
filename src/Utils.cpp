@@ -4,6 +4,7 @@
 #include "Comm.h"
 #include "Context.h"
 #include "Globals.h"
+#include "StobeText.h"
 #include <fstream>
 #include <iomanip>
 #include <kenshi/Character.h>
@@ -339,7 +340,7 @@ std::string NormalizeIniChatMode(const std::string &rawMode) {
 } // namespace
 
 std::string SanitizeDialogueForEventStream(const std::string &value) {
-  return SanitizeDialogueForEventStreamImpl(value);
+  return Stobe::Text::SanitizeDialogueForEventStream(value);
 }
 
 std::wstring WideFromUtf8(const std::string &str) {
@@ -410,141 +411,15 @@ std::string ToString(unsigned int val) { return ToStringT(val); }
 std::string ToString(float val) { return ToStringT(val); }
 
 std::string EscapeJSON(const std::string &s) {
-  std::string res = "";
-  for (size_t i = 0; i < s.length(); ++i) {
-    char c = s[i];
-    if (c == '\"')
-      res += "\\\"";
-    else if (c == '\\')
-      res += "\\\\";
-    else if (c == '\n')
-      res += "\\n";
-    else if (c == '\r')
-      res += "\\r";
-    else
-      res += c;
-  }
-  return res;
+  return Stobe::Text::EscapeJSON(s);
 }
 
 std::string UnescapeJSON(const std::string &s) {
-  std::string res = "";
-  for (size_t i = 0; i < s.length(); ++i) {
-    if (s[i] == '\\' && i + 1 < s.length()) {
-      if (s[i + 1] == 'n') {
-        res += '\n';
-        i++;
-      } else if (s[i + 1] == 'r') {
-        res += '\r';
-        i++;
-      } else if (s[i + 1] == '\"') {
-        res += '\"';
-        i++;
-      } else if (s[i + 1] == '\\') {
-        res += '\\';
-        i++;
-      } else if (s[i + 1] == 'u' && i + 5 < s.length()) {
-        // Handle \uXXXX hex sequence
-        unsigned int cp = 0;
-        bool valid = true;
-        for (int j = 0; j < 4; ++j) {
-          char c = s[i + 2 + j];
-          cp <<= 4;
-          if (c >= '0' && c <= '9')
-            cp += (c - '0');
-          else if (c >= 'a' && c <= 'f')
-            cp += (10 + c - 'a');
-          else if (c >= 'A' && c <= 'F')
-            cp += (10 + c - 'A');
-          else {
-            valid = false;
-            break;
-          }
-        }
-
-        if (valid) {
-          // Convert Unicode codepoint to UTF-8
-          if (cp <= 0x7F) {
-            res += (char)cp;
-          } else if (cp <= 0x7FF) {
-            res += (char)(0xC0 | ((cp >> 6) & 0x1F));
-            res += (char)(0x80 | (cp & 0x3F));
-          } else {
-            res += (char)(0xE0 | ((cp >> 12) & 0x0F));
-            res += (char)(0x80 | ((cp >> 6) & 0x3F));
-            res += (char)(0x80 | (cp & 0x3F));
-          }
-          i += 5; // skip uXXXX
-        } else {
-          res += s[i]; // Not a valid hex sequence, just append the backslash
-        }
-      } else {
-        res += s[i];
-      }
-    } else {
-      res += s[i];
-    }
-  }
-  return res;
+  return Stobe::Text::UnescapeJSON(s);
 }
 
 std::string JsonReadField(const std::string &json, const std::string &key) {
-  std::string keyQuery = "\"" + key + "\":";
-  size_t pos = json.find(keyQuery);
-  if (pos == std::string::npos) {
-    // try without quotes in case it's non-standard but that's unlikely
-    return "";
-  }
-
-  size_t valStart = json.find_first_not_of(" \t\r\n", pos + keyQuery.length());
-  if (valStart == std::string::npos)
-    return "";
-
-  if (json[valStart] == '\"') {
-    // String value
-    valStart++;
-    std::string res = "";
-    for (size_t i = valStart; i < json.length(); ++i) {
-      if (json[i] == '\\' && i + 1 < json.length()) {
-        res += json[i];
-        res += json[i + 1];
-        i++;
-      } else if (json[i] == '\"') {
-        return UnescapeJSON(res);
-      } else {
-        res += json[i];
-      }
-    }
-  } else if (json[valStart] == '[' || json[valStart] == '{') {
-    char open = json[valStart];
-    char close = (open == '[') ? ']' : '}';
-    int bracketCount = 0;
-    bool inString = false;
-    size_t i = valStart;
-    for (; i < json.length(); i++) {
-      if (json[i] == '"' && (i == 0 || json[i - 1] != '\\')) {
-        inString = !inString;
-      } else if (!inString) {
-        if (json[i] == open)
-          bracketCount++;
-        else if (json[i] == close) {
-          bracketCount--;
-          if (bracketCount == 0)
-            break;
-        }
-      }
-    }
-    if (i < json.length() && json[i] == close) {
-      return json.substr(valStart, i - valStart + 1);
-    }
-  } else {
-    // Number or bool
-    size_t end = json.find_first_of(",}", valStart);
-    if (end != std::string::npos) {
-      return json.substr(valStart, end - valStart);
-    }
-  }
-  return "";
+  return Stobe::Text::JsonReadField(json, key);
 }
 
 void SetHotkeyFromString(const std::string &keyStr) {
@@ -1406,7 +1281,7 @@ static std::string BuildEventStreamData(const std::string &type,
 
   std::string body = message;
   if (IsDialogueLikeEventType(type)) {
-    body = SanitizeDialogueForEventStreamImpl(body);
+    body = Stobe::Text::SanitizeDialogueForEventStream(body);
   }
   if (body.empty()) {
     body = type;
