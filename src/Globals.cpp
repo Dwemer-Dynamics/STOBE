@@ -1,5 +1,7 @@
 #include "Globals.h"
 #include "AudioPlayback.h"
+#include "Comm.h"
+#include "Utils.h"
 #include <algorithm>
 
 // Global Definitions
@@ -70,9 +72,44 @@ std::string T(const std::string &key) {
   return key;
 }
 
+namespace {
+std::string ExtractQueuedUtteranceIdToken(const std::string &message) {
+  const std::string marker = "[UTTERANCEID:";
+  size_t markerPos = message.rfind(marker);
+  if (markerPos == std::string::npos) {
+    return "";
+  }
+
+  size_t valuePos = markerPos + marker.length();
+  size_t endPos = message.find(']', valuePos);
+  if (endPos == std::string::npos) {
+    return "";
+  }
+
+  std::string value = message.substr(valuePos, endPos - valuePos);
+  if (value.empty()) {
+    return "";
+  }
+
+  for (size_t i = 0; i < value.length(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(value[i]);
+    bool isSafe =
+        (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+    if (!isSafe) {
+      return "";
+    }
+  }
+
+  return value;
+}
+} // namespace
+
 // Background Name Assignment system
 std::deque<NameCheckItem> g_nameCheckQueue;
 CRITICAL_SECTION g_nameCheckMutex;
+std::set<unsigned int> g_identityRenameCompletedSerials;
+std::map<unsigned int, DWORD> g_identityRenameNextAttemptTick;
 std::set<unsigned int> g_renamedSerials;
 std::set<unsigned int> g_activatedAnimalSerials;
 DWORD g_lastContextPushTick = 0;
@@ -191,16 +228,25 @@ std::map<unsigned int, TravelTarget> SnapshotTravelTargets() {
 
 LONG BeginChatInterruptGeneration() {
   LONG generation = InterlockedIncrement(&g_chatInterruptGeneration);
+  std::set<std::string> cancelledUtterances;
 
   InterruptTtsPlayback();
 
   EnterCriticalSection(&g_msgMutex);
   g_messageQueue.erase(
       std::remove_if(g_messageQueue.begin(), g_messageQueue.end(),
-                     [](const std::string &msg) {
-                       return msg.find("NPC_SAY: ") == 0 ||
-                              msg.find("NPC_ACTION: ") == 0 ||
-                              msg.find("PLAYER_TTS: ") == 0;
+                     [&cancelledUtterances](const std::string &msg) -> bool {
+                       bool shouldRemove = msg.find("NPC_SAY: ") == 0 ||
+                                           msg.find("NPC_ACTION: ") == 0 ||
+                                           msg.find("PLAYER_TTS: ") == 0;
+                       if (shouldRemove && msg.find("NPC_SAY: ") == 0) {
+                         std::string utteranceId =
+                             ExtractQueuedUtteranceIdToken(msg);
+                         if (!utteranceId.empty()) {
+                           cancelledUtterances.insert(utteranceId);
+                         }
+                       }
+                       return shouldRemove;
                      }),
       g_messageQueue.end());
   LeaveCriticalSection(&g_msgMutex);
@@ -208,8 +254,13 @@ LONG BeginChatInterruptGeneration() {
   EnterCriticalSection(&g_uiMutex);
   g_uiActionQueue.erase(
       std::remove_if(g_uiActionQueue.begin(), g_uiActionQueue.end(),
-                     [](const QueuedAction &act) {
-                       return act.type == ACT_SAY || act.type == ACT_PLAY_TTS;
+                     [&cancelledUtterances](const QueuedAction &act) -> bool {
+                       bool shouldRemove =
+                           act.type == ACT_SAY || act.type == ACT_PLAY_TTS;
+                       if (shouldRemove && !act.utteranceId.empty()) {
+                         cancelledUtterances.insert(act.utteranceId);
+                       }
+                       return shouldRemove;
                      }),
       g_uiActionQueue.end());
   LeaveCriticalSection(&g_uiMutex);
@@ -220,6 +271,12 @@ LONG BeginChatInterruptGeneration() {
   g_followTargets.clear();
   g_travelTargets.clear();
   LeaveCriticalSection(&g_stateMutex);
+
+  if (!cancelledUtterances.empty()) {
+    std::vector<std::string> deliveryIds(cancelledUtterances.begin(),
+                                         cancelledUtterances.end());
+    PostSpeechDeliveryStates(deliveryIds, "cancelled");
+  }
 
   return generation;
 }

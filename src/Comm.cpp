@@ -1,9 +1,13 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "Utils.h"
+#include <algorithm>
+#include <cstdint>
 #include <cctype>
 #include <ctime>
 #include <deque>
+#include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 #include <winhttp.h>
@@ -33,9 +37,18 @@ HANDLE g_serialHttpThread = NULL;
 LONG g_serialHttpInitDone = 0;
 LONG g_serialHttpDropped = 0;
 LONG g_serialHttpLastDropLogTick = 0;
+CRITICAL_SECTION g_asyncPostDedupMutex;
+LONG g_asyncPostDedupInitDone = 0;
+DWORD g_asyncPostDedupLastPruneTick = 0;
 
 const size_t kSerialHttpQueueCap = 1024;
 const DWORD kSerialHttpDropLogCooldownMs = 5000;
+const DWORD kAsyncPostDedupRetentionMs = 60000;
+struct AsyncPostDedupState {
+  DWORD lastSentTick;
+};
+
+std::map<std::string, AsyncPostDedupState> g_asyncPostDedupByFingerprint;
 
 struct RequestPlan {
   std::wstring method;
@@ -86,6 +99,29 @@ std::string ReplaceAll(std::string value, const std::string &from,
     startPos += to.length();
   }
   return value;
+}
+
+std::uint64_t HashFnv1a64(const std::string &value) {
+  const std::uint64_t kOffset = 1469598103934665603ull;
+  const std::uint64_t kPrime = 1099511628211ull;
+  std::uint64_t hash = kOffset;
+  for (size_t i = 0; i < value.length(); ++i) {
+    hash ^= static_cast<std::uint64_t>(
+        static_cast<unsigned char>(value[i]));
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+std::string HexFromU64(std::uint64_t value) {
+  static const char *kHex = "0123456789abcdef";
+  std::string hex(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    hex[static_cast<size_t>(i)] =
+        kHex[static_cast<size_t>(value & 0x0full)];
+    value >>= 4;
+  }
+  return hex;
 }
 
 std::string Base64Encode(const std::string &input) {
@@ -174,6 +210,77 @@ bool StartsWith(const std::wstring &value, const std::wstring &prefix) {
   if (value.size() < prefix.size())
     return false;
   return value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool IsAsyncPostDedupEndpoint(const std::wstring &endpoint) {
+  return endpoint == L"/context" || endpoint == L"/gamedata";
+}
+
+DWORD ResolveAsyncPostDedupWindowMs(const std::wstring &endpoint) {
+  if (endpoint == L"/gamedata") {
+    return 8000;
+  }
+  if (endpoint == L"/context") {
+    return 8000;
+  }
+  return 0;
+}
+
+void EnsureAsyncPostDedupReady() {
+  if (InterlockedCompareExchange(&g_asyncPostDedupInitDone, 1, 0) != 0) {
+    return;
+  }
+  InitializeCriticalSection(&g_asyncPostDedupMutex);
+}
+
+bool ShouldSuppressDuplicateAsyncPost(const std::wstring &endpoint,
+                                      const std::string &jsonData) {
+  if (!IsAsyncPostDedupEndpoint(endpoint) || jsonData.empty()) {
+    return false;
+  }
+
+  const DWORD windowMs = ResolveAsyncPostDedupWindowMs(endpoint);
+  if (windowMs == 0) {
+    return false;
+  }
+
+  EnsureAsyncPostDedupReady();
+  if (InterlockedCompareExchange(&g_asyncPostDedupInitDone, 0, 0) == 0) {
+    return false;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  const std::uint64_t payloadHash = HashFnv1a64(jsonData);
+  const std::string fingerprint =
+      ToUtf8(endpoint) + "|" + HexFromU64(payloadHash);
+  bool suppress = false;
+
+  EnterCriticalSection(&g_asyncPostDedupMutex);
+  if (g_asyncPostDedupLastPruneTick == 0 ||
+      (nowTick - g_asyncPostDedupLastPruneTick) >= kAsyncPostDedupRetentionMs) {
+    g_asyncPostDedupLastPruneTick = nowTick;
+    for (std::map<std::string, AsyncPostDedupState>::iterator it =
+             g_asyncPostDedupByFingerprint.begin();
+         it != g_asyncPostDedupByFingerprint.end();) {
+      if (it->second.lastSentTick == 0 ||
+          (nowTick - it->second.lastSentTick) >= kAsyncPostDedupRetentionMs) {
+        it = g_asyncPostDedupByFingerprint.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  AsyncPostDedupState &state = g_asyncPostDedupByFingerprint[fingerprint];
+  if (state.lastSentTick != 0 &&
+      static_cast<std::int32_t>(nowTick - state.lastSentTick) <
+          static_cast<std::int32_t>(windowMs)) {
+    suppress = true;
+  } else {
+    state.lastSentTick = nowTick;
+  }
+  LeaveCriticalSection(&g_asyncPostDedupMutex);
+  return suppress;
 }
 
 bool PathContains(const std::wstring &path, const wchar_t *token) {
@@ -364,7 +471,6 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   HINTERNET hConnect = NULL;
   HINTERNET hRequest = NULL;
   BOOL sendOk = FALSE;
-
   hSession = WinHttpOpen(L"Stobe/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!hSession) {
@@ -410,24 +516,6 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   bool success = false;
   if (sendOk) {
     if (WinHttpReceiveResponse(hRequest, NULL)) {
-      DWORD statusCode = 0;
-      DWORD statusSize = sizeof(statusCode);
-      if (WinHttpQueryHeaders(
-              hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-              WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
-              WINHTTP_NO_HEADER_INDEX)) {
-        std::string pathUtf8 = ToUtf8(request.path);
-        bool isImportRoute =
-            PathContains(request.path, L"/StobeServer/npc_snapshot.php") ||
-            PathContains(request.path, L"/StobeServer/gamedata.php") ||
-            PathContains(request.path, L"/StobeServer/portrait_upload.php") ||
-            PathContains(request.path, L"/StobeServer/world_state.php");
-        if (isImportRoute) {
-          Log("NETWORK_TRACE: " + ToUtf8(request.method) + " " + pathUtf8 +
-              " status=" + ToString((int)statusCode) +
-              " payload_len=" + ToString((int)request.body.size()));
-        }
-      }
       if (expectResponse) {
         bool readResult = true;
         if (lineCallback) {
@@ -620,6 +708,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
 
   if (endpoint == L"/conf_opts") {
     request.path = L"/StobeServer/conf_opts.php";
+    return request;
+  }
+
+  if (endpoint == L"/speech_delivery") {
+    request.path = L"/StobeServer/speech_delivery.php";
     return request;
   }
 
@@ -845,6 +938,51 @@ bool PostToStobeWithResponseStream(const std::wstring &endpoint,
   return SendRawHttp(request, true, &ignoredBody, callback, userData);
 }
 
+void PostSpeechDeliveryState(const std::string &utteranceId,
+                             const std::string &deliveryState) {
+  std::vector<std::string> utteranceIds;
+  if (!utteranceId.empty()) {
+    utteranceIds.push_back(utteranceId);
+  }
+  PostSpeechDeliveryStates(utteranceIds, deliveryState);
+}
+
+void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
+                              const std::string &deliveryState) {
+  std::string normalizedState = Trim(deliveryState);
+  std::transform(normalizedState.begin(), normalizedState.end(),
+                 normalizedState.begin(), ::tolower);
+  if (normalizedState != "spoken" && normalizedState != "cancelled") {
+    return;
+  }
+
+  std::set<std::string> uniqueIds;
+  for (size_t i = 0; i < utteranceIds.size(); ++i) {
+    std::string candidate = Trim(utteranceIds[i]);
+    if (!candidate.empty()) {
+      uniqueIds.insert(candidate);
+    }
+  }
+  if (uniqueIds.empty()) {
+    return;
+  }
+
+  std::string payload = "{\"updates\":[";
+  bool first = true;
+  for (std::set<std::string>::const_iterator it = uniqueIds.begin();
+       it != uniqueIds.end(); ++it) {
+    if (!first) {
+      payload += ",";
+    }
+    first = false;
+    payload += "{\"utterance_id\":\"" + EscapeJSON(*it) +
+               "\",\"delivery_state\":\"" + EscapeJSON(normalizedState) + "\"}";
+  }
+  payload += "]}";
+
+  AsyncPostToStobe(L"/speech_delivery", payload);
+}
+
 std::string UploadCsvImportToStobe(const std::string &csvData,
                                    const std::string &filename,
                                    const std::string &importType) {
@@ -1034,6 +1172,9 @@ DWORD WINAPI AsyncHttpThread(LPVOID lpParam) {
 
 void AsyncPostToStobe(const std::wstring &endpoint,
                       const std::string &jsonData) {
+  if (ShouldSuppressDuplicateAsyncPost(endpoint, jsonData)) {
+    return;
+  }
   HttpTask *task = new HttpTask();
   task->endpoint = endpoint;
   task->data = jsonData;

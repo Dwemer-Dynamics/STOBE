@@ -4,6 +4,7 @@
 #include "Context.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "StobeTiming.h"
 #include "Utils.h"
 
 #include <kenshi/Character.h>
@@ -2016,6 +2017,27 @@ int ParseTtsDurationToken(const std::string &token) {
   return durationMs;
 }
 
+std::string ParseUtteranceIdToken(const std::string &token) {
+  std::string trimmed = TrimChatLine(token);
+  if (trimmed.find("uid=") != 0) {
+    return "";
+  }
+  std::string value = TrimChatLine(trimmed.substr(4));
+  if (value.empty() || value.length() > 80) {
+    return "";
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(value[i]);
+    bool isSafe =
+        (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+    if (!isSafe) {
+      return "";
+    }
+  }
+  return value;
+}
+
 void QueueUiNotifyAction(const std::string &message) {
   std::string text = TrimChatLine(message);
   if (text.empty()) {
@@ -2085,14 +2107,14 @@ DWORD ResolveLineDelayMs(int ttsDurationMs, const std::string &line = "") {
   return delayMs;
 }
 
-void QueueChatPipeLine(const std::string &line, LONG generation) {
+bool QueueChatPipeLine(const std::string &line, LONG generation) {
   if (generation > 0 && !IsChatInterruptGenerationCurrent(generation)) {
-    return;
+    return false;
   }
   EnterCriticalSection(&g_msgMutex);
   if (generation > 0 && !IsChatInterruptGenerationCurrent(generation)) {
     LeaveCriticalSection(&g_msgMutex);
-    return;
+    return false;
   }
   g_messageQueue.push_back(line);
   g_lastDialogueTick = GetTickCount();
@@ -2102,6 +2124,7 @@ void QueueChatPipeLine(const std::string &line, LONG generation) {
     Log("CHAT_TIMING: pipe queued gen=" + ToString((int)generation) +
         " line=" + line.substr(0, std::min<size_t>(line.length(), 120)));
   }
+  return true;
 }
 
 int ResolveCurrentGameTs() {
@@ -2350,16 +2373,18 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   bool responderSelected =
       TrySelectRechatResponder(world, player, speakerNpc, speaker, previousSpeaker,
                                previousSpeakerHandle, responderChoice);
-  if (!responderSelected || responderChoice.name.empty()) {
-    Log("RECHAT: skipped (no eligible responder) speaker=" + speaker +
-        " preferred_listener=" + previousSpeaker +
-        " preferred_listener_serial=" + previousSpeakerHandle);
-    return;
-  }
   std::string selectedResponder = responderChoice.name;
   std::string selectedResponderHandle = responderChoice.serial;
+  if (!responderSelected || selectedResponder.empty()) {
+    selectedResponder.clear();
+    selectedResponderHandle.clear();
+    responderChoice.source = "server_authoritative_fallback";
+    Log("RECHAT: local responder hint unavailable; deferring selection to server speaker=" +
+        speaker + " preferred_listener=" + previousSpeaker +
+        " preferred_listener_serial=" + previousSpeakerHandle);
+  }
   Character *responderNpc = nullptr;
-  if (world) {
+  if (world && !selectedResponder.empty()) {
     responderNpc = ResolveChatTargetCharacter(world, selectedResponder,
                                               selectedResponderHandle);
   }
@@ -2385,7 +2410,9 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
                           L"&profile=" + ToWide(UrlEncode(selectedResponder)) +
                           L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
                           L"&rechat_depth=" + ToWide(ToString(nextRechatDepth));
-  endpoint += L"&rechat_target=" + ToWide(UrlEncode(selectedResponder));
+  if (!selectedResponder.empty()) {
+    endpoint += L"&rechat_target=" + ToWide(UrlEncode(selectedResponder));
+  }
   if (!selectedResponderHandle.empty()) {
     endpoint +=
         L"&rechat_target_sid=" + ToWide(UrlEncode(selectedResponderHandle));
@@ -2404,34 +2431,32 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   }
   std::string peopleJson = "";
   std::string peopleSource = "minimal_rechat_pair";
-  if (responderNpc && (uintptr_t)responderNpc > 0x1000) {
-    // Rebuild listeners per hop around the selected responder (Herika-style).
-    // This keeps the local conversation set anchored to who will speak next.
+  if (speakerNpc && (uintptr_t)speakerNpc > 0x1000) {
+    // Rebuild nearby conversation context around the actual current speaker.
+    // The server is authoritative for responder selection; the client only sends hints.
     peopleJson =
-        BuildPeopleJson(world, selectedResponder, speaker, speakerHandle, "chat",
-                        responderNpc);
+        BuildPeopleJson(world, speaker, previousSpeaker, previousSpeakerHandle,
+                        "chat", speakerNpc);
     if (!peopleJson.empty()) {
-      peopleSource = "rebuilt_from_selected_responder";
-      if (selectedResponderHandle.empty()) {
-        selectedResponderHandle = ToString(responderNpc->getHandle().serial);
-      }
+      peopleSource = "rebuilt_from_current_speaker";
     }
   }
   if (peopleJson.empty()) {
     std::vector<std::string> minimalPeople;
-    if (!selectedResponder.empty()) {
-      if (!selectedResponderHandle.empty()) {
-        AppendUniquePerson(minimalPeople,
-                           selectedResponder + "|" + selectedResponderHandle);
-      } else {
-        AppendUniquePerson(minimalPeople, selectedResponder);
-      }
-    }
     if (!speaker.empty()) {
       if (!speakerHandle.empty()) {
-        AppendUniquePerson(minimalPeople, speaker + "|" + speakerHandle);
+        AppendUniquePerson(minimalPeople,
+                           speaker + "|" + speakerHandle);
       } else {
         AppendUniquePerson(minimalPeople, speaker);
+      }
+    }
+    if (!previousSpeaker.empty()) {
+      if (!previousSpeakerHandle.empty()) {
+        AppendUniquePerson(minimalPeople,
+                           previousSpeaker + "|" + previousSpeakerHandle);
+      } else {
+        AppendUniquePerson(minimalPeople, previousSpeaker);
       }
     }
     peopleJson = "[";
@@ -2788,6 +2813,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   std::string subtitle = line;
   std::string ttsHash = "";
   int ttsDurationMs = 0;
+  std::string utteranceId = "";
 
   size_t bar1 = line.find('|');
   size_t bar2 =
@@ -2819,9 +2845,14 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         if (!parsedHash.empty()) {
           ttsHash = parsedHash;
         } else {
-          int parsedDuration = ParseTtsDurationToken(token);
-          if (parsedDuration > 0) {
-            ttsDurationMs = parsedDuration;
+          std::string parsedUtteranceId = ParseUtteranceIdToken(token);
+          if (!parsedUtteranceId.empty()) {
+            utteranceId = parsedUtteranceId;
+          } else {
+            int parsedDuration = ParseTtsDurationToken(token);
+            if (parsedDuration > 0) {
+              ttsDurationMs = parsedDuration;
+            }
           }
         }
         if (tokenEnd == std::string::npos) {
@@ -2871,6 +2902,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
 
   if (!subtitle.empty()) {
     if (IsLikelyLocalSpeechEcho(state, actor, subtitle)) {
+      if (!utteranceId.empty()) {
+        PostSpeechDeliveryState(utteranceId, "cancelled");
+      }
       Log("CHAT_TIMING: STREAM_LINE dropped local echo actor=" + actor +
           " subtitle_len=" + ToString((int)subtitle.length()) +
           " gen=" + ToString((int)state->generation));
@@ -2878,6 +2912,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
       return true;
     }
     if (!IsChatInterruptGenerationCurrent(state->generation)) {
+      if (!utteranceId.empty()) {
+        PostSpeechDeliveryState(utteranceId, "cancelled");
+      }
       return false;
     }
     std::string queueLine = "";
@@ -2918,13 +2955,21 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     if (g_ttsEnabled && ttsDurationMs > 0) {
       queueLine += " [TTSDUR:" + ToString(ttsDurationMs) + "]";
     }
+    if (!utteranceId.empty()) {
+      queueLine += " [UTTERANCEID:" + utteranceId + "]";
+    }
     Log("CHAT_TIMING: STREAM_LINE actor=" + actor +
         " subtitle_len=" + ToString((int)subtitle.length()) +
         " tts_hash=" + ShortHashForLog(ttsHash) +
         " tts_dur_ms=" + ToString(ttsDurationMs) +
         " tts_enabled=" + std::string(g_ttsEnabled ? "1" : "0") +
         " gen=" + ToString((int)state->generation));
-    QueueChatPipeLine(queueLine, state->generation);
+    if (!QueueChatPipeLine(queueLine, state->generation)) {
+      if (!utteranceId.empty()) {
+        PostSpeechDeliveryState(utteranceId, "cancelled");
+      }
+      return false;
+    }
     std::string speakerHandle = "";
     if (!narratorSpeaker) {
       size_t headerPipePos = speakerHeader.find('|');
@@ -2992,22 +3037,27 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
       " streamed chat lines and " + ToString(parseState.actionCount) +
       " action lines.");
   if (parseState.lineCount > 0 && IsChatInterruptGenerationCurrent(generation)) {
-    DWORD followupDelayMs = parseState.interLineDelayMs;
-    if (followupDelayMs < 250) {
-      followupDelayMs = 250;
-    } else if (followupDelayMs > 600000) {
-      followupDelayMs = 600000;
+    DWORD followupDelayMs = static_cast<DWORD>(
+        Stobe::Timing::ResolveRechatDispatchDelayMs(parseState.interLineDelayMs));
+    bool waitForPlayback =
+        Stobe::Timing::ShouldWaitForPlaybackBeforeRechatDispatch();
+    Log("RECHAT_TIMING: follow-up dispatch scheduled delay_ms=" +
+        ToString((int)followupDelayMs) +
+        " wait_for_playback=" + std::string(waitForPlayback ? "1" : "0") +
+        " gen=" + ToString((int)generation));
+    if (followupDelayMs > 0) {
+      SleepIfPaused(followupDelayMs);
     }
-    Log("RECHAT_TIMING: follow-up wait start delay_ms=" +
-        ToString((int)followupDelayMs) + " gen=" + ToString((int)generation));
-    SleepIfPaused(followupDelayMs);
 
-    DWORD playbackWaitStart = GetTickCount();
-    while (IsChatInterruptGenerationCurrent(generation) && IsTtsPlaybackActive()) {
-      SleepIfPaused(50);
-      if ((GetTickCount() - playbackWaitStart) > 600000) {
-        Log("RECHAT_TIMING: follow-up playback wait timed out");
-        break;
+    if (waitForPlayback) {
+      DWORD playbackWaitStart = GetTickCount();
+      while (IsChatInterruptGenerationCurrent(generation) &&
+             IsTtsPlaybackActive()) {
+        SleepIfPaused(50);
+        if ((GetTickCount() - playbackWaitStart) > 600000) {
+          Log("RECHAT_TIMING: follow-up playback wait timed out");
+          break;
+        }
       }
     }
 

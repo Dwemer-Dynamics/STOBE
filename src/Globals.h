@@ -125,6 +125,7 @@ struct QueuedAction {
   std::string message;    // Item name or notification text
   std::string targetToken; // Optional text fallback for explicit target resolution
   std::string ttsHash; // Optional soundcache hash for line-level TTS playback
+  std::string utteranceId; // Delivery-tracked AI speech chunk id
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
@@ -156,6 +157,8 @@ struct NameCheckItem {
 };
 extern std::deque<NameCheckItem> g_nameCheckQueue;
 extern CRITICAL_SECTION g_nameCheckMutex;
+extern std::set<unsigned int> g_identityRenameCompletedSerials;
+extern std::map<unsigned int, DWORD> g_identityRenameNextAttemptTick;
 extern std::set<unsigned int> g_renamedSerials;
 extern std::set<unsigned int> g_activatedAnimalSerials;
 extern DWORD g_lastContextPushTick;

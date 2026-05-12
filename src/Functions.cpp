@@ -5474,6 +5474,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         bool isPC = target->isPlayerCharacter();
         float appliedBubbleDuration = 0.0f;
         bool forcedSayFallback = false;
+        bool speechExecuted = false;
         Character *listenerForFacing = nullptr;
         std::string explicitTalkTargetToken = TrimCopySimple(act.targetToken);
         if (!explicitTalkTargetToken.empty()) {
@@ -5498,6 +5499,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
           // Primary method: sayALine (supports multiple lines/delays)
           target->sayALine(act.message, !isPC);
+          speechExecuted = true;
           if (listenerForFacing) {
             TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
           }
@@ -5600,6 +5602,13 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             speechDelayMs = ResolveSpeechQueueDelayMs(act);
           }
         }
+        if (speechExecuted) {
+          if (!act.utteranceId.empty()) {
+            PostSpeechDeliveryState(act.utteranceId, "spoken");
+          }
+        } else if (!act.utteranceId.empty()) {
+          PostSpeechDeliveryState(act.utteranceId, "cancelled");
+        }
       } else if (act.type == ACT_PLAY_TTS && target &&
                  !IsCharacterUnavailableForDialogue(target)) {
         float appliedBubbleDuration = 0.0f;
@@ -5683,6 +5692,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         Log("ACTION_EXEC: Skipping speech for unavailable target " +
             SafeCharacterName(target) + " action_type=" + ToString((int)act.type));
         ClearCharacterSpeechBubble(target);
+        if (act.type == ACT_SAY && !act.utteranceId.empty()) {
+          PostSpeechDeliveryState(act.utteranceId, "cancelled");
+        }
+      } else if (act.type == ACT_SAY || act.type == ACT_PLAY_TTS) {
+        Log("ACTION_EXEC: Skipping speech with unresolved target action_type=" +
+            ToString((int)act.type));
+        if (act.type == ACT_SAY && !act.utteranceId.empty()) {
+          PostSpeechDeliveryState(act.utteranceId, "cancelled");
+        }
       } else if (npc) {
         if (act.type != ACT_SUICIDE && IsCharacterUnavailableForDialogue(npc)) {
           Log("ACTION_EXEC: Skipping action for unavailable actor " +

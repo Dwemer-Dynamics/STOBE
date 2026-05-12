@@ -7,7 +7,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(stobe_portable_tests
   stobe_text_tests.cpp
+  ../../src/StobeIdentityRename.cpp
   ../../src/StobeText.cpp
+  ../../src/StobeTiming.cpp
 )
 
 target_include_directories(stobe_portable_tests PRIVATE

@@ -21,6 +21,7 @@
 #include "Functions.h"
 #include "AudioPlayback.h"
 #include "Globals.h"
+#include "StobeIdentityRename.h"
 #include "Utils.h"
 
 #include <kenshi/CharStats.h>
@@ -601,13 +602,25 @@ static void QueueIdentityRenameCandidate(Character *other,
   } catch (...) {
     return;
   }
-  if (otherName.empty()) {
+  if (!Stobe::IdentityRename::IsQueueEligibleName(otherName)) {
     return;
   }
 
+  DWORD nowTick = GetTickCount();
   EnterCriticalSection(&g_nameCheckMutex);
-  bool alreadyDone = (g_renamedSerials.count(serial) > 0);
+  bool alreadyDone = (g_identityRenameCompletedSerials.count(serial) > 0);
+  auto nextAttemptIt = g_identityRenameNextAttemptTick.find(serial);
+  DWORD nextAttemptTick =
+      (nextAttemptIt == g_identityRenameNextAttemptTick.end())
+          ? 0
+          : nextAttemptIt->second;
+  bool attemptReady =
+      Stobe::IdentityRename::IsAttemptReady(nowTick, nextAttemptTick);
   if (alreadyDone) {
+    LeaveCriticalSection(&g_nameCheckMutex);
+    return;
+  }
+  if (!attemptReady) {
     LeaveCriticalSection(&g_nameCheckMutex);
     return;
   }
@@ -655,10 +668,9 @@ static void QueueIdentityRenameCandidate(Character *other,
 
   EnterCriticalSection(&g_nameCheckMutex);
   g_nameCheckQueue.push_back(item);
+  g_identityRenameNextAttemptTick[serial] =
+      Stobe::IdentityRename::ResolveQueuedAttemptDeadline(nowTick);
   LeaveCriticalSection(&g_nameCheckMutex);
-
-  Log("NAME_ASSIGN: queued identity check reason=" + reason + " serial=" +
-      ToString(serial) + " name=" + otherName);
 }
 
 static std::string TrimCopy(const std::string &value) {
@@ -1520,6 +1532,44 @@ static int ExtractTrailingTtsDurationMs(std::string &message) {
   return durationMs;
 }
 
+static std::string ExtractTrailingUtteranceId(std::string &message) {
+  std::string trimmed = TrimCopy(message);
+  size_t markerPos = trimmed.rfind("[UTTERANCEID:");
+  if (markerPos == std::string::npos) {
+    message = trimmed;
+    return "";
+  }
+
+  size_t endPos = trimmed.find(']', markerPos);
+  if (endPos == std::string::npos || endPos != trimmed.size() - 1) {
+    message = trimmed;
+    return "";
+  }
+
+  size_t valuePos = markerPos + 13;
+  std::string utteranceId =
+      TrimCopy(trimmed.substr(valuePos, endPos - valuePos));
+  if (utteranceId.empty() || utteranceId.length() > 80) {
+    message = trimmed;
+    return "";
+  }
+
+  for (size_t i = 0; i < utteranceId.length(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(utteranceId[i]);
+    bool isSafe =
+        (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+    if (!isSafe) {
+      message = trimmed;
+      return "";
+    }
+  }
+
+  trimmed.erase(markerPos);
+  message = TrimCopy(trimmed);
+  return utteranceId;
+}
+
 static std::string ExtractDialogueMessageFromStructuredText(
     const std::string &rawText) {
   std::string candidate = TrimCopy(rawText);
@@ -1710,8 +1760,11 @@ static std::map<unsigned int, DWORD> g_portraitSpeechTriggerBySerial;
 static std::map<std::string, ItemImageSyncState> g_itemImageSyncStateByItemId;
 static std::deque<PendingItemImageSyncRequest> g_itemImageSyncRequestQueue;
 static hand g_pendingSelectionContextHand;
+static unsigned int g_pendingSelectionContextSerial = 0;
 static DWORD g_pendingSelectionContextQueuedTick = 0;
+static unsigned int g_lastSelectionSerial = 0;
 static DWORD g_lastSelectionContextPushedTick = 0;
+static unsigned int g_lastSelectionContextPushedSerial = 0;
 static DWORD g_lastInventorySweepTick = 0;
 static const DWORD kInventorySweepIntervalMs = 6000;
 static const DWORD kInventoryMinResendMs = 1200;
@@ -1749,6 +1802,9 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
+static DWORD g_lastIdentityRenameSweepTick = 0;
+static const DWORD kIdentityRenameSweepIntervalMs = 2500;
+static const size_t kIdentityRenameSweepCandidateLimit = 24;
 static DWORD g_lastInfoNpcTelemetryCheckTick = 0;
 static DWORD g_lastInfoNpcTelemetrySentTick = 0;
 static std::string g_lastInfoNpcTelemetryDigest = "";
@@ -6836,6 +6892,45 @@ static void AppendInfonpcCandidate(std::vector<InfoNearbyNpcCandidate> &out,
   row.distance = dist;
   out.push_back(row);
   seen.insert(serial);
+  QueueIdentityRenameCandidate(candidate, "infonpc_scan");
+}
+
+static void PrimeNearbyIdentityRenames(GameWorld *world, Character *player,
+                                       Character *selection) {
+  if (!world || !player || (uintptr_t)player < 0x1000) {
+    return;
+  }
+
+  float scanRange = g_boredEventRange;
+  if (scanRange < 80.0f) {
+    scanRange = 80.0f;
+  } else if (scanRange > 600.0f) {
+    scanRange = 600.0f;
+  }
+
+  std::vector<InfoNearbyNpcCandidate> candidates;
+  std::set<unsigned int> seen;
+  candidates.reserve(kIdentityRenameSweepCandidateLimit);
+
+  AppendInfonpcCandidate(candidates, seen, selection, player);
+  Character *talkTarget = nullptr;
+  try {
+    talkTarget = g_talkTargetHand.getCharacter();
+  } catch (...) {
+    talkTarget = nullptr;
+  }
+  AppendInfonpcCandidate(candidates, seen, talkTarget, player);
+
+  lektor<RootObject *> nearby;
+  world->getCharactersWithinSphere(nearby, player->getPosition(), scanRange, 0.0f,
+                                   0.0f, 16, 0, player);
+  for (uint32_t i = 0; i < nearby.size(); ++i) {
+    Character *other = (Character *)nearby.stuff[i];
+    AppendInfonpcCandidate(candidates, seen, other, player);
+    if (candidates.size() >= kIdentityRenameSweepCandidateLimit) {
+      break;
+    }
+  }
 }
 
 static bool BuildInfonpcPayload(GameWorld *world, Character *player,
@@ -6938,6 +7033,11 @@ static void RunInfoTelemetrySweep(GameWorld *world, Character *selection) {
   }
 
   DWORD nowTick = GetTickCount();
+  if (nowTick - g_lastIdentityRenameSweepTick >=
+      kIdentityRenameSweepIntervalMs) {
+    g_lastIdentityRenameSweepTick = nowTick;
+    PrimeNearbyIdentityRenames(world, player, selection);
+  }
   if (nowTick - g_lastInfoLocTelemetryCheckTick >=
       kInfoLocTelemetryCheckIntervalMs) {
     g_lastInfoLocTelemetryCheckTick = nowTick;
@@ -10859,6 +10959,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         if (!structuredMessage.empty()) {
           bubbleContent = structuredMessage;
         }
+        std::string utteranceId = ExtractTrailingUtteranceId(bubbleContent);
         int ttsDurationMs = ExtractTrailingTtsDurationMs(bubbleContent);
         std::string ttsHash = ExtractTrailingTtsHash(bubbleContent);
         std::string talkTargetToken = ExtractTalkTargetToken(bubbleContent);
@@ -10866,6 +10967,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         bubbleContent = StripDanglingTrailingClosingBrackets(bubbleContent);
         const bool hadStructuredMessage = !structuredMessage.empty();
         const bool hadTtsMetadata = !ttsHash.empty() || ttsDurationMs > 0;
+        const bool hadAiDeliveryMetadata = !utteranceId.empty();
         if (!g_ttsEnabled) {
           ttsDurationMs = 0;
           ttsHash.clear();
@@ -10884,6 +10986,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             bubbleContent = "";
           else if (isNPCSay && bubbleContent.find("[DEBUG]") == 0)
             bubbleContent = "";
+        }
+        if (bubbleContent.empty() && !utteranceId.empty()) {
+          PostSpeechDeliveryState(utteranceId, "cancelled");
         }
 
         if (!bubbleContent.empty()) {
@@ -10927,7 +11032,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                                       isNPCSay ? "dialogue_npc" : "dialogue_player");
           }
 
-          bool trackAsNonAiDialogue = !hadStructuredMessage && !hadTtsMetadata;
+          bool trackAsNonAiDialogue =
+              !hadStructuredMessage && !hadTtsMetadata && !hadAiDeliveryMetadata;
           std::string nonAiDialogueLine = bubbleContent;
           if (trackAsNonAiDialogue) {
             nonAiDialogueLine = SanitizeCapturedDialogueLine(nonAiDialogueLine);
@@ -11006,6 +11112,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.message = bubbleContent;
             act.targetToken = talkTargetToken;
             act.ttsHash = ttsHash;
+            act.utteranceId = utteranceId;
             int speechTimingMs = ttsDurationMs;
             if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
                 ttsDurationMs <= 0) {
@@ -11018,11 +11125,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LeaveCriticalSection(&g_uiMutex);
             Log("TIMING_META: queued ACT_SAY target=" +
                 (tc ? tc->getName() : "Unknown") +
+                " utterance_id=" + utteranceId +
                 " tts_hash=" + (ttsHash.empty() ? "" : ttsHash.substr(0, 8)) +
                 " tts_dur_ms=" + ToString(ttsDurationMs) +
                 " player_tts_wait_hint=" +
                 std::string(speechTimingMs < 0 ? "1" : "0"));
           } else {
+            if (!utteranceId.empty()) {
+              PostSpeechDeliveryState(utteranceId, "cancelled");
+            }
             Log("HOOK_MSG_PROC: SAY fallback logged without target hand actor=" +
                 std::string(tc ? tc->getName() : "Unknown"));
           }
@@ -11884,6 +11995,7 @@ static Character *ResolveSelectedCharacterSehSafe(PlayerInterface *thisptr) {
 static void ClearPendingSelectionContextPush() {
   EnterCriticalSection(&g_stateMutex);
   g_pendingSelectionContextHand = hand();
+  g_pendingSelectionContextSerial = 0;
   g_pendingSelectionContextQueuedTick = 0;
   LeaveCriticalSection(&g_stateMutex);
 }
@@ -11893,9 +12005,23 @@ static void QueueSelectionContextPush(const hand &selectionHand) {
     ClearPendingSelectionContextPush();
     return;
   }
+  DWORD nowTick = GetTickCount();
   EnterCriticalSection(&g_stateMutex);
+  if (g_pendingSelectionContextSerial == selectionHand.serial &&
+      g_pendingSelectionContextQueuedTick != 0) {
+    LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
+  if (g_lastSelectionContextPushedSerial == selectionHand.serial &&
+      g_lastSelectionContextPushedTick != 0 &&
+      (nowTick - g_lastSelectionContextPushedTick) <
+          kSelectionContextMinIntervalMs) {
+    LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
   g_pendingSelectionContextHand = selectionHand;
-  g_pendingSelectionContextQueuedTick = GetTickCount();
+  g_pendingSelectionContextSerial = selectionHand.serial;
+  g_pendingSelectionContextQueuedTick = nowTick;
   LeaveCriticalSection(&g_stateMutex);
 }
 
@@ -11918,15 +12044,18 @@ static void RunPendingSelectionContextPush(Character *sel,
   }
 
   hand pendingHand;
+  unsigned int pendingSerial = 0;
   DWORD queuedTick = 0;
   DWORD lastPushedTick = 0;
   EnterCriticalSection(&g_stateMutex);
   pendingHand = g_pendingSelectionContextHand;
+  pendingSerial = g_pendingSelectionContextSerial;
   queuedTick = g_pendingSelectionContextQueuedTick;
   lastPushedTick = g_lastSelectionContextPushedTick;
   LeaveCriticalSection(&g_stateMutex);
 
-  if (!pendingHand.isValid() || pendingHand != selectionHand || queuedTick == 0) {
+  if (!pendingHand.isValid() || pendingSerial == 0 ||
+      pendingSerial != selectionHand.serial || queuedTick == 0) {
     return;
   }
   if (nowTick - queuedTick < kSelectionContextDebounceMs) {
@@ -11955,10 +12084,12 @@ static void RunPendingSelectionContextPush(Character *sel,
   AsyncPostToStobe(L"/gamedata", selectedGameData);
 
   EnterCriticalSection(&g_stateMutex);
-  if (g_pendingSelectionContextHand == selectionHand) {
+  if (g_pendingSelectionContextSerial == selectionHand.serial) {
     g_pendingSelectionContextHand = hand();
+    g_pendingSelectionContextSerial = 0;
     g_pendingSelectionContextQueuedTick = 0;
     g_lastSelectionContextPushedTick = nowTick;
+    g_lastSelectionContextPushedSerial = selectionHand.serial;
   }
   LeaveCriticalSection(&g_stateMutex);
 }
@@ -12031,8 +12162,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_itemImageLastRunTick = 0;
       g_worldStableSinceTick = 0;
       g_pendingSelectionContextHand = hand();
+      g_pendingSelectionContextSerial = 0;
       g_pendingSelectionContextQueuedTick = 0;
+      g_lastSelectionSerial = 0;
       g_lastSelectionContextPushedTick = 0;
+      g_lastSelectionContextPushedSerial = 0;
       g_activeInventoryJson = "[]";
       g_playerInventoryJson = "[]";
       g_lastInventoryHand = hand();
@@ -12082,8 +12216,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     EnterCriticalSection(&g_stateMutex);
     g_worldStableSinceTick = worldBecameStableTick;
     g_pendingSelectionContextHand = hand();
+    g_pendingSelectionContextSerial = 0;
     g_pendingSelectionContextQueuedTick = 0;
+    g_lastSelectionSerial = 0;
     g_lastSelectionContextPushedTick = 0;
+    g_lastSelectionContextPushedSerial = 0;
     LeaveCriticalSection(&g_stateMutex);
     heavySweepPrimed = false;
     motdAutoOpenQueued = false;
@@ -12164,8 +12301,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   bool selectionChanged = false;
   hand currentSelectionHand;
   bool hasSelectionHandle = TryGetCharacterHandleSafe(sel, currentSelectionHand);
-  if (hasSelectionHandle) {
-    if (currentSelectionHand != g_lastSelectionHand) {
+  if (hasSelectionHandle && currentSelectionHand.serial != 0) {
+    if (currentSelectionHand.serial != g_lastSelectionSerial) {
       std::string selectedName = "";
       try {
         selectedName = sel->getName();
@@ -12173,11 +12310,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         selectedName = "";
       }
       g_activeCharName = selectedName;
+      g_lastSelectionSerial = currentSelectionHand.serial;
       g_lastSelectionHand = currentSelectionHand;
       selectionChanged = true;
+    } else {
+      g_lastSelectionHand = currentSelectionHand;
     }
-  } else if (g_lastSelectionHand.isValid()) {
+  } else if (g_lastSelectionSerial != 0 || g_lastSelectionHand.isValid()) {
     g_activeCharName = "";
+    g_lastSelectionSerial = 0;
     g_lastSelectionHand = hand();
     selectionChanged = true;
   }
@@ -12432,7 +12573,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 DWORD WINAPI RenameWorker(LPVOID lpParam) {
   // Wait for server to be fully ready
   Sleep(8000);
-  Log("NAME_ASSIGN: Background name-assignment thread started.");
 
   while (true) {
     std::vector<NameCheckItem> batch;
@@ -12470,6 +12610,15 @@ DWORD WINAPI RenameWorker(LPVOID lpParam) {
     std::string resp =
         PostToStobeWithResponse(L"/get_batch_identities", reqJson);
     if (resp.empty()) {
+      DWORD retryTick =
+          Stobe::IdentityRename::ResolveRetryAttemptDeadline(GetTickCount());
+      EnterCriticalSection(&g_nameCheckMutex);
+      for (size_t i = 0; i < batch.size(); ++i) {
+        if (g_identityRenameCompletedSerials.count(batch[i].serial) == 0) {
+          g_identityRenameNextAttemptTick[batch[i].serial] = retryTick;
+        }
+      }
+      LeaveCriticalSection(&g_nameCheckMutex);
       continue;
     }
 
@@ -12482,15 +12631,36 @@ DWORD WINAPI RenameWorker(LPVOID lpParam) {
     }
 
     if (parsedResp.empty() || parsedResp == "[]") {
+      DWORD retryTick =
+          Stobe::IdentityRename::ResolveRetryAttemptDeadline(GetTickCount());
+      EnterCriticalSection(&g_nameCheckMutex);
+      for (size_t i = 0; i < batch.size(); ++i) {
+        if (g_identityRenameCompletedSerials.count(batch[i].serial) == 0) {
+          g_identityRenameNextAttemptTick[batch[i].serial] = retryTick;
+        }
+      }
+      LeaveCriticalSection(&g_nameCheckMutex);
       continue;
     }
     if (parsedResp[0] != '[') {
       std::string snippet = parsedResp.substr(0, std::min<size_t>(120, parsedResp.size()));
       Log("NAME_ASSIGN: Skipping malformed batch identity response: " + snippet);
+      DWORD retryTick =
+          Stobe::IdentityRename::ResolveRetryAttemptDeadline(GetTickCount());
+      EnterCriticalSection(&g_nameCheckMutex);
+      for (size_t i = 0; i < batch.size(); ++i) {
+        if (g_identityRenameCompletedSerials.count(batch[i].serial) == 0) {
+          g_identityRenameNextAttemptTick[batch[i].serial] = retryTick;
+        }
+      }
+      LeaveCriticalSection(&g_nameCheckMutex);
       continue;
     }
 
     int assignedCount = 0;
+    std::set<unsigned int> responseSerials;
+    DWORD retryTick =
+        Stobe::IdentityRename::ResolveRetryAttemptDeadline(GetTickCount());
     size_t pos = 0;
     while ((pos = parsedResp.find("{", pos)) != std::string::npos) {
       size_t endPos = parsedResp.find("}", pos);
@@ -12502,30 +12672,53 @@ DWORD WINAPI RenameWorker(LPVOID lpParam) {
       std::string sSerial = JsonReadField(obj, "serial");
       std::string status = JsonReadField(obj, "status");
       unsigned int serial = (unsigned int)strtoul(sSerial.c_str(), NULL, 10);
+      if (serial == 0) {
+        continue;
+      }
+      responseSerials.insert(serial);
 
-      bool markDone = false;
-      if (status == "rename") {
+      Stobe::IdentityRename::BatchStatus batchStatus =
+          Stobe::IdentityRename::ParseBatchStatus(status);
+      if (batchStatus == Stobe::IdentityRename::BATCH_STATUS_RENAME) {
         std::string newName = JsonReadField(obj, "new_name");
         if (!newName.empty()) {
           std::string renameMsg = "NPC_RENAME: " + sSerial + "|" + newName;
           EnterCriticalSection(&g_msgMutex);
           g_messageQueue.push_back(renameMsg);
           LeaveCriticalSection(&g_msgMutex);
-          Log("NAME_ASSIGN: queued runtime rename serial=" + sSerial +
-              " new_name=" + newName);
           assignedCount++;
-          markDone = true;
+        } else {
+          batchStatus = Stobe::IdentityRename::BATCH_STATUS_RETRY;
         }
       }
 
-      // Only mark complete when a rename has actually been assigned so
-      // transient server-side conflicts can retry later.
-      if (markDone) {
-        EnterCriticalSection(&g_nameCheckMutex);
+      EnterCriticalSection(&g_nameCheckMutex);
+      if (batchStatus == Stobe::IdentityRename::BATCH_STATUS_RENAME) {
         g_renamedSerials.insert(serial);
-        LeaveCriticalSection(&g_nameCheckMutex);
+        g_identityRenameCompletedSerials.insert(serial);
+        g_identityRenameNextAttemptTick.erase(serial);
+      } else if (batchStatus ==
+                 Stobe::IdentityRename::BATCH_STATUS_COMPLETE) {
+        g_identityRenameCompletedSerials.insert(serial);
+        g_identityRenameNextAttemptTick.erase(serial);
+      } else {
+        g_identityRenameNextAttemptTick[serial] = retryTick;
       }
+      LeaveCriticalSection(&g_nameCheckMutex);
+
     }
+
+    EnterCriticalSection(&g_nameCheckMutex);
+    for (size_t i = 0; i < batch.size(); ++i) {
+      unsigned int batchSerial = batch[i].serial;
+      if (batchSerial == 0 ||
+          responseSerials.count(batchSerial) > 0 ||
+          g_identityRenameCompletedSerials.count(batchSerial) > 0) {
+        continue;
+      }
+      g_identityRenameNextAttemptTick[batchSerial] = retryTick;
+    }
+    LeaveCriticalSection(&g_nameCheckMutex);
 
     /*
     if (assignedCount > 0) {

@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <windows.h>
 
 typedef bool (*StobeStreamLineCallback)(const std::string &line, void *userData);
@@ -22,6 +23,10 @@ std::string UrlEncode(const std::string &input);
 std::string BuildStreamQueryData(const std::string &eventType,
                                  const std::string &eventData,
                                  int gameTs = 0);
+void PostSpeechDeliveryState(const std::string &utteranceId,
+                             const std::string &deliveryState);
+void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
+                              const std::string &deliveryState);
 bool IsDwemerDistroConnected();
 DWORD GetDwemerDistroLastSuccessAgeMs();
 std::string GetStobeServerHomeUrl();
