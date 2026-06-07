@@ -2075,6 +2075,9 @@ static bool HasRecentDwemerDistroConnection(DWORD maxSuccessAgeMs) {
   return ageMs != 0xFFFFFFFF && ageMs <= maxSuccessAgeMs;
 }
 
+static bool ShouldDeferVisualSyncWhileInventoryVisible(
+    Character *npc, const char *syncTag, const std::string &reason);
+
 static bool ShouldAttemptPortraitCapture(const std::string &storageId,
                                          DWORD nowTick, bool force,
                                          const std::string &reason,
@@ -2374,6 +2377,10 @@ static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
   }
   if (storageId.empty()) {
     storageId = "hand_" + ToString((int)serial);
+  }
+  if (ShouldDeferVisualSyncWhileInventoryVisible(npc, "PORTRAIT_SYNC",
+                                                 reason)) {
+    return false;
   }
 
   DWORD nowTick = GetTickCount();
@@ -3120,6 +3127,23 @@ static bool IsNpcInventoryWindowVisible(Character *npc) {
   } catch (...) {
     return false;
   }
+}
+
+static bool ShouldDeferVisualSyncWhileInventoryVisible(
+    Character *npc, const char *syncTag, const std::string &reason) {
+  if (!IsNpcInventoryWindowVisible(npc)) {
+    return false;
+  }
+
+  static DWORD lastInventoryUiDeferLogTick = 0;
+  DWORD nowTick = GetTickCount();
+  if (syncTag && syncTag[0] != '\0' &&
+      nowTick - lastInventoryUiDeferLogTick >= 5000) {
+    lastInventoryUiDeferLogTick = nowTick;
+    Log(std::string(syncTag) +
+        ": deferred while inventory UI visible reason=" + reason);
+  }
+  return true;
 }
 
 static bool IsItemImageSyncReasonAllowed(const std::string &reason) {
@@ -3907,6 +3931,10 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
   if (!ShouldAllowItemImageSyncWork(reason, nullptr)) {
     return 0;
   }
+  if (ShouldDeferVisualSyncWhileInventoryVisible(npc, "ITEM_IMAGE_SYNC",
+                                                 reason)) {
+    return 0;
+  }
 
   DWORD nowTick = GetTickCount();
   EnterCriticalSection(&g_stateMutex);
@@ -4140,6 +4168,12 @@ static void RunQueuedItemImageSync() {
   }
 
   if (!ShouldRunItemImageSyncNow(peekReq.reason, false, nullptr)) {
+    return;
+  }
+  Character *peekNpc = ResolveCharacterFromHandSehSafe(peekReq.npcHand);
+  if (peekNpc && (uintptr_t)peekNpc > 0x1000 &&
+      ShouldDeferVisualSyncWhileInventoryVisible(peekNpc, "ITEM_IMAGE_SYNC",
+                                                 peekReq.reason)) {
     return;
   }
 
