@@ -1777,8 +1777,10 @@ static const DWORD kItemImageStateRetentionMs = 60 * 60 * 1000;
 static const DWORD kItemImageRunCooldownMs = 3 * 1000;
 static const DWORD kItemImageStartupDelayMs = 5 * 1000;
 static const DWORD kItemImageAttemptCooldownMs = 60 * 1000;
+static const DWORD kItemImageInventoryUiHideGraceMs = 15 * 1000;
 static const size_t kItemImageRequestQueueMax = 64;
 static DWORD g_itemImageLastRunTick = 0;
+static DWORD g_lastInventoryUiVisibleTick = 0;
 static DWORD g_worldStableSinceTick = 0;
 static volatile LONG g_portraitSehCount = 0;
 static DWORD g_portraitLastSehTick = 0;
@@ -2076,7 +2078,8 @@ static bool HasRecentDwemerDistroConnection(DWORD maxSuccessAgeMs) {
 }
 
 static bool ShouldDeferVisualSyncWhileInventoryVisible(
-    Character *npc, const char *syncTag, const std::string &reason);
+    Character *npc, const char *syncTag, const std::string &reason,
+    DWORD recentVisibleGraceMs = 0);
 
 static bool ShouldAttemptPortraitCapture(const std::string &storageId,
                                          DWORD nowTick, bool force,
@@ -2379,7 +2382,7 @@ static bool SyncPortraitForCharacterUnsafe(Character *npc, bool force,
     storageId = "hand_" + ToString((int)serial);
   }
   if (ShouldDeferVisualSyncWhileInventoryVisible(npc, "PORTRAIT_SYNC",
-                                                 reason)) {
+                                                 reason, 1500)) {
     return false;
   }
 
@@ -3122,6 +3125,7 @@ static bool IsNpcInventoryWindowVisible(Character *npc) {
   if (!inventoryGui || (uintptr_t)inventoryGui < 0x1000) {
     return false;
   }
+
   try {
     return inventoryGui->isVisible();
   } catch (...) {
@@ -3129,19 +3133,65 @@ static bool IsNpcInventoryWindowVisible(Character *npc) {
   }
 }
 
+static bool IsAnyPlayerInventoryWindowVisible() {
+  GameWorld *world = GetWorldSafe();
+  if (!world || !world->player) {
+    return false;
+  }
+
+  try {
+    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+      Character *playerChar = world->player->playerCharacters[i];
+      if (IsNpcInventoryWindowVisible(playerChar)) {
+        return true;
+      }
+    }
+  } catch (...) {
+    return false;
+  }
+
+  return false;
+}
+
+static bool IsAnyInventoryOrTradeUiVisible(Character *npc) {
+  return IsNpcInventoryWindowVisible(npc) ||
+         IsAnyPlayerInventoryWindowVisible();
+}
+
 static bool ShouldDeferVisualSyncWhileInventoryVisible(
-    Character *npc, const char *syncTag, const std::string &reason) {
-  if (!IsNpcInventoryWindowVisible(npc)) {
+    Character *npc, const char *syncTag, const std::string &reason,
+    DWORD recentVisibleGraceMs) {
+  DWORD nowTick = GetTickCount();
+  bool inventoryUiVisibleNow = IsAnyInventoryOrTradeUiVisible(npc);
+  DWORD lastVisibleTick = 0;
+
+  if (inventoryUiVisibleNow) {
+    EnterCriticalSection(&g_stateMutex);
+    g_lastInventoryUiVisibleTick = nowTick;
+    lastVisibleTick = g_lastInventoryUiVisibleTick;
+    LeaveCriticalSection(&g_stateMutex);
+  } else if (recentVisibleGraceMs != 0) {
+    EnterCriticalSection(&g_stateMutex);
+    lastVisibleTick = g_lastInventoryUiVisibleTick;
+    LeaveCriticalSection(&g_stateMutex);
+  }
+
+  bool inventoryUiRecentlyVisible =
+      !inventoryUiVisibleNow && recentVisibleGraceMs != 0 &&
+      lastVisibleTick != 0 &&
+      (nowTick - lastVisibleTick) < recentVisibleGraceMs;
+  if (!inventoryUiVisibleNow && !inventoryUiRecentlyVisible) {
     return false;
   }
 
   static DWORD lastInventoryUiDeferLogTick = 0;
-  DWORD nowTick = GetTickCount();
   if (syncTag && syncTag[0] != '\0' &&
       nowTick - lastInventoryUiDeferLogTick >= 5000) {
     lastInventoryUiDeferLogTick = nowTick;
     Log(std::string(syncTag) +
-        ": deferred while inventory UI visible reason=" + reason);
+        ": deferred while inventory UI " +
+        std::string(inventoryUiVisibleNow ? "visible" : "recently visible") +
+        " reason=" + reason);
   }
   return true;
 }
@@ -3182,6 +3232,12 @@ static bool ShouldAllowItemImageSyncWork(const std::string &reason,
                                          std::string *blockReasonOut = nullptr) {
   if (blockReasonOut) {
     *blockReasonOut = "";
+  }
+  if (!g_enableItemImageSync) {
+    if (blockReasonOut) {
+      *blockReasonOut = "setting_disabled";
+    }
+    return false;
   }
   if (g_itemImageSyncDisabledForSession) {
     if (blockReasonOut) {
@@ -3299,6 +3355,9 @@ static bool ShouldSendItemImageSync(const std::string &itemId,
 }
 
 static void QueueItemImageSyncRequest(Character *npc, const std::string &reason) {
+  if (!g_enableItemImageSync) {
+    return;
+  }
   if (!npc || (uintptr_t)npc < 0x1000) {
     return;
   }
@@ -3931,8 +3990,9 @@ static size_t SyncItemImagesForCharacterUnsafe(Character *npc, bool force,
   if (!ShouldAllowItemImageSyncWork(reason, nullptr)) {
     return 0;
   }
-  if (ShouldDeferVisualSyncWhileInventoryVisible(npc, "ITEM_IMAGE_SYNC",
-                                                 reason)) {
+    if (ShouldDeferVisualSyncWhileInventoryVisible(
+            npc, "ITEM_IMAGE_SYNC", reason,
+            kItemImageInventoryUiHideGraceMs)) {
     return 0;
   }
 
@@ -4151,6 +4211,12 @@ static Character *ResolveCharacterFromHandSehSafe(const hand &characterHand) {
 }
 
 static void RunQueuedItemImageSync() {
+  if (!g_enableItemImageSync) {
+    EnterCriticalSection(&g_stateMutex);
+    g_itemImageSyncRequestQueue.clear();
+    LeaveCriticalSection(&g_stateMutex);
+    return;
+  }
   if (g_itemImageSyncDisabledForSession) {
     return;
   }
@@ -4170,12 +4236,13 @@ static void RunQueuedItemImageSync() {
   if (!ShouldRunItemImageSyncNow(peekReq.reason, false, nullptr)) {
     return;
   }
-  Character *peekNpc = ResolveCharacterFromHandSehSafe(peekReq.npcHand);
-  if (peekNpc && (uintptr_t)peekNpc > 0x1000 &&
-      ShouldDeferVisualSyncWhileInventoryVisible(peekNpc, "ITEM_IMAGE_SYNC",
-                                                 peekReq.reason)) {
-    return;
-  }
+    Character *peekNpc = ResolveCharacterFromHandSehSafe(peekReq.npcHand);
+    if (peekNpc && (uintptr_t)peekNpc > 0x1000 &&
+        ShouldDeferVisualSyncWhileInventoryVisible(
+            peekNpc, "ITEM_IMAGE_SYNC", peekReq.reason,
+            kItemImageInventoryUiHideGraceMs)) {
+      return;
+    }
 
   PendingItemImageSyncRequest req;
   bool hasRequest = false;
@@ -12190,11 +12257,12 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
       EnterCriticalSection(&g_stateMutex);
-      g_inventorySyncStateBySerial.clear();
-      g_itemImageSyncStateByItemId.clear();
-      g_itemImageSyncRequestQueue.clear();
-      g_itemImageLastRunTick = 0;
-      g_worldStableSinceTick = 0;
+        g_inventorySyncStateBySerial.clear();
+        g_itemImageSyncStateByItemId.clear();
+        g_itemImageSyncRequestQueue.clear();
+        g_itemImageLastRunTick = 0;
+        g_lastInventoryUiVisibleTick = 0;
+        g_worldStableSinceTick = 0;
       g_pendingSelectionContextHand = hand();
       g_pendingSelectionContextSerial = 0;
       g_pendingSelectionContextQueuedTick = 0;
@@ -12246,9 +12314,10 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   if (!worldWasStable) {
     worldWasStable = true;
-    worldBecameStableTick = GetTickCount();
-    EnterCriticalSection(&g_stateMutex);
-    g_worldStableSinceTick = worldBecameStableTick;
+      worldBecameStableTick = GetTickCount();
+      EnterCriticalSection(&g_stateMutex);
+      g_lastInventoryUiVisibleTick = 0;
+      g_worldStableSinceTick = worldBecameStableTick;
     g_pendingSelectionContextHand = hand();
     g_pendingSelectionContextSerial = 0;
     g_pendingSelectionContextQueuedTick = 0;
