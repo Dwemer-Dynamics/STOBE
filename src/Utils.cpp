@@ -557,7 +557,7 @@ void LoadStobeRuntimeConfig() {
                         "EnableRegularDialogueCapture", 1) != 0;
   g_enableItemImageSync =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
-                        "EnableItemImageSync", 1) != 0;
+                        "EnableItemImageSync", 0) != 0;
   int boredEventIntervalHours = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
   if (boredEventIntervalHours < 1) {
