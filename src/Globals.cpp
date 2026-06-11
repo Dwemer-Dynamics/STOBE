@@ -35,6 +35,7 @@ int g_ttsVolumePercent = 100;
 bool g_ttsEnabled = true;
 bool g_speedDialogue = true;
 bool g_enableRegularDialogueCapture = false;
+bool g_enableItemImageSync = false;
 int g_dynamicProfileIntervalHours = 24;
 
 std::string g_activeInventoryJson = "[]";
