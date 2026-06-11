@@ -41,6 +41,7 @@ MyGUI::Button *g_animalTalksToggle = nullptr;
 MyGUI::Button *g_ttsToggle = nullptr;
 MyGUI::Button *g_speedDialogueToggle = nullptr;
 MyGUI::Button *g_regularDialogueToggle = nullptr;
+MyGUI::Button *g_itemImageSyncToggle = nullptr;
 
 bool g_pendingAutoChat = false;
 bool g_pendingBoredEvents = true;
@@ -49,6 +50,7 @@ bool g_pendingNearestSpeaker = true;
 bool g_pendingTtsEnabled = true;
 bool g_pendingSpeedDialogue = true;
 bool g_pendingRegularDialogueCapture = true;
+bool g_pendingItemImageSync = true;
 
 int ClampInt(int value, int minValue, int maxValue) {
   if (value < minValue)
@@ -239,6 +241,7 @@ void LoadPendingFromRuntime() {
   g_pendingTtsEnabled = g_ttsEnabled;
   g_pendingSpeedDialogue = g_speedDialogue;
   g_pendingRegularDialogueCapture = g_enableRegularDialogueCapture;
+  g_pendingItemImageSync = g_enableItemImageSync;
 }
 
 void RefreshPluginSettingsUI() {
@@ -279,6 +282,8 @@ void RefreshPluginSettingsUI() {
                    g_pendingSpeedDialogue);
   SetToggleCaption(g_regularDialogueToggle, "Regular Dialogue",
                    g_pendingRegularDialogueCapture);
+  SetToggleCaption(g_itemImageSyncToggle, "Image Sync",
+                   g_pendingItemImageSync);
 }
 
 void OnSettingsSaveClick(MyGUI::Widget *sender) {
@@ -321,6 +326,7 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   g_ttsEnabled = g_pendingTtsEnabled;
   g_speedDialogue = g_pendingSpeedDialogue;
   g_enableRegularDialogueCapture = g_pendingRegularDialogueCapture;
+  g_enableItemImageSync = g_pendingItemImageSync;
 
   int talkRadius = ParseIntOrDefault(
       g_talkRadiusEdit ? g_talkRadiusEdit->getCaption() : "", (int)g_proximityRadius);
@@ -395,6 +401,15 @@ void OnPluginRegularDialogueToggleClick(MyGUI::Widget *sender) {
                    g_pendingRegularDialogueCapture);
 }
 
+void OnPluginItemImageSyncToggleClick(MyGUI::Widget *sender) {
+  g_pendingItemImageSync = !g_pendingItemImageSync;
+  g_enableItemImageSync = g_pendingItemImageSync;
+  SaveStobeRuntimeConfig();
+  SetToggleCaption(g_itemImageSyncToggle, "Image Sync", g_pendingItemImageSync);
+  Log("CONFIG: ItemImageSync toggled to " +
+      std::string(g_enableItemImageSync ? "ON" : "OFF") + " (saved)");
+}
+
 void OnSettingsOpenConfigClick(MyGUI::Widget *sender) {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -461,6 +476,7 @@ void CloseSettingsUI() {
   g_ttsToggle = nullptr;
   g_speedDialogueToggle = nullptr;
   g_regularDialogueToggle = nullptr;
+  g_itemImageSyncToggle = nullptr;
 }
 
 void OnSettingsWindowButtonPressed(MyGUI::Window *sender,
@@ -481,7 +497,7 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.225f, 0.08f, 0.55f, 0.62f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.225f, 0.08f, 0.55f, 0.68f, MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
@@ -493,14 +509,14 @@ void CreateSettingsUI() {
   const float fieldX = 0.52f;
   const float labelW = 0.45f;
   const float fieldW = 0.43f;
-  const float rowH = 0.055f;
-  const float rowGap = 0.006f;
-  const float rangeHintH = 0.04f;
-  const float rangeHintGap = 0.045f;
-  const float sectionGap = 0.015f;
-  const float toggleH = 0.07f;
-  const float actionBtnH = 0.08f;
-  const float toggleRowGap = 0.082f;
+  const float rowH = 0.05f;
+  const float rowGap = 0.004f;
+  const float rangeHintH = 0.035f;
+  const float rangeHintGap = 0.04f;
+  const float sectionGap = 0.01f;
+  const float toggleH = 0.06f;
+  const float actionBtnH = 0.07f;
+  const float toggleRowGap = 0.07f;
   float y = 0.03f;
 
   CreateLabel(client, labelX, y, labelW, rowH, "STOBE Settings Key",
@@ -628,6 +644,14 @@ void CreateSettingsUI() {
       "Stobe_Plugin_SpeedDialogueToggle");
   g_speedDialogueToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginSpeedDialogueToggleClick);
+  y += toggleRowGap;
+
+  g_itemImageSyncToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_ItemImageSyncToggle");
+  g_itemImageSyncToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginItemImageSyncToggleClick);
   y += toggleRowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Speaker Mode",

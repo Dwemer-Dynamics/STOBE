@@ -44,6 +44,7 @@ extern int g_ttsVolumePercent;
 extern bool g_ttsEnabled;
 extern bool g_speedDialogue;
 extern bool g_enableRegularDialogueCapture;
+extern bool g_enableItemImageSync;
 extern int g_dynamicProfileIntervalHours;
 
 // State tracking for inventory/debugger
