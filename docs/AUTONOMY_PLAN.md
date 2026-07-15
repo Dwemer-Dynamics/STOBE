@@ -1,6 +1,6 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phases 0-3 complete; Phase 4 next
+Status: Active implementation; Phases 0-3 accepted; Phase 4 implementation complete and live validation pending
 Last updated: 2026-07-15
 
 ## Objective
@@ -378,7 +378,7 @@ Each action requires a deterministic completion predicate, deadline, and failure
 | Travel | NPC reaches the destination radius and stops. | Path impossible, timeout, invalid destination, manual order. |
 | Use object | Expected object task becomes active and completes or exits normally. | Object unavailable, task rejected, timeout. |
 | First aid | Target is stabilized or the medical task completes. | No supplies, invalid target, task rejected, timeout. |
-| Rest | NPC enters the selected bed or sleeping object. | Bed unavailable, path failure, task rejected. |
+| Rest | Native rest order completes and live medical state reports fully rested. | Rest order unavailable, task rejected, or timeout. |
 | Flee | Immediate hostiles are beyond the safety threshold with no active pursuit. | Trapped, path failure, timeout. |
 | Pick up | NPC is carrying the requested target. | Invalid target, cannot carry, timeout. |
 | Stop carrying | NPC is no longer carrying anything. | Action rejected or timeout. |
@@ -577,6 +577,36 @@ disabled state.
 Exit criterion: the model can choose any registered action whose current preconditions pass, but cannot bypass the validated executor or execute stale commands.
 
 ### Phase 4: Survival Autonomy
+
+Implementation status (2026-07-15): complete and operator-accepted. Automated
+verification and available in-game acceptance checks pass. The server exposes typed
+`MOVE_NEARBY`, `FLEE`, `FIRST_AID`, and `REST` decisions only when normalized
+live telemetry satisfies their preconditions. Local movement and escape
+destinations are derived server-side, urgent survival choices are enforced,
+and first-aid targets are bound to observed runtime serials. All four commands
+are enabled by default in fresh installs and the idempotent database migration.
+
+The plugin revalidates identity, faction, threats, patient range and health,
+bed availability, and recovery state immediately before dispatch. It issues
+directly addressed Kenshi orders, uses `USE_BED_ORDER` against a validated free
+bed for rest, preserves jobs, runs movement at maximum order speed, cancels
+only its owned order, and reports deterministic completion, interruption,
+failure, or timeout. PHP contract, survival, and decision-ledger regressions,
+portable C++ protocol and monitor tests, and the full Kenshi-linked Release
+build pass.
+
+Live testing confirmed `MOVE_NEARBY` destination completion and `REST` bed
+selection through `fully_rested`. The first combat test exposed that a raw move
+order did not reliably disengage Kenshi combat and that a transient hostile-scan
+dropout could falsely complete `FLEE`. The executor now uses Kenshi's player
+combat-disengage movement path, and the monitor requires at least 20 metres of
+real displacement before loss of hostile detection can count as success. This
+fix is compiled and loaded in a restarted game. The restarted build confirmed
+that `FLEE` remains pending without a hostile instead of falsely completing,
+and `MOVE_NEARBY` still completed normally. Residual live-test coverage does
+not include post-fix combat disengagement or real-injury `FIRST_AID` execution
+because the final acceptance save exposed neither condition; their precondition,
+protocol, executor, and monitor paths are covered by automated regressions.
 
 - Implement `FIRST_AID`.
 - Implement `REST`.

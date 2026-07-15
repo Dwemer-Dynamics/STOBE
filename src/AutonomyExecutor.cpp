@@ -1,13 +1,17 @@
 #include "AutonomyExecutor.h"
 
 #include "KenshiAiCompat.h"
+#include "KenshiBuildingCompat.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cmath>
 
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/Character.h>
 #include <kenshi/GameWorld.h>
+#include <kenshi/MedicalSystem.h>
 
 namespace Stobe {
 namespace Autonomy {
@@ -82,6 +86,44 @@ DispatchResult DispatchDecision(GameWorld *world,
     return result;
   }
 
+  const Stobe::KenshiAi::CharacterSnapshot live =
+      Stobe::KenshiAi::CaptureCharacter(world, decision.runtimeSerial);
+  if (decision.command == DECISION_COMMAND_FLEE) {
+    bool hostileObserved = false;
+    for (size_t i = 0; i < live.nearbyActors.size(); ++i) {
+      if (live.nearbyActors[i].hostile && !live.nearbyActors[i].dead &&
+          live.nearbyActors[i].distance <= decision.safeRadius) {
+        hostileObserved = true;
+        break;
+      }
+    }
+    if (!hostileObserved) {
+      result.reason = "flee_threat_no_longer_present";
+      return result;
+    }
+  }
+  if (decision.command == DECISION_COMMAND_REST && live.fullyRested) {
+    result.reason = "already_fully_rested";
+    return result;
+  }
+  if (decision.command == DECISION_COMMAND_REST) {
+    for (size_t i = 0; i < live.nearbyActors.size(); ++i) {
+      if (live.nearbyActors[i].hostile && !live.nearbyActors[i].dead &&
+          live.nearbyActors[i].distance <= 70.0) {
+        result.reason = "rest_hostile_nearby";
+        return result;
+      }
+    }
+  }
+  Building *restBed = NULL;
+  if (decision.command == DECISION_COMMAND_REST) {
+    restBed = Stobe::KenshiAi::ResolveNearestRestBed(world, character, 250.0);
+    if (!restBed || reinterpret_cast<uintptr_t>(restBed) <= 0x1000) {
+      result.reason = "rest_bed_not_found";
+      return result;
+    }
+  }
+
   OrdersReceiver *orders = NULL;
   try {
     orders = character->getOrdersReciever();
@@ -106,19 +148,64 @@ DispatchResult DispatchDecision(GameWorld *world,
     return result;
   }
 
-  const TaskType task = decision.command == DECISION_COMMAND_IDLE
-                            ? IDLE
-                            : MOVE_CUS_ORDERED;
+  TaskType task = MOVE_CUS_ORDERED;
   Ogre::Vector3 location;
+  hand subject;
   try {
-    location = decision.command == DECISION_COMMAND_IDLE
-                   ? character->getPosition()
-                   : Ogre::Vector3(static_cast<float>(decision.x),
-                                   static_cast<float>(decision.y),
-                                   static_cast<float>(decision.z));
-    hand noSubject;
-    orders->addOrder(task, noSubject, location, false, false);
-    if (decision.command == DECISION_COMMAND_TRAVEL_LOCATION) {
+    location = character->getPosition();
+    if (decision.command == DECISION_COMMAND_IDLE) {
+      task = IDLE;
+    } else if (decision.command == DECISION_COMMAND_REST) {
+      task = USE_BED_ORDER;
+      subject = restBed->getHandle();
+      location = restBed->getPosition();
+    } else if (decision.command == DECISION_COMMAND_FIRST_AID) {
+      Character *target = Stobe::KenshiAi::ResolveCharacter(
+          world, decision.targetRuntimeSerial);
+      if (!IsCharacterValid(target) || !target->isPlayerCharacter() ||
+          target->isDead()) {
+        result.reason = "first_aid_target_invalid";
+        return result;
+      }
+      const Ogre::Vector3 targetPosition = target->getPosition();
+      const Ogre::Vector3 delta = targetPosition - character->getPosition();
+      if (std::sqrt(static_cast<double>(delta.x * delta.x + delta.y * delta.y +
+                                        delta.z * delta.z)) > 50.0) {
+        result.reason = "first_aid_target_out_of_range";
+        return result;
+      }
+      MedicalSystem *medical = target->getMedical();
+      if (!medical || reinterpret_cast<uintptr_t>(medical) <= 0x1000) {
+        result.reason = "first_aid_target_medical_unavailable";
+        return result;
+      }
+      const double fleshNeed = std::max(
+          0.0, static_cast<double>(medical->scoreFirstAidNeed(false)));
+      const double robotNeed = std::max(
+          0.0, static_cast<double>(medical->scoreFirstAidNeed(true)));
+      if (fleshNeed <= 0.05 && robotNeed <= 0.05) {
+        result.reason = "first_aid_no_longer_needed";
+        return result;
+      }
+      task = robotNeed > fleshNeed ? FIRST_AID_ROBOT : FIRST_AID_ORDER;
+      subject = target->getHandle();
+      location = targetPosition;
+    } else {
+      location = Ogre::Vector3(static_cast<float>(decision.x),
+                               static_cast<float>(decision.y),
+                               static_cast<float>(decision.z));
+    }
+    if (decision.command == DECISION_COMMAND_FLEE) {
+      // A raw move order does not reliably displace Kenshi's active combat goal.
+      // Use the same disengage/move path as a player-issued ground command.
+      character->endCombatMode();
+      character->playerMoveOrderDefault(NULL, NULL, location);
+    } else {
+      orders->addOrder(task, subject, location, false, false);
+    }
+    if (decision.command == DECISION_COMMAND_TRAVEL_LOCATION ||
+        decision.command == DECISION_COMMAND_MOVE_NEARBY ||
+        decision.command == DECISION_COMMAND_FLEE) {
       CharMovement *movement = character->getMovement();
       if (movement && reinterpret_cast<uintptr_t>(movement) > 0x1000) {
         movement->setDesiredSpeedOrders(RUN);

@@ -45,6 +45,10 @@ enum DecisionCommand {
   DECISION_COMMAND_NONE = 0,
   DECISION_COMMAND_IDLE,
   DECISION_COMMAND_TRAVEL_LOCATION,
+  DECISION_COMMAND_MOVE_NEARBY,
+  DECISION_COMMAND_FLEE,
+  DECISION_COMMAND_FIRST_AID,
+  DECISION_COMMAND_REST,
   DECISION_COMMAND_CATALOG_ACTION
 };
 
@@ -64,11 +68,13 @@ struct DecisionEnvelope {
   long long actionDeadlineTs;
   int idleDurationMs;
   long long locationZoneId;
+  unsigned int targetRuntimeSerial;
   std::string locationLabel;
   double x;
   double y;
   double z;
   double arrivalRadius;
+  double safeRadius;
 
   DecisionEnvelope();
 };

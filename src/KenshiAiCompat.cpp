@@ -1,5 +1,7 @@
 #include "KenshiAiCompat.h"
+#include "KenshiBuildingCompat.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 
@@ -7,6 +9,8 @@
 #include <kenshi/CharMovement.h>
 #include <kenshi/Character.h>
 #include <kenshi/GameWorld.h>
+#include <kenshi/MedicalSystem.h>
+#include <kenshi/RootObject.h>
 
 namespace Stobe {
 namespace KenshiAi {
@@ -39,21 +43,89 @@ Character *ResolveCharacterImpl(GameWorld *world, unsigned int serial) {
   return NULL;
 }
 
+Building *ResolveNearestRestBedImpl(GameWorld *world, Character *character,
+                                    double maxDistance) {
+  if (!world || !IsValidCharacter(character) || maxDistance <= 0.0) {
+    return NULL;
+  }
+  try {
+    if (character->inSomething == IN_BED && character->inWhat.isValid() &&
+        !character->inWhat.isNull()) {
+      Building *currentBed = character->inWhat.getBuilding();
+      if (currentBed && reinterpret_cast<uintptr_t>(currentBed) > 0x1000) {
+        return currentBed;
+      }
+    }
+  } catch (...) {
+  }
+
+  Building *best = NULL;
+  double bestDistance = maxDistance + 1.0;
+  try {
+    const Ogre::Vector3 origin = character->getPosition();
+    lektor<RootObject *> nearby;
+    world->getObjectsWithinSphere(nearby, origin,
+                                  static_cast<float>(maxDistance), BUILDING,
+                                  96, (RootObject *)character);
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      Building *candidate = (Building *)nearby.stuff[i];
+      if (!candidate || reinterpret_cast<uintptr_t>(candidate) <= 0x1000) {
+        continue;
+      }
+      try {
+        const BuildingFunction function = candidate->_NV_getSpecialFunction();
+        const TaskType defaultTask = candidate->_NV_getDefaultTask();
+        const bool bed = function == BF_BED || function == BF_SKELETON_BED ||
+                         defaultTask == USE_BED ||
+                         defaultTask == USE_BED_ORDER;
+        if (!bed || candidate->_NV_isDestroyed() ||
+            candidate->_NV_isBroken()) {
+          continue;
+        }
+        candidate->forceValidUsageNodesValidation();
+        if (!candidate->hasAnyGoodPositionMarkersLeft()) {
+          continue;
+        }
+        const Ogre::Vector3 delta = candidate->getPosition() - origin;
+        const double distance = std::sqrt(static_cast<double>(
+            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
+        if (distance <= maxDistance && distance < bestDistance) {
+          best = candidate;
+          bestDistance = distance;
+        }
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+  }
+  return best;
+}
+
 } // namespace
 
 NearbyActorSnapshot::NearbyActorSnapshot()
     : runtimeSerial(0), distance(0.0), playerCharacter(false), dead(false),
-      unconscious(false) {}
+      unconscious(false), hostile(false), fullyRested(true),
+      probablyDying(false), inBed(false), x(0.0), y(0.0), z(0.0),
+      overallHealth(1.0), bleedRate(0.0), firstAidNeed(0.0),
+      roboticAidNeed(0.0) {}
 
 CharacterSnapshot::CharacterSnapshot()
     : found(false), identityMatches(false), playerCharacter(false), dead(false),
       unconscious(false), hasOrdersReceiver(false), canTakeOrders(false),
       hasPlayerOrders(false), paused(false), moving(false), pathFailed(false),
-      carrying(false), carriedSerial(0), runtimeSerial(0), x(0.0), y(0.0),
-      z(0.0) {}
+      carrying(false), fullyRested(true), probablyDying(false), inBed(false),
+      restBedAvailable(false), carriedSerial(0), runtimeSerial(0), x(0.0), y(0.0), z(0.0),
+      overallHealth(1.0), blood(0.0), maxBlood(0.0), bleedRate(0.0),
+      firstAidNeed(0.0), roboticAidNeed(0.0) {}
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial) {
   return ResolveCharacterImpl(world, serial);
+}
+
+Building *ResolveNearestRestBed(GameWorld *world, Character *character,
+                                double maxDistance) {
+  return ResolveNearestRestBedImpl(world, character, maxDistance);
 }
 
 CharacterSnapshot CaptureCharacter(GameWorld *world,
@@ -85,6 +157,21 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
   }
   try {
     result.unconscious = character->isUnconcious();
+  } catch (...) {
+  }
+  try {
+    MedicalSystem *medical = character->getMedical();
+    if (medical && reinterpret_cast<uintptr_t>(medical) > 0x1000) {
+      result.fullyRested = medical->isFullyRested();
+      result.probablyDying = medical->isProbablyDying();
+      result.overallHealth = medical->getOverallHealthRating();
+      result.blood = medical->blood;
+      result.maxBlood = medical->getMaxBlood();
+      result.bleedRate = medical->currentBleedRate;
+      result.firstAidNeed = std::max(0.0, static_cast<double>(medical->scoreFirstAidNeed(false)));
+      result.roboticAidNeed = std::max(0.0, static_cast<double>(medical->scoreFirstAidNeed(true)));
+    }
+    result.inBed = character->inSomething == IN_BED;
   } catch (...) {
   }
   try {
@@ -125,6 +212,14 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
           result.order.taskType = static_cast<int>(IDLE);
         } else if (orders->hasPlayerOrder(MOVE_CUS_ORDERED)) {
           result.order.taskType = static_cast<int>(MOVE_CUS_ORDERED);
+        } else if (orders->hasPlayerOrder(FIRST_AID_ORDER)) {
+          result.order.taskType = static_cast<int>(FIRST_AID_ORDER);
+        } else if (orders->hasPlayerOrder(FIRST_AID_ROBOT)) {
+          result.order.taskType = static_cast<int>(FIRST_AID_ROBOT);
+        } else if (orders->hasPlayerOrder(USE_BED_ORDER)) {
+          result.order.taskType = static_cast<int>(USE_BED_ORDER);
+        } else if (orders->hasPlayerOrder(REST)) {
+          result.order.taskType = static_cast<int>(REST);
         }
       }
     }
@@ -155,7 +250,11 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
       try {
         nearby.runtimeSerial = candidate->getHandle().serial;
         nearby.name = candidate->getName();
-        const Ogre::Vector3 delta = candidate->getPosition() - actorPosition;
+        const Ogre::Vector3 candidatePosition = candidate->getPosition();
+        const Ogre::Vector3 delta = candidatePosition - actorPosition;
+        nearby.x = candidatePosition.x;
+        nearby.y = candidatePosition.y;
+        nearby.z = candidatePosition.z;
         nearby.distance = std::sqrt(static_cast<double>(delta.x * delta.x +
                                                         delta.y * delta.y +
                                                         delta.z * delta.z));
@@ -166,6 +265,17 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
         nearby.playerCharacter = candidate->isPlayerCharacter();
         nearby.dead = candidate->isDead();
         nearby.unconscious = candidate->isUnconcious();
+        nearby.hostile = character->isEnemy(candidate, true);
+        MedicalSystem *medical = candidate->getMedical();
+        if (medical && reinterpret_cast<uintptr_t>(medical) > 0x1000) {
+          nearby.fullyRested = medical->isFullyRested();
+          nearby.probablyDying = medical->isProbablyDying();
+          nearby.overallHealth = medical->getOverallHealthRating();
+          nearby.bleedRate = medical->currentBleedRate;
+          nearby.firstAidNeed = std::max(0.0, static_cast<double>(medical->scoreFirstAidNeed(false)));
+          nearby.roboticAidNeed = std::max(0.0, static_cast<double>(medical->scoreFirstAidNeed(true)));
+        }
+        nearby.inBed = candidate->inSomething == IN_BED;
         result.nearbyActors.push_back(nearby);
       } catch (...) {
       }

@@ -90,12 +90,16 @@ struct ActiveAction {
   int noProgressElapsedMs;
   bool progressInitialized;
   double bestDistance;
+  double startX;
+  double startY;
+  double startZ;
 
   ActiveAction()
       : active(false), lastMonitorTick(0), lastActiveTick(0),
         activeElapsedMs(0), deadlineMs(0), stationarySamples(0),
         pathFailedSamples(0), noProgressElapsedMs(0),
-        progressInitialized(false), bestDistance(0.0) {}
+        progressInitialized(false), bestDistance(0.0), startX(0.0),
+        startY(0.0), startZ(0.0) {}
 };
 
 struct ActiveCatalogAction {
@@ -204,6 +208,19 @@ void HashContextValue(unsigned long long &hash, unsigned long long value) {
   }
 }
 
+const char *TypedDecisionPhase(
+    Stobe::Autonomy::DecisionCommand command) {
+  switch (command) {
+  case Stobe::Autonomy::DECISION_COMMAND_MOVE_NEARBY:
+  case Stobe::Autonomy::DECISION_COMMAND_FLEE:
+  case Stobe::Autonomy::DECISION_COMMAND_FIRST_AID:
+  case Stobe::Autonomy::DECISION_COMMAND_REST:
+    return "PHASE4";
+  default:
+    return "PHASE2";
+  }
+}
+
 std::string BuildStableContextHash(const TickRequest &tick) {
   unsigned long long hash = 1469598103934665603ull;
   HashContextValue(hash, static_cast<unsigned long long>(tick.control.controlRevision));
@@ -220,15 +237,22 @@ std::string BuildStableContextHash(const TickRequest &tick) {
   HashContextValue(hash, tick.character.unconscious ? 1 : 0);
   HashContextValue(hash, tick.character.carrying ? 1 : 0);
   HashContextValue(hash, tick.character.carriedSerial);
+  HashContextValue(hash, static_cast<unsigned long long>(tick.character.firstAidNeed * 100.0));
+  HashContextValue(hash, static_cast<unsigned long long>(tick.character.roboticAidNeed * 100.0));
+  HashContextValue(hash, tick.character.fullyRested ? 1 : 0);
+  HashContextValue(hash, tick.character.restBedAvailable ? 1 : 0);
   for (size_t i = 0; i < tick.character.nearbyActors.size(); ++i) {
     const Stobe::KenshiAi::NearbyActorSnapshot &actor =
         tick.character.nearbyActors[i];
     HashContextValue(hash, actor.runtimeSerial);
     HashContextValue(hash, actor.dead ? 1 : 0);
     HashContextValue(hash, actor.unconscious ? 1 : 0);
+    HashContextValue(hash, actor.hostile ? 1 : 0);
+    HashContextValue(hash, static_cast<unsigned long long>(actor.firstAidNeed * 100.0));
+    HashContextValue(hash, static_cast<unsigned long long>(actor.roboticAidNeed * 100.0));
   }
   std::ostringstream result;
-  result << "phase3-" << hash;
+  result << "phase4-" << hash;
   return result.str();
 }
 
@@ -240,7 +264,7 @@ std::string BuildTickJson(const TickRequest &tick) {
        << Stobe::Text::EscapeJSON(tick.control.npcStorageId)
        << "\",\"runtime_serial\":" << tick.character.runtimeSerial
        << ",\"state\":\"" << Stobe::Text::EscapeJSON(tick.state)
-       << "\",\"observation\":\"phase_3_runtime_snapshot\""
+       << "\",\"observation\":\"phase_4_runtime_snapshot\""
        << ",\"event_key\":\"\",\"snapshot_sequence\":" << tick.sequence
        << ",\"snapshot_local_ts\":" << tick.localTs
        << ",\"game_ts\":" << tick.gameTs
@@ -261,6 +285,19 @@ std::string BuildTickJson(const TickRequest &tick) {
        << (tick.character.hasPlayerOrders ? "true" : "false")
        << ",\"carrying\":" << (tick.character.carrying ? "true" : "false")
        << ",\"carried_serial\":" << tick.character.carriedSerial
+       << ",\"in_bed\":" << (tick.character.inBed ? "true" : "false")
+       << ",\"fully_rested\":"
+       << (tick.character.fullyRested ? "true" : "false")
+       << ",\"probably_dying\":"
+       << (tick.character.probablyDying ? "true" : "false")
+       << ",\"rest_bed_available\":"
+       << (tick.character.restBedAvailable ? "true" : "false")
+       << "},\"health\":{\"overall\":" << tick.character.overallHealth
+       << ",\"blood\":" << tick.character.blood
+       << ",\"max_blood\":" << tick.character.maxBlood
+       << ",\"bleed_rate\":" << tick.character.bleedRate
+       << ",\"first_aid_need\":" << tick.character.firstAidNeed
+       << ",\"robotic_aid_need\":" << tick.character.roboticAidNeed
        << "},\"movement\":{\"moving\":"
        << (tick.character.moving ? "true" : "false")
        << ",\"path_failed\":"
@@ -280,11 +317,18 @@ std::string BuildTickJson(const TickRequest &tick) {
     item << "{\"name\":\"" << Stobe::Text::EscapeJSON(actor.name)
          << "\",\"runtime_serial\":" << actor.runtimeSerial
          << ",\"distance\":" << actor.distance
+         << ",\"x\":" << actor.x << ",\"y\":" << actor.y
+         << ",\"z\":" << actor.z
          << ",\"player_character\":"
          << (actor.playerCharacter ? "true" : "false")
          << ",\"dead\":" << (actor.dead ? "true" : "false")
          << ",\"unconscious\":"
-         << (actor.unconscious ? "true" : "false") << "}";
+         << (actor.unconscious ? "true" : "false")
+         << ",\"hostile\":" << (actor.hostile ? "true" : "false")
+         << ",\"overall_health\":" << actor.overallHealth
+         << ",\"bleed_rate\":" << actor.bleedRate
+         << ",\"first_aid_need\":" << actor.firstAidNeed
+         << ",\"robotic_aid_need\":" << actor.roboticAidNeed << "}";
     built += item.str();
   }
   built += "]}";
@@ -576,7 +620,8 @@ void ClearActiveAction(GameWorld *world, bool attemptCancel,
     const bool cancelled = Stobe::Autonomy::TryCancelOwnedOrder(
         world, g_active.decision.runtimeSerial, g_active.ownedOrder,
         cancelReason);
-    Log("AUTONOMY_PHASE2_CANCEL: decision=" + g_active.decision.decisionId +
+    Log(std::string("AUTONOMY_") + TypedDecisionPhase(g_active.decision.command) +
+        "_CANCEL: decision=" + g_active.decision.decisionId +
         " requested_reason=" + reason + " result=" +
         (cancelled ? "1" : "0") + " reason=" + cancelReason);
   }
@@ -600,7 +645,8 @@ void FinishActiveAction(GameWorld *world,
   const std::string outcomeName = Stobe::Autonomy::MonitorOutcomeName(outcome);
   QueueActionReport(control, decision, outcomeName, reason, elapsed, gameTs,
                     true);
-  Log("AUTONOMY_PHASE2_TERMINAL: decision=" + decision.decisionId +
+  Log(std::string("AUTONOMY_") + TypedDecisionPhase(decision.command) +
+      "_TERMINAL: decision=" + decision.decisionId +
       " command=" + decision.commandName + " outcome=" + outcomeName +
       " reason=" + reason + " elapsed_ms=" + ToString(elapsed));
   g_active = ActiveAction();
@@ -789,7 +835,11 @@ void UpdateAutonomyController(GameWorld *world) {
         g_active.pathFailedSamples = 0;
       }
       if (g_active.decision.command ==
-          Stobe::Autonomy::DECISION_COMMAND_TRAVEL_LOCATION) {
+              Stobe::Autonomy::DECISION_COMMAND_TRAVEL_LOCATION ||
+          g_active.decision.command ==
+              Stobe::Autonomy::DECISION_COMMAND_MOVE_NEARBY ||
+          g_active.decision.command ==
+              Stobe::Autonomy::DECISION_COMMAND_FLEE) {
         const double dx = character.x - g_active.decision.x;
         const double dy = character.y - g_active.decision.y;
         const double dz = character.z - g_active.decision.z;
@@ -798,6 +848,32 @@ void UpdateAutonomyController(GameWorld *world) {
             distance + 2.0 < g_active.bestDistance) {
           g_active.progressInitialized = true;
           g_active.bestDistance = distance;
+          g_active.noProgressElapsedMs = 0;
+        } else {
+          g_active.noProgressElapsedMs += static_cast<int>(delta);
+        }
+      } else if (g_active.decision.command ==
+                 Stobe::Autonomy::DECISION_COMMAND_FIRST_AID) {
+        double need = 0.0;
+        bool foundTarget = false;
+        if (g_active.decision.targetRuntimeSerial == character.runtimeSerial) {
+          need = std::max(character.firstAidNeed, character.roboticAidNeed);
+          foundTarget = true;
+        } else {
+          for (size_t i = 0; i < character.nearbyActors.size(); ++i) {
+            if (character.nearbyActors[i].runtimeSerial ==
+                g_active.decision.targetRuntimeSerial) {
+              need = std::max(character.nearbyActors[i].firstAidNeed,
+                              character.nearbyActors[i].roboticAidNeed);
+              foundTarget = true;
+              break;
+            }
+          }
+        }
+        if (foundTarget && (!g_active.progressInitialized ||
+                            need + 0.05 < g_active.bestDistance)) {
+          g_active.progressInitialized = true;
+          g_active.bestDistance = need;
           g_active.noProgressElapsedMs = 0;
         } else {
           g_active.noProgressElapsedMs += static_cast<int>(delta);
@@ -815,6 +891,11 @@ void UpdateAutonomyController(GameWorld *world) {
     facts.moving = character.moving;
     facts.pathFailed = character.pathFailed;
     facts.hasPlayerOrders = character.hasPlayerOrders;
+    facts.fullyRested = character.fullyRested;
+    facts.inBed = character.inBed;
+    facts.firstAidNeed = std::max(character.firstAidNeed,
+                                  character.roboticAidNeed);
+    facts.bleedRate = character.bleedRate;
     facts.pathFailedSamples = g_active.pathFailedSamples;
     facts.stationarySamples = g_active.stationarySamples;
     facts.activeElapsedMs = g_active.activeElapsedMs;
@@ -822,7 +903,36 @@ void UpdateAutonomyController(GameWorld *world) {
     facts.x = character.x;
     facts.y = character.y;
     facts.z = character.z;
+    const double fleeDx = character.x - g_active.startX;
+    const double fleeDy = character.y - g_active.startY;
+    const double fleeDz = character.z - g_active.startZ;
+    facts.fleeDistanceTravelled =
+        std::sqrt(fleeDx * fleeDx + fleeDy * fleeDy + fleeDz * fleeDz);
     facts.currentOrder = character.order;
+    facts.nearestHostileDistance = 1000000.0;
+    for (size_t i = 0; i < character.nearbyActors.size(); ++i) {
+      const Stobe::KenshiAi::NearbyActorSnapshot &actor =
+          character.nearbyActors[i];
+      if (actor.hostile && !actor.dead) {
+        facts.hostileObserved = true;
+        facts.nearestHostileDistance =
+            std::min(facts.nearestHostileDistance, actor.distance);
+      }
+      if (actor.runtimeSerial == g_active.decision.targetRuntimeSerial) {
+        facts.targetFound = true;
+        facts.targetDead = actor.dead;
+        facts.targetFirstAidNeed =
+            std::max(actor.firstAidNeed, actor.roboticAidNeed);
+        facts.targetBleedRate = actor.bleedRate;
+      }
+    }
+    if (g_active.decision.targetRuntimeSerial == character.runtimeSerial) {
+      facts.targetFound = true;
+      facts.targetDead = character.dead;
+      facts.targetFirstAidNeed =
+          std::max(character.firstAidNeed, character.roboticAidNeed);
+      facts.targetBleedRate = character.bleedRate;
+    }
     const Stobe::Autonomy::MonitorResult monitored =
         Stobe::Autonomy::EvaluateActionMonitor(
             g_active.decision, g_active.ownedOrder, facts,
@@ -973,6 +1083,9 @@ void UpdateAutonomyController(GameWorld *world) {
       g_active.decision = tickResult.decision;
       g_active.ownedOrder = dispatched.ownedOrder;
       g_active.lastActiveTick = GetTickCount();
+      g_active.startX = character.x;
+      g_active.startY = character.y;
+      g_active.startZ = character.z;
       const long long remaining =
           tickResult.decision.actionDeadlineTs -
           static_cast<long long>(time(NULL));
@@ -980,7 +1093,9 @@ void UpdateAutonomyController(GameWorld *world) {
           std::max<long long>(1, std::min<long long>(remaining, 3600)) * 1000);
       QueueActionReport(control, tickResult.decision, "DISPATCHED",
                         dispatched.reason, 0, gameTs, false);
-      Log("AUTONOMY_PHASE2_DISPATCH: decision=" +
+      Log(std::string("AUTONOMY_") +
+          TypedDecisionPhase(tickResult.decision.command) +
+          "_DISPATCH: decision=" +
           tickResult.decision.decisionId + " command=" +
           tickResult.decision.commandName + " serial=" +
           ToString(tickResult.decision.runtimeSerial) +
@@ -998,6 +1113,10 @@ void UpdateAutonomyController(GameWorld *world) {
     return;
   }
 
+  Character *restCandidate =
+      Stobe::KenshiAi::ResolveCharacter(world, character.runtimeSerial);
+  character.restBedAvailable = character.inBed ||
+      Stobe::KenshiAi::ResolveNearestRestBed(world, restCandidate, 250.0) != NULL;
   QueueTickRequest(control, character, gameTs);
   PublishRuntimeState(control, character.runtimeSerial, "DECIDING",
                       "planner_tick_requested", character.name, gameTs,

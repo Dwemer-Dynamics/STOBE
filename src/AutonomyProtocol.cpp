@@ -105,8 +105,9 @@ StateDecision::StateDecision(const std::string &stateValue,
 DecisionEnvelope::DecisionEnvelope()
     : valid(false), controlRevision(-1), npcId(0), runtimeSerial(0),
       command(DECISION_COMMAND_NONE), contextGameTs(0), dispatchDeadlineTs(0),
-      actionDeadlineTs(0), idleDurationMs(1500), locationZoneId(0), x(0.0),
-      y(0.0), z(0.0), arrivalRadius(8.0) {}
+      actionDeadlineTs(0), idleDurationMs(1500), locationZoneId(0),
+      targetRuntimeSerial(0), x(0.0), y(0.0), z(0.0), arrivalRadius(8.0),
+      safeRadius(70.0) {}
 
 bool ParseControlResponse(const std::string &response, ControlSnapshot &out) {
   ControlSnapshot parsed;
@@ -239,6 +240,14 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
     parsed.command = DECISION_COMMAND_IDLE;
   } else if (parsed.commandName == "TRAVEL_LOCATION") {
     parsed.command = DECISION_COMMAND_TRAVEL_LOCATION;
+  } else if (parsed.commandName == "MOVE_NEARBY") {
+    parsed.command = DECISION_COMMAND_MOVE_NEARBY;
+  } else if (parsed.commandName == "FLEE") {
+    parsed.command = DECISION_COMMAND_FLEE;
+  } else if (parsed.commandName == "FIRST_AID") {
+    parsed.command = DECISION_COMMAND_FIRST_AID;
+  } else if (parsed.commandName == "REST") {
+    parsed.command = DECISION_COMMAND_REST;
   } else if (IsCatalogCommand(parsed.commandName)) {
     parsed.command = DECISION_COMMAND_CATALOG_ACTION;
   }
@@ -260,16 +269,28 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
       Text::JsonReadField(arguments, "legacy_argument"));
   parsed.locationZoneId = ParseLongLong(
       Text::JsonReadField(arguments, "location_zone_id"), 0);
+  const long long targetRuntimeSerial = ParseLongLong(
+      Text::JsonReadField(arguments, "target_runtime_serial"), 0);
+  if (targetRuntimeSerial > 0 && targetRuntimeSerial <= 0xffffffffLL) {
+    parsed.targetRuntimeSerial = static_cast<unsigned int>(targetRuntimeSerial);
+  }
   parsed.locationLabel = Trim(Text::JsonReadField(arguments, "zone_name"));
   if (parsed.locationLabel.empty()) {
     parsed.locationLabel = Trim(Text::JsonReadField(arguments, "city_name"));
   }
-  if (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION) {
+  if (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION ||
+      parsed.command == DECISION_COMMAND_MOVE_NEARBY ||
+      parsed.command == DECISION_COMMAND_FLEE) {
     if (!ParseDouble(Text::JsonReadField(arguments, "x"), parsed.x) ||
         !ParseDouble(Text::JsonReadField(arguments, "y"), parsed.y) ||
         !ParseDouble(Text::JsonReadField(arguments, "z"), parsed.z) ||
         !ParseDouble(Text::JsonReadField(arguments, "arrival_radius"),
                      parsed.arrivalRadius)) {
+      return false;
+    }
+    if (parsed.command == DECISION_COMMAND_FLEE &&
+        !ParseDouble(Text::JsonReadField(arguments, "safe_radius"),
+                     parsed.safeRadius)) {
       return false;
     }
   }
@@ -282,11 +303,21 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
       parsed.actionDeadlineTs < parsed.dispatchDeadlineTs ||
       (parsed.command == DECISION_COMMAND_IDLE &&
        (parsed.idleDurationMs < 250 || parsed.idleDurationMs > 30000)) ||
-       (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION &&
+      (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION &&
        (parsed.locationZoneId <= 0 || parsed.arrivalRadius < 1.0 ||
         parsed.arrivalRadius > 100.0 || std::fabs(parsed.x) > 10000000.0 ||
         std::fabs(parsed.y) > 10000000.0 ||
          std::fabs(parsed.z) > 10000000.0)) ||
+      ((parsed.command == DECISION_COMMAND_MOVE_NEARBY ||
+        parsed.command == DECISION_COMMAND_FLEE) &&
+       (parsed.arrivalRadius < 1.0 || parsed.arrivalRadius > 100.0 ||
+        std::fabs(parsed.x) > 10000000.0 ||
+        std::fabs(parsed.y) > 10000000.0 ||
+        std::fabs(parsed.z) > 10000000.0)) ||
+      (parsed.command == DECISION_COMMAND_FLEE &&
+       (parsed.safeRadius < 10.0 || parsed.safeRadius > 500.0)) ||
+      (parsed.command == DECISION_COMMAND_FIRST_AID &&
+       parsed.targetRuntimeSerial == 0) ||
       (parsed.command == DECISION_COMMAND_CATALOG_ACTION &&
        parsed.actionArgument.size() > 1200)) {
     return false;

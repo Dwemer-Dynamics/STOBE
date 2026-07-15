@@ -328,6 +328,62 @@ int main() {
           invalidDecision, invalidPresent),
       false);
 
+  const std::string phase4Prefix =
+      "{\"ok\":true,\"phase\":4,\"decision\":{"
+      "\"decision_id\":\"phase4-typed\",\"control_revision\":7,"
+      "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+      "\"runtime_serial\":884422,";
+  const std::string phase4Suffix =
+      ",\"context_hash\":\"phase4-context\",\"context_game_ts\":1234,"
+      "\"dispatch_deadline_ts\":2000,\"action_deadline_ts\":3000}}";
+  DecisionEnvelope moveNearbyDecision;
+  bool phase4Present = false;
+  ExpectBool("Phase 4 parses MOVE_NEARBY",
+             ParseDecisionResponse(
+                 phase4Prefix +
+                     "\"command\":\"MOVE_NEARBY\",\"arguments\":{"
+                     "\"x\":25,\"y\":2,\"z\":10,\"arrival_radius\":4}" +
+                     phase4Suffix,
+                 moveNearbyDecision, phase4Present),
+             true);
+  ExpectUInt32("Phase 4 classifies MOVE_NEARBY as typed",
+               static_cast<unsigned int>(moveNearbyDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_MOVE_NEARBY));
+
+  DecisionEnvelope fleeDecision;
+  ExpectBool("Phase 4 parses FLEE",
+             ParseDecisionResponse(
+                 phase4Prefix +
+                     "\"command\":\"FLEE\",\"arguments\":{\"x\":80,"
+                     "\"y\":2,\"z\":20,\"arrival_radius\":6,"
+                     "\"safe_radius\":70}" + phase4Suffix,
+                 fleeDecision, phase4Present),
+             true);
+  ExpectUInt32("Phase 4 classifies FLEE as typed",
+               static_cast<unsigned int>(fleeDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_FLEE));
+
+  DecisionEnvelope firstAidDecision;
+  ExpectBool("Phase 4 parses FIRST_AID",
+             ParseDecisionResponse(
+                 phase4Prefix +
+                     "\"command\":\"FIRST_AID\",\"arguments\":{"
+                     "\"target_runtime_serial\":9911}" + phase4Suffix,
+                 firstAidDecision, phase4Present),
+             true);
+  ExpectUInt32("Phase 4 binds FIRST_AID target serial",
+               firstAidDecision.targetRuntimeSerial, 9911);
+
+  DecisionEnvelope restDecision;
+  ExpectBool("Phase 4 parses REST",
+             ParseDecisionResponse(phase4Prefix +
+                                       "\"command\":\"REST\","
+                                       "\"arguments\":{}" + phase4Suffix,
+                                   restDecision, phase4Present),
+             true);
+
   static const char *phase3CatalogCommands[] = {
       "ATTACK",       "SUICIDE",          "FOLLOW",
       "STOP_FOLLOW",  "JOIN_PARTY",       "LEAVE",
@@ -483,6 +539,95 @@ int main() {
                                     20000)
                                     .outcome),
       static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  MonitorFacts localArrival = arrived;
+  localArrival.x = moveNearbyDecision.x;
+  localArrival.y = moveNearbyDecision.y;
+  localArrival.z = moveNearbyDecision.z;
+  localArrival.stationarySamples = 2;
+  ExpectUInt32(
+      "Phase 4 MOVE_NEARBY completes at its derived destination",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    moveNearbyDecision, ownedOrder,
+                                    localArrival, 60000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  MonitorFacts escaped = arrived;
+  escaped.hostileObserved = false;
+  escaped.nearestHostileDistance = 1000000.0;
+  escaped.fleeDistanceTravelled = 25.0;
+  ExpectUInt32(
+      "Phase 4 FLEE completes after threats leave observation",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    fleeDecision, ownedOrder, escaped, 90000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+  MonitorFacts scanDropout = arrived;
+  scanDropout.hostileObserved = false;
+  scanDropout.nearestHostileDistance = 1000000.0;
+  scanDropout.fleeDistanceTravelled = 0.0;
+  ExpectUInt32(
+      "Phase 4 FLEE does not complete on a transient hostile scan dropout",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    fleeDecision, ownedOrder, scanDropout,
+                                    90000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
+  MonitorFacts followed = localArrival;
+  followed.hostileObserved = true;
+  followed.nearestHostileDistance = 15.0;
+  followed.x = fleeDecision.x;
+  followed.y = fleeDecision.y;
+  followed.z = fleeDecision.z;
+  ExpectUInt32(
+      "Phase 4 FLEE rejects an unsafe reached waypoint",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    fleeDecision, ownedOrder, followed, 90000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
+  MonitorFacts treated = arrived;
+  treated.targetFound = true;
+  treated.targetFirstAidNeed = 0.0;
+  treated.targetBleedRate = 0.0;
+  ExpectUInt32(
+      "Phase 4 FIRST_AID completes from live patient health",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    firstAidDecision, ownedOrder, treated,
+                                    180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+  treated.targetFirstAidNeed = 4.0;
+  treated.noProgressElapsedMs = 45000;
+  ExpectUInt32(
+      "Phase 4 FIRST_AID fails after bounded no progress",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    firstAidDecision, ownedOrder, treated,
+                                    180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
+  MonitorFacts rested = arrived;
+  rested.fullyRested = true;
+  ExpectUInt32(
+      "Phase 4 REST completes from live recovery state",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    restDecision, ownedOrder, rested, 600000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+  MonitorFacts healingInBed = arrived;
+  healingInBed.fullyRested = false;
+  healingInBed.inBed = true;
+  healingInBed.activeElapsedMs = 5000;
+  healingInBed.currentOrder = OrderFingerprint();
+  ExpectUInt32(
+      "Phase 4 REST keeps monitoring after the bed order is consumed",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    restDecision, ownedOrder, healingInBed,
+                                    600000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";
