@@ -499,4 +499,3 @@ Phase 2 is complete only when one live run proves all of the following:
 Exit criterion: repeated deterministic `IDLE` and `TRAVEL_LOCATION` decisions
 execute one at a time, produce accurate durable outcomes, and stop safely on
 manual intervention, control changes, save/load, and server loss.
-
