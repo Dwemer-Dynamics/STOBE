@@ -20,6 +20,7 @@
 #include <core/Functions.h>
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomyController.h"
 #include "AutonomySafetyProbe.h"
 #include "Globals.h"
 #include "StobeIdentityRename.h"
@@ -12244,6 +12245,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
@@ -12255,6 +12257,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   if (!worldStable) {
+    ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
@@ -12448,6 +12451,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
       bool dispatchedViaStream =
@@ -12880,6 +12884,7 @@ __declspec(dllexport) void startPlugin() {
   Log(std::string("STARTUP: Stobe plugin version ") + kStobePluginVersion);
   Log(std::string("STARTUP: Stobe plugin release date ") + kStobePluginReleaseDate);
   Log("UI: MOTD auto-popup enabled when EnableMOTD is ON.");
+  StartAutonomyController();
 
   HMODULE hLib = GetModuleHandleA("KenshiLib.dll");
   if (!hLib) {

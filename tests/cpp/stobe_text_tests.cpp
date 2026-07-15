@@ -1,4 +1,5 @@
 #include "AutonomySafetyProbePolicy.h"
+#include "AutonomyProtocol.h"
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
 #include "StobeTiming.h"
@@ -68,6 +69,11 @@ int main() {
   using Stobe::AutonomySafetyProbe::VALIDATION_TARGET_UNCONSCIOUS;
   using Stobe::AutonomySafetyProbe::VALIDATION_TRAVEL_DESTINATION_NOT_SET;
   using Stobe::AutonomySafetyProbe::ValidateMutation;
+  using Stobe::Autonomy::ControlSnapshot;
+  using Stobe::Autonomy::EvaluatePhase1State;
+  using Stobe::Autonomy::ParseControlResponse;
+  using Stobe::Autonomy::ParseStorageSerial;
+  using Stobe::Autonomy::RuntimeFacts;
   using Stobe::IdentityRename::BatchStatus;
   using Stobe::IdentityRename::IsAttemptReady;
   using Stobe::IdentityRename::IsQueueEligibleName;
@@ -125,6 +131,61 @@ int main() {
   ExpectUInt32("Autonomy probe rejects unknown command names",
                static_cast<unsigned int>(ParseCommand("raw_task")),
                static_cast<unsigned int>(COMMAND_NONE));
+
+  ControlSnapshot control;
+  ExpectBool("Autonomy control parses server session",
+             ParseControlResponse(
+                 "{\"ok\":true,\"phase\":1,\"session\":{\"enabled\":true,"
+                 "\"desired_state\":\"ARMING\",\"control_revision\":7,"
+                 "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+                 "\"npc_name\":\"Ruka\",\"stop_mode\":\"normal\"}}",
+                 control),
+             true);
+  ExpectUInt32("Autonomy control keeps exact NPC id",
+               static_cast<unsigned int>(control.npcId), 12);
+  ExpectUInt32("Autonomy storage identity parses serial",
+               ParseStorageSerial("hand_884422"), 884422);
+  ExpectUInt32("Autonomy storage identity rejects malformed ids",
+               ParseStorageSerial("serial:884422"), 0);
+
+  RuntimeFacts runtimeReady;
+  runtimeReady.found = true;
+  runtimeReady.identityMatches = true;
+  runtimeReady.playerCharacter = true;
+  runtimeReady.hasOrdersReceiver = true;
+  runtimeReady.canTakeOrders = true;
+  ExpectEq("Phase 1 observes an available exact player NPC",
+           EvaluatePhase1State(control, runtimeReady).state, "OBSERVING");
+
+  RuntimeFacts runtimeManualOrder = runtimeReady;
+  runtimeManualOrder.hasPlayerOrders = true;
+  ExpectEq("Phase 1 pauses when the player gives a manual order",
+           EvaluatePhase1State(control, runtimeManualOrder).state,
+           "PAUSED_USER");
+
+  RuntimeFacts runtimeManualPauseLatched = runtimeReady;
+  runtimeManualPauseLatched.requiresExplicitResume = true;
+  runtimeManualPauseLatched.manualPauseLatched = true;
+  ExpectEq("Phase 1 retains manual pause until a new revision",
+           EvaluatePhase1State(control, runtimeManualPauseLatched).state,
+           "PAUSED_USER");
+
+  RuntimeFacts runtimeAfterLoad = runtimeReady;
+  runtimeAfterLoad.requiresExplicitResume = true;
+  ExpectEq("Phase 1 requires explicit resume after load",
+           EvaluatePhase1State(control, runtimeAfterLoad).state,
+           "PAUSED_UNSAFE");
+
+  RuntimeFacts runtimeServerLost = runtimeReady;
+  runtimeServerLost.serverAvailable = false;
+  ExpectEq("Phase 1 fails closed when server is unavailable",
+           EvaluatePhase1State(control, runtimeServerLost).state,
+           "PAUSED_UNSAFE");
+
+  RuntimeFacts runtimeWrongNpc = runtimeReady;
+  runtimeWrongNpc.identityMatches = false;
+  ExpectEq("Phase 1 errors on runtime identity mismatch",
+           EvaluatePhase1State(control, runtimeWrongNpc).state, "ERROR");
 
   MutationPreconditions probeReady;
   probeReady.enabled = true;

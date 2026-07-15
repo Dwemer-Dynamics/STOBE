@@ -88,6 +88,8 @@
   <ItemGroup>
     <ClCompile Include="src\AiNpcInfoWindow.cpp" />
     <ClCompile Include="src\AudioPlayback.cpp" />
+    <ClCompile Include="src\AutonomyController.cpp" />
+    <ClCompile Include="src\AutonomyProtocol.cpp" />
     <ClCompile Include="src\AutonomySafetyProbe.cpp" />
     <ClCompile Include="src\AutonomySafetyProbePolicy.cpp" />
     <ClCompile Include="src\ChatBox.cpp" />
@@ -97,6 +99,7 @@
     <ClCompile Include="src\Context.cpp" />
     <ClCompile Include="src\\Functions.cpp" />
     <ClCompile Include="src\Globals.cpp" />
+    <ClCompile Include="src\KenshiAiCompat.cpp" />
     <ClCompile Include="src\KenshiRvaCompat.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
@@ -110,6 +113,8 @@
   <ItemGroup>
     <ClInclude Include="src\AiNpcInfoWindow.h" />
     <ClInclude Include="src\AudioPlayback.h" />
+    <ClInclude Include="src\AutonomyController.h" />
+    <ClInclude Include="src\AutonomyProtocol.h" />
     <ClInclude Include="src\AutonomySafetyProbe.h" />
     <ClInclude Include="src\AutonomySafetyProbePolicy.h" />
     <ClInclude Include="src\ChatBox.h" />
@@ -119,6 +124,7 @@
     <ClInclude Include="src\Context.h" />
     <ClInclude Include="src\\Functions.h" />
     <ClInclude Include="src\Globals.h" />
+    <ClInclude Include="src\KenshiAiCompat.h" />
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />
