@@ -1,4 +1,5 @@
 #include "AutonomySafetyProbePolicy.h"
+#include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
@@ -70,10 +71,21 @@ int main() {
   using Stobe::AutonomySafetyProbe::VALIDATION_TRAVEL_DESTINATION_NOT_SET;
   using Stobe::AutonomySafetyProbe::ValidateMutation;
   using Stobe::Autonomy::ControlSnapshot;
+  using Stobe::Autonomy::DecisionEnvelope;
   using Stobe::Autonomy::EvaluatePhase1State;
+  using Stobe::Autonomy::EvaluateActionMonitor;
+  using Stobe::Autonomy::MONITOR_COMPLETED;
+  using Stobe::Autonomy::MONITOR_FAILED;
+  using Stobe::Autonomy::MONITOR_INTERRUPTED;
+  using Stobe::Autonomy::MONITOR_RUNNING;
+  using Stobe::Autonomy::MONITOR_TIMED_OUT;
+  using Stobe::Autonomy::MonitorFacts;
+  using Stobe::Autonomy::OrderFingerprint;
   using Stobe::Autonomy::ParseControlResponse;
+  using Stobe::Autonomy::ParseDecisionResponse;
   using Stobe::Autonomy::ParseStorageSerial;
   using Stobe::Autonomy::RuntimeFacts;
+  using Stobe::Autonomy::ValidateDecisionEnvelope;
   using Stobe::IdentityRename::BatchStatus;
   using Stobe::IdentityRename::IsAttemptReady;
   using Stobe::IdentityRename::IsQueueEligibleName;
@@ -260,6 +272,152 @@ int main() {
                    ValidateMutation(COMMAND_TRAVEL, probeTravelUnset)),
                static_cast<unsigned int>(
                    VALIDATION_TRAVEL_DESTINATION_NOT_SET));
+
+  const std::string travelDecisionJson =
+      "{\"ok\":true,\"phase\":2,\"decision\":{"
+      "\"decision_id\":\"5df4f15b-b99a-4fea-bfce-3ed6ef816e5e\","
+      "\"control_revision\":7,\"npc_id\":12,"
+      "\"npc_storage_id\":\"hand_884422\",\"runtime_serial\":884422,"
+      "\"command\":\"TRAVEL_LOCATION\","
+      "\"arguments\":{\"location_zone_id\":44,\"zone_name\":\"Squin\","
+      "\"x\":123.5,\"y\":4,\"z\":-77.25,\"arrival_radius\":8},"
+      "\"context_hash\":\"phase2-7-1-884422\",\"context_game_ts\":1234,"
+      "\"dispatch_deadline_ts\":2000,\"action_deadline_ts\":3000}}";
+  DecisionEnvelope travelDecision;
+  bool hasDecision = false;
+  ExpectBool("Phase 2 parses a typed travel decision",
+             ParseDecisionResponse(travelDecisionJson, travelDecision,
+                                   hasDecision),
+             true);
+  ExpectBool("Phase 2 identifies a present decision", hasDecision, true);
+  ExpectUInt32("Phase 2 preserves the exact visited location id",
+               static_cast<unsigned int>(travelDecision.locationZoneId), 44);
+  ExpectUInt32(
+      "Phase 2 validates matching revision and identity",
+      static_cast<unsigned int>(ValidateDecisionEnvelope(
+          travelDecision, control, 884422, 1900)),
+      static_cast<unsigned int>(Stobe::Autonomy::DECISION_VALID));
+  ExpectUInt32(
+      "Phase 2 rejects an expired dispatch",
+      static_cast<unsigned int>(ValidateDecisionEnvelope(
+          travelDecision, control, 884422, 2100)),
+      static_cast<unsigned int>(Stobe::Autonomy::DECISION_EXPIRED));
+
+  DecisionEnvelope noDecision;
+  bool hasNoDecision = true;
+  ExpectBool("Phase 2 accepts an empty pilot tick",
+             ParseDecisionResponse(
+                 "{\"ok\":true,\"phase\":2,\"decision\":null}",
+                 noDecision, hasNoDecision),
+             true);
+  ExpectBool("Phase 2 leaves an empty tick actionless", hasNoDecision, false);
+
+  DecisionEnvelope invalidDecision;
+  bool invalidPresent = false;
+  ExpectBool(
+      "Phase 2 rejects non-finite travel coordinates",
+      ParseDecisionResponse(
+          "{\"ok\":true,\"decision\":{\"decision_id\":\"bad\","
+          "\"control_revision\":7,\"npc_id\":12,"
+          "\"npc_storage_id\":\"hand_884422\",\"runtime_serial\":884422,"
+          "\"command\":\"TRAVEL_LOCATION\",\"arguments\":{"
+          "\"location_zone_id\":1,\"x\":1e999,\"y\":0,\"z\":0,"
+          "\"arrival_radius\":8},\"context_hash\":\"phase2-invalid\","
+          "\"context_game_ts\":1234,\"dispatch_deadline_ts\":2000,"
+          "\"action_deadline_ts\":3000}}",
+          invalidDecision, invalidPresent),
+      false);
+
+  OrderFingerprint ownedOrder;
+  ownedOrder.taskType = 106;
+  ownedOrder.x = travelDecision.x;
+  ownedOrder.y = travelDecision.y;
+  ownedOrder.z = travelDecision.z;
+  ownedOrder.runtimePointer = 1234;
+  ownedOrder.orderCount = 1;
+
+  MonitorFacts arrived;
+  arrived.found = true;
+  arrived.identityMatches = true;
+  arrived.playerCharacter = true;
+  arrived.stationarySamples = 2;
+  arrived.x = travelDecision.x;
+  arrived.y = travelDecision.y;
+  arrived.z = travelDecision.z;
+  arrived.currentOrder = ownedOrder;
+  ExpectUInt32(
+      "Phase 2 travel completes by distance and stable movement",
+      static_cast<unsigned int>(
+          EvaluateActionMonitor(travelDecision, ownedOrder, arrived, 900000)
+              .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  MonitorFacts interrupted = arrived;
+  interrupted.x = travelDecision.x + 50.0;
+  interrupted.currentOrder.taskType = 99;
+  ExpectUInt32(
+      "Phase 2 detects a replacement player order",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder, interrupted,
+                                    900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_INTERRUPTED));
+
+  MonitorFacts pathFailed = arrived;
+  pathFailed.x = travelDecision.x + 50.0;
+  pathFailed.stationarySamples = 0;
+  pathFailed.pathFailedSamples = 3;
+  ExpectUInt32(
+      "Phase 2 bounds repeated path failure",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder, pathFailed,
+                                    900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
+  MonitorFacts noProgress = pathFailed;
+  noProgress.pathFailedSamples = 0;
+  noProgress.noProgressElapsedMs = 30000;
+  ExpectUInt32(
+      "Phase 2 bounds travel with no meaningful progress",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder, noProgress,
+                                    900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
+  MonitorFacts timedOut = pathFailed;
+  timedOut.pathFailedSamples = 0;
+  timedOut.activeElapsedMs = 900000;
+  ExpectUInt32(
+      "Phase 2 enforces the active-time deadline",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder, timedOut,
+                                    900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_TIMED_OUT));
+
+  DecisionEnvelope idleDecision;
+  idleDecision.command = Stobe::Autonomy::DECISION_COMMAND_IDLE;
+  idleDecision.idleDurationMs = 1500;
+  MonitorFacts idleStable = arrived;
+  idleStable.stationarySamples = 3;
+  idleStable.activeElapsedMs = 1000;
+  ExpectUInt32(
+      "Phase 2 IDLE waits for its declared duration",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    idleDecision, ownedOrder, idleStable,
+                                    20000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
+  idleStable.activeElapsedMs = 1500;
+  ExpectUInt32(
+      "Phase 2 IDLE completes after duration and stable samples",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    idleDecision, ownedOrder, idleStable,
+                                    20000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";

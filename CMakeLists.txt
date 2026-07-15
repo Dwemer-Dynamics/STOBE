@@ -67,6 +67,8 @@ endif()
 add_library(Stobe SHARED
   src/AudioPlayback.cpp
   src/AutonomyController.cpp
+  src/AutonomyExecutor.cpp
+  src/AutonomyMonitor.cpp
   src/AutonomyProtocol.cpp
   src/AutonomySafetyProbe.cpp
   src/AutonomySafetyProbePolicy.cpp

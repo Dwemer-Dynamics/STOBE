@@ -4,7 +4,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
+#if defined(_MSC_VER) && _MSC_VER < 1800
+#include <float.h>
+#endif
 
 namespace Stobe {
 namespace Autonomy {
@@ -40,6 +44,26 @@ long long ParseLongLong(const std::string &value, long long fallback) {
   return end != normalized.c_str() && *end == '\0' ? parsed : fallback;
 }
 
+bool ParseDouble(const std::string &value, double &out) {
+  const std::string normalized = Trim(value);
+  if (normalized.empty()) {
+    return false;
+  }
+  char *end = NULL;
+  const double parsed = strtod(normalized.c_str(), &end);
+  bool finite = true;
+#if defined(_MSC_VER) && _MSC_VER < 1800
+  finite = _finite(parsed) != 0;
+#else
+  finite = std::isfinite(parsed);
+#endif
+  if (end == normalized.c_str() || *end != '\0' || !finite) {
+    return false;
+  }
+  out = parsed;
+  return true;
+}
+
 } // namespace
 
 ControlSnapshot::ControlSnapshot()
@@ -56,6 +80,12 @@ RuntimeFacts::RuntimeFacts()
 StateDecision::StateDecision(const std::string &stateValue,
                              const std::string &reasonValue)
     : state(stateValue), reason(reasonValue) {}
+
+DecisionEnvelope::DecisionEnvelope()
+    : valid(false), controlRevision(-1), npcId(0), runtimeSerial(0),
+      command(DECISION_COMMAND_NONE), contextGameTs(0), dispatchDeadlineTs(0),
+      actionDeadlineTs(0), idleDurationMs(1500), locationZoneId(0), x(0.0),
+      y(0.0), z(0.0), arrivalRadius(8.0) {}
 
 bool ParseControlResponse(const std::string &response, ControlSnapshot &out) {
   ControlSnapshot parsed;
@@ -153,6 +183,134 @@ StateDecision EvaluatePhase1State(const ControlSnapshot &control,
     return StateDecision("PAUSED_USER", "manual_player_order_detected");
   }
   return StateDecision("OBSERVING", "phase_1_observation_active");
+}
+
+bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
+                           bool &hasDecision) {
+  hasDecision = false;
+  if (!ParseBool(Text::JsonReadField(response, "ok"))) {
+    return false;
+  }
+  const std::string decisionJson = Text::JsonReadField(response, "decision");
+  if (decisionJson.empty() || Trim(decisionJson) == "null") {
+    out = DecisionEnvelope();
+    return true;
+  }
+  if (decisionJson[0] != '{') {
+    return false;
+  }
+
+  DecisionEnvelope parsed;
+  parsed.decisionId = Trim(Text::JsonReadField(decisionJson, "decision_id"));
+  parsed.controlRevision = ParseLongLong(
+      Text::JsonReadField(decisionJson, "control_revision"), -1);
+  parsed.npcId = static_cast<int>(ParseLongLong(
+      Text::JsonReadField(decisionJson, "npc_id"), 0));
+  parsed.npcStorageId =
+      Trim(Text::JsonReadField(decisionJson, "npc_storage_id"));
+  const long long runtimeSerial = ParseLongLong(
+      Text::JsonReadField(decisionJson, "runtime_serial"), 0);
+  if (runtimeSerial > 0 && runtimeSerial <= 0xffffffffLL) {
+    parsed.runtimeSerial = static_cast<unsigned int>(runtimeSerial);
+  }
+  parsed.commandName = Trim(Text::JsonReadField(decisionJson, "command"));
+  if (parsed.commandName == "IDLE") {
+    parsed.command = DECISION_COMMAND_IDLE;
+  } else if (parsed.commandName == "TRAVEL_LOCATION") {
+    parsed.command = DECISION_COMMAND_TRAVEL_LOCATION;
+  }
+  parsed.contextHash = Trim(Text::JsonReadField(decisionJson, "context_hash"));
+  parsed.contextGameTs = ParseLongLong(
+      Text::JsonReadField(decisionJson, "context_game_ts"), 0);
+  parsed.dispatchDeadlineTs = ParseLongLong(
+      Text::JsonReadField(decisionJson, "dispatch_deadline_ts"), 0);
+  parsed.actionDeadlineTs = ParseLongLong(
+      Text::JsonReadField(decisionJson, "action_deadline_ts"), 0);
+
+  const std::string arguments = Text::JsonReadField(decisionJson, "arguments");
+  if (arguments.empty() || arguments[0] != '{') {
+    return false;
+  }
+  parsed.idleDurationMs = static_cast<int>(ParseLongLong(
+      Text::JsonReadField(arguments, "duration_ms"), 1500));
+  parsed.locationZoneId = ParseLongLong(
+      Text::JsonReadField(arguments, "location_zone_id"), 0);
+  parsed.locationLabel = Trim(Text::JsonReadField(arguments, "zone_name"));
+  if (parsed.locationLabel.empty()) {
+    parsed.locationLabel = Trim(Text::JsonReadField(arguments, "city_name"));
+  }
+  if (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION) {
+    if (!ParseDouble(Text::JsonReadField(arguments, "x"), parsed.x) ||
+        !ParseDouble(Text::JsonReadField(arguments, "y"), parsed.y) ||
+        !ParseDouble(Text::JsonReadField(arguments, "z"), parsed.z) ||
+        !ParseDouble(Text::JsonReadField(arguments, "arrival_radius"),
+                     parsed.arrivalRadius)) {
+      return false;
+    }
+  }
+
+  if (parsed.decisionId.empty() || parsed.controlRevision < 0 ||
+      parsed.npcId <= 0 || parsed.npcStorageId.empty() ||
+      parsed.runtimeSerial == 0 || parsed.command == DECISION_COMMAND_NONE ||
+      parsed.contextHash.empty() || parsed.contextHash.size() > 128 ||
+      parsed.dispatchDeadlineTs <= 0 || parsed.actionDeadlineTs <= 0 ||
+      parsed.actionDeadlineTs < parsed.dispatchDeadlineTs ||
+      (parsed.command == DECISION_COMMAND_IDLE &&
+       (parsed.idleDurationMs < 250 || parsed.idleDurationMs > 30000)) ||
+      (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION &&
+       (parsed.locationZoneId <= 0 || parsed.arrivalRadius < 1.0 ||
+        parsed.arrivalRadius > 100.0 || std::fabs(parsed.x) > 10000000.0 ||
+        std::fabs(parsed.y) > 10000000.0 ||
+        std::fabs(parsed.z) > 10000000.0))) {
+    return false;
+  }
+  parsed.valid = true;
+  out = parsed;
+  hasDecision = true;
+  return true;
+}
+
+DecisionValidation ValidateDecisionEnvelope(const DecisionEnvelope &decision,
+                                             const ControlSnapshot &control,
+                                             unsigned int runtimeSerial,
+                                             long long nowEpochSeconds) {
+  if (!decision.valid || decision.decisionId.empty() ||
+      decision.command == DECISION_COMMAND_NONE) {
+    return DECISION_INVALID;
+  }
+  if (decision.controlRevision != control.controlRevision) {
+    return DECISION_STALE_REVISION;
+  }
+  if (decision.npcId != control.npcId ||
+      decision.npcStorageId != control.npcStorageId) {
+    return DECISION_IDENTITY_MISMATCH;
+  }
+  if (runtimeSerial == 0 || decision.runtimeSerial != runtimeSerial) {
+    return DECISION_RUNTIME_SERIAL_MISMATCH;
+  }
+  if (nowEpochSeconds <= 0 || nowEpochSeconds > decision.dispatchDeadlineTs) {
+    return DECISION_EXPIRED;
+  }
+  return DECISION_VALID;
+}
+
+const char *DecisionValidationName(DecisionValidation validation) {
+  switch (validation) {
+  case DECISION_VALID:
+    return "valid";
+  case DECISION_INVALID:
+    return "invalid_decision";
+  case DECISION_STALE_REVISION:
+    return "stale_control_revision";
+  case DECISION_IDENTITY_MISMATCH:
+    return "npc_identity_mismatch";
+  case DECISION_RUNTIME_SERIAL_MISMATCH:
+    return "runtime_serial_mismatch";
+  case DECISION_EXPIRED:
+    return "dispatch_deadline_expired";
+  default:
+    return "unknown_validation";
+  }
 }
 
 } // namespace Autonomy

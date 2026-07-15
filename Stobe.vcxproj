@@ -89,6 +89,8 @@
     <ClCompile Include="src\AiNpcInfoWindow.cpp" />
     <ClCompile Include="src\AudioPlayback.cpp" />
     <ClCompile Include="src\AutonomyController.cpp" />
+    <ClCompile Include="src\AutonomyExecutor.cpp" />
+    <ClCompile Include="src\AutonomyMonitor.cpp" />
     <ClCompile Include="src\AutonomyProtocol.cpp" />
     <ClCompile Include="src\AutonomySafetyProbe.cpp" />
     <ClCompile Include="src\AutonomySafetyProbePolicy.cpp" />
@@ -114,6 +116,8 @@
     <ClInclude Include="src\AiNpcInfoWindow.h" />
     <ClInclude Include="src\AudioPlayback.h" />
     <ClInclude Include="src\AutonomyController.h" />
+    <ClInclude Include="src\AutonomyExecutor.h" />
+    <ClInclude Include="src\AutonomyMonitor.h" />
     <ClInclude Include="src\AutonomyProtocol.h" />
     <ClInclude Include="src\AutonomySafetyProbe.h" />
     <ClInclude Include="src\AutonomySafetyProbePolicy.h" />
