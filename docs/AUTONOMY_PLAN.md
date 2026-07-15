@@ -1,6 +1,6 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phases 0-1 validated; Phase 2 planned
+Status: Active implementation; Phases 0-2 complete; Phase 3 next
 Last updated: 2026-07-14
 
 ## Objective
@@ -515,6 +515,21 @@ Exit criterion: the UI can safely select one player-faction NPC and the plugin r
 ### Phase 2: Deterministic Closed-Loop Pilot
 
 [Detailed implementation plan](AUTONOMY_PHASE2_PLAN.md).
+
+Implementation status (2026-07-14): complete by operator acceptance. The
+server and plugin implement the deterministic decision ledger, pilot queue,
+typed `IDLE` and `TRAVEL_LOCATION` decisions, exact identity and revision
+validation, owned-order dispatch and cancellation, action monitoring, durable
+terminal observations, retry handling, and the autonomy UI. Portable C++ and
+PHP coverage passed, and the production DLL was built and deployed.
+
+The live run proved crash-safe save loading, exact single dispatch for both
+pilot commands, durable `IDLE` completion, distance-based arrival, visible
+travel movement, bounded `owned_order_missing` failure, pause-aware active
+time, and safe normal stop. The operator accepted Phase 2 without repeating
+manual-order interruption, active-action save/load, and network-loss scenarios
+in the final run. Those remain mandatory regression checks before promoting a
+Phase 3 build beyond internal testing.
 
 - Support `IDLE` and `TRAVEL_LOCATION` only.
 - Add action correlation, deadlines, completion predicates, and observations.

@@ -1,6 +1,6 @@
 # Stobe Autonomy Phase 2 Plan
 
-Status: Planned
+Status: Complete by operator acceptance
 Last updated: 2026-07-14
 
 ## Goal
@@ -14,6 +14,36 @@ Phase 2 is an internal technical pilot. It does not yet decide what the NPC
 wants. Phase 3 will replace the deterministic pilot input with the supervised
 LLM planner while retaining the same decision contract, executor, monitor, and
 safety gates.
+
+## Completion Record
+
+Phase 2 was accepted on 2026-07-14 after implementation, automated validation,
+production deployment, and a live Kenshi run.
+
+Verified in the final live run:
+
+- Save loading completed with the post-load Stobe hook and Direct Control
+  reacquisition both remaining stable.
+- One `IDLE` step received one decision ID, dispatched once, and completed with
+  `idle_stable`.
+- A visited-location travel step received one decision ID and dispatched once.
+  A target already inside the eight-unit arrival radius completed by distance;
+  a second run visibly moved Doran from a distant start.
+- The distant run terminated after 16.9 active seconds with the bounded
+  `owned_order_missing` failure instead of looping or issuing a second action.
+- Game pause time did not advance the action timer.
+- Normal stop returned the session to `DISABLED`; closing Kenshi produced a
+  clean exit with no crash dump.
+
+Portable C++ tests cover arrival, path failure, no progress, timeout, manual
+interruption, stale identity and revision handling, and envelope validation.
+Server tests cover idempotency, decision transitions, pilot validation,
+playthrough lifecycle behavior, and report acknowledgement.
+
+The operator accepted Phase 2 without repeating manual-order interruption,
+active-action save/load invalidation, emergency cancellation, and network-loss
+recovery in the final live session. Keep those scenarios as required regression
+checks before a Phase 3 build is promoted beyond internal testing.
 
 ## Critical Design Decisions
 
