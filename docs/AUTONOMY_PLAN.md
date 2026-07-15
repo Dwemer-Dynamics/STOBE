@@ -1,6 +1,6 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phase 0 validated  
+Status: Active implementation; Phases 0-1 validated
 Last updated: 2026-07-14
 
 ## Objective
@@ -497,6 +497,12 @@ distance to the requested target with order and path state rather than relying
 on that flag alone.
 
 ### Phase 1: Control Plane
+
+Implementation status (2026-07-14): complete. A live Kenshi run selected a
+player-faction NPC by exact storage identity, reached `OBSERVING`, and reflected
+pause, resume, normal stop, restart, and emergency stop at matching control
+revisions. The Phase 1 tick returned no decision or action, and the runtime log
+contained no autonomous command dispatch.
 
 - Add schema and database migrations.
 - Add control/state endpoints.
