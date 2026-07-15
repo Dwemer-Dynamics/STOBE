@@ -12220,6 +12220,7 @@ static bool IsSpeechSystemBusyForMOTD() {
 
 
 void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
+  static LONG postLoadHookProbe = 0;
   if (!thisptr || reinterpret_cast<uintptr_t>(thisptr) < 0x10000) {
     static bool loggedInvalidThis = false;
     if (!loggedInvalidThis) {
@@ -12229,10 +12230,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     return;
   }
 
+  const bool tracePostLoadHook =
+      InterlockedCompareExchange(&postLoadHookProbe, 2, 1) == 1;
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: entering first post-stable PlayerInterface::update");
+  }
   if (playerUpdate_orig)
     playerUpdate_orig(thisptr);
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: original PlayerInterface::update returned");
+  }
 
   GameWorld *worldUi = GetWorldSafe();
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: GameWorld lookup returned");
+  }
   static bool worldWasStable = false;
   static DWORD worldBecameStableTick = 0;
   static bool heavySweepPrimed = false;
@@ -12241,8 +12253,16 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static DWORD motdAutoOpenDeadlineTick = 0;
   static bool loadInitEventDispatched = false;
   bool worldStable = IsWorldStableForUI(worldUi);
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: stability check returned stable=") +
+        (worldStable ? "1" : "0"));
+  }
 
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: GUI lookup returned available=") +
+        (gui ? "1" : "0"));
+  }
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     ResetAutonomyController("gui_unavailable");
@@ -12336,6 +12356,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
     loadInitEventDispatched = false;
+    InterlockedExchange(&postLoadHookProbe, 1);
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
   }

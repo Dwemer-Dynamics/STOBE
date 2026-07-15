@@ -532,6 +532,11 @@ void ResetAutonomyController(const char *reason) {
   EnterCriticalSection(&g_controlMutex);
   control = g_control;
   LeaveCriticalSection(&g_controlMutex);
+  if (!control.valid || !control.enabled) {
+    g_boundSerial = 0;
+    return;
+  }
+
   const std::string resetReason = reason ? reason : "world_transition";
   if (g_active.active && control.valid) {
     QueueActionReport(control, g_active.decision, "INTERRUPTED", resetReason,
@@ -540,14 +545,16 @@ void ResetAutonomyController(const char *reason) {
   }
   ClearTickState();
   g_boundSerial = 0;
-  if (!control.valid || !control.enabled) {
-    return;
-  }
+  const bool changed = !g_requiresExplicitResume ||
+                       g_runtimeState != "PAUSED_UNSAFE" ||
+                       g_runtimeReason != resetReason;
   g_requiresExplicitResume = true;
   g_runtimeState = "PAUSED_UNSAFE";
   g_runtimeReason = resetReason;
-  QueueStateReport(control, 0, g_runtimeState, g_runtimeReason, 0, true);
-  Log("AUTONOMY_PHASE2: paused for world transition reason=" + resetReason);
+  if (changed) {
+    QueueStateReport(control, 0, g_runtimeState, g_runtimeReason, 0, true);
+    Log("AUTONOMY_PHASE2: paused for world transition reason=" + resetReason);
+  }
 }
 
 void UpdateAutonomyController(GameWorld *world) {
