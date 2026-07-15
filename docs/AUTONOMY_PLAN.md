@@ -1,6 +1,6 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phases 0-1 validated
+Status: Active implementation; Phases 0-1 validated; Phase 2 planned
 Last updated: 2026-07-14
 
 ## Objective
@@ -513,6 +513,8 @@ contained no autonomous command dispatch.
 Exit criterion: the UI can safely select one player-faction NPC and the plugin reflects control changes without executing autonomous actions.
 
 ### Phase 2: Deterministic Closed-Loop Pilot
+
+[Detailed implementation plan](AUTONOMY_PHASE2_PLAN.md).
 
 - Support `IDLE` and `TRAVEL_LOCATION` only.
 - Add action correlation, deadlines, completion predicates, and observations.
