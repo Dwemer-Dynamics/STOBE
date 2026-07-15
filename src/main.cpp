@@ -20,6 +20,7 @@
 #include <core/Functions.h>
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomySafetyProbe.h"
 #include "Globals.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
@@ -12243,6 +12244,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    ResetAutonomySafetyProbe("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
@@ -12253,6 +12255,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   if (!worldStable) {
+    ResetAutonomySafetyProbe("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12445,6 +12448,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
       bool dispatchedViaStream =
           TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));

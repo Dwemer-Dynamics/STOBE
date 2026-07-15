@@ -66,6 +66,8 @@ endif()
 
 add_library(Stobe SHARED
   src/AudioPlayback.cpp
+  src/AutonomySafetyProbe.cpp
+  src/AutonomySafetyProbePolicy.cpp
   src/ChatUI.cpp
   src/ChatUIGlobals.cpp
   src/ChatBox.cpp

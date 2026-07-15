@@ -1,3 +1,4 @@
+#include "AutonomySafetyProbePolicy.h"
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
 #include "StobeTiming.h"
@@ -51,6 +52,22 @@ void ExpectBool(const std::string &name, bool actual, bool expected) {
 } // namespace
 
 int main() {
+  using Stobe::AutonomySafetyProbe::COMMAND_IDLE;
+  using Stobe::AutonomySafetyProbe::COMMAND_NONE;
+  using Stobe::AutonomySafetyProbe::COMMAND_TRAVEL;
+  using Stobe::AutonomySafetyProbe::MutationPreconditions;
+  using Stobe::AutonomySafetyProbe::ParseCommand;
+  using Stobe::AutonomySafetyProbe::VALIDATION_CANNOT_TAKE_ORDERS;
+  using Stobe::AutonomySafetyProbe::VALIDATION_DISABLED;
+  using Stobe::AutonomySafetyProbe::VALIDATION_EXISTING_ORDER;
+  using Stobe::AutonomySafetyProbe::VALIDATION_NO_BOUND_TARGET;
+  using Stobe::AutonomySafetyProbe::VALIDATION_NO_ORDERS_RECEIVER;
+  using Stobe::AutonomySafetyProbe::VALIDATION_NOT_PLAYER_CHARACTER;
+  using Stobe::AutonomySafetyProbe::VALIDATION_OK;
+  using Stobe::AutonomySafetyProbe::VALIDATION_TARGET_DEAD;
+  using Stobe::AutonomySafetyProbe::VALIDATION_TARGET_UNCONSCIOUS;
+  using Stobe::AutonomySafetyProbe::VALIDATION_TRAVEL_DESTINATION_NOT_SET;
+  using Stobe::AutonomySafetyProbe::ValidateMutation;
   using Stobe::IdentityRename::BatchStatus;
   using Stobe::IdentityRename::IsAttemptReady;
   using Stobe::IdentityRename::IsQueueEligibleName;
@@ -101,6 +118,87 @@ int main() {
                ResolveRechatDispatchDelayMs(6600), 0);
   ExpectBool("Rechat dispatch does not wait for playback",
              ShouldWaitForPlaybackBeforeRechatDispatch(), false);
+
+  ExpectUInt32("Autonomy probe parses trimmed case-insensitive command",
+               static_cast<unsigned int>(ParseCommand("  travel  ")),
+               static_cast<unsigned int>(COMMAND_TRAVEL));
+  ExpectUInt32("Autonomy probe rejects unknown command names",
+               static_cast<unsigned int>(ParseCommand("raw_task")),
+               static_cast<unsigned int>(COMMAND_NONE));
+
+  MutationPreconditions probeReady;
+  probeReady.enabled = true;
+  probeReady.hasBoundTarget = true;
+  probeReady.isPlayerCharacter = true;
+  probeReady.hasOrdersReceiver = true;
+  probeReady.canTakeOrders = true;
+  probeReady.travelDestinationSet = true;
+  ExpectUInt32("Autonomy probe permits idle for an available bound player",
+               static_cast<unsigned int>(ValidateMutation(COMMAND_IDLE, probeReady)),
+               static_cast<unsigned int>(VALIDATION_OK));
+
+  MutationPreconditions probeDisabled = probeReady;
+  probeDisabled.enabled = false;
+  ExpectUInt32("Autonomy probe rejects mutation while disabled",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeDisabled)),
+               static_cast<unsigned int>(VALIDATION_DISABLED));
+
+  MutationPreconditions probeUnbound = probeReady;
+  probeUnbound.hasBoundTarget = false;
+  ExpectUInt32("Autonomy probe rejects mutation without a bound target",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeUnbound)),
+               static_cast<unsigned int>(VALIDATION_NO_BOUND_TARGET));
+
+  MutationPreconditions probeNonPlayer = probeReady;
+  probeNonPlayer.isPlayerCharacter = false;
+  ExpectUInt32("Autonomy probe rejects non-player characters",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeNonPlayer)),
+               static_cast<unsigned int>(VALIDATION_NOT_PLAYER_CHARACTER));
+
+  MutationPreconditions probeDead = probeReady;
+  probeDead.isDead = true;
+  ExpectUInt32("Autonomy probe rejects dead characters",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeDead)),
+               static_cast<unsigned int>(VALIDATION_TARGET_DEAD));
+
+  MutationPreconditions probeUnconscious = probeReady;
+  probeUnconscious.isUnconscious = true;
+  ExpectUInt32("Autonomy probe rejects unconscious characters",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeUnconscious)),
+               static_cast<unsigned int>(VALIDATION_TARGET_UNCONSCIOUS));
+
+  MutationPreconditions probeMissingReceiver = probeReady;
+  probeMissingReceiver.hasOrdersReceiver = false;
+  ExpectUInt32("Autonomy probe requires an orders receiver",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeMissingReceiver)),
+               static_cast<unsigned int>(VALIDATION_NO_ORDERS_RECEIVER));
+
+  MutationPreconditions probeCannotTakeOrders = probeReady;
+  probeCannotTakeOrders.canTakeOrders = false;
+  ExpectUInt32("Autonomy probe respects Kenshi order availability",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_IDLE, probeCannotTakeOrders)),
+               static_cast<unsigned int>(VALIDATION_CANNOT_TAKE_ORDERS));
+
+  MutationPreconditions probeBusy = probeReady;
+  probeBusy.hasOrders = true;
+  ExpectUInt32("Autonomy probe preserves existing orders by rejecting mutation",
+               static_cast<unsigned int>(ValidateMutation(COMMAND_IDLE, probeBusy)),
+               static_cast<unsigned int>(VALIDATION_EXISTING_ORDER));
+
+  MutationPreconditions probeTravelUnset = probeReady;
+  probeTravelUnset.travelDestinationSet = false;
+  ExpectUInt32("Autonomy travel requires an explicitly armed destination",
+               static_cast<unsigned int>(
+                   ValidateMutation(COMMAND_TRAVEL, probeTravelUnset)),
+               static_cast<unsigned int>(
+                   VALIDATION_TRAVEL_DESTINATION_NOT_SET));
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";

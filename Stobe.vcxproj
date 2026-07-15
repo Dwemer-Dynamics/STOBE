@@ -88,6 +88,8 @@
   <ItemGroup>
     <ClCompile Include="src\AiNpcInfoWindow.cpp" />
     <ClCompile Include="src\AudioPlayback.cpp" />
+    <ClCompile Include="src\AutonomySafetyProbe.cpp" />
+    <ClCompile Include="src\AutonomySafetyProbePolicy.cpp" />
     <ClCompile Include="src\ChatBox.cpp" />
     <ClCompile Include="src\ChatUI.cpp" />
     <ClCompile Include="src\ChatUIGlobals.cpp" />
@@ -108,6 +110,8 @@
   <ItemGroup>
     <ClInclude Include="src\AiNpcInfoWindow.h" />
     <ClInclude Include="src\AudioPlayback.h" />
+    <ClInclude Include="src\AutonomySafetyProbe.h" />
+    <ClInclude Include="src\AutonomySafetyProbePolicy.h" />
     <ClInclude Include="src\ChatBox.h" />
     <ClInclude Include="src\ChatUI.h" />
     <ClInclude Include="src\ChatUIGlobals.h" />
