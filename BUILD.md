@@ -51,3 +51,10 @@ Snapshot root:
 - `Stobe\vendor\stobe-sdk\Libraries\ogre\OgreMain_x64.lib`
 - `Stobe\vendor\stobe-sdk\Runtime\KenshiLib.dll`
 - `Stobe\vendor\stobe-sdk\sdk-manifest.json`
+
+## KenshiLib Revision
+
+Stobe is compiled against the exact KenshiLib commit recorded in
+`KENSHILIB_REVISION`. The SDK preparation step rejects a standalone KenshiLib
+checkout at any other revision so newer headers cannot be paired with an older
+runtime DLL or import library.

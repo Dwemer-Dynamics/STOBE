@@ -46,14 +46,14 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetName>Stobe</TargetName>
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\KenshiLib\Include;$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\third_party\kenshi\KenshiLib;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\mygui;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\ogre;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>Stobe</TargetName>
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\KenshiLib\Include;$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\Kenshi Deps\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\third_party\kenshi\KenshiLib;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\mygui;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\ogre;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -95,8 +95,12 @@
     <ClCompile Include="src\Context.cpp" />
     <ClCompile Include="src\\Functions.cpp" />
     <ClCompile Include="src\Globals.cpp" />
+    <ClCompile Include="src\KenshiRvaCompat.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
+    <ClCompile Include="src\StobeIdentityRename.cpp" />
+    <ClCompile Include="src\StobeText.cpp" />
+    <ClCompile Include="src\StobeTiming.cpp" />
     <ClCompile Include="src\StartingWindow.cpp" />
     <ClCompile Include="src\Utils.cpp" />
     <ClCompile Include="src\WelcomeWindow.cpp" />
@@ -111,7 +115,11 @@
     <ClInclude Include="src\Context.h" />
     <ClInclude Include="src\\Functions.h" />
     <ClInclude Include="src\Globals.h" />
+    <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\SettingsWindow.h" />
+    <ClInclude Include="src\StobeIdentityRename.h" />
+    <ClInclude Include="src\StobeText.h" />
+    <ClInclude Include="src\StobeTiming.h" />
     <ClInclude Include="src\StartingWindow.h" />
     <ClInclude Include="src\Utils.h" />
     <ClInclude Include="src\WelcomeWindow.h" />
