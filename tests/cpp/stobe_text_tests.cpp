@@ -328,6 +328,71 @@ int main() {
           invalidDecision, invalidPresent),
       false);
 
+  static const char *phase3CatalogCommands[] = {
+      "ATTACK",       "SUICIDE",          "FOLLOW",
+      "STOP_FOLLOW",  "JOIN_PARTY",       "LEAVE",
+      "STOP_CARRYING", "PICKUP_NPC",      "GIVE_CATS",
+      "TAKE_CATS",    "TAKE_ITEM",        "GIVE_ITEM",
+      "DROP_ITEM",    "ROLEPLAY_ACTION",  "FACTION_RELATIONS",
+      "SET_BLOCK",    "SET_HOLD",         "SET_PASSIVE",
+      "SET_JOBS",     "SET_RANGED",       "SET_TAUNT",
+      "SET_SNEAK",    "SET_RESOURCE",     "SET_MEDIC",
+      "REMOVE_LIMB",  "CUT_HORNS",        "KNOCKOUT",
+      "KILL",         "USE_OBJECT",       "USE_DRUGS",
+      "DRINK",        "FORCE_DRINK",      "TALK"};
+  for (size_t i = 0;
+       i < sizeof(phase3CatalogCommands) / sizeof(phase3CatalogCommands[0]);
+       ++i) {
+    const std::string command = phase3CatalogCommands[i];
+    const std::string catalogJson =
+        "{\"ok\":true,\"phase\":3,\"decision\":{"
+        "\"decision_id\":\"phase3-catalog\",\"control_revision\":7,"
+        "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+        "\"runtime_serial\":884422,\"command\":\"" + command +
+        "\",\"arguments\":{\"legacy_argument\":\"Dust Bandit@5\"},"
+        "\"context_hash\":\"phase3-catalog-context\","
+        "\"context_game_ts\":1234,\"dispatch_deadline_ts\":2000,"
+        "\"action_deadline_ts\":3000}}";
+    DecisionEnvelope catalogDecision;
+    bool catalogPresent = false;
+    ExpectBool("Phase 3 parses catalog action " + command,
+               ParseDecisionResponse(catalogJson, catalogDecision,
+                                     catalogPresent),
+               true);
+    ExpectBool("Phase 3 identifies catalog action " + command,
+               catalogPresent, true);
+    ExpectUInt32(
+        "Phase 3 classifies generic catalog action " + command,
+        static_cast<unsigned int>(catalogDecision.command),
+        static_cast<unsigned int>(
+            Stobe::Autonomy::DECISION_COMMAND_CATALOG_ACTION));
+    ExpectEq("Phase 3 preserves catalog command " + command,
+             catalogDecision.commandName, command);
+    ExpectEq("Phase 3 preserves adapter argument " + command,
+             catalogDecision.actionArgument, "Dust Bandit@5");
+    ExpectUInt32(
+        "Phase 3 validates catalog envelope " + command,
+        static_cast<unsigned int>(ValidateDecisionEnvelope(
+            catalogDecision, control, 884422, 1900)),
+        static_cast<unsigned int>(Stobe::Autonomy::DECISION_VALID));
+  }
+
+  DecisionEnvelope unregisteredDecision;
+  bool unregisteredPresent = false;
+  ExpectBool(
+      "Phase 3 rejects unregistered catalog commands",
+      ParseDecisionResponse(
+          "{\"ok\":true,\"phase\":3,\"decision\":{"
+          "\"decision_id\":\"phase3-unknown\",\"control_revision\":7,"
+          "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+          "\"runtime_serial\":884422,\"command\":\"SPAWN_ITEM\","
+          "\"arguments\":{\"legacy_argument\":\"Bread\"},"
+          "\"context_hash\":\"phase3-unknown-context\","
+          "\"context_game_ts\":1234,\"dispatch_deadline_ts\":2000,"
+          "\"action_deadline_ts\":3000}}",
+          unregisteredDecision, unregisteredPresent),
+      false);
+
   OrderFingerprint ownedOrder;
   ownedOrder.taskType = 106;
   ownedOrder.x = travelDecision.x;

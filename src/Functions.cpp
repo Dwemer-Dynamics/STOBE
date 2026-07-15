@@ -1,5 +1,6 @@
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomyController.h"
 #include "Comm.h"
 #include "Context.h"
 #include "Globals.h"
@@ -8945,6 +8946,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       }
       if (lockReacquired) {
         LeaveCriticalSection(&g_uiMutex);
+      }
+      if (!queueDeferredAction && !act.autonomyDecisionId.empty()) {
+        ReportAutonomyCatalogActionResult(
+            act.autonomyDecisionId, true, "catalog_action_executed");
       }
       if (blockSpeechQueue || deferActionQueue) {
         break;

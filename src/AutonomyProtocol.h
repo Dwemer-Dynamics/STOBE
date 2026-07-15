@@ -44,7 +44,8 @@ struct StateDecision {
 enum DecisionCommand {
   DECISION_COMMAND_NONE = 0,
   DECISION_COMMAND_IDLE,
-  DECISION_COMMAND_TRAVEL_LOCATION
+  DECISION_COMMAND_TRAVEL_LOCATION,
+  DECISION_COMMAND_CATALOG_ACTION
 };
 
 struct DecisionEnvelope {
@@ -56,6 +57,7 @@ struct DecisionEnvelope {
   unsigned int runtimeSerial;
   DecisionCommand command;
   std::string commandName;
+  std::string actionArgument;
   std::string contextHash;
   long long contextGameTs;
   long long dispatchDeadlineTs;

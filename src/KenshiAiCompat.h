@@ -3,12 +3,24 @@
 #include "AutonomyMonitor.h"
 
 #include <string>
+#include <vector>
 
 class Character;
 class GameWorld;
 
 namespace Stobe {
 namespace KenshiAi {
+
+struct NearbyActorSnapshot {
+  unsigned int runtimeSerial;
+  double distance;
+  bool playerCharacter;
+  bool dead;
+  bool unconscious;
+  std::string name;
+
+  NearbyActorSnapshot();
+};
 
 struct CharacterSnapshot {
   bool found;
@@ -22,12 +34,15 @@ struct CharacterSnapshot {
   bool paused;
   bool moving;
   bool pathFailed;
+  bool carrying;
+  unsigned int carriedSerial;
   unsigned int runtimeSerial;
   double x;
   double y;
   double z;
   Stobe::Autonomy::OrderFingerprint order;
   std::string name;
+  std::vector<NearbyActorSnapshot> nearbyActors;
 
   CharacterSnapshot();
 };

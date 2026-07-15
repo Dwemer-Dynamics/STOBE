@@ -130,11 +130,28 @@ struct QueuedAction {
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
+  std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
       : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
         proximityMoveIssued(false) {}
 };
+
+struct PendingAutonomyCatalogMessage {
+  std::string message;
+  std::string decisionId;
+};
+
+extern std::deque<PendingAutonomyCatalogMessage>
+    g_pendingAutonomyCatalogMessages;
+
+// Register acquires g_msgMutex. Claim is called only while ProcessMessageQueue
+// already owns g_msgMutex.
+void RegisterPendingAutonomyCatalogMessage(const std::string &message,
+                                           const std::string &decisionId);
+bool ClaimPendingAutonomyCatalogMessageLocked(const std::string &message,
+                                              std::string &decisionIdOut);
+void CancelPendingAutonomyCatalogDecision(const std::string &decisionId);
 
 extern std::deque<QueuedAction> g_uiActionQueue;
 extern CRITICAL_SECTION g_uiMutex;

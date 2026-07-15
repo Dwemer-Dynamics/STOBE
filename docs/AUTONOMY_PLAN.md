@@ -1,7 +1,7 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phases 0-2 complete; Phase 3 next
-Last updated: 2026-07-14
+Status: Active implementation; Phases 0-3 complete; Phase 4 next
+Last updated: 2026-07-15
 
 ## Objective
 
@@ -539,6 +539,33 @@ Phase 3 build beyond internal testing.
 Exit criterion: repeated deterministic decisions execute one at a time, report accurate outcomes, and stop safely on intervention.
 
 ### Phase 3: Supervised LLM Planner
+
+Implementation status (2026-07-15): complete by operator acceptance. The
+server, plugin, database, and operator UI are implemented. The server builds a
+strict action catalog from live preconditions and user overrides, supplies
+persistent goals and bounded context to the selected connector, validates the
+structured proposal, and records connector, policy, allowlist, hashes, timing,
+and outcome data in the decision ledger. The plugin revalidates identity,
+revision, deadlines, and action arguments before routing a single decision
+through the existing validated action adapters.
+
+Automated coverage passes for strict proposal contracts, malformed responses,
+local and remote connector requirements, exponential failure backoff, planner
+rate limits, stale revisions, one-action invariants, interruption cleanup,
+exact-completed-action suppression, and the default-enabled action policy. The
+production schema migration, Release DLL build, local deployment, HTTP state
+endpoint, and operator UI were also verified.
+
+The live Doran run proved exact player-faction identity binding, structured
+Gemini planning, generic `TALK` dispatch, and terminal completion. The initial
+run exposed terminal cadence being reset to two seconds and repeated completed
+actions; both defects were fixed before acceptance. Revision 8 then held the
+hard 30-second planner floor, executed exactly one `TALK`, and converted the
+model's repeated proposal into an audited `duplicate_suppressed` wait. Revision
+11 dispatched a 20-second `IDLE`; pausing at revision 12 cancelled its owned
+order, left no active decision, and produced no delayed completion after the
+original deadline. Revision 13 stopped autonomy and the plugin acknowledged the
+disabled state.
 
 - Add strict structured decision output.
 - Add persistent goals and recent event context.

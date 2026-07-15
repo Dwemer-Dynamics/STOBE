@@ -4,6 +4,7 @@
 #include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
 #include "Comm.h"
+#include "Globals.h"
 #include "KenshiAiCompat.h"
 #include "StobeText.h"
 #include "Utils.h"
@@ -97,6 +98,16 @@ struct ActiveAction {
         progressInitialized(false), bestDistance(0.0) {}
 };
 
+struct ActiveCatalogAction {
+  bool active;
+  Stobe::Autonomy::ControlSnapshot control;
+  Stobe::Autonomy::DecisionEnvelope decision;
+  DWORD startedTick;
+  int gameTs;
+
+  ActiveCatalogAction() : active(false), startedTick(0), gameTs(0) {}
+};
+
 CRITICAL_SECTION g_controlMutex;
 LONG g_initialized = 0;
 LONG g_threadStarted = 0;
@@ -119,6 +130,7 @@ DWORD g_lastQueuedHeartbeatTick = 0;
 DWORD g_cooldownStartedTick = 0;
 DWORD g_nextTickAllowedTick = 0;
 ActiveAction g_active;
+ActiveCatalogAction g_catalogActive;
 
 void EnsureInitialized() {
   if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0) {
@@ -184,6 +196,42 @@ std::string BuildReportJson(const RuntimeReport &report) {
   return json.str();
 }
 
+void HashContextValue(unsigned long long &hash, unsigned long long value) {
+  const unsigned long long prime = 1099511628211ull;
+  for (int index = 0; index < 8; ++index) {
+    hash ^= (value >> (index * 8)) & 0xffull;
+    hash *= prime;
+  }
+}
+
+std::string BuildStableContextHash(const TickRequest &tick) {
+  unsigned long long hash = 1469598103934665603ull;
+  HashContextValue(hash, static_cast<unsigned long long>(tick.control.controlRevision));
+  HashContextValue(hash, tick.character.runtimeSerial);
+  HashContextValue(hash, static_cast<unsigned long long>(
+                             static_cast<long long>(tick.character.x / 10.0)));
+  HashContextValue(hash, static_cast<unsigned long long>(
+                             static_cast<long long>(tick.character.y / 10.0)));
+  HashContextValue(hash, static_cast<unsigned long long>(
+                             static_cast<long long>(tick.character.z / 10.0)));
+  HashContextValue(hash, static_cast<unsigned long long>(tick.character.order.orderCount));
+  HashContextValue(hash, static_cast<unsigned long long>(tick.character.order.taskType));
+  HashContextValue(hash, tick.character.dead ? 1 : 0);
+  HashContextValue(hash, tick.character.unconscious ? 1 : 0);
+  HashContextValue(hash, tick.character.carrying ? 1 : 0);
+  HashContextValue(hash, tick.character.carriedSerial);
+  for (size_t i = 0; i < tick.character.nearbyActors.size(); ++i) {
+    const Stobe::KenshiAi::NearbyActorSnapshot &actor =
+        tick.character.nearbyActors[i];
+    HashContextValue(hash, actor.runtimeSerial);
+    HashContextValue(hash, actor.dead ? 1 : 0);
+    HashContextValue(hash, actor.unconscious ? 1 : 0);
+  }
+  std::ostringstream result;
+  result << "phase3-" << hash;
+  return result.str();
+}
+
 std::string BuildTickJson(const TickRequest &tick) {
   std::ostringstream json;
   json << "{\"control_revision\":" << tick.control.controlRevision
@@ -192,22 +240,85 @@ std::string BuildTickJson(const TickRequest &tick) {
        << Stobe::Text::EscapeJSON(tick.control.npcStorageId)
        << "\",\"runtime_serial\":" << tick.character.runtimeSerial
        << ",\"state\":\"" << Stobe::Text::EscapeJSON(tick.state)
-       << "\",\"observation\":\"phase_2_runtime_snapshot\""
+       << "\",\"observation\":\"phase_3_runtime_snapshot\""
        << ",\"event_key\":\"\",\"snapshot_sequence\":" << tick.sequence
        << ",\"snapshot_local_ts\":" << tick.localTs
        << ",\"game_ts\":" << tick.gameTs
-       << ",\"context_hash\":\"phase2-" << tick.control.controlRevision << "-"
-       << tick.sequence << "-" << tick.character.runtimeSerial << "\""
+       << ",\"context_hash\":\"" << BuildStableContextHash(tick) << "\""
        << ",\"position\":{\"x\":" << tick.character.x
        << ",\"y\":" << tick.character.y << ",\"z\":" << tick.character.z
        << "},\"order\":{\"count\":" << tick.character.order.orderCount
        << ",\"task\":" << tick.character.order.taskType
        << ",\"subject_serial\":" << tick.character.order.subjectSerial
+       << "},\"status\":{\"player_character\":"
+       << (tick.character.playerCharacter ? "true" : "false")
+       << ",\"dead\":" << (tick.character.dead ? "true" : "false")
+       << ",\"unconscious\":"
+       << (tick.character.unconscious ? "true" : "false")
+       << ",\"can_take_orders\":"
+       << (tick.character.canTakeOrders ? "true" : "false")
+       << ",\"has_player_orders\":"
+       << (tick.character.hasPlayerOrders ? "true" : "false")
+       << ",\"carrying\":" << (tick.character.carrying ? "true" : "false")
+       << ",\"carried_serial\":" << tick.character.carriedSerial
        << "},\"movement\":{\"moving\":"
        << (tick.character.moving ? "true" : "false")
        << ",\"path_failed\":"
        << (tick.character.pathFailed ? "true" : "false") << "}}";
-  return json.str();
+  std::string built = json.str();
+  if (!built.empty() && built[built.size() - 1] == '}') {
+    built.erase(built.size() - 1);
+  }
+  built += ",\"nearby_actors\":[";
+  for (size_t i = 0; i < tick.character.nearbyActors.size(); ++i) {
+    const Stobe::KenshiAi::NearbyActorSnapshot &actor =
+        tick.character.nearbyActors[i];
+    if (i > 0) {
+      built += ",";
+    }
+    std::ostringstream item;
+    item << "{\"name\":\"" << Stobe::Text::EscapeJSON(actor.name)
+         << "\",\"runtime_serial\":" << actor.runtimeSerial
+         << ",\"distance\":" << actor.distance
+         << ",\"player_character\":"
+         << (actor.playerCharacter ? "true" : "false")
+         << ",\"dead\":" << (actor.dead ? "true" : "false")
+         << ",\"unconscious\":"
+         << (actor.unconscious ? "true" : "false") << "}";
+    built += item.str();
+  }
+  built += "]}";
+  return built;
+}
+
+bool QueueCatalogAction(const Stobe::Autonomy::ControlSnapshot &control,
+                        const Stobe::Autonomy::DecisionEnvelope &decision) {
+  if (decision.command !=
+          Stobe::Autonomy::DECISION_COMMAND_CATALOG_ACTION ||
+      decision.commandName.empty() || decision.actionArgument.size() > 1200 ||
+      control.npcName.empty()) {
+    return false;
+  }
+  const std::string prefix = decision.commandName == "TALK"
+                                 ? "NPC_SAY: "
+                                 : "NPC_ACTION: ";
+  std::string message = prefix + control.npcName + "|" +
+                        ToString(decision.runtimeSerial) + ": ";
+  if (decision.commandName == "TALK") {
+    if (decision.actionArgument.empty()) {
+      return false;
+    }
+    message += decision.actionArgument;
+  } else {
+    const std::string adapterCommand =
+        decision.commandName == "DRINK" ? "DRINK_ITEM" : decision.commandName;
+    message += adapterCommand + "@" + decision.actionArgument;
+  }
+  EnterCriticalSection(&g_msgMutex);
+  g_messageQueue.push_back(message);
+  LeaveCriticalSection(&g_msgMutex);
+  RegisterPendingAutonomyCatalogMessage(message, decision.decisionId);
+  return true;
 }
 
 void QueueReportInternal(const RuntimeReport &report) {
@@ -309,7 +420,7 @@ void PublishRuntimeState(const Stobe::Autonomy::ControlSnapshot &control,
     QueueStateReport(control, serial, state, reason, gameTs, changed);
   }
   if (changed) {
-    Log("AUTONOMY_PHASE2_STATE: revision=" +
+    Log("AUTONOMY_PHASE3_STATE: revision=" +
         ToString(static_cast<int>(control.controlRevision)) + " state=" + state +
         " reason=" + reason + " serial=" + ToString(serial) + " name=\"" +
         name + "\"");
@@ -519,7 +630,7 @@ void StartAutonomyController() {
   HANDLE thread = CreateThread(NULL, 0, AutonomyPollThread, NULL, 0, NULL);
   if (thread) {
     CloseHandle(thread);
-    Log("AUTONOMY_PHASE2: deterministic control loop started");
+    Log("AUTONOMY_PHASE3: supervised planner control loop started");
   } else {
     InterlockedExchange(&g_threadStarted, 0);
     Log("AUTONOMY_PHASE2_ERROR: failed to start control polling thread");
@@ -534,15 +645,26 @@ void ResetAutonomyController(const char *reason) {
   LeaveCriticalSection(&g_controlMutex);
   if (!control.valid || !control.enabled) {
     g_boundSerial = 0;
+    g_catalogActive = ActiveCatalogAction();
     return;
   }
 
   const std::string resetReason = reason ? reason : "world_transition";
+  if (g_catalogActive.active && control.valid) {
+    CancelPendingAutonomyCatalogDecision(
+        g_catalogActive.decision.decisionId);
+    QueueActionReport(control, g_catalogActive.decision, "INTERRUPTED",
+                      resetReason,
+                      static_cast<int>(GetTickCount() -
+                                       g_catalogActive.startedTick),
+                      0, true);
+  }
   if (g_active.active && control.valid) {
     QueueActionReport(control, g_active.decision, "INTERRUPTED", resetReason,
                       g_active.activeElapsedMs, 0, true);
     g_active = ActiveAction();
   }
+  g_catalogActive = ActiveCatalogAction();
   ClearTickState();
   g_boundSerial = 0;
   const bool changed = !g_requiresExplicitResume ||
@@ -561,9 +683,11 @@ void UpdateAutonomyController(GameWorld *world) {
   EnsureInitialized();
   Stobe::Autonomy::ControlSnapshot control;
   DWORD lastServerSuccess = 0;
+  bool tickRequestOutstanding = false;
   EnterCriticalSection(&g_controlMutex);
   control = g_control;
   lastServerSuccess = g_lastServerSuccessTick;
+  tickRequestOutstanding = g_tickRequestOutstanding;
   LeaveCriticalSection(&g_controlMutex);
   if (!control.valid) {
     return;
@@ -573,7 +697,12 @@ void UpdateAutonomyController(GameWorld *world) {
   if (revisionChanged) {
     ClearActiveAction(world, true, "control_revision_changed");
     ClearTickState();
+    if (g_catalogActive.active) {
+      CancelPendingAutonomyCatalogDecision(
+          g_catalogActive.decision.decisionId);
+    }
     g_appliedRevision = control.controlRevision;
+    g_catalogActive = ActiveCatalogAction();
     g_boundSerial = 0;
     g_cooldownStartedTick = 0;
     g_nextTickAllowedTick = 0;
@@ -601,6 +730,37 @@ void UpdateAutonomyController(GameWorld *world) {
       Stobe::Autonomy::ParseStorageSerial(control.npcStorageId);
   Stobe::KenshiAi::CharacterSnapshot character =
       Stobe::KenshiAi::CaptureCharacter(world, expectedSerial);
+
+  if (g_catalogActive.active) {
+    const DWORD elapsed = GetTickCount() - g_catalogActive.startedTick;
+    if (elapsed >= 3000) {
+      CancelPendingAutonomyCatalogDecision(
+          g_catalogActive.decision.decisionId);
+      QueueActionReport(g_catalogActive.control, g_catalogActive.decision,
+                        "FAILED", "catalog_adapter_rejected", elapsed, gameTs,
+                        true);
+      Log("AUTONOMY_PHASE3_TERMINAL: decision=" +
+          g_catalogActive.decision.decisionId +
+          " outcome=FAILED reason=catalog_adapter_rejected");
+      g_catalogActive = ActiveCatalogAction();
+      g_cooldownStartedTick = GetTickCount();
+      PublishRuntimeState(control, character.runtimeSerial, "COOLDOWN",
+                          "catalog_adapter_rejected", character.name, gameTs,
+                          true);
+    } else {
+      PublishRuntimeState(control, character.runtimeSerial, "EXECUTING",
+                          "catalog_adapter_executing", character.name, gameTs,
+                          false);
+    }
+    return;
+  }
+
+  if (character.paused) {
+    PublishRuntimeState(control, character.runtimeSerial, "OBSERVING",
+                        "game_paused", character.name, gameTs,
+                        revisionChanged);
+    return;
+  }
 
   if (g_active.active) {
     const DWORD now = GetTickCount();
@@ -680,9 +840,10 @@ void UpdateAutonomyController(GameWorld *world) {
   }
 
   Stobe::Autonomy::RuntimeFacts facts;
-  facts.serverAvailable = lastServerSuccess != 0 &&
-                          GetTickCount() - lastServerSuccess <=
-                              kServerUnavailableMs;
+  facts.serverAvailable = tickRequestOutstanding ||
+                          (lastServerSuccess != 0 &&
+                           GetTickCount() - lastServerSuccess <=
+                               kServerUnavailableMs);
   facts.requiresExplicitResume = g_requiresExplicitResume;
   facts.manualPauseLatched = g_requiresExplicitResume &&
                              g_runtimeState == "PAUSED_USER" &&
@@ -752,6 +913,34 @@ void UpdateAutonomyController(GameWorld *world) {
 
       PublishRuntimeState(control, character.runtimeSerial, "ACTION_QUEUED",
                           "decision_validated", character.name, gameTs, true);
+      if (tickResult.decision.command ==
+          Stobe::Autonomy::DECISION_COMMAND_CATALOG_ACTION) {
+        if (!QueueCatalogAction(control, tickResult.decision)) {
+          QueueActionReport(control, tickResult.decision, "FAILED",
+                            "catalog_action_rejected", 0, gameTs, true);
+          g_cooldownStartedTick = GetTickCount();
+          PublishRuntimeState(control, 0, "COOLDOWN",
+                              "catalog_action_rejected", character.name,
+                              gameTs, true);
+          return;
+        }
+        QueueActionReport(control, tickResult.decision, "DISPATCHED",
+                          "validated_catalog_adapter", 0, gameTs, false);
+        g_catalogActive = ActiveCatalogAction();
+        g_catalogActive.active = true;
+        g_catalogActive.control = control;
+        g_catalogActive.decision = tickResult.decision;
+        g_catalogActive.startedTick = GetTickCount();
+        g_catalogActive.gameTs = gameTs;
+        Log("AUTONOMY_PHASE3_DISPATCH: decision=" +
+            tickResult.decision.decisionId + " command=" +
+            tickResult.decision.commandName + " serial=" +
+            ToString(tickResult.decision.runtimeSerial));
+        PublishRuntimeState(control, character.runtimeSerial, "EXECUTING",
+                            "catalog_adapter_executing", character.name,
+                            gameTs, true);
+        return;
+      }
       const Stobe::Autonomy::DispatchResult dispatched =
           Stobe::Autonomy::DispatchDecision(world, tickResult.decision);
       if (!dispatched.success) {
@@ -811,6 +1000,27 @@ void UpdateAutonomyController(GameWorld *world) {
 
   QueueTickRequest(control, character, gameTs);
   PublishRuntimeState(control, character.runtimeSerial, "DECIDING",
-                      "deterministic_tick_requested", character.name, gameTs,
+                      "planner_tick_requested", character.name, gameTs,
                       revisionChanged);
+}
+
+void ReportAutonomyCatalogActionResult(const std::string &decisionId,
+                                       bool success,
+                                       const std::string &reason) {
+  if (!g_catalogActive.active || decisionId.empty() ||
+      g_catalogActive.decision.decisionId != decisionId) {
+    return;
+  }
+  const int elapsed = static_cast<int>(GetTickCount() -
+                                       g_catalogActive.startedTick);
+  QueueActionReport(g_catalogActive.control, g_catalogActive.decision,
+                    success ? "COMPLETED" : "FAILED", reason, elapsed,
+                    g_catalogActive.gameTs, true);
+  Log("AUTONOMY_PHASE3_TERMINAL: decision=" + decisionId + " command=" +
+      g_catalogActive.decision.commandName + " outcome=" +
+      (success ? "COMPLETED" : "FAILED") + " reason=" + reason);
+  g_catalogActive = ActiveCatalogAction();
+  g_cooldownStartedTick = GetTickCount();
+  g_runtimeState = "COOLDOWN";
+  g_runtimeReason = reason;
 }

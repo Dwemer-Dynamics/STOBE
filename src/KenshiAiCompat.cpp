@@ -1,6 +1,7 @@
 #include "KenshiAiCompat.h"
 
 #include <cstdint>
+#include <cmath>
 
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/CharMovement.h>
@@ -40,11 +41,16 @@ Character *ResolveCharacterImpl(GameWorld *world, unsigned int serial) {
 
 } // namespace
 
+NearbyActorSnapshot::NearbyActorSnapshot()
+    : runtimeSerial(0), distance(0.0), playerCharacter(false), dead(false),
+      unconscious(false) {}
+
 CharacterSnapshot::CharacterSnapshot()
     : found(false), identityMatches(false), playerCharacter(false), dead(false),
       unconscious(false), hasOrdersReceiver(false), canTakeOrders(false),
       hasPlayerOrders(false), paused(false), moving(false), pathFailed(false),
-      runtimeSerial(0), x(0.0), y(0.0), z(0.0) {}
+      carrying(false), carriedSerial(0), runtimeSerial(0), x(0.0), y(0.0),
+      z(0.0) {}
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial) {
   return ResolveCharacterImpl(world, serial);
@@ -80,6 +86,15 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
   try {
     result.unconscious = character->isUnconcious();
   } catch (...) {
+  }
+  try {
+    result.carrying = character->isCarryingSomething;
+    if (result.carrying) {
+      result.carriedSerial = character->getCarryingObject().serial;
+    }
+  } catch (...) {
+    result.carrying = false;
+    result.carriedSerial = 0;
   }
   try {
     const Ogre::Vector3 position = character->getPosition();
@@ -124,6 +139,36 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
       result.order.x = destination.x;
       result.order.y = destination.y;
       result.order.z = destination.z;
+    }
+  } catch (...) {
+  }
+  try {
+    const Ogre::Vector3 actorPosition = character->getPosition();
+    const auto &characters = world->getCharacterUpdateList();
+    for (auto it = characters.begin();
+         it != characters.end() && result.nearbyActors.size() < 32; ++it) {
+      Character *candidate = *it;
+      if (!IsValidCharacter(candidate) || candidate == character) {
+        continue;
+      }
+      NearbyActorSnapshot nearby;
+      try {
+        nearby.runtimeSerial = candidate->getHandle().serial;
+        nearby.name = candidate->getName();
+        const Ogre::Vector3 delta = candidate->getPosition() - actorPosition;
+        nearby.distance = std::sqrt(static_cast<double>(delta.x * delta.x +
+                                                        delta.y * delta.y +
+                                                        delta.z * delta.z));
+        if (nearby.runtimeSerial == 0 || nearby.name.empty() ||
+            nearby.distance > 250.0) {
+          continue;
+        }
+        nearby.playerCharacter = candidate->isPlayerCharacter();
+        nearby.dead = candidate->isDead();
+        nearby.unconscious = candidate->isUnconcious();
+        result.nearbyActors.push_back(nearby);
+      } catch (...) {
+      }
     }
   } catch (...) {
   }

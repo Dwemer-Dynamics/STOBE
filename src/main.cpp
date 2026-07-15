@@ -8427,6 +8427,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
     while (!g_messageQueue.empty()) {
       std::string msg = g_messageQueue.front();
       g_messageQueue.pop_front();
+      std::string autonomyDecisionId;
+      const bool autonomyCatalogMessage =
+          ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);
+      size_t autonomyQueueSizeBefore = 0;
+      if (autonomyCatalogMessage) {
+        EnterCriticalSection(&g_uiMutex);
+        autonomyQueueSizeBefore = g_uiActionQueue.size();
+        LeaveCriticalSection(&g_uiMutex);
+      }
       Log("HOOK_MSG_PROC: Processing: " + msg);
 
       bool isNPCAction = (msg.find("NPC_ACTION: ") == 0);
@@ -11240,6 +11249,25 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             Log("HOOK_MSG_PROC: SAY fallback logged without target hand actor=" +
                 std::string(tc ? tc->getName() : "Unknown"));
           }
+        }
+      }
+      if (autonomyCatalogMessage) {
+        size_t tagged = 0;
+        EnterCriticalSection(&g_uiMutex);
+        if (g_uiActionQueue.size() > autonomyQueueSizeBefore) {
+          for (size_t index = autonomyQueueSizeBefore;
+               index < g_uiActionQueue.size(); ++index) {
+            g_uiActionQueue[index].autonomyDecisionId = autonomyDecisionId;
+            ++tagged;
+          }
+        }
+        LeaveCriticalSection(&g_uiMutex);
+        if (tagged > 0) {
+          Log("AUTONOMY_PHASE3_ADAPTER: decision=" + autonomyDecisionId +
+              " queued_actions=" + ToString(static_cast<int>(tagged)));
+        } else {
+          ReportAutonomyCatalogActionResult(
+              autonomyDecisionId, false, "catalog_adapter_no_queued_action");
         }
       }
     }

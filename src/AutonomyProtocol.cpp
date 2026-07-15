@@ -64,6 +64,27 @@ bool ParseDouble(const std::string &value, double &out) {
   return true;
 }
 
+bool IsCatalogCommand(const std::string &command) {
+  static const char *commands[] = {
+      "ATTACK",       "SUICIDE",          "FOLLOW",
+      "STOP_FOLLOW",  "JOIN_PARTY",       "LEAVE",
+      "STOP_CARRYING", "PICKUP_NPC",      "GIVE_CATS",
+      "TAKE_CATS",    "TAKE_ITEM",        "GIVE_ITEM",
+      "DROP_ITEM",    "ROLEPLAY_ACTION",  "FACTION_RELATIONS",
+      "SET_BLOCK",    "SET_HOLD",         "SET_PASSIVE",
+      "SET_JOBS",     "SET_RANGED",       "SET_TAUNT",
+      "SET_SNEAK",    "SET_RESOURCE",     "SET_MEDIC",
+      "REMOVE_LIMB",  "CUT_HORNS",        "KNOCKOUT",
+      "KILL",         "USE_OBJECT",       "USE_DRUGS",
+      "DRINK",        "FORCE_DRINK",      "TALK"};
+  for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+    if (command == commands[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 ControlSnapshot::ControlSnapshot()
@@ -218,6 +239,8 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
     parsed.command = DECISION_COMMAND_IDLE;
   } else if (parsed.commandName == "TRAVEL_LOCATION") {
     parsed.command = DECISION_COMMAND_TRAVEL_LOCATION;
+  } else if (IsCatalogCommand(parsed.commandName)) {
+    parsed.command = DECISION_COMMAND_CATALOG_ACTION;
   }
   parsed.contextHash = Trim(Text::JsonReadField(decisionJson, "context_hash"));
   parsed.contextGameTs = ParseLongLong(
@@ -233,6 +256,8 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
   }
   parsed.idleDurationMs = static_cast<int>(ParseLongLong(
       Text::JsonReadField(arguments, "duration_ms"), 1500));
+  parsed.actionArgument = Trim(
+      Text::JsonReadField(arguments, "legacy_argument"));
   parsed.locationZoneId = ParseLongLong(
       Text::JsonReadField(arguments, "location_zone_id"), 0);
   parsed.locationLabel = Trim(Text::JsonReadField(arguments, "zone_name"));
@@ -257,11 +282,13 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
       parsed.actionDeadlineTs < parsed.dispatchDeadlineTs ||
       (parsed.command == DECISION_COMMAND_IDLE &&
        (parsed.idleDurationMs < 250 || parsed.idleDurationMs > 30000)) ||
-      (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION &&
+       (parsed.command == DECISION_COMMAND_TRAVEL_LOCATION &&
        (parsed.locationZoneId <= 0 || parsed.arrivalRadius < 1.0 ||
         parsed.arrivalRadius > 100.0 || std::fabs(parsed.x) > 10000000.0 ||
         std::fabs(parsed.y) > 10000000.0 ||
-        std::fabs(parsed.z) > 10000000.0))) {
+         std::fabs(parsed.z) > 10000000.0)) ||
+      (parsed.command == DECISION_COMMAND_CATALOG_ACTION &&
+       parsed.actionArgument.size() > 1200)) {
     return false;
   }
   parsed.valid = true;
