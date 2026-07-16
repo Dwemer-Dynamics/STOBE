@@ -66,16 +66,15 @@ bool ParseDouble(const std::string &value, double &out) {
 
 bool IsCatalogCommand(const std::string &command) {
   static const char *commands[] = {
-      "ATTACK",       "SUICIDE",          "FOLLOW",
+      "SUICIDE",      "FOLLOW",
       "STOP_FOLLOW",  "JOIN_PARTY",       "LEAVE",
       "STOP_CARRYING", "PICKUP_NPC",      "GIVE_CATS",
-      "TAKE_CATS",    "TAKE_ITEM",        "GIVE_ITEM",
+      "TAKE_CATS",    "GIVE_ITEM",
       "DROP_ITEM",    "ROLEPLAY_ACTION",  "FACTION_RELATIONS",
       "SET_BLOCK",    "SET_HOLD",         "SET_PASSIVE",
       "SET_JOBS",     "SET_RANGED",       "SET_TAUNT",
       "SET_SNEAK",    "SET_RESOURCE",     "SET_MEDIC",
-      "REMOVE_LIMB",  "CUT_HORNS",        "KNOCKOUT",
-      "KILL",         "USE_OBJECT",       "USE_DRUGS",
+      "USE_OBJECT",   "USE_DRUGS",
       "DRINK",        "FORCE_DRINK",      "TALK"};
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
     if (command == commands[i]) {
@@ -105,7 +104,8 @@ StateDecision::StateDecision(const std::string &stateValue,
 DecisionEnvelope::DecisionEnvelope()
     : valid(false), controlRevision(-1), npcId(0), runtimeSerial(0),
       command(DECISION_COMMAND_NONE), contextGameTs(0), dispatchDeadlineTs(0),
-      actionDeadlineTs(0), idleDurationMs(1500), locationZoneId(0),
+      actionDeadlineTs(0), idleDurationMs(1500), itemAmount(1), limbCode(0),
+      locationZoneId(0),
       targetRuntimeSerial(0), x(0.0), y(0.0), z(0.0), arrivalRadius(8.0),
       safeRadius(70.0) {}
 
@@ -248,6 +248,20 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
     parsed.command = DECISION_COMMAND_FIRST_AID;
   } else if (parsed.commandName == "REST") {
     parsed.command = DECISION_COMMAND_REST;
+  } else if (parsed.commandName == "ATTACK") {
+    parsed.command = DECISION_COMMAND_ATTACK;
+  } else if (parsed.commandName == "TAKE_ITEM") {
+    parsed.command = DECISION_COMMAND_TAKE_ITEM;
+  } else if (parsed.commandName == "EQUIP_ITEM") {
+    parsed.command = DECISION_COMMAND_EQUIP_ITEM;
+  } else if (parsed.commandName == "KNOCKOUT") {
+    parsed.command = DECISION_COMMAND_KNOCKOUT;
+  } else if (parsed.commandName == "KILL") {
+    parsed.command = DECISION_COMMAND_KILL;
+  } else if (parsed.commandName == "REMOVE_LIMB") {
+    parsed.command = DECISION_COMMAND_REMOVE_LIMB;
+  } else if (parsed.commandName == "CUT_HORNS") {
+    parsed.command = DECISION_COMMAND_CUT_HORNS;
   } else if (IsCatalogCommand(parsed.commandName)) {
     parsed.command = DECISION_COMMAND_CATALOG_ACTION;
   }
@@ -267,6 +281,20 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
       Text::JsonReadField(arguments, "duration_ms"), 1500));
   parsed.actionArgument = Trim(
       Text::JsonReadField(arguments, "legacy_argument"));
+  parsed.targetName = Trim(Text::JsonReadField(arguments, "target"));
+  parsed.itemName = Trim(Text::JsonReadField(arguments, "item"));
+  parsed.limbName = Trim(Text::JsonReadField(arguments, "limb"));
+  parsed.itemAmount = static_cast<int>(ParseLongLong(
+      Text::JsonReadField(arguments, "amount"), 1));
+  if (parsed.limbName == "LEFT_ARM") {
+    parsed.limbCode = 1;
+  } else if (parsed.limbName == "RIGHT_ARM") {
+    parsed.limbCode = 2;
+  } else if (parsed.limbName == "LEFT_LEG") {
+    parsed.limbCode = 3;
+  } else if (parsed.limbName == "RIGHT_LEG") {
+    parsed.limbCode = 4;
+  }
   parsed.locationZoneId = ParseLongLong(
       Text::JsonReadField(arguments, "location_zone_id"), 0);
   const long long targetRuntimeSerial = ParseLongLong(
@@ -318,6 +346,20 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
        (parsed.safeRadius < 10.0 || parsed.safeRadius > 500.0)) ||
       (parsed.command == DECISION_COMMAND_FIRST_AID &&
        parsed.targetRuntimeSerial == 0) ||
+      ((parsed.command == DECISION_COMMAND_ATTACK ||
+        parsed.command == DECISION_COMMAND_TAKE_ITEM ||
+        parsed.command == DECISION_COMMAND_KNOCKOUT ||
+        parsed.command == DECISION_COMMAND_KILL ||
+        parsed.command == DECISION_COMMAND_REMOVE_LIMB ||
+        parsed.command == DECISION_COMMAND_CUT_HORNS) &&
+       (parsed.targetRuntimeSerial == 0 || parsed.targetName.empty() ||
+        parsed.targetName.size() > 160)) ||
+      ((parsed.command == DECISION_COMMAND_TAKE_ITEM ||
+        parsed.command == DECISION_COMMAND_EQUIP_ITEM) &&
+       (parsed.itemName.empty() || parsed.itemName.size() > 160 ||
+        parsed.itemAmount < 1 || parsed.itemAmount > 20)) ||
+      (parsed.command == DECISION_COMMAND_REMOVE_LIMB &&
+       parsed.limbCode == 0) ||
       (parsed.command == DECISION_COMMAND_CATALOG_ACTION &&
        parsed.actionArgument.size() > 1200)) {
     return false;

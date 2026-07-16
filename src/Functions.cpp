@@ -2739,6 +2739,11 @@ static CloseActionApproachResult TryDeferCloseActionUntilInRange(
   if (!IsCloseActionApproachRetryableReason(rangeReason)) {
     return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
   }
+  if (!act.autonomyDecisionId.empty()) {
+    // Autonomy actions are only valid at the observed close range. Do not
+    // create an unowned approach/follow order that cannot be safely cancelled.
+    return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
+  }
 
   DWORD nowTick = GetTickCount();
   if (act.proximityStartTick == 0 || nowTick < act.proximityStartTick) {
@@ -5285,6 +5290,72 @@ std::string ToggleActionLabel(const std::string &command) {
     return "medic";
   }
   return "toggle";
+}
+
+bool EvaluateAutonomyQueuedActionPostcondition(
+    const QueuedAction &action, Character *actor, Character *target,
+    bool &successOut, std::string &reasonOut) {
+  successOut = false;
+  reasonOut = "action_postcondition_failed";
+  if (action.autonomyDecisionId.empty()) {
+    return false;
+  }
+  if (!actor || (uintptr_t)actor <= 0x1000) {
+    reasonOut = "selected_npc_not_loaded";
+    return true;
+  }
+  if (!target || (uintptr_t)target <= 0x1000) {
+    reasonOut = "target_not_loaded";
+    return true;
+  }
+  try {
+    if (action.type == ACT_KNOCKOUT) {
+      successOut = target->isUnconcious();
+      reasonOut =
+          successOut ? "target_unconscious" : "knockout_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_KILL) {
+      successOut = target->isDead();
+      reasonOut = successOut ? "target_dead" : "kill_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_REMOVE_LIMB) {
+      RobotLimbs::Limb limb = RobotLimbs::NULL_LIMB;
+      std::string limbName;
+      if (!ResolveRobotLimbFromCode(action.taskValue, limb, limbName) ||
+          limb == RobotLimbs::NULL_LIMB) {
+        reasonOut = "invalid_limb_code";
+        return true;
+      }
+      MedicalSystem *medical = target->getMedical();
+      if (!medical || (uintptr_t)medical <= 0x1000) {
+        reasonOut = "target_medical_unavailable";
+        return true;
+      }
+      const LimbState state = medical->getLimbState(limb);
+      successOut = state == LIMB_STUMP || state == LIMB_CRUSHED;
+      reasonOut = successOut ? "limb_removal_verified"
+                             : "limb_removal_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_CUT_HORNS) {
+      float average = 0.0f;
+      std::string hornReason;
+      successOut = TryGetCharacterHornAverageInternal(
+                       target, average, hornReason) &&
+                   average >= kHornCutOffThreshold;
+      reasonOut =
+          successOut ? "horn_removal_verified"
+                     : (hornReason.empty() ? "horn_removal_postcondition_failed"
+                                           : hornReason);
+      return true;
+    }
+  } catch (...) {
+    reasonOut = "action_postcondition_exception";
+    return true;
+  }
+  return false;
 }
 
 void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
@@ -8948,8 +9019,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         LeaveCriticalSection(&g_uiMutex);
       }
       if (!queueDeferredAction && !act.autonomyDecisionId.empty()) {
-        ReportAutonomyCatalogActionResult(
-            act.autonomyDecisionId, true, "catalog_action_executed");
+        bool success = true;
+        std::string reason = "catalog_action_executed";
+        EvaluateAutonomyQueuedActionPostcondition(act, npc, target, success,
+                                                  reason);
+        ReportAutonomyActionExecutionResult(act.autonomyDecisionId, success,
+                                            reason);
       }
       if (blockSpeechQueue || deferActionQueue) {
         break;

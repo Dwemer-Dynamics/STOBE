@@ -51,7 +51,9 @@ struct CharacterSnapshot {
   bool probablyDying;
   bool inBed;
   bool restBedAvailable;
+  bool inCombat;
   unsigned int carriedSerial;
+  unsigned int attackTargetSerial;
   unsigned int runtimeSerial;
   double x;
   double y;

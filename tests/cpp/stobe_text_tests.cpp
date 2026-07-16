@@ -384,17 +384,86 @@ int main() {
                                    restDecision, phase4Present),
              true);
 
+  const std::string phase5Prefix =
+      "{\"ok\":true,\"phase\":5,\"decision\":{"
+      "\"decision_id\":\"phase5-typed\",\"control_revision\":7,"
+      "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+      "\"runtime_serial\":884422,";
+  const std::string phase5Suffix =
+      ",\"context_hash\":\"phase5-context\",\"context_game_ts\":1234,"
+      "\"dispatch_deadline_ts\":2000,\"action_deadline_ts\":3000}}";
+  DecisionEnvelope attackDecision;
+  bool phase5Present = false;
+  ExpectBool("Phase 5 parses ATTACK",
+             ParseDecisionResponse(
+                 phase5Prefix +
+                     "\"command\":\"ATTACK\",\"arguments\":{"
+                     "\"target\":\"Dust Bandit\","
+                     "\"target_runtime_serial\":9911}" + phase5Suffix,
+                 attackDecision, phase5Present),
+             true);
+  ExpectUInt32("Phase 5 classifies ATTACK as typed",
+               static_cast<unsigned int>(attackDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_ATTACK));
+  ExpectUInt32("Phase 5 binds ATTACK target serial",
+               attackDecision.targetRuntimeSerial, 9911);
+
+  DecisionEnvelope takeItemDecision;
+  ExpectBool("Phase 5 parses constrained TAKE_ITEM",
+             ParseDecisionResponse(
+                 phase5Prefix +
+                     "\"command\":\"TAKE_ITEM\",\"arguments\":{"
+                     "\"target\":\"Dust Bandit\","
+                     "\"target_runtime_serial\":9911,"
+                     "\"item\":\"Bread\",\"amount\":2}" + phase5Suffix,
+                 takeItemDecision, phase5Present),
+             true);
+  ExpectUInt32("Phase 5 classifies TAKE_ITEM as typed",
+               static_cast<unsigned int>(takeItemDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_TAKE_ITEM));
+  ExpectEq("Phase 5 preserves the specific loot item",
+           takeItemDecision.itemName, "Bread");
+  ExpectUInt32("Phase 5 preserves bounded loot amount",
+               static_cast<unsigned int>(takeItemDecision.itemAmount), 2);
+
+  DecisionEnvelope equipItemDecision;
+  ExpectBool("Phase 5 parses EQUIP_ITEM",
+             ParseDecisionResponse(
+                 phase5Prefix +
+                     "\"command\":\"EQUIP_ITEM\",\"arguments\":{"
+                     "\"item\":\"Nodachi\"}" + phase5Suffix,
+                 equipItemDecision, phase5Present),
+             true);
+  ExpectUInt32("Phase 5 classifies EQUIP_ITEM as typed",
+               static_cast<unsigned int>(equipItemDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_EQUIP_ITEM));
+
+  DecisionEnvelope removeLimbDecision;
+  ExpectBool("Phase 5 parses REMOVE_LIMB",
+             ParseDecisionResponse(
+                 phase5Prefix +
+                     "\"command\":\"REMOVE_LIMB\",\"arguments\":{"
+                     "\"target\":\"Dust Bandit\","
+                     "\"target_runtime_serial\":9911,"
+                     "\"limb\":\"LEFT_ARM\"}" + phase5Suffix,
+                 removeLimbDecision, phase5Present),
+             true);
+  ExpectUInt32("Phase 5 maps the limb enum",
+               static_cast<unsigned int>(removeLimbDecision.limbCode), 1);
+
   static const char *phase3CatalogCommands[] = {
-      "ATTACK",       "SUICIDE",          "FOLLOW",
-      "STOP_FOLLOW",  "JOIN_PARTY",       "LEAVE",
+      "SUICIDE",      "FOLLOW",           "STOP_FOLLOW",
+      "JOIN_PARTY",   "LEAVE",
       "STOP_CARRYING", "PICKUP_NPC",      "GIVE_CATS",
-      "TAKE_CATS",    "TAKE_ITEM",        "GIVE_ITEM",
+      "TAKE_CATS",    "GIVE_ITEM",
       "DROP_ITEM",    "ROLEPLAY_ACTION",  "FACTION_RELATIONS",
       "SET_BLOCK",    "SET_HOLD",         "SET_PASSIVE",
       "SET_JOBS",     "SET_RANGED",       "SET_TAUNT",
       "SET_SNEAK",    "SET_RESOURCE",     "SET_MEDIC",
-      "REMOVE_LIMB",  "CUT_HORNS",        "KNOCKOUT",
-      "KILL",         "USE_OBJECT",       "USE_DRUGS",
+      "USE_OBJECT",   "USE_DRUGS",
       "DRINK",        "FORCE_DRINK",      "TALK"};
   for (size_t i = 0;
        i < sizeof(phase3CatalogCommands) / sizeof(phase3CatalogCommands[0]);
@@ -447,6 +516,19 @@ int main() {
           "\"context_game_ts\":1234,\"dispatch_deadline_ts\":2000,"
           "\"action_deadline_ts\":3000}}",
           unregisteredDecision, unregisteredPresent),
+      false);
+
+  DecisionEnvelope broadLootDecision;
+  bool broadLootPresent = false;
+  ExpectBool(
+      "Phase 5 rejects broad TAKE_ITEM queries",
+      ParseDecisionResponse(
+          phase5Prefix +
+              "\"command\":\"TAKE_ITEM\",\"arguments\":{"
+              "\"target\":\"Dust Bandit\","
+              "\"target_runtime_serial\":9911,\"item\":\"\",\"amount\":1}" +
+              phase5Suffix,
+          broadLootDecision, broadLootPresent),
       false);
 
   OrderFingerprint ownedOrder;
@@ -552,6 +634,41 @@ int main() {
                                     localArrival, 60000)
                                     .outcome),
       static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  OrderFingerprint attackOrder;
+  attackOrder.taskType = 124;
+  attackOrder.subjectSerial = 9911;
+  attackOrder.runtimePointer = 5678;
+  attackOrder.orderCount = 1;
+  MonitorFacts combatActive = arrived;
+  combatActive.currentOrder = attackOrder;
+  combatActive.targetFound = true;
+  combatActive.inCombat = true;
+  combatActive.attackTargetSerial = 9911;
+  ExpectUInt32(
+      "Phase 5 ATTACK remains active while native combat owns the target",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    attackDecision, attackOrder,
+                                    combatActive, 180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
+  combatActive.targetUnconscious = true;
+  ExpectUInt32(
+      "Phase 5 ATTACK completes when the target is neutralized",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    attackDecision, attackOrder,
+                                    combatActive, 180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+  combatActive.targetUnconscious = false;
+  combatActive.attackTargetSerial = 7722;
+  ExpectUInt32(
+      "Phase 5 ATTACK stops when native combat replaces the target",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    attackDecision, attackOrder,
+                                    combatActive, 180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_INTERRUPTED));
 
   MonitorFacts escaped = arrived;
   escaped.hostileObserved = false;

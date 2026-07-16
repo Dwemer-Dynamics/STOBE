@@ -115,7 +115,8 @@ CharacterSnapshot::CharacterSnapshot()
       unconscious(false), hasOrdersReceiver(false), canTakeOrders(false),
       hasPlayerOrders(false), paused(false), moving(false), pathFailed(false),
       carrying(false), fullyRested(true), probablyDying(false), inBed(false),
-      restBedAvailable(false), carriedSerial(0), runtimeSerial(0), x(0.0), y(0.0), z(0.0),
+      restBedAvailable(false), inCombat(false), carriedSerial(0),
+      attackTargetSerial(0), runtimeSerial(0), x(0.0), y(0.0), z(0.0),
       overallHealth(1.0), blood(0.0), maxBlood(0.0), bleedRate(0.0),
       firstAidNeed(0.0), roboticAidNeed(0.0) {}
 
@@ -184,6 +185,16 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
     result.carriedSerial = 0;
   }
   try {
+    result.inCombat = character->isInCombatMode(true, true);
+    const hand attackTarget = character->getAttackTarget();
+    if (attackTarget.isValid() && !attackTarget.isNull()) {
+      result.attackTargetSerial = attackTarget.serial;
+    }
+  } catch (...) {
+    result.inCombat = false;
+    result.attackTargetSerial = 0;
+  }
+  try {
     const Ogre::Vector3 position = character->getPosition();
     result.x = position.x;
     result.y = position.y;
@@ -220,6 +231,12 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
           result.order.taskType = static_cast<int>(USE_BED_ORDER);
         } else if (orders->hasPlayerOrder(REST)) {
           result.order.taskType = static_cast<int>(REST);
+        } else if (orders->hasPlayerOrder(
+                       UNPROVOKED_FOCUSED_MELEE_ATTACK)) {
+          result.order.taskType =
+              static_cast<int>(UNPROVOKED_FOCUSED_MELEE_ATTACK);
+        } else if (orders->hasPlayerOrder(FOCUSED_MELEE_ATTACK)) {
+          result.order.taskType = static_cast<int>(FOCUSED_MELEE_ATTACK);
         }
       }
     }

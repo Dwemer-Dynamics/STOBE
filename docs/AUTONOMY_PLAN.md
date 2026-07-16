@@ -1,7 +1,7 @@
 # Stobe Single-NPC Autonomy Plan
 
-Status: Active implementation; Phases 0-3 accepted; Phase 4 implementation complete and live validation pending
-Last updated: 2026-07-15
+Status: Active implementation; Phases 0-4 accepted; Phase 5 implemented and awaiting live validation
+Last updated: 2026-07-16
 
 ## Objective
 
@@ -617,6 +617,17 @@ protocol, executor, and monitor paths are covered by automated regressions.
 Exit criterion: the NPC can handle common non-combat survival needs without continuous player direction.
 
 ### Phase 5: Expanded Equipment, Loot, and Combat Support
+
+Implementation status (2026-07-16): implemented for automated and manual
+pilot validation. `ATTACK`, `TAKE_ITEM`, `EQUIP_ITEM`, `KNOCKOUT`, `KILL`,
+`REMOVE_LIMB`, and `CUT_HORNS` now use typed Phase 5 envelopes rather than the
+generic catalog adapter. Targeted actions bind an exact observed runtime
+serial. Looting requires one explicit item and a bounded amount. Equipment
+changes and loot transfers verify inventory postconditions immediately;
+queued irreversible mutations report their verified game-side result back to
+the active decision. `ATTACK` uses Kenshi's native focused combat order and is
+monitored until the target is neutralized, replaced, missing, cancelled, or
+timed out. All actions remain enabled by default.
 
 - Add deterministic equipment behavior.
 - Add constrained looting.

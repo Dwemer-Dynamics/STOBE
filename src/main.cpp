@@ -11266,7 +11266,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           Log("AUTONOMY_PHASE3_ADAPTER: decision=" + autonomyDecisionId +
               " queued_actions=" + ToString(static_cast<int>(tagged)));
         } else {
-          ReportAutonomyCatalogActionResult(
+          ReportAutonomyActionExecutionResult(
               autonomyDecisionId, false, "catalog_adapter_no_queued_action");
         }
       }

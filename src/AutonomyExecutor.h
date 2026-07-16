@@ -12,6 +12,8 @@ namespace Autonomy {
 
 struct DispatchResult {
   bool success;
+  bool completedImmediately;
+  bool awaitingExecutionResult;
   std::string reason;
   OrderFingerprint ownedOrder;
   bool jobsPreserved;

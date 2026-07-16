@@ -1,16 +1,22 @@
 #include "AutonomyExecutor.h"
 
+#include "Functions.h"
+#include "Globals.h"
 #include "KenshiAiCompat.h"
 #include "KenshiBuildingCompat.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cmath>
+#include <vector>
 
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/Character.h>
 #include <kenshi/GameWorld.h>
+#include <kenshi/Inventory.h>
+#include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
 
 namespace Stobe {
@@ -19,6 +25,148 @@ namespace {
 
 bool IsCharacterValid(Character *character) {
   return character && reinterpret_cast<uintptr_t>(character) > 0x1000;
+}
+
+std::string NormalizeItemToken(const std::string &value) {
+  std::string result;
+  bool previousSpace = false;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(value[i]);
+    if (std::isalnum(ch)) {
+      result.push_back(static_cast<char>(std::tolower(ch)));
+      previousSpace = false;
+    } else if (!result.empty() && !previousSpace) {
+      result.push_back(' ');
+      previousSpace = true;
+    }
+  }
+  while (!result.empty() && result[result.size() - 1] == ' ') {
+    result.erase(result.size() - 1);
+  }
+  return result;
+}
+
+bool ItemMatches(Item *item, const std::string &queryToken) {
+  if (!item || reinterpret_cast<uintptr_t>(item) <= 0x1000 ||
+      queryToken.empty()) {
+    return false;
+  }
+  try {
+    const std::string itemToken = NormalizeItemToken(item->getName());
+    return !itemToken.empty() && itemToken == queryToken;
+  } catch (...) {
+    return false;
+  }
+}
+
+int CountMatchingItems(Character *character, const std::string &queryToken) {
+  if (!IsCharacterValid(character) || queryToken.empty()) {
+    return 0;
+  }
+  Inventory *inventory = NULL;
+  try {
+    inventory = character->getInventory();
+  } catch (...) {
+  }
+  if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000) {
+    return 0;
+  }
+  int count = 0;
+  try {
+    const lektor<Item *> &items = inventory->getAllItems();
+    for (uint32_t i = 0; i < items.size(); ++i) {
+      Item *item = items.stuff[i];
+      if (!ItemMatches(item, queryToken)) {
+        continue;
+      }
+      int quantity = 1;
+      try {
+        quantity = item->quantity > 0 ? item->quantity : 1;
+      } catch (...) {
+      }
+      count += quantity;
+    }
+  } catch (...) {
+    return 0;
+  }
+  return count;
+}
+
+Item *FindMatchingItem(Character *character, const std::string &queryToken) {
+  if (!IsCharacterValid(character) || queryToken.empty()) {
+    return NULL;
+  }
+  Inventory *inventory = NULL;
+  try {
+    inventory = character->getInventory();
+  } catch (...) {
+  }
+  if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000) {
+    return NULL;
+  }
+  try {
+    const lektor<Item *> &items = inventory->getAllItems();
+    Item *partialMatch = NULL;
+    std::string partialToken;
+    for (uint32_t i = 0; i < items.size(); ++i) {
+      Item *item = items.stuff[i];
+      if (!item || reinterpret_cast<uintptr_t>(item) <= 0x1000) {
+        continue;
+      }
+      const std::string itemToken = NormalizeItemToken(item->getName());
+      if (itemToken == queryToken) {
+        return item;
+      }
+      if (itemToken.empty() ||
+          (itemToken.find(queryToken) == std::string::npos &&
+           queryToken.find(itemToken) == std::string::npos)) {
+        continue;
+      }
+      if (partialMatch && partialToken != itemToken) {
+        return NULL;
+      }
+      partialMatch = item;
+      partialToken = itemToken;
+    }
+    return partialMatch;
+  } catch (...) {
+  }
+  return NULL;
+}
+
+double CharacterDistance(Character *left, Character *right) {
+  if (!IsCharacterValid(left) || !IsCharacterValid(right)) {
+    return 1000000.0;
+  }
+  try {
+    const Ogre::Vector3 delta = left->getPosition() - right->getPosition();
+    return std::sqrt(static_cast<double>(
+        delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
+  } catch (...) {
+    return 1000000.0;
+  }
+}
+
+bool IsQueuedMutationCommand(DecisionCommand command) {
+  return command == DECISION_COMMAND_KNOCKOUT ||
+         command == DECISION_COMMAND_KILL ||
+         command == DECISION_COMMAND_REMOVE_LIMB ||
+         command == DECISION_COMMAND_CUT_HORNS;
+}
+
+ActionType QueuedMutationType(DecisionCommand command) {
+  switch (command) {
+  case DECISION_COMMAND_KNOCKOUT:
+    return ACT_KNOCKOUT;
+  case DECISION_COMMAND_KILL:
+    return ACT_KILL;
+  case DECISION_COMMAND_REMOVE_LIMB:
+    return ACT_REMOVE_LIMB;
+  case DECISION_COMMAND_CUT_HORNS:
+    return ACT_CUT_HORNS;
+  default:
+    return ACT_NOTIFY;
+  }
 }
 
 OrderFingerprint CaptureFirstOrder(OrdersReceiver *orders, TaskType expectedTask,
@@ -49,7 +197,8 @@ OrderFingerprint CaptureFirstOrder(OrdersReceiver *orders, TaskType expectedTask
 } // namespace
 
 DispatchResult::DispatchResult()
-    : success(false), jobsPreserved(false) {}
+    : success(false), completedImmediately(false),
+      awaitingExecutionResult(false), jobsPreserved(false) {}
 
 DispatchResult DispatchDecision(GameWorld *world,
                                 const DecisionEnvelope &decision) {
@@ -148,12 +297,229 @@ DispatchResult DispatchDecision(GameWorld *world,
     return result;
   }
 
+  Character *targetCharacter = NULL;
+  if (decision.targetRuntimeSerial != 0) {
+    targetCharacter = Stobe::KenshiAi::ResolveCharacter(
+        world, decision.targetRuntimeSerial);
+  }
+  if (decision.command == DECISION_COMMAND_ATTACK ||
+      decision.command == DECISION_COMMAND_TAKE_ITEM ||
+      IsQueuedMutationCommand(decision.command)) {
+    if (!IsCharacterValid(targetCharacter)) {
+      result.reason = "target_not_loaded";
+      return result;
+    }
+    try {
+      if (targetCharacter->getHandle().serial !=
+          decision.targetRuntimeSerial) {
+        result.reason = "target_runtime_serial_mismatch";
+        return result;
+      }
+    } catch (...) {
+      result.reason = "target_validation_failed";
+      return result;
+    }
+  }
+
+  if (decision.command == DECISION_COMMAND_EQUIP_ITEM) {
+    const std::string queryToken = NormalizeItemToken(decision.itemName);
+    Item *item = FindMatchingItem(character, queryToken);
+    if (!item) {
+      result.reason = "equip_item_not_found";
+      return result;
+    }
+    try {
+      if (item->isEquipped) {
+        result.success = true;
+        result.completedImmediately = true;
+        result.jobsPreserved = true;
+        result.reason = "item_already_equipped";
+        return result;
+      }
+      Inventory *inventory = character->getInventory();
+      if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000 ||
+          !inventory->equipItem(item) || !item->isEquipped) {
+        result.reason = "equip_item_failed";
+        return result;
+      }
+      character->reThinkCurrentAIAction();
+    } catch (...) {
+      result.reason = "equip_item_exception";
+      return result;
+    }
+    result.success = true;
+    result.completedImmediately = true;
+    result.jobsPreserved = true;
+    result.reason = "item_equipped";
+    return result;
+  }
+
+  if (decision.command == DECISION_COMMAND_TAKE_ITEM) {
+    if (targetCharacter == character) {
+      result.reason = "loot_self_target";
+      return result;
+    }
+    bool sourceDead = false;
+    std::string lootReason;
+    if (!IsTakeItemLootTargetValid(world, targetCharacter, lootReason,
+                                   sourceDead)) {
+      result.reason = lootReason.empty() ? "loot_target_not_helpless"
+                                         : "loot_target_" + lootReason;
+      return result;
+    }
+    if (CharacterDistance(character, targetCharacter) > 15.0) {
+      result.reason = "loot_target_out_of_range";
+      return result;
+    }
+    const std::string queryToken = NormalizeItemToken(decision.itemName);
+    if (queryToken == "equipment" || queryToken == "all" ||
+        queryToken == "everything" || queryToken == "inventory" ||
+        queryToken == "loot") {
+      result.reason = "loot_item_must_be_specific";
+      return result;
+    }
+    Item *item = FindMatchingItem(targetCharacter, queryToken);
+    if (!item) {
+      result.reason = "loot_item_not_found_or_ambiguous";
+      return result;
+    }
+    std::string resolvedItemToken;
+    try {
+      resolvedItemToken = NormalizeItemToken(item->getName());
+    } catch (...) {
+    }
+    if (resolvedItemToken.empty()) {
+      result.reason = "loot_item_name_unavailable";
+      return result;
+    }
+    const int actorCountBefore =
+        CountMatchingItems(character, resolvedItemToken);
+    const int sourceCountBefore =
+        CountMatchingItems(targetCharacter, resolvedItemToken);
+    int transferQuantity = decision.itemAmount;
+    try {
+      const int available = item->quantity > 0 ? item->quantity : 1;
+      transferQuantity = std::min(transferQuantity, available);
+      if (item->isEquipped) {
+        targetCharacter->unequipItem(item->inventorySection, item);
+      }
+    } catch (...) {
+    }
+    Inventory *sourceInventory = NULL;
+    try {
+      sourceInventory = item->getInventory();
+      if (!sourceInventory) {
+        sourceInventory = targetCharacter->getInventory();
+      }
+    } catch (...) {
+    }
+    if (!sourceInventory ||
+        reinterpret_cast<uintptr_t>(sourceInventory) <= 0x1000) {
+      result.reason = "loot_source_inventory_unavailable";
+      return result;
+    }
+    Item *detached = NULL;
+    try {
+      detached = sourceInventory->removeItemDontDestroy_returnsItem(
+          item, transferQuantity, false);
+    } catch (...) {
+    }
+    if (!detached || reinterpret_cast<uintptr_t>(detached) <= 0x1000) {
+      result.reason = "loot_item_detach_failed";
+      return result;
+    }
+    bool accepted = false;
+    try {
+      accepted = character->giveItem(detached, false, false);
+    } catch (...) {
+    }
+    if (!accepted) {
+      bool restored = false;
+      try {
+        restored = sourceInventory->addItem(
+            detached, transferQuantity, false, false);
+      } catch (...) {
+      }
+      if (!restored) {
+        try {
+          restored = targetCharacter->giveItem(detached, true, false);
+        } catch (...) {
+        }
+      }
+      result.reason = restored ? "loot_recipient_inventory_full"
+                               : "loot_recipient_full_rollback_failed";
+      return result;
+    }
+    const int actorCountAfter =
+        CountMatchingItems(character, resolvedItemToken);
+    const int sourceCountAfter =
+        CountMatchingItems(targetCharacter, resolvedItemToken);
+    if (actorCountAfter <= actorCountBefore ||
+        sourceCountAfter >= sourceCountBefore) {
+      result.reason = "loot_postcondition_failed";
+      return result;
+    }
+    try {
+      character->reThinkCurrentAIAction();
+      targetCharacter->reThinkCurrentAIAction();
+    } catch (...) {
+    }
+    result.success = true;
+    result.completedImmediately = true;
+    result.jobsPreserved = true;
+    result.reason = sourceDead ? "corpse_item_looted" : "item_looted";
+    return result;
+  }
+
+  if (IsQueuedMutationCommand(decision.command)) {
+    if (decision.command != DECISION_COMMAND_KNOCKOUT &&
+        targetCharacter == character) {
+      result.reason = "self_target_not_allowed";
+      return result;
+    }
+    if ((decision.command == DECISION_COMMAND_REMOVE_LIMB ||
+         decision.command == DECISION_COMMAND_CUT_HORNS) &&
+        !CharacterHasHacksaw(character)) {
+      result.reason = "missing_hacksaw";
+      return result;
+    }
+    if (CharacterDistance(character, targetCharacter) > 15.0) {
+      result.reason = "target_out_of_range";
+      return result;
+    }
+    QueuedAction action;
+    action.type = QueuedMutationType(decision.command);
+    action.actor = character->getHandle();
+    action.target = targetCharacter->getHandle();
+    action.message = decision.targetName;
+    action.targetToken = decision.targetName;
+    action.taskValue = decision.limbCode;
+    action.autonomyDecisionId = decision.decisionId;
+    EnterCriticalSection(&g_uiMutex);
+    g_uiActionQueue.push_back(action);
+    LeaveCriticalSection(&g_uiMutex);
+    result.success = true;
+    result.awaitingExecutionResult = true;
+    result.jobsPreserved = true;
+    result.reason = "validated_action_queued";
+    return result;
+  }
+
   TaskType task = MOVE_CUS_ORDERED;
   Ogre::Vector3 location;
   hand subject;
   try {
     location = character->getPosition();
-    if (decision.command == DECISION_COMMAND_IDLE) {
+    if (decision.command == DECISION_COMMAND_ATTACK) {
+      if (targetCharacter == character || targetCharacter->isDead()) {
+        result.reason = targetCharacter == character ? "attack_self_target"
+                                                     : "attack_target_dead";
+        return result;
+      }
+      task = UNPROVOKED_FOCUSED_MELEE_ATTACK;
+      subject = targetCharacter->getHandle();
+      location = targetCharacter->getPosition();
+    } else if (decision.command == DECISION_COMMAND_IDLE) {
       task = IDLE;
     } else if (decision.command == DECISION_COMMAND_REST) {
       task = USE_BED_ORDER;
@@ -202,6 +568,9 @@ DispatchResult DispatchDecision(GameWorld *world,
       character->playerMoveOrderDefault(NULL, NULL, location);
     } else {
       orders->addOrder(task, subject, location, false, false);
+      if (decision.command == DECISION_COMMAND_ATTACK) {
+        character->attackTarget(targetCharacter);
+      }
     }
     if (decision.command == DECISION_COMMAND_TRAVEL_LOCATION ||
         decision.command == DECISION_COMMAND_MOVE_NEARBY ||
@@ -284,6 +653,10 @@ bool TryCancelOwnedOrder(GameWorld *world, unsigned int runtimeSerial,
   }
   try {
     orders->clearOrders();
+    if (ownedOrder.taskType ==
+        static_cast<int>(UNPROVOKED_FOCUSED_MELEE_ATTACK)) {
+      character->endCombatMode();
+    }
     character->reThinkCurrentAIAction();
     reasonOut = "owned_order_cancelled";
     return true;

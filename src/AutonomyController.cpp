@@ -93,13 +93,18 @@ struct ActiveAction {
   double startX;
   double startY;
   double startZ;
+  bool awaitingExecutionResult;
+  bool executionResultReady;
+  bool executionSuccess;
+  std::string executionReason;
 
   ActiveAction()
       : active(false), lastMonitorTick(0), lastActiveTick(0),
         activeElapsedMs(0), deadlineMs(0), stationarySamples(0),
         pathFailedSamples(0), noProgressElapsedMs(0),
         progressInitialized(false), bestDistance(0.0), startX(0.0),
-        startY(0.0), startZ(0.0) {}
+        startY(0.0), startZ(0.0), awaitingExecutionResult(false),
+        executionResultReady(false), executionSuccess(false) {}
 };
 
 struct ActiveCatalogAction {
@@ -216,6 +221,14 @@ const char *TypedDecisionPhase(
   case Stobe::Autonomy::DECISION_COMMAND_FIRST_AID:
   case Stobe::Autonomy::DECISION_COMMAND_REST:
     return "PHASE4";
+  case Stobe::Autonomy::DECISION_COMMAND_ATTACK:
+  case Stobe::Autonomy::DECISION_COMMAND_TAKE_ITEM:
+  case Stobe::Autonomy::DECISION_COMMAND_EQUIP_ITEM:
+  case Stobe::Autonomy::DECISION_COMMAND_KNOCKOUT:
+  case Stobe::Autonomy::DECISION_COMMAND_KILL:
+  case Stobe::Autonomy::DECISION_COMMAND_REMOVE_LIMB:
+  case Stobe::Autonomy::DECISION_COMMAND_CUT_HORNS:
+    return "PHASE5";
   default:
     return "PHASE2";
   }
@@ -615,11 +628,20 @@ void ClearActiveAction(GameWorld *world, bool attemptCancel,
   if (!g_active.active) {
     return;
   }
-  if (attemptCancel && world) {
+  if (attemptCancel) {
     std::string cancelReason;
-    const bool cancelled = Stobe::Autonomy::TryCancelOwnedOrder(
-        world, g_active.decision.runtimeSerial, g_active.ownedOrder,
-        cancelReason);
+    bool cancelled = false;
+    if (g_active.awaitingExecutionResult) {
+      CancelPendingAutonomyCatalogDecision(g_active.decision.decisionId);
+      cancelled = true;
+      cancelReason = "queued_action_cancelled";
+    } else if (world) {
+      cancelled = Stobe::Autonomy::TryCancelOwnedOrder(
+          world, g_active.decision.runtimeSerial, g_active.ownedOrder,
+          cancelReason);
+    } else {
+      cancelReason = "world_unavailable";
+    }
     Log(std::string("AUTONOMY_") + TypedDecisionPhase(g_active.decision.command) +
         "_CANCEL: decision=" + g_active.decision.decisionId +
         " requested_reason=" + reason + " result=" +
@@ -637,7 +659,9 @@ void FinishActiveAction(GameWorld *world,
   }
   const Stobe::Autonomy::DecisionEnvelope decision = g_active.decision;
   const int elapsed = g_active.activeElapsedMs;
-  if (outcome != Stobe::Autonomy::MONITOR_INTERRUPTED) {
+  if (g_active.awaitingExecutionResult) {
+    CancelPendingAutonomyCatalogDecision(decision.decisionId);
+  } else if (outcome != Stobe::Autonomy::MONITOR_INTERRUPTED) {
     std::string cancelReason;
     Stobe::Autonomy::TryCancelOwnedOrder(
         world, decision.runtimeSerial, g_active.ownedOrder, cancelReason);
@@ -706,6 +730,9 @@ void ResetAutonomyController(const char *reason) {
                       0, true);
   }
   if (g_active.active && control.valid) {
+    if (g_active.awaitingExecutionResult) {
+      CancelPendingAutonomyCatalogDecision(g_active.decision.decisionId);
+    }
     QueueActionReport(control, g_active.decision, "INTERRUPTED", resetReason,
                       g_active.activeElapsedMs, 0, true);
     g_active = ActiveAction();
@@ -881,6 +908,35 @@ void UpdateAutonomyController(GameWorld *world) {
       }
     }
 
+    if (g_active.awaitingExecutionResult) {
+      if (g_active.executionResultReady) {
+        FinishActiveAction(
+            world, control,
+            g_active.executionSuccess ? Stobe::Autonomy::MONITOR_COMPLETED
+                                      : Stobe::Autonomy::MONITOR_FAILED,
+            g_active.executionReason.empty()
+                ? (g_active.executionSuccess ? "action_postcondition_verified"
+                                             : "action_postcondition_failed")
+                : g_active.executionReason,
+            gameTs);
+        PublishRuntimeState(control, 0, g_runtimeState, g_runtimeReason,
+                            character.name, gameTs, true);
+        return;
+      }
+      if (g_active.deadlineMs > 0 &&
+          g_active.activeElapsedMs >= g_active.deadlineMs) {
+        FinishActiveAction(world, control, Stobe::Autonomy::MONITOR_TIMED_OUT,
+                           "queued_action_deadline_exceeded", gameTs);
+        PublishRuntimeState(control, 0, g_runtimeState, g_runtimeReason,
+                            character.name, gameTs, true);
+        return;
+      }
+      PublishRuntimeState(control, g_active.decision.runtimeSerial,
+                          "EXECUTING", "awaiting_action_postcondition",
+                          character.name, gameTs, false);
+      return;
+    }
+
     Stobe::Autonomy::MonitorFacts facts;
     facts.found = character.found;
     facts.identityMatches = character.identityMatches;
@@ -893,6 +949,8 @@ void UpdateAutonomyController(GameWorld *world) {
     facts.hasPlayerOrders = character.hasPlayerOrders;
     facts.fullyRested = character.fullyRested;
     facts.inBed = character.inBed;
+    facts.inCombat = character.inCombat;
+    facts.attackTargetSerial = character.attackTargetSerial;
     facts.firstAidNeed = std::max(character.firstAidNeed,
                                   character.roboticAidNeed);
     facts.bleedRate = character.bleedRate;
@@ -921,6 +979,7 @@ void UpdateAutonomyController(GameWorld *world) {
       if (actor.runtimeSerial == g_active.decision.targetRuntimeSerial) {
         facts.targetFound = true;
         facts.targetDead = actor.dead;
+        facts.targetUnconscious = actor.unconscious;
         facts.targetFirstAidNeed =
             std::max(actor.firstAidNeed, actor.roboticAidNeed);
         facts.targetBleedRate = actor.bleedRate;
@@ -929,6 +988,7 @@ void UpdateAutonomyController(GameWorld *world) {
     if (g_active.decision.targetRuntimeSerial == character.runtimeSerial) {
       facts.targetFound = true;
       facts.targetDead = character.dead;
+      facts.targetUnconscious = character.unconscious;
       facts.targetFirstAidNeed =
           std::max(character.firstAidNeed, character.roboticAidNeed);
       facts.targetBleedRate = character.bleedRate;
@@ -1086,6 +1146,8 @@ void UpdateAutonomyController(GameWorld *world) {
       g_active.startX = character.x;
       g_active.startY = character.y;
       g_active.startZ = character.z;
+      g_active.awaitingExecutionResult =
+          dispatched.awaitingExecutionResult;
       const long long remaining =
           tickResult.decision.actionDeadlineTs -
           static_cast<long long>(time(NULL));
@@ -1093,6 +1155,21 @@ void UpdateAutonomyController(GameWorld *world) {
           std::max<long long>(1, std::min<long long>(remaining, 3600)) * 1000);
       QueueActionReport(control, tickResult.decision, "DISPATCHED",
                         dispatched.reason, 0, gameTs, false);
+      if (dispatched.completedImmediately) {
+        QueueActionReport(control, tickResult.decision, "COMPLETED",
+                          dispatched.reason, 0, gameTs, true);
+        Log("AUTONOMY_PHASE5_TERMINAL: decision=" +
+            tickResult.decision.decisionId + " command=" +
+            tickResult.decision.commandName +
+            " outcome=COMPLETED reason=" + dispatched.reason);
+        g_active = ActiveAction();
+        g_cooldownStartedTick = GetTickCount();
+        g_runtimeState = "COOLDOWN";
+        g_runtimeReason = dispatched.reason;
+        PublishRuntimeState(control, 0, g_runtimeState, g_runtimeReason,
+                            character.name, gameTs, true);
+        return;
+      }
       Log(std::string("AUTONOMY_") +
           TypedDecisionPhase(tickResult.decision.command) +
           "_DISPATCH: decision=" +
@@ -1123,9 +1200,17 @@ void UpdateAutonomyController(GameWorld *world) {
                       revisionChanged);
 }
 
-void ReportAutonomyCatalogActionResult(const std::string &decisionId,
-                                       bool success,
-                                       const std::string &reason) {
+void ReportAutonomyActionExecutionResult(const std::string &decisionId,
+                                         bool success,
+                                         const std::string &reason) {
+  if (g_active.active && g_active.awaitingExecutionResult &&
+      !decisionId.empty() &&
+      g_active.decision.decisionId == decisionId) {
+    g_active.executionResultReady = true;
+    g_active.executionSuccess = success;
+    g_active.executionReason = reason;
+    return;
+  }
   if (!g_catalogActive.active || decisionId.empty() ||
       g_catalogActive.decision.decisionId != decisionId) {
     return;

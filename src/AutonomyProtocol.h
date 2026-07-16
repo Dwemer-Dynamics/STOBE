@@ -49,6 +49,13 @@ enum DecisionCommand {
   DECISION_COMMAND_FLEE,
   DECISION_COMMAND_FIRST_AID,
   DECISION_COMMAND_REST,
+  DECISION_COMMAND_ATTACK,
+  DECISION_COMMAND_TAKE_ITEM,
+  DECISION_COMMAND_EQUIP_ITEM,
+  DECISION_COMMAND_KNOCKOUT,
+  DECISION_COMMAND_KILL,
+  DECISION_COMMAND_REMOVE_LIMB,
+  DECISION_COMMAND_CUT_HORNS,
   DECISION_COMMAND_CATALOG_ACTION
 };
 
@@ -62,11 +69,16 @@ struct DecisionEnvelope {
   DecisionCommand command;
   std::string commandName;
   std::string actionArgument;
+  std::string targetName;
+  std::string itemName;
+  std::string limbName;
   std::string contextHash;
   long long contextGameTs;
   long long dispatchDeadlineTs;
   long long actionDeadlineTs;
   int idleDurationMs;
+  int itemAmount;
+  int limbCode;
   long long locationZoneId;
   unsigned int targetRuntimeSerial;
   std::string locationLabel;

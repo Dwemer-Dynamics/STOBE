@@ -13,12 +13,13 @@ MonitorFacts::MonitorFacts()
     : found(false), identityMatches(false), playerCharacter(false), dead(false),
       unconscious(false), paused(false), moving(false), pathFailed(false),
       hasPlayerOrders(false), fullyRested(true), inBed(false),
-      targetFound(false), targetDead(false), hostileObserved(false),
+      targetFound(false), targetDead(false), targetUnconscious(false),
+      inCombat(false), hostileObserved(false),
       pathFailedSamples(0), stationarySamples(0), activeElapsedMs(0),
       noProgressElapsedMs(0), x(0.0), y(0.0), z(0.0),
       firstAidNeed(0.0), bleedRate(0.0), targetFirstAidNeed(0.0),
       targetBleedRate(0.0), nearestHostileDistance(1000000.0),
-      fleeDistanceTravelled(0.0) {}
+      fleeDistanceTravelled(0.0), attackTargetSerial(0) {}
 
 MonitorResult::MonitorResult(MonitorOutcome outcomeValue,
                              const std::string &reasonValue,
@@ -158,6 +159,24 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
     }
     return MonitorResult(MONITOR_RUNNING,
                          facts.inBed ? "resting_in_bed" : "seeking_rest");
+  }
+  if (decision.command == DECISION_COMMAND_ATTACK) {
+    if (facts.targetFound &&
+        (facts.targetDead || facts.targetUnconscious)) {
+      return MonitorResult(MONITOR_COMPLETED, "attack_target_neutralized");
+    }
+    if (!facts.targetFound && facts.activeElapsedMs >= 2000) {
+      return MonitorResult(MONITOR_FAILED, "attack_target_not_loaded");
+    }
+    if (facts.attackTargetSerial != 0 &&
+        facts.attackTargetSerial != decision.targetRuntimeSerial) {
+      return MonitorResult(MONITOR_INTERRUPTED,
+                           "combat_target_replaced");
+    }
+    if (!orderPresent && !facts.inCombat && facts.activeElapsedMs >= 3000) {
+      return MonitorResult(MONITOR_FAILED, "attack_order_not_active");
+    }
+    return MonitorResult(MONITOR_RUNNING, "attack_in_progress");
   }
   return MonitorResult(MONITOR_FAILED, "unsupported_command");
 }

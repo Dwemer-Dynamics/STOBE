@@ -42,6 +42,8 @@ struct MonitorFacts {
   bool inBed;
   bool targetFound;
   bool targetDead;
+  bool targetUnconscious;
+  bool inCombat;
   bool hostileObserved;
   int pathFailedSamples;
   int stationarySamples;
@@ -56,6 +58,7 @@ struct MonitorFacts {
   double targetBleedRate;
   double nearestHostileDistance;
   double fleeDistanceTravelled;
+  unsigned int attackTargetSerial;
   OrderFingerprint currentOrder;
 
   MonitorFacts();
