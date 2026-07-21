@@ -131,6 +131,7 @@ struct CharacterSnapshot {
 };
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial);
+void ClearCharacterHandleCache();
 Building *ResolveNearestRestBed(GameWorld *world, Character *character,
                                 double maxDistance = 250.0);
 CharacterSnapshot CaptureCharacter(GameWorld *world,

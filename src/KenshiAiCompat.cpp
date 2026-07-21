@@ -15,6 +15,7 @@
 #include <kenshi/Inventory.h>
 #include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
+#include <kenshi/PlayerInterface.h>
 #include <kenshi/RootObject.h>
 #include <kenshi/ShopTrader.h>
 
@@ -31,6 +32,7 @@ struct TraderSnapshotCache {
 };
 
 std::map<unsigned int, TraderSnapshotCache> g_traderSnapshotCache;
+std::map<unsigned int, hand> g_characterHandles;
 
 bool IsValidCharacter(Character *character) {
   return character && reinterpret_cast<uintptr_t>(character) > 0x1000;
@@ -67,26 +69,80 @@ void CaptureInventoryItems(Inventory *inventory,
   }
 }
 
-Character *ResolveCharacterImpl(GameWorld *world, unsigned int serial) {
-  if (!world || serial == 0) {
-    return NULL;
+bool HandlesMatch(const hand &expected, const hand &actual) {
+  return expected.type == actual.type &&
+         expected.container == actual.container &&
+         expected.containerSerial == actual.containerSerial &&
+         expected.index == actual.index && expected.serial == actual.serial;
+}
+
+bool RememberCharacterHandle(Character *character) {
+  if (!IsValidCharacter(character)) {
+    return false;
   }
   try {
-    const auto &characters = world->getCharacterUpdateList();
-    for (auto it = characters.begin(); it != characters.end(); ++it) {
-      Character *candidate = *it;
+    const hand runtimeHandle = character->getHandle();
+    if (runtimeHandle.serial == 0 || runtimeHandle.isNull() ||
+        !runtimeHandle.isValid()) {
+      return false;
+    }
+    g_characterHandles[runtimeHandle.serial] = runtimeHandle;
+    return true;
+  } catch (...) {
+  }
+  return false;
+}
+
+bool RememberPlayerCharacterHandle(GameWorld *world, unsigned int serial) {
+  if (!world || !world->player || serial == 0) {
+    return false;
+  }
+  try {
+    const lektor<Character *> &characters =
+        world->player->getAllPlayerCharacters();
+    for (uint32_t i = 0; i < characters.size(); ++i) {
+      Character *candidate = characters.stuff[i];
       if (!IsValidCharacter(candidate)) {
         continue;
       }
       try {
-        if (candidate->getHandle().serial == serial) {
-          return candidate;
+        const hand runtimeHandle = candidate->getHandle();
+        if (runtimeHandle.serial == serial) {
+          return RememberCharacterHandle(candidate);
         }
       } catch (...) {
       }
     }
   } catch (...) {
   }
+  return false;
+}
+
+Character *ResolveCharacterImpl(GameWorld *world, unsigned int serial,
+                                bool allowPlayerRosterBootstrap) {
+  if (!world || serial == 0) {
+    return NULL;
+  }
+  std::map<unsigned int, hand>::iterator found =
+      g_characterHandles.find(serial);
+  if (found == g_characterHandles.end() && allowPlayerRosterBootstrap) {
+    RememberPlayerCharacterHandle(world, serial);
+    found = g_characterHandles.find(serial);
+  }
+  if (found == g_characterHandles.end()) {
+    return NULL;
+  }
+  try {
+    Character *candidate = found->second.getCharacter();
+    if (IsValidCharacter(candidate)) {
+      const hand liveHandle = candidate->getHandle();
+      if (HandlesMatch(found->second, liveHandle)) {
+        return candidate;
+      }
+    }
+  } catch (...) {
+  }
+  g_characterHandles.erase(serial);
   return NULL;
 }
 
@@ -184,7 +240,12 @@ CharacterSnapshot::CharacterSnapshot()
       inventoryItemCount(0), aiPathFailureCount(0) {}
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial) {
-  return ResolveCharacterImpl(world, serial);
+  return ResolveCharacterImpl(world, serial, true);
+}
+
+void ClearCharacterHandleCache() {
+  g_characterHandles.clear();
+  g_traderSnapshotCache.clear();
 }
 
 Building *ResolveNearestRestBed(GameWorld *world, Character *character,
@@ -195,7 +256,7 @@ Building *ResolveNearestRestBed(GameWorld *world, Character *character,
 CharacterSnapshot CaptureCharacter(GameWorld *world,
                                    unsigned int expectedSerial) {
   CharacterSnapshot result;
-  Character *character = ResolveCharacterImpl(world, expectedSerial);
+  Character *character = ResolveCharacterImpl(world, expectedSerial, true);
   if (!IsValidCharacter(character)) {
     return result;
   }
@@ -276,8 +337,12 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
       result.aiPathFailureCount =
           static_cast<int>(std::min<size_t>(taskSystem->pathFailures.size(),
                                             1000));
-      Character *attackTarget =
-          ResolveCharacterImpl(world, result.attackTargetSerial);
+      Character *attackTarget = NULL;
+      const hand attackTargetHandle = character->getAttackTarget();
+      if (attackTargetHandle.isValid() && !attackTargetHandle.isNull()) {
+        attackTarget = attackTargetHandle.getCharacter();
+        RememberCharacterHandle(attackTarget);
+      }
       if (IsValidCharacter(attackTarget)) {
         result.aiIntendsToAttackTarget =
             taskSystem->intendsToAttackTarget(attackTarget);
@@ -379,6 +444,7 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
             nearby.distance > 250.0) {
           continue;
         }
+        RememberCharacterHandle(candidate);
         nearby.playerCharacter = candidate->isPlayerCharacter();
         nearby.trader = candidate->isATrader();
         nearby.cats = std::max(0, candidate->getMoney());

@@ -870,6 +870,7 @@ void ResetAutonomyController(const char *reason) {
     return;
   }
   EnsureInitialized();
+  Stobe::KenshiAi::ClearCharacterHandleCache();
   Stobe::Autonomy::ControlSnapshot control;
   EnterCriticalSection(&g_controlMutex);
   control = g_control;
