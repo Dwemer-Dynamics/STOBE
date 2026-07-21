@@ -23,6 +23,7 @@
 #include "AutonomyController.h"
 #include "AutonomySafetyProbe.h"
 #include "Globals.h"
+#include "KenshiTownCompat.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
 
@@ -51,6 +52,8 @@
 #include <kenshi/RaceData.h>
 #include <kenshi/RootObject.h>
 #include <kenshi/RootObjectBase.h>
+#include <kenshi/SharedKing.h>
+#include <kenshi/Globals.h>
 #include <kenshi/WorldEventStateQuery.h>
 
 // Helper to safely get faction names for logging
@@ -1861,6 +1864,12 @@ static std::map<std::string, FactionRelationSnapshotEntry>
 static DWORD g_lastFactionRelationSyncTick = 0;
 static const DWORD kFactionRelationSyncIntervalMs = 30 * 1000;
 static const size_t kFactionRelationSyncHardCap = 262144;
+static DWORD g_lastTownKnowledgeScanTick = 0;
+static DWORD g_lastTownKnowledgeSentTick = 0;
+static std::string g_lastTownKnowledgeDigest = "";
+static const DWORD kTownKnowledgeScanIntervalMs = 30 * 1000;
+static const DWORD kTownKnowledgeResendIntervalMs = 5 * 60 * 1000;
+static const size_t kTownKnowledgeHardCap = 512;
 
 const char *GetStobePluginVersion() {
   return kStobePluginVersion ? kStobePluginVersion : "";
@@ -2713,6 +2722,14 @@ static void ResetFactionRelationSyncState() {
   EnterCriticalSection(&g_stateMutex);
   g_factionRelationStateByKey.clear();
   g_lastFactionRelationSyncTick = 0;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void ResetTownKnowledgeSyncState() {
+  EnterCriticalSection(&g_stateMutex);
+  g_lastTownKnowledgeScanTick = 0;
+  g_lastTownKnowledgeSentTick = 0;
+  g_lastTownKnowledgeDigest = "";
   LeaveCriticalSection(&g_stateMutex);
 }
 
@@ -7409,6 +7426,102 @@ static void RunFactionRelationSync(GameWorld *world) {
       " scanned_pairs=" + ToString((int)scannedPairs) +
       " full_snapshot=" + std::string(isFullSnapshot ? "1" : "0") +
       " truncated=" + std::string(truncated ? "1" : "0"));
+}
+
+static void RunTownKnowledgeSync(GameWorld *world) {
+  if (!world || (uintptr_t)world < 0x1000 || !shou ||
+      (uintptr_t)shou < 0x1000 || !shou->townList ||
+      (uintptr_t)shou->townList < 0x1000) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  if (g_lastTownKnowledgeScanTick != 0 &&
+      (nowTick - g_lastTownKnowledgeScanTick) <
+          kTownKnowledgeScanIntervalMs) {
+    return;
+  }
+  g_lastTownKnowledgeScanTick = nowTick;
+
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    return;
+  }
+
+  lektor<RootObject *> *allTowns = nullptr;
+  try {
+    allTowns = &shou->townList->getAllTowns();
+  } catch (...) {
+    allTowns = nullptr;
+  }
+  if (!allTowns) {
+    return;
+  }
+
+  std::string townsJson = "[";
+  size_t emitted = 0;
+  const uint32_t count = allTowns->count;
+  for (uint32_t i = 0; i < count && emitted < kTownKnowledgeHardCap; ++i) {
+    RootObject *object = allTowns->stuff[i];
+    if (!object || (uintptr_t)object < 0x1000) {
+      continue;
+    }
+
+    TownBase *townBase = nullptr;
+    bool discovered = false;
+    bool explored = false;
+    std::string name;
+    Ogre::Vector3 position = Ogre::Vector3::ZERO;
+    try {
+      if (object->getDataType() != TOWN) {
+        continue;
+      }
+      townBase = static_cast<TownBase *>(object);
+      discovered = townBase->_NV_isDiscovered();
+      explored = townBase->_NV_isExplored();
+      if (!discovered) {
+        continue;
+      }
+      name = TrimCopy(townBase->getKnownName());
+      if (name.empty()) {
+        continue;
+      }
+      position = object->getPosition();
+    } catch (...) {
+      continue;
+    }
+
+    if (emitted > 0) {
+      townsJson += ",";
+    }
+    townsJson += "{\"name\":\"" + EscapeJSON(name) + "\",";
+    townsJson += "\"x\":" + ToString(position.x) + ",";
+    townsJson += "\"y\":" + ToString(position.y) + ",";
+    townsJson += "\"z\":" + ToString(position.z) + ",";
+    townsJson += "\"discovered\":true,";
+    townsJson +=
+        "\"explored\":" + std::string(explored ? "true" : "false") + "}";
+    ++emitted;
+  }
+  townsJson += "]";
+
+  const bool changed = townsJson != g_lastTownKnowledgeDigest;
+  const bool resendDue = g_lastTownKnowledgeSentTick == 0 ||
+                         (nowTick - g_lastTownKnowledgeSentTick) >=
+                             kTownKnowledgeResendIntervalMs;
+  if (!changed && !resendDue) {
+    return;
+  }
+
+  const int gameTs = ResolveCurrentGameTsSafe(world);
+  std::string payload = "{\"source\":\"kenshi_town_list\",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload += "\"towns\":" + townsJson + "}";
+  AsyncPostToStobe(L"/town_knowledge", payload);
+  g_lastTownKnowledgeDigest = townsJson;
+  g_lastTownKnowledgeSentTick = nowTick;
+  Log("TOWN_KNOWLEDGE_SYNC: sent discovered=" + ToString((int)emitted) +
+      " scanned=" + ToString((int)count) +
+      " changed=" + std::string(changed ? "1" : "0"));
 }
 
 static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
@@ -12343,6 +12456,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
+      ResetTownKnowledgeSyncState();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
@@ -12560,6 +12674,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       RunPlayerFactionPortraitSweep(world);
       RunInfoTelemetrySweep(world, sel);
       RunFactionRelationSync(world);
+      RunTownKnowledgeSync(world);
     }
   }
 
