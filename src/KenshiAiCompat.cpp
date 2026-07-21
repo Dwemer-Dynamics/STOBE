@@ -164,6 +164,13 @@ NearbyResourceSnapshot::NearbyResourceSnapshot()
     : runtimeSerial(0), distance(0.0), natural(false), usable(false),
       taskType(static_cast<int>(NULL_TASK)), x(0.0), y(0.0), z(0.0) {}
 
+NearbyWorkSnapshot::NearbyWorkSnapshot()
+    : runtimeSerial(0), distance(0.0), usable(false), needsWork(false),
+      inputEmpty(false), inputFull(false), outputEmpty(false),
+      outputFull(false), powerOn(false), workQueued(false),
+      slotAvailable(false), taskType(static_cast<int>(NULL_TASK)),
+      powerOutput(0.0), x(0.0), y(0.0), z(0.0) {}
+
 CharacterSnapshot::CharacterSnapshot()
     : found(false), identityMatches(false), playerCharacter(false), dead(false),
       unconscious(false), hasOrdersReceiver(false), canTakeOrders(false),
@@ -424,38 +431,149 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
     lektor<RootObject *> nearbyBuildings;
     world->getObjectsWithinSphere(nearbyBuildings, origin, 250.0f, BUILDING,
                                   128, (RootObject *)character);
-    for (uint32_t i = 0;
-         i < nearbyBuildings.size() && result.nearbyResources.size() < 32;
-         ++i) {
+    for (uint32_t i = 0; i < nearbyBuildings.size(); ++i) {
       Building *building = (Building *)nearbyBuildings.stuff[i];
       if (!building || reinterpret_cast<uintptr_t>(building) <= 0x1000) {
         continue;
       }
       try {
         const BuildingFunction function = building->_NV_getSpecialFunction();
-        if (function != BF_MINE && function != BF_MINE_NATURAL) {
-          continue;
-        }
-        NearbyResourceSnapshot resource;
-        resource.runtimeSerial = building->getHandle().serial;
-        resource.name = building->getName();
+        const BuildingClassType buildingClass =
+            building->_NV_getBuildingClass();
         const Ogre::Vector3 position = building->getPosition();
         const Ogre::Vector3 delta = position - origin;
-        resource.distance = std::sqrt(static_cast<double>(
+        const double distance = std::sqrt(static_cast<double>(
             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
-        resource.natural = function == BF_MINE_NATURAL;
-        resource.taskType = static_cast<int>(OPERATE_MACHINERY);
-        resource.x = position.x;
-        resource.y = position.y;
-        resource.z = position.z;
-        resource.usable = !building->_NV_isDestroyed() &&
-                          !building->_NV_isBroken();
-        if (resource.usable) {
-          building->forceValidUsageNodesValidation();
-          resource.usable = building->hasAnyGoodPositionMarkersLeft();
+        const bool intact = !building->_NV_isDestroyed() &&
+                            !building->_NV_isBroken();
+
+        if ((function == BF_MINE || function == BF_MINE_NATURAL) &&
+            result.nearbyResources.size() < 32) {
+          NearbyResourceSnapshot resource;
+          resource.runtimeSerial = building->getHandle().serial;
+          resource.name = building->getName();
+          resource.distance = distance;
+          resource.natural = function == BF_MINE_NATURAL;
+          resource.taskType = static_cast<int>(OPERATE_MACHINERY);
+          resource.x = position.x;
+          resource.y = position.y;
+          resource.z = position.z;
+          resource.usable = intact;
+          if (resource.usable) {
+            building->forceValidUsageNodesValidation();
+            resource.usable = building->hasAnyGoodPositionMarkersLeft();
+          }
+          if (resource.runtimeSerial != 0 && resource.distance <= 250.0) {
+            result.nearbyResources.push_back(resource);
+          }
         }
-        if (resource.runtimeSerial != 0 && resource.distance <= 250.0) {
-          result.nearbyResources.push_back(resource);
+
+        std::string kind;
+        if (buildingClass == BCTYPE_FARM) {
+          kind = "farm";
+        } else if (buildingClass == BCTYPE_CRAFTING ||
+                   function == BF_CRAFTING) {
+          kind = "crafting";
+        } else if (buildingClass == BCTYPE_RESEARCH ||
+                   function == BF_RESEARCH) {
+          kind = "research";
+        } else if (buildingClass == BCTYPE_STORAGE ||
+                   function == BF_RESOURCE_STORAGE ||
+                   function == BF_GENERAL_STORAGE ||
+                   function == BF_LIQUID_TANK) {
+          kind = "storage";
+        } else if (function == BF_GENERATOR || function == BF_BATTERY) {
+          kind = "power";
+        } else if (buildingClass == BCTYPE_TURRET ||
+                   function == BF_TURRET) {
+          kind = "turret";
+        }
+        if (kind.empty() || result.nearbyWork.size() >= 64 ||
+            distance > 250.0) {
+          continue;
+        }
+
+        NearbyWorkSnapshot work;
+        work.runtimeSerial = building->getHandle().serial;
+        work.name = building->getName();
+        work.kind = kind;
+        work.distance = distance;
+        work.x = position.x;
+        work.y = position.y;
+        work.z = position.z;
+        work.usable = intact;
+        UseableStuff *useable = static_cast<UseableStuff *>(building);
+        if (useable && reinterpret_cast<uintptr_t>(useable) > 0x1000) {
+          work.powerOn = useable->_NV_isPowerOn();
+          work.powerOutput = useable->_NV_getPowerOutput();
+        }
+
+        StorageBuilding *storage = NULL;
+        if (buildingClass == BCTYPE_STORAGE ||
+            buildingClass == BCTYPE_PRODUCTION ||
+            buildingClass == BCTYPE_CRAFTING ||
+            buildingClass == BCTYPE_FARM || function == BF_GENERATOR ||
+            function == BF_BATTERY) {
+          storage = static_cast<StorageBuilding *>(building)
+                        ->_NV_getFunctionStuff();
+        }
+        if (storage && reinterpret_cast<uintptr_t>(storage) > 0x1000) {
+          work.inputEmpty = storage->_NV_isAnyInputsEmpty();
+          work.inputFull = storage->_NV_isAnyInputsFull();
+          work.outputEmpty = storage->_NV_isProductionEmpty();
+          work.outputFull = storage->_NV_isProductionFull();
+        }
+        if (kind == "crafting") {
+          work.workQueued =
+              static_cast<CraftingBuilding *>(building)
+                  ->_NV_hasCraftingQueued();
+          work.taskType = static_cast<int>(
+              static_cast<ProductionBuilding *>(building)
+                  ->_NV_getDefaultTask());
+          work.needsWork = work.workQueued && !work.inputEmpty &&
+                           !work.outputFull && work.powerOn;
+        } else if (kind == "farm") {
+          work.taskType = static_cast<int>(
+              static_cast<ProductionBuilding *>(building)
+                  ->_NV_getDefaultTask());
+          work.needsWork =
+              !static_cast<FarmBuilding *>(building)
+                   ->_NV_dontNeedWorkRightNow() &&
+              !work.outputFull && work.powerOn;
+        } else if (kind == "research") {
+          work.taskType = static_cast<int>(
+              static_cast<ResearchBuilding *>(building)
+                  ->_NV_getDefaultTask());
+          work.needsWork =
+              !static_cast<ResearchBuilding *>(building)
+                   ->_NV_dontNeedWorkRightNow() &&
+              work.powerOn;
+        } else if (kind == "power") {
+          work.taskType = static_cast<int>(
+              static_cast<ProductionBuilding *>(building)
+                  ->_NV_getDefaultTask());
+          work.powerOutput =
+              static_cast<GeneratorBuilding *>(building)
+                  ->_NV_getPowerOutput();
+          work.needsWork = work.inputEmpty;
+        } else if (kind == "turret") {
+          work.taskType = static_cast<int>(
+              static_cast<TurretBuilding *>(building)
+                  ->_NV_getDefaultTask());
+          work.slotAvailable = building->hasAnyGoodPositionMarkersLeft();
+          work.needsWork = work.slotAvailable && work.powerOn;
+        } else if (kind == "storage") {
+          work.taskType = static_cast<int>(
+              static_cast<StorageBuilding *>(building)
+                  ->_NV_getDefaultTask());
+        }
+        work.usable = work.usable && work.powerOn;
+        if (kind == "storage") {
+          // Storage is hauling context, not an executable work order yet.
+          work.needsWork = false;
+        }
+        if (work.runtimeSerial != 0) {
+          result.nearbyWork.push_back(work);
         }
       } catch (...) {
       }

@@ -60,6 +60,29 @@ struct NearbyResourceSnapshot {
   NearbyResourceSnapshot();
 };
 
+struct NearbyWorkSnapshot {
+  unsigned int runtimeSerial;
+  double distance;
+  bool usable;
+  bool needsWork;
+  bool inputEmpty;
+  bool inputFull;
+  bool outputEmpty;
+  bool outputFull;
+  bool powerOn;
+  bool workQueued;
+  bool slotAvailable;
+  int taskType;
+  double powerOutput;
+  double x;
+  double y;
+  double z;
+  std::string name;
+  std::string kind;
+
+  NearbyWorkSnapshot();
+};
+
 struct CharacterSnapshot {
   bool found;
   bool identityMatches;
@@ -102,6 +125,7 @@ struct CharacterSnapshot {
   std::vector<InventoryItemSnapshot> inventoryItems;
   std::vector<NearbyActorSnapshot> nearbyActors;
   std::vector<NearbyResourceSnapshot> nearbyResources;
+  std::vector<NearbyWorkSnapshot> nearbyWork;
 
   CharacterSnapshot();
 };

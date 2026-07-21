@@ -316,6 +316,17 @@ std::string BuildStableContextHash(const TickRequest &tick) {
     HashContextValue(hash, resource.runtimeSerial);
     HashContextValue(hash, resource.usable ? 1 : 0);
   }
+  for (size_t i = 0; i < tick.character.nearbyWork.size(); ++i) {
+    const Stobe::KenshiAi::NearbyWorkSnapshot &work =
+        tick.character.nearbyWork[i];
+    HashContextValue(hash, work.runtimeSerial);
+    HashContextString(hash, work.kind);
+    HashContextValue(hash, work.usable ? 1 : 0);
+    HashContextValue(hash, work.needsWork ? 1 : 0);
+    HashContextValue(hash, work.inputEmpty ? 1 : 0);
+    HashContextValue(hash, work.outputFull ? 1 : 0);
+    HashContextValue(hash, work.workQueued ? 1 : 0);
+  }
   std::ostringstream result;
   result << "phase6-" << hash;
   return result.str();
@@ -457,6 +468,34 @@ std::string BuildTickJson(const TickRequest &tick) {
          << ",\"usable\":" << (resource.usable ? "true" : "false")
          << ",\"task\":" << resource.taskType << ",\"x\":" << resource.x
          << ",\"y\":" << resource.y << ",\"z\":" << resource.z << "}";
+    built += item.str();
+  }
+  built += "],\"nearby_work\":[";
+  for (size_t i = 0; i < tick.character.nearbyWork.size(); ++i) {
+    const Stobe::KenshiAi::NearbyWorkSnapshot &work =
+        tick.character.nearbyWork[i];
+    if (i > 0) {
+      built += ",";
+    }
+    std::ostringstream item;
+    item << "{\"name\":\"" << Stobe::Text::EscapeJSON(work.name)
+         << "\",\"kind\":\"" << Stobe::Text::EscapeJSON(work.kind)
+         << "\",\"runtime_serial\":" << work.runtimeSerial
+         << ",\"distance\":" << work.distance
+         << ",\"read_only\":true"
+         << ",\"usable\":" << (work.usable ? "true" : "false")
+         << ",\"needs_work\":" << (work.needsWork ? "true" : "false")
+         << ",\"input_empty\":" << (work.inputEmpty ? "true" : "false")
+         << ",\"input_full\":" << (work.inputFull ? "true" : "false")
+         << ",\"output_empty\":" << (work.outputEmpty ? "true" : "false")
+         << ",\"output_full\":" << (work.outputFull ? "true" : "false")
+         << ",\"power_on\":" << (work.powerOn ? "true" : "false")
+         << ",\"power_output\":" << work.powerOutput
+         << ",\"work_queued\":" << (work.workQueued ? "true" : "false")
+         << ",\"slot_available\":"
+         << (work.slotAvailable ? "true" : "false")
+         << ",\"task\":" << work.taskType << ",\"x\":" << work.x
+         << ",\"y\":" << work.y << ",\"z\":" << work.z << "}";
     built += item.str();
   }
   built += "]}";
