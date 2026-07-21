@@ -665,6 +665,43 @@ int main() {
                                     .outcome),
       static_cast<unsigned int>(MONITOR_FAILED));
 
+  MonitorFacts nativePathFailed = arrived;
+  nativePathFailed.x = travelDecision.x + 50.0;
+  nativePathFailed.pathFailedSamples = 1;
+  nativePathFailed.nativePathFailureCount = 1;
+  ExpectUInt32(
+      "Native path failure corroborates movement failure",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder,
+                                    nativePathFailed, 900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
+  MonitorFacts nativeGoalRunning = arrived;
+  nativeGoalRunning.x = travelDecision.x + 50.0;
+  nativeGoalRunning.currentOrder = OrderFingerprint();
+  nativeGoalRunning.activeElapsedMs = 5000;
+  nativeGoalRunning.nativeCurrentGoal = "MOVE_CUS_ORDERED";
+  ExpectUInt32(
+      "Native current goal survives consumed order pointer",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder,
+                                    nativeGoalRunning, 900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
+
+  MonitorFacts nativeGoalExpired = nativeGoalRunning;
+  nativeGoalExpired.nativeTaskExpired = true;
+  nativeGoalExpired.nativeGoalExpired = true;
+  nativeGoalExpired.nativeExpiredSamples = 3;
+  ExpectUInt32(
+      "Repeated native task and goal expiry terminates monitoring",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    travelDecision, ownedOrder,
+                                    nativeGoalExpired, 900000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_FAILED));
+
   MonitorFacts noProgress = pathFailed;
   noProgress.pathFailedSamples = 0;
   noProgress.noProgressElapsedMs = 30000;
@@ -737,6 +774,19 @@ int main() {
       static_cast<unsigned int>(EvaluateActionMonitor(
                                     attackDecision, attackOrder,
                                     combatActive, 180000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_RUNNING));
+  MonitorFacts intendedAttack = combatActive;
+  intendedAttack.currentOrder = OrderFingerprint();
+  intendedAttack.inCombat = false;
+  intendedAttack.attackTargetSerial = 0;
+  intendedAttack.activeElapsedMs = 5000;
+  intendedAttack.nativeIntendsToAttackTarget = true;
+  ExpectUInt32(
+      "Native attack intent survives consumed combat order",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    attackDecision, attackOrder,
+                                    intendedAttack, 180000)
                                     .outcome),
       static_cast<unsigned int>(MONITOR_RUNNING));
   combatActive.targetUnconscious = true;

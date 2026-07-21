@@ -88,6 +88,7 @@ struct ActiveAction {
   int deadlineMs;
   int stationarySamples;
   int pathFailedSamples;
+  int nativeExpiredSamples;
   int noProgressElapsedMs;
   bool progressInitialized;
   double bestDistance;
@@ -102,7 +103,7 @@ struct ActiveAction {
   ActiveAction()
       : active(false), lastMonitorTick(0), lastActiveTick(0),
         activeElapsedMs(0), deadlineMs(0), stationarySamples(0),
-        pathFailedSamples(0), noProgressElapsedMs(0),
+        pathFailedSamples(0), nativeExpiredSamples(0), noProgressElapsedMs(0),
         progressInitialized(false), bestDistance(0.0), startX(0.0),
         startY(0.0), startZ(0.0), awaitingExecutionResult(false),
         executionResultReady(false), executionSuccess(false) {}
@@ -271,6 +272,13 @@ std::string BuildStableContextHash(const TickRequest &tick) {
   HashContextValue(hash, static_cast<unsigned long long>(tick.character.cats));
   HashContextValue(
       hash, static_cast<unsigned long long>(tick.character.inventoryItemCount));
+  HashContextString(hash, tick.character.aiCurrentGoal);
+  HashContextValue(hash, tick.character.aiTaskExpired ? 1 : 0);
+  HashContextValue(hash, tick.character.aiGoalExpired ? 1 : 0);
+  HashContextValue(hash,
+                   static_cast<unsigned long long>(
+                       tick.character.aiPathFailureCount));
+  HashContextValue(hash, tick.character.aiIntendsToAttackTarget ? 1 : 0);
   for (size_t i = 0; i < tick.character.nearbyActors.size(); ++i) {
     const Stobe::KenshiAi::NearbyActorSnapshot &actor =
         tick.character.nearbyActors[i];
@@ -362,7 +370,18 @@ std::string BuildTickJson(const TickRequest &tick) {
        << "},\"movement\":{\"moving\":"
        << (tick.character.moving ? "true" : "false")
        << ",\"path_failed\":"
-       << (tick.character.pathFailed ? "true" : "false") << "}}";
+       << (tick.character.pathFailed ? "true" : "false")
+       << "},\"ai\":{\"current_goal\":\""
+       << Stobe::Text::EscapeJSON(tick.character.aiCurrentGoal)
+       << "\",\"task_expired\":"
+       << (tick.character.aiTaskExpired ? "true" : "false")
+       << ",\"goal_expired\":"
+       << (tick.character.aiGoalExpired ? "true" : "false")
+       << ",\"path_failure_count\":"
+       << tick.character.aiPathFailureCount
+       << ",\"intends_to_attack_target\":"
+       << (tick.character.aiIntendsToAttackTarget ? "true" : "false")
+       << "}}";
   std::string built = json.str();
   if (!built.empty() && built[built.size() - 1] == '}') {
     built.erase(built.size() - 1);
@@ -967,6 +986,11 @@ void UpdateAutonomyController(GameWorld *world) {
       } else {
         g_active.pathFailedSamples = 0;
       }
+      if (character.aiTaskExpired && character.aiGoalExpired) {
+        ++g_active.nativeExpiredSamples;
+      } else {
+        g_active.nativeExpiredSamples = 0;
+      }
       if (g_active.decision.command ==
               Stobe::Autonomy::DECISION_COMMAND_TRAVEL_LOCATION ||
           g_active.decision.command ==
@@ -1056,11 +1080,18 @@ void UpdateAutonomyController(GameWorld *world) {
     facts.fullyRested = character.fullyRested;
     facts.inBed = character.inBed;
     facts.inCombat = character.inCombat;
+    facts.nativeTaskExpired = character.aiTaskExpired;
+    facts.nativeGoalExpired = character.aiGoalExpired;
+    facts.nativeIntendsToAttackTarget =
+        character.aiIntendsToAttackTarget;
+    facts.nativeCurrentGoal = character.aiCurrentGoal;
+    facts.nativePathFailureCount = character.aiPathFailureCount;
     facts.attackTargetSerial = character.attackTargetSerial;
     facts.firstAidNeed = std::max(character.firstAidNeed,
                                   character.roboticAidNeed);
     facts.bleedRate = character.bleedRate;
     facts.pathFailedSamples = g_active.pathFailedSamples;
+    facts.nativeExpiredSamples = g_active.nativeExpiredSamples;
     facts.stationarySamples = g_active.stationarySamples;
     facts.activeElapsedMs = g_active.activeElapsedMs;
     facts.noProgressElapsedMs = g_active.noProgressElapsedMs;

@@ -14,8 +14,10 @@ MonitorFacts::MonitorFacts()
       unconscious(false), paused(false), moving(false), pathFailed(false),
       hasPlayerOrders(false), fullyRested(true), inBed(false),
       targetFound(false), targetDead(false), targetUnconscious(false),
-      inCombat(false), hostileObserved(false),
-      pathFailedSamples(0), stationarySamples(0), activeElapsedMs(0),
+      inCombat(false), hostileObserved(false), nativeTaskExpired(false),
+      nativeGoalExpired(false), nativeIntendsToAttackTarget(false),
+      pathFailedSamples(0), nativeExpiredSamples(0),
+      nativePathFailureCount(0), stationarySamples(0), activeElapsedMs(0),
       noProgressElapsedMs(0), x(0.0), y(0.0), z(0.0),
       firstAidNeed(0.0), bleedRate(0.0), targetFirstAidNeed(0.0),
       targetBleedRate(0.0), nearestHostileDistance(1000000.0),
@@ -80,12 +82,19 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
                          "manual_player_order_detected");
   }
 
+  const bool nativeGoalActive = !facts.nativeCurrentGoal.empty() &&
+                                !facts.nativeTaskExpired &&
+                                !facts.nativeGoalExpired;
+  if (!orderPresent && facts.nativeExpiredSamples >= 3) {
+    return MonitorResult(MONITOR_FAILED, "native_goal_expired");
+  }
+
   if (decision.command == DECISION_COMMAND_IDLE) {
     if (!facts.moving && facts.stationarySamples >= 3 &&
         facts.activeElapsedMs >= decision.idleDurationMs) {
       return MonitorResult(MONITOR_COMPLETED, "idle_stable");
     }
-    if (!orderPresent && facts.activeElapsedMs >= 2000) {
+    if (!orderPresent && !nativeGoalActive && facts.activeElapsedMs >= 2000) {
       return MonitorResult(MONITOR_FAILED, "owned_order_missing");
     }
     return MonitorResult(MONITOR_RUNNING, "idle_in_progress");
@@ -114,13 +123,14 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
       return MonitorResult(MONITOR_COMPLETED, "destination_reached",
                            distance);
     }
-    if (facts.pathFailedSamples >= 3) {
+    if (facts.pathFailedSamples >= 3 ||
+        (facts.pathFailedSamples >= 1 && facts.nativePathFailureCount > 0)) {
       return MonitorResult(MONITOR_FAILED, "path_failed", distance);
     }
     if (facts.noProgressElapsedMs >= 30000) {
       return MonitorResult(MONITOR_FAILED, "no_travel_progress", distance);
     }
-    if (!orderPresent && facts.activeElapsedMs >= 2000) {
+    if (!orderPresent && !nativeGoalActive && facts.activeElapsedMs >= 2000) {
       return MonitorResult(MONITOR_FAILED, "owned_order_missing", distance);
     }
     return MonitorResult(MONITOR_RUNNING,
@@ -143,7 +153,7 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
     if (facts.noProgressElapsedMs >= 45000) {
       return MonitorResult(MONITOR_FAILED, "no_first_aid_progress");
     }
-    if (!orderPresent && facts.activeElapsedMs >= 2000) {
+    if (!orderPresent && !nativeGoalActive && facts.activeElapsedMs >= 2000) {
       return MonitorResult(MONITOR_FAILED, "owned_order_missing");
     }
     return MonitorResult(MONITOR_RUNNING, "first_aid_in_progress");
@@ -152,10 +162,14 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
     if (facts.fullyRested) {
       return MonitorResult(MONITOR_COMPLETED, "fully_rested");
     }
-    if (!facts.inBed && facts.pathFailedSamples >= 3) {
+    if (!facts.inBed &&
+        (facts.pathFailedSamples >= 3 ||
+         (facts.pathFailedSamples >= 1 &&
+          facts.nativePathFailureCount > 0))) {
       return MonitorResult(MONITOR_FAILED, "rest_path_failed");
     }
-    if (!facts.inBed && !orderPresent && facts.activeElapsedMs >= 2000) {
+    if (!facts.inBed && !orderPresent && !nativeGoalActive &&
+        facts.activeElapsedMs >= 2000) {
       return MonitorResult(MONITOR_FAILED, "owned_order_missing");
     }
     return MonitorResult(MONITOR_RUNNING,
@@ -174,7 +188,9 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
       return MonitorResult(MONITOR_INTERRUPTED,
                            "combat_target_replaced");
     }
-    if (!orderPresent && !facts.inCombat && facts.activeElapsedMs >= 3000) {
+    if (!orderPresent && !facts.inCombat &&
+        !facts.nativeIntendsToAttackTarget && !nativeGoalActive &&
+        facts.activeElapsedMs >= 3000) {
       return MonitorResult(MONITOR_FAILED, "attack_order_not_active");
     }
     return MonitorResult(MONITOR_RUNNING, "attack_in_progress");
@@ -183,13 +199,14 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
     if (facts.hostileObserved && facts.nearestHostileDistance <= 70.0) {
       return MonitorResult(MONITOR_UNSAFE, "resource_work_threat_detected");
     }
-    if (facts.pathFailedSamples >= 3) {
+    if (facts.pathFailedSamples >= 3 ||
+        (facts.pathFailedSamples >= 1 && facts.nativePathFailureCount > 0)) {
       return MonitorResult(MONITOR_FAILED, "resource_work_path_failed");
     }
     if (facts.activeElapsedMs >= 30000 && orderPresent) {
       return MonitorResult(MONITOR_COMPLETED, "resource_work_cycle_observed");
     }
-    if (!orderPresent && facts.activeElapsedMs >= 3000) {
+    if (!orderPresent && !nativeGoalActive && facts.activeElapsedMs >= 3000) {
       return MonitorResult(MONITOR_FAILED, "resource_work_order_missing");
     }
     return MonitorResult(MONITOR_RUNNING, "resource_work_in_progress");
@@ -198,13 +215,14 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
     if (facts.hostileObserved && facts.nearestHostileDistance <= 70.0) {
       return MonitorResult(MONITOR_UNSAFE, "prospecting_threat_detected");
     }
-    if (facts.pathFailedSamples >= 3) {
+    if (facts.pathFailedSamples >= 3 ||
+        (facts.pathFailedSamples >= 1 && facts.nativePathFailureCount > 0)) {
       return MonitorResult(MONITOR_FAILED, "prospecting_path_failed");
     }
     if (facts.activeElapsedMs >= 15000) {
       return MonitorResult(MONITOR_COMPLETED, "prospecting_scan_completed");
     }
-    if (!orderPresent && facts.activeElapsedMs >= 3000) {
+    if (!orderPresent && !nativeGoalActive && facts.activeElapsedMs >= 3000) {
       return MonitorResult(MONITOR_FAILED, "prospecting_order_missing");
     }
     return MonitorResult(MONITOR_RUNNING, "prospecting_in_progress");

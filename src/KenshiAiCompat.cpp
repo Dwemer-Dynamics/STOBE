@@ -1,4 +1,5 @@
 #include "KenshiAiCompat.h"
+#include "KenshiAiRuntimeCompat.h"
 #include "KenshiBuildingCompat.h"
 
 #include <algorithm>
@@ -168,11 +169,12 @@ CharacterSnapshot::CharacterSnapshot()
       unconscious(false), hasOrdersReceiver(false), canTakeOrders(false),
       hasPlayerOrders(false), paused(false), moving(false), pathFailed(false),
       carrying(false), fullyRested(true), probablyDying(false), inBed(false),
-      restBedAvailable(false), inCombat(false), carriedSerial(0),
+      restBedAvailable(false), inCombat(false), aiTaskExpired(false),
+      aiGoalExpired(false), aiIntendsToAttackTarget(false), carriedSerial(0),
       attackTargetSerial(0), runtimeSerial(0), x(0.0), y(0.0), z(0.0),
       overallHealth(1.0), blood(0.0), maxBlood(0.0), bleedRate(0.0),
       firstAidNeed(0.0), roboticAidNeed(0.0), cats(0),
-      inventoryItemCount(0) {}
+      inventoryItemCount(0), aiPathFailureCount(0) {}
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial) {
   return ResolveCharacterImpl(world, serial);
@@ -253,6 +255,33 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
   } catch (...) {
     result.inCombat = false;
     result.attackTargetSerial = 0;
+  }
+  try {
+    AI *ai = character->getAI();
+    AITaskSytem *taskSystem =
+        ai && reinterpret_cast<uintptr_t>(ai) > 0x1000
+            ? ai->getTaskSystem()
+            : NULL;
+    if (taskSystem && reinterpret_cast<uintptr_t>(taskSystem) > 0x1000) {
+      result.aiCurrentGoal = taskSystem->getCurrentGoalString();
+      result.aiTaskExpired = taskSystem->isTaskExpired();
+      result.aiGoalExpired = taskSystem->isGoalExpired();
+      result.aiPathFailureCount =
+          static_cast<int>(std::min<size_t>(taskSystem->pathFailures.size(),
+                                            1000));
+      Character *attackTarget =
+          ResolveCharacterImpl(world, result.attackTargetSerial);
+      if (IsValidCharacter(attackTarget)) {
+        result.aiIntendsToAttackTarget =
+            taskSystem->intendsToAttackTarget(attackTarget);
+      }
+    }
+  } catch (...) {
+    result.aiCurrentGoal.clear();
+    result.aiTaskExpired = false;
+    result.aiGoalExpired = false;
+    result.aiPathFailureCount = 0;
+    result.aiIntendsToAttackTarget = false;
   }
   try {
     const Ogre::Vector3 position = character->getPosition();

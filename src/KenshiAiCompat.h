@@ -78,6 +78,9 @@ struct CharacterSnapshot {
   bool inBed;
   bool restBedAvailable;
   bool inCombat;
+  bool aiTaskExpired;
+  bool aiGoalExpired;
+  bool aiIntendsToAttackTarget;
   unsigned int carriedSerial;
   unsigned int attackTargetSerial;
   unsigned int runtimeSerial;
@@ -92,8 +95,10 @@ struct CharacterSnapshot {
   double roboticAidNeed;
   int cats;
   int inventoryItemCount;
+  int aiPathFailureCount;
   Stobe::Autonomy::OrderFingerprint order;
   std::string name;
+  std::string aiCurrentGoal;
   std::vector<InventoryItemSnapshot> inventoryItems;
   std::vector<NearbyActorSnapshot> nearbyActors;
   std::vector<NearbyResourceSnapshot> nearbyResources;

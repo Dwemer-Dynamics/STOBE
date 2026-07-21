@@ -45,7 +45,12 @@ struct MonitorFacts {
   bool targetUnconscious;
   bool inCombat;
   bool hostileObserved;
+  bool nativeTaskExpired;
+  bool nativeGoalExpired;
+  bool nativeIntendsToAttackTarget;
   int pathFailedSamples;
+  int nativeExpiredSamples;
+  int nativePathFailureCount;
   int stationarySamples;
   int activeElapsedMs;
   int noProgressElapsedMs;
@@ -59,6 +64,7 @@ struct MonitorFacts {
   double nearestHostileDistance;
   double fleeDistanceTravelled;
   unsigned int attackTargetSerial;
+  std::string nativeCurrentGoal;
   OrderFingerprint currentOrder;
 
   MonitorFacts();
