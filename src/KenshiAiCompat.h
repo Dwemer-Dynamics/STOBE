@@ -14,9 +14,12 @@ namespace KenshiAi {
 
 struct InventoryItemSnapshot {
   std::string name;
+  std::string kind;
+  std::string detail;
   int count;
   int buyValueEach;
   int sellValueEach;
+  std::vector<std::string> revealsTowns;
 
   InventoryItemSnapshot();
 };

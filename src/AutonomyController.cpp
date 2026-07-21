@@ -299,7 +299,15 @@ std::string BuildStableContextHash(const TickRequest &tick) {
       HashContextValue(hash, static_cast<unsigned long long>(
                                  actor.traderItems[itemIndex].buyValueEach));
       HashContextValue(hash, static_cast<unsigned long long>(
-                                 actor.traderItems[itemIndex].sellValueEach));
+                                  actor.traderItems[itemIndex].sellValueEach));
+      HashContextString(hash, actor.traderItems[itemIndex].kind);
+      HashContextString(hash, actor.traderItems[itemIndex].detail);
+      for (size_t townIndex = 0;
+           townIndex < actor.traderItems[itemIndex].revealsTowns.size();
+           ++townIndex) {
+        HashContextString(
+            hash, actor.traderItems[itemIndex].revealsTowns[townIndex]);
+      }
     }
   }
   for (size_t i = 0; i < tick.character.inventoryItems.size(); ++i) {
@@ -309,6 +317,14 @@ std::string BuildStableContextHash(const TickRequest &tick) {
         static_cast<unsigned long long>(tick.character.inventoryItems[i].count));
     HashContextValue(hash, static_cast<unsigned long long>(
                                tick.character.inventoryItems[i].sellValueEach));
+    HashContextString(hash, tick.character.inventoryItems[i].kind);
+    HashContextString(hash, tick.character.inventoryItems[i].detail);
+    for (size_t townIndex = 0;
+         townIndex < tick.character.inventoryItems[i].revealsTowns.size();
+         ++townIndex) {
+      HashContextString(
+          hash, tick.character.inventoryItems[i].revealsTowns[townIndex]);
+    }
   }
   for (size_t i = 0; i < tick.character.nearbyResources.size(); ++i) {
     const Stobe::KenshiAi::NearbyResourceSnapshot &resource =
@@ -433,7 +449,21 @@ std::string BuildTickJson(const TickRequest &tick) {
       item << "{\"name\":\"" << Stobe::Text::EscapeJSON(tradeItem.name)
            << "\",\"count\":" << tradeItem.count
            << ",\"buy_value_each\":" << tradeItem.buyValueEach
-           << ",\"sell_value_each\":" << tradeItem.sellValueEach << "}";
+           << ",\"sell_value_each\":" << tradeItem.sellValueEach
+           << ",\"kind\":\"" << Stobe::Text::EscapeJSON(tradeItem.kind)
+           << "\",\"detail\":\""
+           << Stobe::Text::EscapeJSON(tradeItem.detail)
+           << "\",\"reveals_towns\":[";
+      for (size_t townIndex = 0;
+           townIndex < tradeItem.revealsTowns.size(); ++townIndex) {
+        if (townIndex > 0) {
+          item << ",";
+        }
+        item << "\""
+             << Stobe::Text::EscapeJSON(tradeItem.revealsTowns[townIndex])
+             << "\"";
+      }
+      item << "]}";
     }
     item << "]}";
     built += item.str();
@@ -450,7 +480,21 @@ std::string BuildTickJson(const TickRequest &tick) {
          << Stobe::Text::EscapeJSON(inventoryItem.name)
          << "\",\"count\":" << inventoryItem.count
          << ",\"buy_value_each\":" << inventoryItem.buyValueEach
-         << ",\"sell_value_each\":" << inventoryItem.sellValueEach << "}";
+         << ",\"sell_value_each\":" << inventoryItem.sellValueEach
+         << ",\"kind\":\"" << Stobe::Text::EscapeJSON(inventoryItem.kind)
+         << "\",\"detail\":\""
+         << Stobe::Text::EscapeJSON(inventoryItem.detail)
+         << "\",\"reveals_towns\":[";
+    for (size_t townIndex = 0;
+         townIndex < inventoryItem.revealsTowns.size(); ++townIndex) {
+      if (townIndex > 0) {
+        item << ",";
+      }
+      item << "\""
+           << Stobe::Text::EscapeJSON(inventoryItem.revealsTowns[townIndex])
+           << "\"";
+    }
+    item << "]}";
     built += item.str();
   }
   built += "],\"nearby_resources\":[";

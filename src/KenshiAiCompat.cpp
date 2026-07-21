@@ -1,6 +1,7 @@
 #include "KenshiAiCompat.h"
 #include "KenshiAiRuntimeCompat.h"
 #include "KenshiBuildingCompat.h"
+#include "KenshiTownCompat.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <kenshi/CharMovement.h>
 #include <kenshi/Character.h>
 #include <kenshi/GameWorld.h>
+#include <kenshi/GameData.h>
+#include <kenshi/Gear.h>
 #include <kenshi/Inventory.h>
 #include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
@@ -38,6 +41,74 @@ bool IsValidCharacter(Character *character) {
   return character && reinterpret_cast<uintptr_t>(character) > 0x1000;
 }
 
+const char *RobotLimbSlotName(AttachSlot slot) {
+  switch (slot) {
+  case ATTACH_LEFT_ARM:
+    return "left arm";
+  case ATTACH_RIGHT_ARM:
+    return "right arm";
+  case ATTACH_LEFT_LEG:
+    return "left leg";
+  case ATTACH_RIGHT_LEG:
+    return "right leg";
+  default:
+    return "robotic limb";
+  }
+}
+
+void CaptureItemAwareness(Item *item, InventoryItemSnapshot &captured) {
+  captured.kind = "item";
+  if (!item) {
+    return;
+  }
+  const itemType dataType = item->getDataType();
+  if (dataType == MAP_ITEM) {
+    captured.kind = "map";
+    MapItem *mapItem = static_cast<MapItem *>(item);
+    const size_t count = std::min<size_t>(mapItem->townsHandles.size(), 32);
+    for (size_t i = 0; i < count; ++i) {
+      try {
+        TownBase *town = mapItem->townsHandles[i].getTown();
+        if (!town || reinterpret_cast<uintptr_t>(town) <= 0x1000) {
+          continue;
+        }
+        // A map's own contents may name towns that are not discovered yet.
+        const std::string name = town->getName();
+        if (!name.empty() &&
+            std::find(captured.revealsTowns.begin(),
+                      captured.revealsTowns.end(), name) ==
+                captured.revealsTowns.end()) {
+          captured.revealsTowns.push_back(name);
+        }
+      } catch (...) {
+      }
+    }
+    return;
+  }
+  if (dataType == BLUEPRINT || item->itemFunction == ITEM_BLUEPRINT) {
+    captured.kind = "blueprint";
+    if (dataType == BLUEPRINT) {
+      try {
+        GameData *research =
+            static_cast<BlueprintItem *>(item)->getResearchData();
+        if (research && reinterpret_cast<uintptr_t>(research) > 0x1000) {
+          captured.detail = research->name;
+        }
+      } catch (...) {
+      }
+    }
+    return;
+  }
+  if (item->itemFunction == ITEM_SEVERED_LIMB) {
+    captured.kind = "severed_limb";
+    return;
+  }
+  if (dataType == LIMB_REPLACEMENT) {
+    captured.kind = "robotic_limb";
+    captured.detail = RobotLimbSlotName(item->slotType);
+  }
+}
+
 void CaptureInventoryItems(Inventory *inventory,
                            std::vector<InventoryItemSnapshot> &out,
                            int &totalCount, size_t maxEntries) {
@@ -58,6 +129,7 @@ void CaptureInventoryItems(Inventory *inventory,
       captured.count = item->quantity > 0 ? item->quantity : 1;
       captured.buyValueEach = std::max(0, item->getValueSingle(true));
       captured.sellValueEach = std::max(0, item->getValueSingle(false));
+      CaptureItemAwareness(item, captured);
       totalCount += captured.count;
       if (!captured.name.empty() && out.size() < maxEntries) {
         out.push_back(captured);
@@ -207,7 +279,7 @@ Building *ResolveNearestRestBedImpl(GameWorld *world, Character *character,
 } // namespace
 
 InventoryItemSnapshot::InventoryItemSnapshot()
-    : count(0), buyValueEach(0), sellValueEach(0) {}
+    : kind("item"), count(0), buyValueEach(0), sellValueEach(0) {}
 
 NearbyActorSnapshot::NearbyActorSnapshot()
     : runtimeSerial(0), distance(0.0), playerCharacter(false), trader(false),
