@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 0.9.1 LANGUAGES CXX)
+project(Stobe VERSION 0.9.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,6 +66,12 @@ endif()
 
 add_library(Stobe SHARED
   src/AudioPlayback.cpp
+  src/AutonomyController.cpp
+  src/AutonomyExecutor.cpp
+  src/AutonomyMonitor.cpp
+  src/AutonomyProtocol.cpp
+  src/AutonomySafetyProbe.cpp
+  src/AutonomySafetyProbePolicy.cpp
   src/ChatUI.cpp
   src/ChatUIGlobals.cpp
   src/ChatBox.cpp
@@ -73,6 +79,7 @@ add_library(Stobe SHARED
   src/Context.cpp
   src/Functions.cpp
   src/Globals.cpp
+  src/KenshiAiCompat.cpp
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiRvaCompat.cpp

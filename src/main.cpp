@@ -20,7 +20,10 @@
 #include <core/Functions.h>
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomyController.h"
+#include "AutonomySafetyProbe.h"
 #include "Globals.h"
+#include "KenshiTownCompat.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
 
@@ -49,6 +52,8 @@
 #include <kenshi/RaceData.h>
 #include <kenshi/RootObject.h>
 #include <kenshi/RootObjectBase.h>
+#include <kenshi/SharedKing.h>
+#include <kenshi/Globals.h>
 #include <kenshi/WorldEventStateQuery.h>
 
 // Helper to safely get faction names for logging
@@ -1821,8 +1826,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.9.1";
-static const char *kStobePluginReleaseDate = "2026-06-11";
+static const char *kStobePluginVersion = "0.9.3";
+static const char *kStobePluginReleaseDate = "2026-07-20";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -1859,6 +1864,12 @@ static std::map<std::string, FactionRelationSnapshotEntry>
 static DWORD g_lastFactionRelationSyncTick = 0;
 static const DWORD kFactionRelationSyncIntervalMs = 30 * 1000;
 static const size_t kFactionRelationSyncHardCap = 262144;
+static DWORD g_lastTownKnowledgeScanTick = 0;
+static DWORD g_lastTownKnowledgeSentTick = 0;
+static std::string g_lastTownKnowledgeDigest = "";
+static const DWORD kTownKnowledgeScanIntervalMs = 30 * 1000;
+static const DWORD kTownKnowledgeResendIntervalMs = 5 * 60 * 1000;
+static const size_t kTownKnowledgeHardCap = 512;
 
 const char *GetStobePluginVersion() {
   return kStobePluginVersion ? kStobePluginVersion : "";
@@ -2711,6 +2722,14 @@ static void ResetFactionRelationSyncState() {
   EnterCriticalSection(&g_stateMutex);
   g_factionRelationStateByKey.clear();
   g_lastFactionRelationSyncTick = 0;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void ResetTownKnowledgeSyncState() {
+  EnterCriticalSection(&g_stateMutex);
+  g_lastTownKnowledgeScanTick = 0;
+  g_lastTownKnowledgeSentTick = 0;
+  g_lastTownKnowledgeDigest = "";
   LeaveCriticalSection(&g_stateMutex);
 }
 
@@ -7409,6 +7428,102 @@ static void RunFactionRelationSync(GameWorld *world) {
       " truncated=" + std::string(truncated ? "1" : "0"));
 }
 
+static void RunTownKnowledgeSync(GameWorld *world) {
+  if (!world || (uintptr_t)world < 0x1000 || !shou ||
+      (uintptr_t)shou < 0x1000 || !shou->townList ||
+      (uintptr_t)shou->townList < 0x1000) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  if (g_lastTownKnowledgeScanTick != 0 &&
+      (nowTick - g_lastTownKnowledgeScanTick) <
+          kTownKnowledgeScanIntervalMs) {
+    return;
+  }
+  g_lastTownKnowledgeScanTick = nowTick;
+
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    return;
+  }
+
+  lektor<RootObject *> *allTowns = nullptr;
+  try {
+    allTowns = &shou->townList->getAllTowns();
+  } catch (...) {
+    allTowns = nullptr;
+  }
+  if (!allTowns) {
+    return;
+  }
+
+  std::string townsJson = "[";
+  size_t emitted = 0;
+  const uint32_t count = allTowns->count;
+  for (uint32_t i = 0; i < count && emitted < kTownKnowledgeHardCap; ++i) {
+    RootObject *object = allTowns->stuff[i];
+    if (!object || (uintptr_t)object < 0x1000) {
+      continue;
+    }
+
+    TownBase *townBase = nullptr;
+    bool discovered = false;
+    bool explored = false;
+    std::string name;
+    Ogre::Vector3 position = Ogre::Vector3::ZERO;
+    try {
+      if (object->getDataType() != TOWN) {
+        continue;
+      }
+      townBase = static_cast<TownBase *>(object);
+      discovered = townBase->_NV_isDiscovered();
+      explored = townBase->_NV_isExplored();
+      if (!discovered) {
+        continue;
+      }
+      name = TrimCopy(townBase->getKnownName());
+      if (name.empty()) {
+        continue;
+      }
+      position = object->getPosition();
+    } catch (...) {
+      continue;
+    }
+
+    if (emitted > 0) {
+      townsJson += ",";
+    }
+    townsJson += "{\"name\":\"" + EscapeJSON(name) + "\",";
+    townsJson += "\"x\":" + ToString(position.x) + ",";
+    townsJson += "\"y\":" + ToString(position.y) + ",";
+    townsJson += "\"z\":" + ToString(position.z) + ",";
+    townsJson += "\"discovered\":true,";
+    townsJson +=
+        "\"explored\":" + std::string(explored ? "true" : "false") + "}";
+    ++emitted;
+  }
+  townsJson += "]";
+
+  const bool changed = townsJson != g_lastTownKnowledgeDigest;
+  const bool resendDue = g_lastTownKnowledgeSentTick == 0 ||
+                         (nowTick - g_lastTownKnowledgeSentTick) >=
+                             kTownKnowledgeResendIntervalMs;
+  if (!changed && !resendDue) {
+    return;
+  }
+
+  const int gameTs = ResolveCurrentGameTsSafe(world);
+  std::string payload = "{\"source\":\"kenshi_town_list\",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload += "\"towns\":" + townsJson + "}";
+  AsyncPostToStobe(L"/town_knowledge", payload);
+  g_lastTownKnowledgeDigest = townsJson;
+  g_lastTownKnowledgeSentTick = nowTick;
+  Log("TOWN_KNOWLEDGE_SYNC: sent discovered=" + ToString((int)emitted) +
+      " scanned=" + ToString((int)count) +
+      " changed=" + std::string(changed ? "1" : "0"));
+}
+
 static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
@@ -8425,6 +8540,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
     while (!g_messageQueue.empty()) {
       std::string msg = g_messageQueue.front();
       g_messageQueue.pop_front();
+      std::string autonomyDecisionId;
+      const bool autonomyCatalogMessage =
+          ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);
+      size_t autonomyQueueSizeBefore = 0;
+      if (autonomyCatalogMessage) {
+        EnterCriticalSection(&g_uiMutex);
+        autonomyQueueSizeBefore = g_uiActionQueue.size();
+        LeaveCriticalSection(&g_uiMutex);
+      }
       Log("HOOK_MSG_PROC: Processing: " + msg);
 
       bool isNPCAction = (msg.find("NPC_ACTION: ") == 0);
@@ -11240,6 +11364,25 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           }
         }
       }
+      if (autonomyCatalogMessage) {
+        size_t tagged = 0;
+        EnterCriticalSection(&g_uiMutex);
+        if (g_uiActionQueue.size() > autonomyQueueSizeBefore) {
+          for (size_t index = autonomyQueueSizeBefore;
+               index < g_uiActionQueue.size(); ++index) {
+            g_uiActionQueue[index].autonomyDecisionId = autonomyDecisionId;
+            ++tagged;
+          }
+        }
+        LeaveCriticalSection(&g_uiMutex);
+        if (tagged > 0) {
+          Log("AUTONOMY_PHASE3_ADAPTER: decision=" + autonomyDecisionId +
+              " queued_actions=" + ToString(static_cast<int>(tagged)));
+        } else {
+          ReportAutonomyActionExecutionResult(
+              autonomyDecisionId, false, "catalog_adapter_no_queued_action");
+        }
+      }
     }
     LeaveCriticalSection(&g_msgMutex);
   }
@@ -12218,6 +12361,7 @@ static bool IsSpeechSystemBusyForMOTD() {
 
 
 void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
+  static LONG postLoadHookProbe = 0;
   if (!thisptr || reinterpret_cast<uintptr_t>(thisptr) < 0x10000) {
     static bool loggedInvalidThis = false;
     if (!loggedInvalidThis) {
@@ -12227,10 +12371,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     return;
   }
 
+  const bool tracePostLoadHook =
+      InterlockedCompareExchange(&postLoadHookProbe, 2, 1) == 1;
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: entering first post-stable PlayerInterface::update");
+  }
   if (playerUpdate_orig)
     playerUpdate_orig(thisptr);
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: original PlayerInterface::update returned");
+  }
 
   GameWorld *worldUi = GetWorldSafe();
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: GameWorld lookup returned");
+  }
   static bool worldWasStable = false;
   static DWORD worldBecameStableTick = 0;
   static bool heavySweepPrimed = false;
@@ -12239,10 +12394,20 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static DWORD motdAutoOpenDeadlineTick = 0;
   static bool loadInitEventDispatched = false;
   bool worldStable = IsWorldStableForUI(worldUi);
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: stability check returned stable=") +
+        (worldStable ? "1" : "0"));
+  }
 
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: GUI lookup returned available=") +
+        (gui ? "1" : "0"));
+  }
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    ResetAutonomyController("gui_unavailable");
+    ResetAutonomySafetyProbe("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
@@ -12253,6 +12418,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   if (!worldStable) {
+    ResetAutonomyController("world_unstable");
+    ResetAutonomySafetyProbe("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12289,6 +12456,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
+      ResetTownKnowledgeSyncState();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
@@ -12330,6 +12498,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
     loadInitEventDispatched = false;
+    InterlockedExchange(&postLoadHookProbe, 1);
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
   }
@@ -12445,6 +12614,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    UpdateAutonomyController(world);
+    UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
       bool dispatchedViaStream =
           TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));
@@ -12503,6 +12674,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       RunPlayerFactionPortraitSweep(world);
       RunInfoTelemetrySweep(world, sel);
       RunFactionRelationSync(world);
+      RunTownKnowledgeSync(world);
     }
   }
 
@@ -12876,6 +13048,7 @@ __declspec(dllexport) void startPlugin() {
   Log(std::string("STARTUP: Stobe plugin version ") + kStobePluginVersion);
   Log(std::string("STARTUP: Stobe plugin release date ") + kStobePluginReleaseDate);
   Log("UI: MOTD auto-popup enabled when EnableMOTD is ON.");
+  StartAutonomyController();
 
   HMODULE hLib = GetModuleHandleA("KenshiLib.dll");
   if (!hLib) {

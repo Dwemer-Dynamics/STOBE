@@ -480,6 +480,9 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   }
 
   int timeoutMs = expectResponse ? (lineCallback ? 120000 : 60000) : 8000;
+  if (PathContains(request.path, L"/autonomy_")) {
+    timeoutMs = 5000;
+  }
   WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
 
   hConnect = WinHttpConnect(hSession, g_stobeHost.c_str(), g_stobePort, 0);
@@ -686,6 +689,23 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/autonomy_state") {
+    request.method = L"GET";
+    request.path = L"/StobeServer/autonomy_state.php";
+    request.body.clear();
+    return request;
+  }
+
+  if (endpoint == L"/autonomy_observation") {
+    request.path = L"/StobeServer/autonomy_observation.php";
+    return request;
+  }
+
+  if (endpoint == L"/autonomy_tick") {
+    request.path = L"/StobeServer/autonomy_tick.php";
+    return request;
+  }
+
   if (endpoint == L"/portrait_upload") {
     request.path = L"/StobeServer/portrait_upload.php";
     return request;
@@ -703,6 +723,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
 
   if (endpoint == L"/faction_relations") {
     request.path = L"/StobeServer/faction_relations.php";
+    return request;
+  }
+
+  if (endpoint == L"/town_knowledge") {
+    request.path = L"/StobeServer/town_knowledge.php";
     return request;
   }
 
