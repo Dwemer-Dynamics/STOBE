@@ -18,6 +18,7 @@
 #include <kenshi/Inventory.h>
 #include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
+#include <kenshi/ShopTrader.h>
 
 namespace Stobe {
 namespace Autonomy {
@@ -129,6 +130,71 @@ Item *FindMatchingItem(Character *character, const std::string &queryToken) {
       partialToken = itemToken;
     }
     return partialMatch;
+  } catch (...) {
+  }
+  return NULL;
+}
+
+Item *FindMatchingItem(Inventory *inventory, const std::string &queryToken) {
+  if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000 ||
+      queryToken.empty()) {
+    return NULL;
+  }
+  try {
+    const lektor<Item *> &items = inventory->getAllItems();
+    Item *match = NULL;
+    for (uint32_t i = 0; i < items.size(); ++i) {
+      Item *item = items.stuff[i];
+      if (!ItemMatches(item, queryToken)) {
+        continue;
+      }
+      if (match) {
+        return NULL;
+      }
+      match = item;
+    }
+    return match;
+  } catch (...) {
+    return NULL;
+  }
+}
+
+int CountMatchingItems(Inventory *inventory, const std::string &queryToken) {
+  if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000 ||
+      queryToken.empty()) {
+    return 0;
+  }
+  int count = 0;
+  try {
+    const lektor<Item *> &items = inventory->getAllItems();
+    for (uint32_t i = 0; i < items.size(); ++i) {
+      Item *item = items.stuff[i];
+      if (ItemMatches(item, queryToken)) {
+        count += item->quantity > 0 ? item->quantity : 1;
+      }
+    }
+  } catch (...) {
+    return 0;
+  }
+  return count;
+}
+
+Building *ResolveResourceBuilding(GameWorld *world, Character *character,
+                                  unsigned int serial) {
+  if (!world || !IsCharacterValid(character) || serial == 0) {
+    return NULL;
+  }
+  try {
+    lektor<RootObject *> nearby;
+    world->getObjectsWithinSphere(nearby, character->getPosition(), 300.0f,
+                                  BUILDING, 160, (RootObject *)character);
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      Building *building = (Building *)nearby.stuff[i];
+      if (building && reinterpret_cast<uintptr_t>(building) > 0x1000 &&
+          building->getHandle().serial == serial) {
+        return building;
+      }
+    }
   } catch (...) {
   }
   return NULL;
@@ -304,6 +370,8 @@ DispatchResult DispatchDecision(GameWorld *world,
   }
   if (decision.command == DECISION_COMMAND_ATTACK ||
       decision.command == DECISION_COMMAND_TAKE_ITEM ||
+      decision.command == DECISION_COMMAND_BUY_ITEM ||
+      decision.command == DECISION_COMMAND_SELL_ITEM ||
       IsQueuedMutationCommand(decision.command)) {
     if (!IsCharacterValid(targetCharacter)) {
       result.reason = "target_not_loaded";
@@ -317,6 +385,100 @@ DispatchResult DispatchDecision(GameWorld *world,
       }
     } catch (...) {
       result.reason = "target_validation_failed";
+      return result;
+    }
+  }
+
+  if (decision.command == DECISION_COMMAND_BUY_ITEM ||
+      decision.command == DECISION_COMMAND_SELL_ITEM) {
+    if (targetCharacter == character) {
+      result.reason = "trade_self_target";
+      return result;
+    }
+    try {
+      if (!targetCharacter->isATrader()) {
+        result.reason = "trade_target_not_trader";
+        return result;
+      }
+    } catch (...) {
+      result.reason = "trade_target_validation_failed";
+      return result;
+    }
+    if (CharacterDistance(character, targetCharacter) > 15.0) {
+      result.reason = "trade_target_out_of_range";
+      return result;
+    }
+    const std::string queryToken = NormalizeItemToken(decision.itemName);
+    if (queryToken.empty()) {
+      result.reason = "trade_item_invalid";
+      return result;
+    }
+    try {
+      ShopTrader trader(targetCharacter);
+      Inventory *shopInventory = trader.getInventory();
+      Inventory *actorInventory = character->getInventory();
+      if (!shopInventory || !actorInventory) {
+        result.reason = "trade_inventory_unavailable";
+        return result;
+      }
+      const bool buying = decision.command == DECISION_COMMAND_BUY_ITEM;
+      Inventory *sourceInventory = buying ? shopInventory : actorInventory;
+      Item *item = FindMatchingItem(sourceInventory, queryToken);
+      if (!item) {
+        result.reason = "trade_item_not_found_or_ambiguous";
+        return result;
+      }
+      const int stackCount = item->quantity > 0 ? item->quantity : 1;
+      if (stackCount != 1 || decision.itemAmount != 1) {
+        result.reason = "trade_requires_single_item_stack";
+        return result;
+      }
+      const int quotedPrice =
+          std::max(0, item->getValueSingle(buying));
+      if (buying && quotedPrice > decision.maxTotalPrice) {
+        result.reason = "buy_price_limit_exceeded";
+        return result;
+      }
+      if (!buying && quotedPrice < decision.minTotalPrice) {
+        result.reason = "sell_price_below_minimum";
+        return result;
+      }
+      const int actorCatsBefore = character->getMoney();
+      const int actorCountBefore =
+          CountMatchingItems(actorInventory, queryToken);
+      Item *transferred = sourceInventory->buyItem(
+          item, buying ? static_cast<RootObject *>(character)
+                       : static_cast<RootObject *>(&trader));
+      if (!transferred) {
+        result.reason = buying ? "buy_transaction_rejected"
+                               : "sell_transaction_rejected";
+        return result;
+      }
+      const int actorCatsAfter = character->getMoney();
+      const int actorCountAfter =
+          CountMatchingItems(actorInventory, queryToken);
+      const int actualPrice =
+          buying ? actorCatsBefore - actorCatsAfter
+                 : actorCatsAfter - actorCatsBefore;
+      const bool inventoryChanged =
+          buying ? actorCountAfter > actorCountBefore
+                 : actorCountAfter < actorCountBefore;
+      const bool moneyChanged = actualPrice > 0;
+      if (!inventoryChanged || !moneyChanged ||
+          (buying && actualPrice > decision.maxTotalPrice) ||
+          (!buying && actualPrice < decision.minTotalPrice)) {
+        result.reason = "trade_postcondition_failed";
+        return result;
+      }
+      character->reThinkCurrentAIAction();
+      targetCharacter->reThinkCurrentAIAction();
+      result.success = true;
+      result.completedImmediately = true;
+      result.jobsPreserved = true;
+      result.reason = buying ? "item_bought" : "item_sold";
+      return result;
+    } catch (...) {
+      result.reason = "trade_transaction_exception";
       return result;
     }
   }
@@ -508,6 +670,7 @@ DispatchResult DispatchDecision(GameWorld *world,
   TaskType task = MOVE_CUS_ORDERED;
   Ogre::Vector3 location;
   hand subject;
+  Building *resourceBuilding = NULL;
   try {
     location = character->getPosition();
     if (decision.command == DECISION_COMMAND_ATTACK) {
@@ -556,6 +719,35 @@ DispatchResult DispatchDecision(GameWorld *world,
       task = robotNeed > fleshNeed ? FIRST_AID_ROBOT : FIRST_AID_ORDER;
       subject = target->getHandle();
       location = targetPosition;
+    } else if (decision.command == DECISION_COMMAND_WORK_RESOURCE ||
+               decision.command == DECISION_COMMAND_PROSPECT) {
+      resourceBuilding = ResolveResourceBuilding(
+          world, character, decision.resourceRuntimeSerial);
+      if (!resourceBuilding) {
+        result.reason = "resource_target_not_loaded";
+        return result;
+      }
+      const BuildingFunction function =
+          resourceBuilding->_NV_getSpecialFunction();
+      if (function != BF_MINE && function != BF_MINE_NATURAL) {
+        result.reason = "resource_target_not_mine";
+        return result;
+      }
+      if (resourceBuilding->_NV_isDestroyed() ||
+          resourceBuilding->_NV_isBroken()) {
+        result.reason = "resource_target_unusable";
+        return result;
+      }
+      resourceBuilding->forceValidUsageNodesValidation();
+      if (!resourceBuilding->hasAnyGoodPositionMarkersLeft()) {
+        result.reason = "resource_target_occupied";
+        return result;
+      }
+      task = decision.command == DECISION_COMMAND_WORK_RESOURCE
+                 ? OPERATE_MACHINERY
+                 : PROSPECTING;
+      subject = resourceBuilding->getHandle();
+      location = resourceBuilding->getPosition();
     } else {
       location = Ogre::Vector3(static_cast<float>(decision.x),
                                static_cast<float>(decision.y),
@@ -588,6 +780,9 @@ DispatchResult DispatchDecision(GameWorld *world,
   }
 
   result.ownedOrder = CaptureFirstOrder(orders, task, location);
+  if (resourceBuilding) {
+    result.ownedOrder.subjectSerial = decision.resourceRuntimeSerial;
+  }
   try {
     result.jobsPreserved = jobsEnabledBefore == orders->isJobsEnabled() &&
                            permajobCountBefore == orders->getPermajobCount();

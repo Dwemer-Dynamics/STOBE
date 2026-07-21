@@ -3,6 +3,7 @@
 #include "AutonomyExecutor.h"
 #include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
+#include "AutonomyReleaseGate.h"
 #include "Comm.h"
 #include "Globals.h"
 #include "KenshiAiCompat.h"
@@ -213,6 +214,14 @@ void HashContextValue(unsigned long long &hash, unsigned long long value) {
   }
 }
 
+void HashContextString(unsigned long long &hash, const std::string &value) {
+  const unsigned long long prime = 1099511628211ull;
+  for (size_t index = 0; index < value.size(); ++index) {
+    hash ^= static_cast<unsigned char>(value[index]);
+    hash *= prime;
+  }
+}
+
 const char *TypedDecisionPhase(
     Stobe::Autonomy::DecisionCommand command) {
   switch (command) {
@@ -229,6 +238,11 @@ const char *TypedDecisionPhase(
   case Stobe::Autonomy::DECISION_COMMAND_REMOVE_LIMB:
   case Stobe::Autonomy::DECISION_COMMAND_CUT_HORNS:
     return "PHASE5";
+  case Stobe::Autonomy::DECISION_COMMAND_BUY_ITEM:
+  case Stobe::Autonomy::DECISION_COMMAND_SELL_ITEM:
+  case Stobe::Autonomy::DECISION_COMMAND_WORK_RESOURCE:
+  case Stobe::Autonomy::DECISION_COMMAND_PROSPECT:
+    return "PHASE6";
   default:
     return "PHASE2";
   }
@@ -254,6 +268,9 @@ std::string BuildStableContextHash(const TickRequest &tick) {
   HashContextValue(hash, static_cast<unsigned long long>(tick.character.roboticAidNeed * 100.0));
   HashContextValue(hash, tick.character.fullyRested ? 1 : 0);
   HashContextValue(hash, tick.character.restBedAvailable ? 1 : 0);
+  HashContextValue(hash, static_cast<unsigned long long>(tick.character.cats));
+  HashContextValue(
+      hash, static_cast<unsigned long long>(tick.character.inventoryItemCount));
   for (size_t i = 0; i < tick.character.nearbyActors.size(); ++i) {
     const Stobe::KenshiAi::NearbyActorSnapshot &actor =
         tick.character.nearbyActors[i];
@@ -261,11 +278,38 @@ std::string BuildStableContextHash(const TickRequest &tick) {
     HashContextValue(hash, actor.dead ? 1 : 0);
     HashContextValue(hash, actor.unconscious ? 1 : 0);
     HashContextValue(hash, actor.hostile ? 1 : 0);
+    HashContextValue(hash, actor.trader ? 1 : 0);
+    HashContextValue(hash, static_cast<unsigned long long>(actor.cats));
     HashContextValue(hash, static_cast<unsigned long long>(actor.firstAidNeed * 100.0));
     HashContextValue(hash, static_cast<unsigned long long>(actor.roboticAidNeed * 100.0));
+    for (size_t itemIndex = 0; itemIndex < actor.traderItems.size();
+         ++itemIndex) {
+      HashContextString(hash, actor.traderItems[itemIndex].name);
+      HashContextValue(
+          hash,
+          static_cast<unsigned long long>(actor.traderItems[itemIndex].count));
+      HashContextValue(hash, static_cast<unsigned long long>(
+                                 actor.traderItems[itemIndex].buyValueEach));
+      HashContextValue(hash, static_cast<unsigned long long>(
+                                 actor.traderItems[itemIndex].sellValueEach));
+    }
+  }
+  for (size_t i = 0; i < tick.character.inventoryItems.size(); ++i) {
+    HashContextString(hash, tick.character.inventoryItems[i].name);
+    HashContextValue(
+        hash,
+        static_cast<unsigned long long>(tick.character.inventoryItems[i].count));
+    HashContextValue(hash, static_cast<unsigned long long>(
+                               tick.character.inventoryItems[i].sellValueEach));
+  }
+  for (size_t i = 0; i < tick.character.nearbyResources.size(); ++i) {
+    const Stobe::KenshiAi::NearbyResourceSnapshot &resource =
+        tick.character.nearbyResources[i];
+    HashContextValue(hash, resource.runtimeSerial);
+    HashContextValue(hash, resource.usable ? 1 : 0);
   }
   std::ostringstream result;
-  result << "phase4-" << hash;
+  result << "phase6-" << hash;
   return result.str();
 }
 
@@ -277,7 +321,7 @@ std::string BuildTickJson(const TickRequest &tick) {
        << Stobe::Text::EscapeJSON(tick.control.npcStorageId)
        << "\",\"runtime_serial\":" << tick.character.runtimeSerial
        << ",\"state\":\"" << Stobe::Text::EscapeJSON(tick.state)
-       << "\",\"observation\":\"phase_4_runtime_snapshot\""
+       << "\",\"observation\":\"phase_6_runtime_snapshot\""
        << ",\"event_key\":\"\",\"snapshot_sequence\":" << tick.sequence
        << ",\"snapshot_local_ts\":" << tick.localTs
        << ",\"game_ts\":" << tick.gameTs
@@ -305,12 +349,16 @@ std::string BuildTickJson(const TickRequest &tick) {
        << (tick.character.probablyDying ? "true" : "false")
        << ",\"rest_bed_available\":"
        << (tick.character.restBedAvailable ? "true" : "false")
+       << ",\"in_combat\":"
+       << (tick.character.inCombat ? "true" : "false")
        << "},\"health\":{\"overall\":" << tick.character.overallHealth
        << ",\"blood\":" << tick.character.blood
        << ",\"max_blood\":" << tick.character.maxBlood
        << ",\"bleed_rate\":" << tick.character.bleedRate
        << ",\"first_aid_need\":" << tick.character.firstAidNeed
        << ",\"robotic_aid_need\":" << tick.character.roboticAidNeed
+       << "},\"economy\":{\"cats\":" << tick.character.cats
+       << ",\"inventory_item_count\":" << tick.character.inventoryItemCount
        << "},\"movement\":{\"moving\":"
        << (tick.character.moving ? "true" : "false")
        << ",\"path_failed\":"
@@ -334,6 +382,8 @@ std::string BuildTickJson(const TickRequest &tick) {
          << ",\"z\":" << actor.z
          << ",\"player_character\":"
          << (actor.playerCharacter ? "true" : "false")
+         << ",\"trader\":" << (actor.trader ? "true" : "false")
+         << ",\"cats\":" << actor.cats
          << ",\"dead\":" << (actor.dead ? "true" : "false")
          << ",\"unconscious\":"
          << (actor.unconscious ? "true" : "false")
@@ -341,7 +391,53 @@ std::string BuildTickJson(const TickRequest &tick) {
          << ",\"overall_health\":" << actor.overallHealth
          << ",\"bleed_rate\":" << actor.bleedRate
          << ",\"first_aid_need\":" << actor.firstAidNeed
-         << ",\"robotic_aid_need\":" << actor.roboticAidNeed << "}";
+         << ",\"robotic_aid_need\":" << actor.roboticAidNeed
+         << ",\"trader_items\":[";
+    for (size_t itemIndex = 0; itemIndex < actor.traderItems.size();
+         ++itemIndex) {
+      const Stobe::KenshiAi::InventoryItemSnapshot &tradeItem =
+          actor.traderItems[itemIndex];
+      if (itemIndex > 0) {
+        item << ",";
+      }
+      item << "{\"name\":\"" << Stobe::Text::EscapeJSON(tradeItem.name)
+           << "\",\"count\":" << tradeItem.count
+           << ",\"buy_value_each\":" << tradeItem.buyValueEach
+           << ",\"sell_value_each\":" << tradeItem.sellValueEach << "}";
+    }
+    item << "]}";
+    built += item.str();
+  }
+  built += "],\"inventory_items\":[";
+  for (size_t i = 0; i < tick.character.inventoryItems.size(); ++i) {
+    const Stobe::KenshiAi::InventoryItemSnapshot &inventoryItem =
+        tick.character.inventoryItems[i];
+    if (i > 0) {
+      built += ",";
+    }
+    std::ostringstream item;
+    item << "{\"name\":\""
+         << Stobe::Text::EscapeJSON(inventoryItem.name)
+         << "\",\"count\":" << inventoryItem.count
+         << ",\"buy_value_each\":" << inventoryItem.buyValueEach
+         << ",\"sell_value_each\":" << inventoryItem.sellValueEach << "}";
+    built += item.str();
+  }
+  built += "],\"nearby_resources\":[";
+  for (size_t i = 0; i < tick.character.nearbyResources.size(); ++i) {
+    const Stobe::KenshiAi::NearbyResourceSnapshot &resource =
+        tick.character.nearbyResources[i];
+    if (i > 0) {
+      built += ",";
+    }
+    std::ostringstream item;
+    item << "{\"name\":\"" << Stobe::Text::EscapeJSON(resource.name)
+         << "\",\"runtime_serial\":" << resource.runtimeSerial
+         << ",\"distance\":" << resource.distance
+         << ",\"natural\":" << (resource.natural ? "true" : "false")
+         << ",\"usable\":" << (resource.usable ? "true" : "false")
+         << ",\"task\":" << resource.taskType << ",\"x\":" << resource.x
+         << ",\"y\":" << resource.y << ",\"z\":" << resource.z << "}";
     built += item.str();
   }
   built += "]}";
@@ -693,6 +789,10 @@ void FinishActiveAction(GameWorld *world,
 } // namespace
 
 void StartAutonomyController() {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    Log("AUTONOMY: disabled for this beta release");
+    return;
+  }
   EnsureInitialized();
   if (InterlockedCompareExchange(&g_threadStarted, 1, 0) != 0) {
     return;
@@ -708,6 +808,9 @@ void StartAutonomyController() {
 }
 
 void ResetAutonomyController(const char *reason) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
   EnsureInitialized();
   Stobe::Autonomy::ControlSnapshot control;
   EnterCriticalSection(&g_controlMutex);
@@ -753,6 +856,9 @@ void ResetAutonomyController(const char *reason) {
 }
 
 void UpdateAutonomyController(GameWorld *world) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
   EnsureInitialized();
   Stobe::Autonomy::ControlSnapshot control;
   DWORD lastServerSuccess = 0;
@@ -1203,6 +1309,9 @@ void UpdateAutonomyController(GameWorld *world) {
 void ReportAutonomyActionExecutionResult(const std::string &decisionId,
                                          bool success,
                                          const std::string &reason) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
   if (g_active.active && g_active.awaitingExecutionResult &&
       !decisionId.empty() &&
       g_active.decision.decisionId == decisionId) {

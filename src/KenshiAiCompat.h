@@ -12,10 +12,20 @@ class Building;
 namespace Stobe {
 namespace KenshiAi {
 
+struct InventoryItemSnapshot {
+  std::string name;
+  int count;
+  int buyValueEach;
+  int sellValueEach;
+
+  InventoryItemSnapshot();
+};
+
 struct NearbyActorSnapshot {
   unsigned int runtimeSerial;
   double distance;
   bool playerCharacter;
+  bool trader;
   bool dead;
   bool unconscious;
   bool hostile;
@@ -29,9 +39,25 @@ struct NearbyActorSnapshot {
   double bleedRate;
   double firstAidNeed;
   double roboticAidNeed;
+  int cats;
   std::string name;
+  std::vector<InventoryItemSnapshot> traderItems;
 
   NearbyActorSnapshot();
+};
+
+struct NearbyResourceSnapshot {
+  unsigned int runtimeSerial;
+  double distance;
+  bool natural;
+  bool usable;
+  int taskType;
+  std::string name;
+  double x;
+  double y;
+  double z;
+
+  NearbyResourceSnapshot();
 };
 
 struct CharacterSnapshot {
@@ -64,9 +90,13 @@ struct CharacterSnapshot {
   double bleedRate;
   double firstAidNeed;
   double roboticAidNeed;
+  int cats;
+  int inventoryItemCount;
   Stobe::Autonomy::OrderFingerprint order;
   std::string name;
+  std::vector<InventoryItemSnapshot> inventoryItems;
   std::vector<NearbyActorSnapshot> nearbyActors;
+  std::vector<NearbyResourceSnapshot> nearbyResources;
 
   CharacterSnapshot();
 };

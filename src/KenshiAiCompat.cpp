@@ -4,20 +4,66 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <ctime>
+#include <map>
 
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/Character.h>
 #include <kenshi/GameWorld.h>
+#include <kenshi/Inventory.h>
+#include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/RootObject.h>
+#include <kenshi/ShopTrader.h>
 
 namespace Stobe {
 namespace KenshiAi {
 namespace {
 
+struct TraderSnapshotCache {
+  std::vector<InventoryItemSnapshot> items;
+  int cats;
+  time_t capturedAt;
+
+  TraderSnapshotCache() : cats(0), capturedAt(0) {}
+};
+
+std::map<unsigned int, TraderSnapshotCache> g_traderSnapshotCache;
+
 bool IsValidCharacter(Character *character) {
   return character && reinterpret_cast<uintptr_t>(character) > 0x1000;
+}
+
+void CaptureInventoryItems(Inventory *inventory,
+                           std::vector<InventoryItemSnapshot> &out,
+                           int &totalCount, size_t maxEntries) {
+  out.clear();
+  totalCount = 0;
+  if (!inventory || reinterpret_cast<uintptr_t>(inventory) <= 0x1000) {
+    return;
+  }
+  try {
+    const lektor<Item *> &items = inventory->getAllItems();
+    for (uint32_t i = 0; i < items.size(); ++i) {
+      Item *item = items.stuff[i];
+      if (!item || reinterpret_cast<uintptr_t>(item) <= 0x1000) {
+        continue;
+      }
+      InventoryItemSnapshot captured;
+      captured.name = item->getName();
+      captured.count = item->quantity > 0 ? item->quantity : 1;
+      captured.buyValueEach = std::max(0, item->getValueSingle(true));
+      captured.sellValueEach = std::max(0, item->getValueSingle(false));
+      totalCount += captured.count;
+      if (!captured.name.empty() && out.size() < maxEntries) {
+        out.push_back(captured);
+      }
+    }
+  } catch (...) {
+    out.clear();
+    totalCount = 0;
+  }
 }
 
 Character *ResolveCharacterImpl(GameWorld *world, unsigned int serial) {
@@ -103,12 +149,19 @@ Building *ResolveNearestRestBedImpl(GameWorld *world, Character *character,
 
 } // namespace
 
+InventoryItemSnapshot::InventoryItemSnapshot()
+    : count(0), buyValueEach(0), sellValueEach(0) {}
+
 NearbyActorSnapshot::NearbyActorSnapshot()
-    : runtimeSerial(0), distance(0.0), playerCharacter(false), dead(false),
-      unconscious(false), hostile(false), fullyRested(true),
+    : runtimeSerial(0), distance(0.0), playerCharacter(false), trader(false),
+      dead(false), unconscious(false), hostile(false), fullyRested(true),
       probablyDying(false), inBed(false), x(0.0), y(0.0), z(0.0),
       overallHealth(1.0), bleedRate(0.0), firstAidNeed(0.0),
-      roboticAidNeed(0.0) {}
+      roboticAidNeed(0.0), cats(0) {}
+
+NearbyResourceSnapshot::NearbyResourceSnapshot()
+    : runtimeSerial(0), distance(0.0), natural(false), usable(false),
+      taskType(static_cast<int>(NULL_TASK)), x(0.0), y(0.0), z(0.0) {}
 
 CharacterSnapshot::CharacterSnapshot()
     : found(false), identityMatches(false), playerCharacter(false), dead(false),
@@ -118,7 +171,8 @@ CharacterSnapshot::CharacterSnapshot()
       restBedAvailable(false), inCombat(false), carriedSerial(0),
       attackTargetSerial(0), runtimeSerial(0), x(0.0), y(0.0), z(0.0),
       overallHealth(1.0), blood(0.0), maxBlood(0.0), bleedRate(0.0),
-      firstAidNeed(0.0), roboticAidNeed(0.0) {}
+      firstAidNeed(0.0), roboticAidNeed(0.0), cats(0),
+      inventoryItemCount(0) {}
 
 Character *ResolveCharacter(GameWorld *world, unsigned int serial) {
   return ResolveCharacterImpl(world, serial);
@@ -150,6 +204,12 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
   }
   try {
     result.playerCharacter = character->isPlayerCharacter();
+  } catch (...) {
+  }
+  try {
+    result.cats = std::max(0, character->getMoney());
+    CaptureInventoryItems(character->getInventory(), result.inventoryItems,
+                          result.inventoryItemCount, 80);
   } catch (...) {
   }
   try {
@@ -237,6 +297,10 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
               static_cast<int>(UNPROVOKED_FOCUSED_MELEE_ATTACK);
         } else if (orders->hasPlayerOrder(FOCUSED_MELEE_ATTACK)) {
           result.order.taskType = static_cast<int>(FOCUSED_MELEE_ATTACK);
+        } else if (orders->hasPlayerOrder(OPERATE_MACHINERY)) {
+          result.order.taskType = static_cast<int>(OPERATE_MACHINERY);
+        } else if (orders->hasPlayerOrder(PROSPECTING)) {
+          result.order.taskType = static_cast<int>(PROSPECTING);
         }
       }
     }
@@ -280,6 +344,8 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
           continue;
         }
         nearby.playerCharacter = candidate->isPlayerCharacter();
+        nearby.trader = candidate->isATrader();
+        nearby.cats = std::max(0, candidate->getMoney());
         nearby.dead = candidate->isDead();
         nearby.unconscious = candidate->isUnconcious();
         nearby.hostile = character->isEnemy(candidate, true);
@@ -293,7 +359,75 @@ CharacterSnapshot CaptureCharacter(GameWorld *world,
           nearby.roboticAidNeed = std::max(0.0, static_cast<double>(medical->scoreFirstAidNeed(true)));
         }
         nearby.inBed = candidate->inSomething == IN_BED;
+        if (nearby.trader && nearby.distance <= 30.0) {
+          const time_t now = time(NULL);
+          std::map<unsigned int, TraderSnapshotCache>::iterator cached =
+              g_traderSnapshotCache.find(nearby.runtimeSerial);
+          if (cached != g_traderSnapshotCache.end() &&
+              now - cached->second.capturedAt < 5) {
+            nearby.traderItems = cached->second.items;
+            nearby.cats = cached->second.cats;
+          } else {
+            try {
+              ShopTrader trader(candidate);
+              int traderItemCount = 0;
+              CaptureInventoryItems(trader.getInventory(), nearby.traderItems,
+                                    traderItemCount, 100);
+              nearby.cats = std::max(0, trader.getMoney());
+              TraderSnapshotCache updated;
+              updated.items = nearby.traderItems;
+              updated.cats = nearby.cats;
+              updated.capturedAt = now;
+              g_traderSnapshotCache[nearby.runtimeSerial] = updated;
+            } catch (...) {
+              nearby.traderItems.clear();
+            }
+          }
+        }
         result.nearbyActors.push_back(nearby);
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+  }
+  try {
+    const Ogre::Vector3 origin = character->getPosition();
+    lektor<RootObject *> nearbyBuildings;
+    world->getObjectsWithinSphere(nearbyBuildings, origin, 250.0f, BUILDING,
+                                  128, (RootObject *)character);
+    for (uint32_t i = 0;
+         i < nearbyBuildings.size() && result.nearbyResources.size() < 32;
+         ++i) {
+      Building *building = (Building *)nearbyBuildings.stuff[i];
+      if (!building || reinterpret_cast<uintptr_t>(building) <= 0x1000) {
+        continue;
+      }
+      try {
+        const BuildingFunction function = building->_NV_getSpecialFunction();
+        if (function != BF_MINE && function != BF_MINE_NATURAL) {
+          continue;
+        }
+        NearbyResourceSnapshot resource;
+        resource.runtimeSerial = building->getHandle().serial;
+        resource.name = building->getName();
+        const Ogre::Vector3 position = building->getPosition();
+        const Ogre::Vector3 delta = position - origin;
+        resource.distance = std::sqrt(static_cast<double>(
+            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
+        resource.natural = function == BF_MINE_NATURAL;
+        resource.taskType = static_cast<int>(OPERATE_MACHINERY);
+        resource.x = position.x;
+        resource.y = position.y;
+        resource.z = position.z;
+        resource.usable = !building->_NV_isDestroyed() &&
+                          !building->_NV_isBroken();
+        if (resource.usable) {
+          building->forceValidUsageNodesValidation();
+          resource.usable = building->hasAnyGoodPositionMarkersLeft();
+        }
+        if (resource.runtimeSerial != 0 && resource.distance <= 250.0) {
+          result.nearbyResources.push_back(resource);
+        }
       } catch (...) {
       }
     }

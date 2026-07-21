@@ -454,6 +454,93 @@ int main() {
   ExpectUInt32("Phase 5 maps the limb enum",
                static_cast<unsigned int>(removeLimbDecision.limbCode), 1);
 
+  const std::string phase6Prefix =
+      "{\"ok\":true,\"phase\":6,\"decision\":{"
+      "\"decision_id\":\"phase6-typed\",\"control_revision\":7,"
+      "\"npc_id\":12,\"npc_storage_id\":\"hand_884422\","
+      "\"runtime_serial\":884422,";
+  const std::string phase6Suffix =
+      ",\"context_hash\":\"phase6-context\",\"context_game_ts\":1234,"
+      "\"dispatch_deadline_ts\":2000,\"action_deadline_ts\":3000}}";
+  bool phase6Present = false;
+
+  DecisionEnvelope buyItemDecision;
+  ExpectBool("Phase 6 parses constrained BUY_ITEM",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"BUY_ITEM\",\"arguments\":{"
+                     "\"target\":\"Bar Trader\","
+                     "\"target_runtime_serial\":7711,"
+                     "\"item\":\"Dried Meat\",\"amount\":1,"
+                     "\"max_total_price\":125}" + phase6Suffix,
+                 buyItemDecision, phase6Present),
+             true);
+  ExpectUInt32("Phase 6 classifies BUY_ITEM as typed",
+               static_cast<unsigned int>(buyItemDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_BUY_ITEM));
+  ExpectUInt32("Phase 6 preserves BUY_ITEM price cap",
+               static_cast<unsigned int>(buyItemDecision.maxTotalPrice), 125);
+
+  DecisionEnvelope sellItemDecision;
+  ExpectBool("Phase 6 parses constrained SELL_ITEM",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"SELL_ITEM\",\"arguments\":{"
+                     "\"target\":\"Bar Trader\","
+                     "\"target_runtime_serial\":7711,"
+                     "\"item\":\"Iron Plate\",\"amount\":1,"
+                     "\"min_total_price\":40}" + phase6Suffix,
+                 sellItemDecision, phase6Present),
+             true);
+  ExpectUInt32("Phase 6 preserves SELL_ITEM price floor",
+               static_cast<unsigned int>(sellItemDecision.minTotalPrice), 40);
+
+  DecisionEnvelope workResourceDecision;
+  ExpectBool("Phase 6 parses WORK_RESOURCE",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"WORK_RESOURCE\",\"arguments\":{"
+                     "\"resource_runtime_serial\":8801}" + phase6Suffix,
+                 workResourceDecision, phase6Present),
+             true);
+  ExpectUInt32("Phase 6 binds WORK_RESOURCE serial",
+               workResourceDecision.resourceRuntimeSerial, 8801);
+
+  DecisionEnvelope prospectDecision;
+  ExpectBool("Phase 6 parses PROSPECT",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"PROSPECT\",\"arguments\":{"
+                     "\"resource_runtime_serial\":8802}" + phase6Suffix,
+                 prospectDecision, phase6Present),
+             true);
+  ExpectUInt32("Phase 6 classifies PROSPECT as typed",
+               static_cast<unsigned int>(prospectDecision.command),
+               static_cast<unsigned int>(
+                   Stobe::Autonomy::DECISION_COMMAND_PROSPECT));
+
+  DecisionEnvelope uncappedBuyDecision;
+  ExpectBool("Phase 6 rejects BUY_ITEM without a positive price cap",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"BUY_ITEM\",\"arguments\":{"
+                     "\"target\":\"Bar Trader\","
+                     "\"target_runtime_serial\":7711,"
+                     "\"item\":\"Dried Meat\",\"amount\":1,"
+                     "\"max_total_price\":0}" + phase6Suffix,
+                 uncappedBuyDecision, phase6Present),
+             false);
+
+  DecisionEnvelope unboundWorkDecision;
+  ExpectBool("Phase 6 rejects work without an exact resource serial",
+             ParseDecisionResponse(
+                 phase6Prefix +
+                     "\"command\":\"WORK_RESOURCE\",\"arguments\":{}" +
+                     phase6Suffix,
+                 unboundWorkDecision, phase6Present),
+             false);
+
   static const char *phase3CatalogCommands[] = {
       "SUICIDE",      "FOLLOW",           "STOP_FOLLOW",
       "JOIN_PARTY",   "LEAVE",
@@ -745,6 +832,47 @@ int main() {
                                     600000)
                                     .outcome),
       static_cast<unsigned int>(MONITOR_RUNNING));
+
+  OrderFingerprint resourceOrder;
+  resourceOrder.taskType = 141;
+  resourceOrder.subjectSerial = workResourceDecision.resourceRuntimeSerial;
+  resourceOrder.runtimePointer = 9012;
+  resourceOrder.orderCount = 1;
+  MonitorFacts workCycle = arrived;
+  workCycle.currentOrder = resourceOrder;
+  workCycle.activeElapsedMs = 30000;
+  ExpectUInt32(
+      "Phase 6 WORK_RESOURCE completes after a bounded active cycle",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    workResourceDecision, resourceOrder,
+                                    workCycle, 120000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  MonitorFacts unsafeWork = workCycle;
+  unsafeWork.activeElapsedMs = 1000;
+  unsafeWork.hostileObserved = true;
+  unsafeWork.nearestHostileDistance = 50.0;
+  ExpectUInt32(
+      "Phase 6 WORK_RESOURCE stops for a nearby threat",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    workResourceDecision, resourceOrder,
+                                    unsafeWork, 120000)
+                                    .outcome),
+      static_cast<unsigned int>(Stobe::Autonomy::MONITOR_UNSAFE));
+
+  OrderFingerprint prospectOrder = resourceOrder;
+  prospectOrder.subjectSerial = prospectDecision.resourceRuntimeSerial;
+  MonitorFacts prospectScan = arrived;
+  prospectScan.currentOrder = prospectOrder;
+  prospectScan.activeElapsedMs = 15000;
+  ExpectUInt32(
+      "Phase 6 PROSPECT completes after a bounded native scan",
+      static_cast<unsigned int>(EvaluateActionMonitor(
+                                    prospectDecision, prospectOrder,
+                                    prospectScan, 60000)
+                                    .outcome),
+      static_cast<unsigned int>(MONITOR_COMPLETED));
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";

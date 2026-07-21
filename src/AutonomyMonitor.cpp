@@ -31,7 +31,8 @@ bool OrderFingerprintMatches(const OrderFingerprint &expected,
                              double locationTolerance) {
   if (expected.orderCount != 1 || current.orderCount != 1 ||
       expected.taskType != current.taskType ||
-      expected.subjectSerial != current.subjectSerial) {
+      (expected.subjectSerial != 0 && current.subjectSerial != 0 &&
+       expected.subjectSerial != current.subjectSerial)) {
     return false;
   }
   if (expected.runtimePointer != 0 && current.runtimePointer != 0 &&
@@ -177,6 +178,36 @@ MonitorResult EvaluateActionMonitor(const DecisionEnvelope &decision,
       return MonitorResult(MONITOR_FAILED, "attack_order_not_active");
     }
     return MonitorResult(MONITOR_RUNNING, "attack_in_progress");
+  }
+  if (decision.command == DECISION_COMMAND_WORK_RESOURCE) {
+    if (facts.hostileObserved && facts.nearestHostileDistance <= 70.0) {
+      return MonitorResult(MONITOR_UNSAFE, "resource_work_threat_detected");
+    }
+    if (facts.pathFailedSamples >= 3) {
+      return MonitorResult(MONITOR_FAILED, "resource_work_path_failed");
+    }
+    if (facts.activeElapsedMs >= 30000 && orderPresent) {
+      return MonitorResult(MONITOR_COMPLETED, "resource_work_cycle_observed");
+    }
+    if (!orderPresent && facts.activeElapsedMs >= 3000) {
+      return MonitorResult(MONITOR_FAILED, "resource_work_order_missing");
+    }
+    return MonitorResult(MONITOR_RUNNING, "resource_work_in_progress");
+  }
+  if (decision.command == DECISION_COMMAND_PROSPECT) {
+    if (facts.hostileObserved && facts.nearestHostileDistance <= 70.0) {
+      return MonitorResult(MONITOR_UNSAFE, "prospecting_threat_detected");
+    }
+    if (facts.pathFailedSamples >= 3) {
+      return MonitorResult(MONITOR_FAILED, "prospecting_path_failed");
+    }
+    if (facts.activeElapsedMs >= 15000) {
+      return MonitorResult(MONITOR_COMPLETED, "prospecting_scan_completed");
+    }
+    if (!orderPresent && facts.activeElapsedMs >= 3000) {
+      return MonitorResult(MONITOR_FAILED, "prospecting_order_missing");
+    }
+    return MonitorResult(MONITOR_RUNNING, "prospecting_in_progress");
   }
   return MonitorResult(MONITOR_FAILED, "unsupported_command");
 }

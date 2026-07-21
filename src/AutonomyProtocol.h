@@ -56,6 +56,10 @@ enum DecisionCommand {
   DECISION_COMMAND_KILL,
   DECISION_COMMAND_REMOVE_LIMB,
   DECISION_COMMAND_CUT_HORNS,
+  DECISION_COMMAND_BUY_ITEM,
+  DECISION_COMMAND_SELL_ITEM,
+  DECISION_COMMAND_WORK_RESOURCE,
+  DECISION_COMMAND_PROSPECT,
   DECISION_COMMAND_CATALOG_ACTION
 };
 
@@ -78,9 +82,12 @@ struct DecisionEnvelope {
   long long actionDeadlineTs;
   int idleDurationMs;
   int itemAmount;
+  int maxTotalPrice;
+  int minTotalPrice;
   int limbCode;
   long long locationZoneId;
   unsigned int targetRuntimeSerial;
+  unsigned int resourceRuntimeSerial;
   std::string locationLabel;
   double x;
   double y;

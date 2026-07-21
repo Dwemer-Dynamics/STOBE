@@ -104,10 +104,10 @@ StateDecision::StateDecision(const std::string &stateValue,
 DecisionEnvelope::DecisionEnvelope()
     : valid(false), controlRevision(-1), npcId(0), runtimeSerial(0),
       command(DECISION_COMMAND_NONE), contextGameTs(0), dispatchDeadlineTs(0),
-      actionDeadlineTs(0), idleDurationMs(1500), itemAmount(1), limbCode(0),
-      locationZoneId(0),
-      targetRuntimeSerial(0), x(0.0), y(0.0), z(0.0), arrivalRadius(8.0),
-      safeRadius(70.0) {}
+      actionDeadlineTs(0), idleDurationMs(1500), itemAmount(1),
+      maxTotalPrice(0), minTotalPrice(0), limbCode(0), locationZoneId(0),
+      targetRuntimeSerial(0), resourceRuntimeSerial(0), x(0.0), y(0.0),
+      z(0.0), arrivalRadius(8.0), safeRadius(70.0) {}
 
 bool ParseControlResponse(const std::string &response, ControlSnapshot &out) {
   ControlSnapshot parsed;
@@ -262,6 +262,14 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
     parsed.command = DECISION_COMMAND_REMOVE_LIMB;
   } else if (parsed.commandName == "CUT_HORNS") {
     parsed.command = DECISION_COMMAND_CUT_HORNS;
+  } else if (parsed.commandName == "BUY_ITEM") {
+    parsed.command = DECISION_COMMAND_BUY_ITEM;
+  } else if (parsed.commandName == "SELL_ITEM") {
+    parsed.command = DECISION_COMMAND_SELL_ITEM;
+  } else if (parsed.commandName == "WORK_RESOURCE") {
+    parsed.command = DECISION_COMMAND_WORK_RESOURCE;
+  } else if (parsed.commandName == "PROSPECT") {
+    parsed.command = DECISION_COMMAND_PROSPECT;
   } else if (IsCatalogCommand(parsed.commandName)) {
     parsed.command = DECISION_COMMAND_CATALOG_ACTION;
   }
@@ -286,6 +294,10 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
   parsed.limbName = Trim(Text::JsonReadField(arguments, "limb"));
   parsed.itemAmount = static_cast<int>(ParseLongLong(
       Text::JsonReadField(arguments, "amount"), 1));
+  parsed.maxTotalPrice = static_cast<int>(ParseLongLong(
+      Text::JsonReadField(arguments, "max_total_price"), 0));
+  parsed.minTotalPrice = static_cast<int>(ParseLongLong(
+      Text::JsonReadField(arguments, "min_total_price"), 0));
   if (parsed.limbName == "LEFT_ARM") {
     parsed.limbCode = 1;
   } else if (parsed.limbName == "RIGHT_ARM") {
@@ -301,6 +313,13 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
       Text::JsonReadField(arguments, "target_runtime_serial"), 0);
   if (targetRuntimeSerial > 0 && targetRuntimeSerial <= 0xffffffffLL) {
     parsed.targetRuntimeSerial = static_cast<unsigned int>(targetRuntimeSerial);
+  }
+  const long long resourceRuntimeSerial = ParseLongLong(
+      Text::JsonReadField(arguments, "resource_runtime_serial"), 0);
+  if (resourceRuntimeSerial > 0 &&
+      resourceRuntimeSerial <= 0xffffffffLL) {
+    parsed.resourceRuntimeSerial =
+        static_cast<unsigned int>(resourceRuntimeSerial);
   }
   parsed.locationLabel = Trim(Text::JsonReadField(arguments, "zone_name"));
   if (parsed.locationLabel.empty()) {
@@ -355,9 +374,22 @@ bool ParseDecisionResponse(const std::string &response, DecisionEnvelope &out,
        (parsed.targetRuntimeSerial == 0 || parsed.targetName.empty() ||
         parsed.targetName.size() > 160)) ||
       ((parsed.command == DECISION_COMMAND_TAKE_ITEM ||
-        parsed.command == DECISION_COMMAND_EQUIP_ITEM) &&
+        parsed.command == DECISION_COMMAND_EQUIP_ITEM ||
+        parsed.command == DECISION_COMMAND_BUY_ITEM ||
+        parsed.command == DECISION_COMMAND_SELL_ITEM) &&
        (parsed.itemName.empty() || parsed.itemName.size() > 160 ||
         parsed.itemAmount < 1 || parsed.itemAmount > 20)) ||
+      ((parsed.command == DECISION_COMMAND_BUY_ITEM ||
+        parsed.command == DECISION_COMMAND_SELL_ITEM) &&
+       (parsed.targetRuntimeSerial == 0 || parsed.targetName.empty() ||
+        parsed.itemAmount != 1 || parsed.maxTotalPrice < 0 ||
+        parsed.maxTotalPrice > 10000000 || parsed.minTotalPrice < 0 ||
+        parsed.minTotalPrice > 10000000)) ||
+      (parsed.command == DECISION_COMMAND_BUY_ITEM &&
+       parsed.maxTotalPrice <= 0) ||
+      ((parsed.command == DECISION_COMMAND_WORK_RESOURCE ||
+        parsed.command == DECISION_COMMAND_PROSPECT) &&
+       parsed.resourceRuntimeSerial == 0) ||
       (parsed.command == DECISION_COMMAND_REMOVE_LIMB &&
        parsed.limbCode == 0) ||
       (parsed.command == DECISION_COMMAND_CATALOG_ACTION &&

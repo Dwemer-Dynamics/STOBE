@@ -638,6 +638,28 @@ Exit criterion: every irreversible or hostile action has validated arguments, de
 
 ### Phase 6: Economy and Work
 
+Implementation status (2026-07-16): implemented; automated verification passes.
+Live Kenshi acceptance is still required for the SDK-backed transaction and
+order behavior. The autonomy snapshot now includes squad cats, exact carried
+item stacks, nearby traders with their native shop inventory and prices, and
+nearby mine/resource objects bound to runtime serials. `BUY_ITEM` and
+`SELL_ITEM` use Kenshi's native inventory transaction path and require an exact
+observed trader, exact single-item stack, and explicit purchase or sale price
+limits. Both actions verify cats and inventory changes before reporting
+completion.
+
+`WORK_RESOURCE` and `PROSPECT` issue owned, cancellable Kenshi orders against
+an exact observed `BF_MINE` or `BF_MINE_NATURAL` object. Work completes after
+a bounded observed operating cycle; prospecting completes after a bounded
+native scan. Both stop for manual orders, invalid identity, threats, path
+failure, timeout, or controller shutdown without altering permanent jobs.
+
+StobeServer persists deduplicated trader inventory snapshots with game time,
+position, nearest visited location, trader cats, prices, and quantities. The
+planner receives recent per-trader shortage and surplus deltas as town economy
+context. Purchase caps and minimum sale prices are configurable in the
+Autonomy UI, and deterministic pilot controls cover all four Phase 6 actions.
+
 - Add real trader interactions.
 - Add buying and selling policy limits.
 - Add resource work and prospecting.

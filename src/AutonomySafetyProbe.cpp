@@ -1,5 +1,6 @@
 #include "AutonomySafetyProbe.h"
 
+#include "AutonomyReleaseGate.h"
 #include "AutonomySafetyProbePolicy.h"
 #include "Utils.h"
 
@@ -708,10 +709,16 @@ void ExecuteCommand(GameWorld *world, Character *character,
 } // namespace
 
 void ResetAutonomySafetyProbe(const char *reason) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
   ClearBinding(reason ? reason : "runtime_reset");
 }
 
 void UpdateAutonomySafetyProbe(GameWorld *world, Character *selectedCharacter) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
   if (!world) {
     return;
   }
