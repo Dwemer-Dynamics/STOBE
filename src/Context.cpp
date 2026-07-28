@@ -4059,16 +4059,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         std::string o_orders = BuildStandingOrderPayload(other);
         int o_bountyTotal = 0;
         std::string o_bountyPayload = BuildBountyPayload(other, o_bountyTotal);
-        std::string o_equip = GetVisibleEquipment(other);
-        std::string o_inventory = "[]";
-        std::string o_inventoryHash = "";
-        int o_inventoryCount = 0;
-        bool o_hasInventory = false;
-        if (BuildInventorySnapshot(other, o_inventory, o_inventoryHash,
-                                   o_inventoryCount) &&
-            o_inventoryCount > 0) {
-          o_hasInventory = true;
-        }
+        // Nearby sphere results can outlive nested inventory/equipment objects
+        // during streaming. Dedicated inventory sync supplies those details.
         std::string o_charState = "normal";
         try {
           if (other->isDead()) {
@@ -4134,11 +4126,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         }
         if (o_bountyPayload != "{}") {
           json += "\"bounty_info\":" + o_bountyPayload + ",";
-        }
-        json += "\"equipment\":\"" + EscapeJSON(o_equip) + "\",";
-        if (o_hasInventory) {
-          json += "\"inventory\":" + o_inventory + ",";
-          json += "\"inventory_item_count\":" + ToString(o_inventoryCount) + ",";
         }
         json += "\"drunk_level\": " + ToString(oDrunkLevel) + ",";
         json += "\"is_drunk\": " + std::string(oIsDrunk ? "true" : "false") +

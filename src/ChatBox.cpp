@@ -4614,7 +4614,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
       ToWide(BuildStreamQueryData("init", eventData, ResolveCurrentGameTs())) +
       L"&mode=narrator" + L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
       L"&people=" + ToWide(UrlEncode(peopleJson));
-  AppendGeoQueryFromPlayer(endpoint, speaker);
+  // Save-load callbacks can still expose stale streamed objects. The first
+  // explicit interaction will attach a fully warmed-up location context.
 
   StreamChatTask *task = new StreamChatTask();
   task->endpoint = endpoint;

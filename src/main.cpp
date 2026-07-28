@@ -1832,7 +1832,7 @@ static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
 static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
-static const DWORD kNpcWorldEventWarmupMs = 10 * 1000;
+static const DWORD kNpcWorldEventWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
@@ -7524,7 +7524,7 @@ static void RunTownKnowledgeSync(GameWorld *world) {
       " changed=" + std::string(changed ? "1" : "0"));
 }
 
-static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
   }
@@ -8061,6 +8061,22 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   if (nowTick - lastPruneTick >= 60000) {
     lastPruneTick = nowTick;
     PruneNpcWorldEventState();
+  }
+}
+
+static volatile LONG g_npcWorldEventSweepSehCount = 0;
+static DWORD g_npcWorldEventSweepLastSehCode = 0;
+
+static int NpcWorldEventSweepSehFilter(unsigned int code) {
+  g_npcWorldEventSweepLastSehCode = code;
+  InterlockedIncrement(&g_npcWorldEventSweepSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+  __try {
+    RunNpcWorldEventSweepUnsafe(world, selection);
+  } __except (NpcWorldEventSweepSehFilter(GetExceptionCode())) {
   }
 }
 
@@ -12401,6 +12417,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
   static bool loadInitEventDispatched = false;
+  static bool postLoadPipelineProbed = false;
+  static bool heavySyncPipelineProbed = false;
   bool worldStable = IsWorldStableForUI(worldUi);
   if (tracePostLoadHook) {
     Log(std::string("HOOK_LOAD_PROBE: stability check returned stable=") +
@@ -12473,6 +12491,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
       loadInitEventDispatched = false;
+      postLoadPipelineProbed = false;
+      heavySyncPipelineProbed = false;
       Log("INV_SYNC: state reset on world transition.");
       Log("PORTRAIT_SYNC: state reset on world transition.");
     }
@@ -12503,6 +12523,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
     loadInitEventDispatched = false;
+    postLoadPipelineProbed = false;
+    heavySyncPipelineProbed = false;
     InterlockedExchange(&postLoadHookProbe, 1);
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
@@ -12572,6 +12594,11 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   UpdateStatusHud(worldUi);
 
+  bool probePostLoadPipeline = !postLoadPipelineProbed;
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: entering warmed post-load pipeline");
+  }
+
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
 
@@ -12606,8 +12633,12 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (selectionChanged && hasSelectionHandle && sel &&
       (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
-      SyncInventoryForCharacter(sel, true, "selection_change");
-      SyncPortraitForCharacter(sel, false, "selection_change");
+      if (GetTickCount() - worldBecameStableTick >= kHookHeavySyncWarmupMs) {
+        SyncInventoryForCharacter(sel, true, "selection_change");
+        SyncPortraitForCharacter(sel, false, "selection_change");
+      } else {
+        Log("HOOK_LOAD_PROBE: deferred initial selection inventory and portrait sync");
+      }
       // Full context snapshots can traverse stale nearby objects immediately
       // after a save load. Dialogue and action paths still build them on demand.
       ClearPendingSelectionContextPush();
@@ -12618,6 +12649,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   } else if (selectionChanged) {
     ClearPendingSelectionContextPush();
   }
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: selection stage complete");
+  }
 
   // 2. Message queue + queued actions
   GameWorld *world = GetWorldSafe();
@@ -12626,6 +12660,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage starting");
+      }
       bool dispatchedViaStream =
           TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));
       if (!dispatchedViaStream) {
@@ -12652,8 +12689,14 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
             initActor + " serial=" + ToString((int)initActorSerial));
       }
       loadInitEventDispatched = true;
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage complete");
+      }
     }
 
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage starting");
+    }
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
@@ -12661,6 +12704,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
     RunPendingSelectionContextPush(sel, worldBecameStableTick);
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage complete");
+    }
 
     DWORD nowTick = GetTickCount();
     if (!heavySweepPrimed) {
@@ -12675,16 +12721,59 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
     bool npcEventSyncReady =
         (nowTick - worldBecameStableTick) >= kNpcWorldEventWarmupMs;
+    bool probeHeavySyncPipeline = heavySyncReady && !heavySyncPipelineProbed;
     if (npcEventSyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep starting");
+      }
+      LONG sweepSehBefore =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
       RunNpcWorldEventSweep(world, sel);
+      LONG sweepSehAfter =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
+      if (sweepSehAfter != sweepSehBefore) {
+        Log("NPC_WORLD_EVENT: skipped unsafe sweep after engine fault code=" +
+            ToString((int)g_npcWorldEventSweepLastSehCode));
+      }
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep complete");
+      }
     }
     if (heavySyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep starting");
+      }
       RunInventorySyncSweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep complete");
+        Log("HOOK_LOAD_PROBE: portrait sweep starting");
+      }
       RunPlayerFactionPortraitSweep(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: portrait sweep complete");
+        Log("HOOK_LOAD_PROBE: info telemetry sweep starting");
+      }
       RunInfoTelemetrySweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: info telemetry sweep complete");
+        Log("HOOK_LOAD_PROBE: faction relation sync starting");
+      }
       RunFactionRelationSync(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: faction relation sync complete");
+        Log("HOOK_LOAD_PROBE: town knowledge sync starting");
+      }
       RunTownKnowledgeSync(world);
+      if (probeHeavySyncPipeline) {
+        heavySyncPipelineProbed = true;
+        Log("HOOK_LOAD_PROBE: town knowledge sync complete");
+        Log("HOOK_LOAD_PROBE: heavy sync pipeline complete");
+      }
     }
+  }
+  if (probePostLoadPipeline) {
+    postLoadPipelineProbed = true;
+    Log("HOOK_LOAD_PROBE: warmed post-load pipeline complete");
   }
 
   if (world && worldFrameStable && g_enableBoredEvents) {
