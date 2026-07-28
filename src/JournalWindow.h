@@ -25,4 +25,3 @@ void CloseStatusHud();
 
 } // namespace UI
 } // namespace Stobe
-
