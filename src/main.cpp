@@ -8588,8 +8588,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiNpcInfoText(data);
           } else if (command == "POPULATE_AIDIARIES") {
             PopulateAiDiaryUI(data);
+          } else if (command == "POPULATE_AIDIARY_ENTRIES") {
+            PopulateAiDiaryEntries(data);
           } else if (command == "SET_AIDIARY_TEXT") {
             SetAiDiaryText(data);
+          } else if (command == "SET_STOBE_HISTORY") {
+            SetRecentHistoryText(data);
+          } else if (command == "POPULATE_STOBE_WORLD_LIST") {
+            PopulateWorldJournalList(data);
+          } else if (command == "SET_STOBE_WORLD_DETAIL") {
+            SetWorldJournalDetail(data);
           } else if (command == "SET_CONFIG") {
             size_t colon = data.find(":");
             if (colon != std::string::npos) {
@@ -12414,6 +12422,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_welcomeWindow = nullptr;
     g_aiNpcInfoWindow = nullptr;
     g_aiDiaryWindow = nullptr;
+    g_recentHistoryWindow = nullptr;
+    g_worldJournalWindow = nullptr;
+    g_statusHudWindow = nullptr;
     return;
   }
 
@@ -12465,16 +12476,10 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       Log("INV_SYNC: state reset on world transition.");
       Log("PORTRAIT_SYNC: state reset on world transition.");
     }
-    if (g_settingsWindow)
-      CloseSettingsUI();
-    if (g_startingWindow)
-      CloseStartingUI();
-    if (g_welcomeWindow)
-      CloseWelcomeUI();
-    if (g_aiNpcInfoWindow)
-      CloseAiNpcInfoUI();
-    if (g_aiDiaryWindow)
-      CloseAiDiaryUI();
+    if (IsAnyStobeMenuUIOpen())
+      CloseAllStobeMenuUI();
+    if (g_statusHudWindow)
+      CloseStatusHud();
     if (g_chatWindow)
       CloseChatUI();
     return;
@@ -12529,8 +12534,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         motdAutoOpenDeadlineTick = 0;
         Log("UI: MOTD auto-open skipped (startup quiet window expired).");
       } else if ((LONG)(now - motdAutoOpenTick) >= 0 &&
-                 !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
-                 !g_startingWindow && !g_settingsWindow) {
+                  !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
+                  !IsAnyStobeMenuUIOpen()) {
         try {
           CreateWelcomeUI();
           g_welcomeShown = true;
@@ -12555,15 +12560,17 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     if (now - lastSettingsTick > 500) {
       lastSettingsTick = now;
       Log("UI: general hotkey pressed [" + g_generalHotkeyStr + "].");
-      if (g_startingWindow) {
-        CloseStartingUI();
-        Log("UI: CloseStartingUI done.");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: CloseAllStobeMenuUI done.");
       } else {
         CreateStartingUI();
         Log("UI: CreateStartingUI done.");
       }
     }
   }
+
+  UpdateStatusHud(worldUi);
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
@@ -12755,7 +12762,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   // Rename checks are now queued only for dialogue-tagged NPCs.
   // 4. Input Handling ??? Chat window hotkey
   if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow &&
-      !g_aiNpcInfoWindow) {
+      !IsAnyStobeMenuUIOpen()) {
     static DWORD lastTalkTick = 0;
     if (GetTickCount() - lastTalkTick > 500) {
       lastTalkTick = GetTickCount();

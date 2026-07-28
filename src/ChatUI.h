@@ -5,6 +5,7 @@
 #include "ChatBox.h"
 #include "StartingWindow.h"
 #include "AiNpcInfoWindow.h"
+#include "JournalWindow.h"
 #include "SettingsWindow.h"
 #include "WelcomeWindow.h"
 

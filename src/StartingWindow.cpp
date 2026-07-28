@@ -2,6 +2,7 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "AiNpcInfoWindow.h"
+#include "JournalWindow.h"
 #include "SettingsWindow.h"
 #include "Utils.h"
 #include "WelcomeWindow.h"
@@ -89,15 +90,59 @@ void CloseStartingUI() {
   }
 }
 
-void OnStartingAiNpcsClick(MyGUI::Widget *sender) { CreateAiNpcInfoUI(); }
-void OnStartingAiDiariesClick(MyGUI::Widget *sender) { CreateAiDiaryUI(); }
-void OnStartingPluginSettingsClick(MyGUI::Widget *sender) { CreateSettingsUI(); }
-void OnStartingWelcomeClick(MyGUI::Widget *sender) { CreateWelcomeUI(); }
+void CloseStobeChildWindows() {
+  CloseAiNpcInfoUI();
+  CloseAiDiaryUI();
+  CloseRecentHistoryUI();
+  CloseWorldJournalUI();
+  CloseSettingsUI();
+  CloseWelcomeUI();
+}
+
+void CloseAllStobeMenuUI() {
+  CloseStobeChildWindows();
+  CloseStartingUI();
+}
+
+bool IsAnyStobeMenuUIOpen() {
+  return g_startingWindow || g_aiNpcInfoWindow || g_aiDiaryWindow ||
+         g_recentHistoryWindow || g_worldJournalWindow || g_settingsWindow ||
+         g_welcomeWindow;
+}
+
+void OnStartingAiNpcsClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateAiNpcInfoUI();
+}
+void OnStartingAiDiariesClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateAiDiaryUI();
+}
+void OnStartingHistoryClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateRecentHistoryUI();
+}
+void OnStartingWorldClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateWorldJournalUI();
+}
+void OnStartingPluginSettingsClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateSettingsUI();
+}
+void OnStartingStatusHudClick(MyGUI::Widget *sender) {
+  SetStatusHudEnabled(!g_enableStatusHud);
+  RefreshStartingUI();
+}
+void OnStartingWelcomeClick(MyGUI::Widget *sender) {
+  CloseStobeChildWindows();
+  CreateWelcomeUI();
+}
 
 void OnStartingWindowButtonPressed(MyGUI::Window *sender,
                                    const std::string &name) {
   if (name == "close")
-    CloseStartingUI();
+    CloseAllStobeMenuUI();
 }
 
 void CreateStartingUI() {
@@ -116,7 +161,7 @@ void CreateStartingUI() {
   g_startingPausedGame = pausedByUs;
 
   g_startingWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.03f, 0.1f, 0.20f, 0.64f,
+      "Kenshi_WindowCX", 0.03f, 0.07f, 0.20f, 0.86f,
       MyGUI::Align::Left | MyGUI::Align::Top, "Popup", "Stobe_AIHub");
 
   if (!g_startingWindow) {
@@ -124,7 +169,7 @@ void CreateStartingUI() {
     return;
   }
 
-  g_startingWindow->setCaption(WideFromUtf8("Stobe Settings").c_str());
+  g_startingWindow->setCaption(WideFromUtf8("STOBE").c_str());
   g_startingWindow->eventWindowButtonPressed +=
       MyGUI::newDelegate(OnStartingWindowButtonPressed);
 
@@ -135,7 +180,7 @@ void CreateStartingUI() {
   }
 
   MyGUI::TextBox *hotkeyLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.02f, 0.9f, 0.20f,
+      "Kenshi_TextboxStandardText", 0.05f, 0.02f, 0.9f, 0.13f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHotkeys");
   hotkeyLabel->setCaption(WideFromUtf8("Menu Key [" + g_generalHotkeyStr +
                                        "]: Open/Close Menu\nChat Hotkey: " +
@@ -145,28 +190,53 @@ void CreateStartingUI() {
   hotkeyLabel->setTextAlign(MyGUI::Align::Center);
 
   MyGUI::Button *aiNpcsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.24f, 0.9f, 0.12f,
+      "Kenshi_Button1", 0.05f, 0.18f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiNpcsBtn");
   aiNpcsBtn->setCaption(WideFromUtf8(T("Stobe NPCs")).c_str());
   aiNpcsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingAiNpcsClick);
 
   MyGUI::Button *aiDiariesBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.38f, 0.9f, 0.12f,
+      "Kenshi_Button1", 0.05f, 0.285f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiDiariesBtn");
   aiDiariesBtn->setCaption(WideFromUtf8(T("Stobe Diaries")).c_str());
   aiDiariesBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingAiDiariesClick);
 
+  MyGUI::Button *historyBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.39f, 0.9f, 0.085f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHistoryBtn");
+  historyBtn->setCaption(WideFromUtf8(T("Recent History")).c_str());
+  historyBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnStartingHistoryClick);
+
+  MyGUI::Button *worldBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.495f, 0.9f, 0.085f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWorldBtn");
+  worldBtn->setCaption(WideFromUtf8(T("World Journal")).c_str());
+  worldBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnStartingWorldClick);
+
   MyGUI::Button *pluginSettingsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.52f, 0.9f, 0.12f,
+      "Kenshi_Button1", 0.05f, 0.60f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
   pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
   pluginSettingsBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
+  MyGUI::Button *statusHudBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.705f, 0.9f, 0.085f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch,
+      "Stobe_StartingStatusHudBtn");
+  statusHudBtn->setCaption(
+      WideFromUtf8(std::string("Status HUD: ") +
+                   (g_enableStatusHud ? "[ON]" : "[OFF]"))
+          .c_str());
+  statusHudBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnStartingStatusHudClick);
+
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.66f, 0.9f, 0.12f,
+      "Kenshi_Button1", 0.05f, 0.81f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
@@ -177,7 +247,7 @@ void CreateStartingUI() {
 void RefreshStartingUI() {
   if (!g_startingWindow)
     return;
-  g_startingWindow->setCaption(WideFromUtf8(T("AI PANEL")).c_str());
+  g_startingWindow->setCaption(WideFromUtf8(T("STOBE")).c_str());
   MyGUI::Widget *client = g_startingWindow->getClientWidget();
   if (!client)
     return;
@@ -187,9 +257,11 @@ void RefreshStartingUI() {
     std::string key;
   };
   RefreshMap items[] = {{"Stobe_StartingAiNpcsBtn", "Stobe NPCs"},
-                        {"Stobe_StartingAiDiariesBtn", "Stobe Diaries"},
-                        {"Stobe_StartingPluginSetBtn", "Settings"},
-                        {"Stobe_StartingWelBtn", "MOTD"}};
+                         {"Stobe_StartingAiDiariesBtn", "Stobe Diaries"},
+                         {"Stobe_StartingHistoryBtn", "Recent History"},
+                         {"Stobe_StartingWorldBtn", "World Journal"},
+                         {"Stobe_StartingPluginSetBtn", "Settings"},
+                         {"Stobe_StartingWelBtn", "MOTD"}};
 
   for (int i = 0; i < sizeof(items) / sizeof(items[0]); ++i) {
     const RefreshMap &item = items[i];
@@ -202,6 +274,15 @@ void RefreshStartingUI() {
         w->castType<MyGUI::TextBox>()->setCaption(
             WideFromUtf8(T(item.key)).c_str());
     }
+  }
+
+  MyGUI::Widget *statusWidget =
+      client->findWidget("Stobe_StartingStatusHudBtn");
+  if (statusWidget && statusWidget->castType<MyGUI::Button>(false)) {
+    statusWidget->castType<MyGUI::Button>()->setCaption(
+        WideFromUtf8(std::string("Status HUD: ") +
+                     (g_enableStatusHud ? "[ON]" : "[OFF]"))
+            .c_str());
   }
 
   MyGUI::Widget *hkWidget = client->findWidget("Stobe_StartingHotkeys");

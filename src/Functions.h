@@ -1,10 +1,12 @@
 #pragma once
+#include <kenshi/util/hand.h>
 #include <string>
 #include <windows.h>
 
 class Character;
 class GameWorld;
 
+Character *ResolveLiveCharacter(GameWorld *world, const hand &characterHandle);
 bool CharacterHasHacksaw(Character *npc);
 bool IsCharacterSkeletonRace(Character *npc);
 bool IsCharacterShekRace(Character *npc);
