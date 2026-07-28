@@ -3883,7 +3883,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
     zoneName = ResolveTownZoneName(town);
     townRegionName = ResolveTownRegionName(town);
   }
-  ResolveNearbyTownAndZoneFallback(world, npc, town, townName, zoneName);
+  // LOCATION/TOWN sphere scans can return stale streamed objects after a load.
+  // Use the character's live town pointer instead of dereferencing those results.
   bool inTownWalls = IsNpcInsideTownContext(npc, town);
   std::string zonePromptName = "";
   if (inTownWalls) {
@@ -3906,12 +3907,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   }
   if (regionPromptName.empty()) {
     regionPromptName = ResolveMappedRegionFromTownName(zonePromptName);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestTownMappedRegion(world, npc);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestWorldZoneName(world, npc);
   }
   std::string cachedTraderInventoryJson = "[]";
   int cachedTraderInventoryCount = 0;
@@ -4589,16 +4584,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
       }
     }
     nearbyUseObjectsJson += "],";
-
-    lektor<RootObject *> nearbyLocations;
-    world->getObjectsWithinSphere(nearbyLocations, npc->getPosition(), poiRange,
-                                  LOCATION, 48, (RootObject *)npc);
-    appendPoiResults(nearbyLocations, "location");
-
-    lektor<RootObject *> nearbyTowns;
-    world->getObjectsWithinSphere(nearbyTowns, npc->getPosition(), poiRange,
-                                  TOWN, 24, (RootObject *)npc);
-    appendPoiResults(nearbyTowns, "town");
 
     json += "],";
     json += nearbyUseObjectsJson;
