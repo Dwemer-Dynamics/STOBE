@@ -12608,7 +12608,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     if (ShouldProcessAnimalCharacter(sel)) {
       SyncInventoryForCharacter(sel, true, "selection_change");
       SyncPortraitForCharacter(sel, false, "selection_change");
-      QueueSelectionContextPush(currentSelectionHand);
+      // Full context snapshots can traverse stale nearby objects immediately
+      // after a save load. Dialogue and action paths still build them on demand.
+      ClearPendingSelectionContextPush();
     } else {
       ClearPendingSelectionContextPush();
       Log("ANIMAL_TALKS: ignoring selection context sync for inactive animal.");
