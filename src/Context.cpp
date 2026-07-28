@@ -948,13 +948,9 @@ std::string ResolveGameDataRefName(GameData *data, const char *key) {
   }
   for (size_t i = 0; i < refs->size(); ++i) {
     const GameDataReference &ref = refs->at(i);
-    std::string value = "";
-    if (ref.ptr) {
-      value = TrimCopy(ref.ptr->name);
-    }
-    if (value.empty()) {
-      value = TrimCopy(ref.sid);
-    }
+    // Runtime reference pointers can be stale for nearby streamed world objects.
+    // The persisted string ID remains valid without dereferencing that object.
+    std::string value = TrimCopy(ref.sid);
     if (!IsUnknownToken(value)) {
       return value;
     }
