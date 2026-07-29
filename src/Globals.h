@@ -180,14 +180,11 @@ extern std::set<unsigned int> g_identityRenameCompletedSerials;
 extern std::map<unsigned int, DWORD> g_identityRenameNextAttemptTick;
 extern std::set<unsigned int> g_renamedSerials;
 extern std::set<unsigned int> g_activatedAnimalSerials;
-extern std::map<unsigned int, std::string> g_activatedAiActorNames;
 extern DWORD g_lastContextPushTick;
 extern DWORD g_lastWorldStatePushTick;
 
 void MarkAnimalActivated(unsigned int serial);
 bool IsAnimalActivated(unsigned int serial);
-void MarkAiActorActivated(unsigned int serial, const std::string &name);
-std::vector<std::string> SnapshotActivatedAiActorNames();
 
 // Safely resolves the current GameWorld pointer from KenshiLib globals.
 // Returns nullptr when the world pointer is not initialized or unreadable.

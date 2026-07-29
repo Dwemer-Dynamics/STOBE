@@ -3002,10 +3002,6 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     return 0;
 
   LONG generation = task->generation;
-  unsigned int activatedActorSerial = 0;
-  if (TryParseSerial(task->handleStr, activatedActorSerial)) {
-    MarkAiActorActivated(activatedActorSerial, task->npcName);
-  }
   StreamChatParseState parseState;
   parseState.task = task;
   parseState.generation = generation;
@@ -4135,9 +4131,32 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
 
 void OnWriteDiaryClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
-  std::string targetNpcName = TrimChatLine(g_chatTargetNameStr);
+  if (!world || !world->player ||
+      !world->player->selectedCharacter.isValid()) {
+    Log("DIARY: button trigger failed (no selected NPC).");
+    QueueUiNotifyAction("Diary: select an NPC first.");
+    CloseChatUI();
+    return;
+  }
+
+  hand selectedHandle = world->player->selectedCharacter;
+  Character *targetNpc = ResolveLiveCharacter(world, selectedHandle);
+  if (!targetNpc || (uintptr_t)targetNpc <= 0x1000) {
+    Log("DIARY: button trigger failed (selected NPC unavailable).");
+    QueueUiNotifyAction("Diary: the selected NPC is unavailable.");
+    CloseChatUI();
+    return;
+  }
+
+  std::string targetNpcName;
+  try {
+    targetNpcName = TrimChatLine(targetNpc->getName());
+  } catch (...) {
+    targetNpcName.clear();
+  }
   if (targetNpcName.empty()) {
-    Log("DIARY: button trigger failed (empty target NPC).");
+    Log("DIARY: button trigger failed (selected NPC has no name).");
+    QueueUiNotifyAction("Diary: the selected NPC has no name.");
     CloseChatUI();
     return;
   }
@@ -4151,9 +4170,7 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   if (playerName.empty()) {
     playerName = "Player";
   }
-  std::string targetHandle = TrimChatLine(g_chatTargetHandleStr);
-  Character *targetNpc =
-      ResolveChatTargetCharacter(world, targetNpcName, targetHandle);
+  std::string targetHandle = ToString(selectedHandle.serial);
   Character *bestSpeaker =
       ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
   if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
@@ -4189,8 +4206,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
       CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
   if (diaryThread) {
     CloseHandle(diaryThread);
-    Log("DIARY: manual diary trigger dispatched for '" + targetNpcName +
-        "' people_len=" + ToString((int)peopleJson.length()));
+    Log("DIARY: manual diary trigger dispatched for selected NPC '" +
+        targetNpcName + "' serial=" + targetHandle +
+        " people_len=" + ToString((int)peopleJson.length()));
   } else {
     delete task;
     Log("DIARY: failed to start manual diary response thread for '" +

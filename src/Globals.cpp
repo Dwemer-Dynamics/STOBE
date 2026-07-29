@@ -184,7 +184,6 @@ std::set<unsigned int> g_identityRenameCompletedSerials;
 std::map<unsigned int, DWORD> g_identityRenameNextAttemptTick;
 std::set<unsigned int> g_renamedSerials;
 std::set<unsigned int> g_activatedAnimalSerials;
-std::map<unsigned int, std::string> g_activatedAiActorNames;
 DWORD g_lastContextPushTick = 0;
 DWORD g_lastWorldStatePushTick = 0;
 
@@ -229,31 +228,6 @@ bool IsAnimalActivated(unsigned int serial) {
   bool active = g_activatedAnimalSerials.count(serial) > 0;
   LeaveCriticalSection(&g_stateMutex);
   return active;
-}
-
-void MarkAiActorActivated(unsigned int serial, const std::string &name) {
-  if (serial == 0 || name.empty() || name == "The Narrator") {
-    return;
-  }
-  EnterCriticalSection(&g_stateMutex);
-  g_activatedAiActorNames[serial] = name;
-  LeaveCriticalSection(&g_stateMutex);
-}
-
-std::vector<std::string> SnapshotActivatedAiActorNames() {
-  std::vector<std::string> names;
-  EnterCriticalSection(&g_stateMutex);
-  for (std::map<unsigned int, std::string>::const_iterator it =
-           g_activatedAiActorNames.begin();
-       it != g_activatedAiActorNames.end(); ++it) {
-    if (!it->second.empty()) {
-      names.push_back(it->second);
-    }
-  }
-  LeaveCriticalSection(&g_stateMutex);
-  std::sort(names.begin(), names.end());
-  names.erase(std::unique(names.begin(), names.end()), names.end());
-  return names;
 }
 
 void SetFollowTarget(unsigned int followerSerial, const hand &target) {

@@ -11,6 +11,7 @@
 #include <mygui/MyGUI_Delegate.h>
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
+#include <mygui/MyGUI_ListBox.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 #include <string>
@@ -31,7 +32,9 @@ struct JournalTask {
   std::string field;
 };
 
+MyGUI::ListBox *g_historyList = nullptr;
 MyGUI::EditBox *g_historyText = nullptr;
+std::vector<std::string> g_historyEntries;
 std::string g_historyPendingFilter;
 
 MyGUI::TextBox *g_statusHudText = nullptr;
@@ -71,6 +74,86 @@ void SetReadOnlyText(MyGUI::EditBox *box, const std::string &text) {
   }
   box->setOnlyText(WideFromUtf8(text).c_str());
   box->setVScrollPosition(0);
+}
+
+std::string TrimHistoryLine(const std::string &value) {
+  size_t first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return "";
+  }
+  size_t last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+std::string BuildHistorySummary(const std::string &entry) {
+  size_t firstBreak = entry.find('\n');
+  std::string heading =
+      TrimHistoryLine(firstBreak == std::string::npos
+                          ? entry
+                          : entry.substr(0, firstBreak));
+  std::string content;
+  size_t cursor =
+      firstBreak == std::string::npos ? entry.length() : firstBreak + 1;
+  while (cursor < entry.length()) {
+    size_t next = entry.find('\n', cursor);
+    std::string line =
+        TrimHistoryLine(next == std::string::npos
+                            ? entry.substr(cursor)
+                            : entry.substr(cursor, next - cursor));
+    if (!line.empty() && line.compare(0, 7, "People:") != 0 &&
+        line.compare(0, 9, "Location:") != 0) {
+      content = line;
+      break;
+    }
+    if (next == std::string::npos) {
+      break;
+    }
+    cursor = next + 1;
+  }
+
+  std::string summary = heading;
+  if (!content.empty()) {
+    summary += " | " + content;
+  }
+  if (summary.length() > 240) {
+    summary = summary.substr(0, 237) + "...";
+  }
+  return summary.empty() ? "Recorded event" : summary;
+}
+
+void PopulateHistoryEntries(const std::string &text) {
+  g_historyEntries.clear();
+  std::string current;
+  size_t cursor = 0;
+  while (cursor <= text.length()) {
+    size_t next = text.find('\n', cursor);
+    std::string line =
+        next == std::string::npos ? text.substr(cursor)
+                                  : text.substr(cursor, next - cursor);
+    if (!line.empty() && line[line.length() - 1] == '\r') {
+      line.erase(line.length() - 1);
+    }
+    if (TrimHistoryLine(line).empty()) {
+      std::string entry = TrimHistoryLine(current);
+      if (!entry.empty()) {
+        g_historyEntries.push_back(entry);
+      }
+      current.clear();
+    } else {
+      if (!current.empty()) {
+        current += "\n";
+      }
+      current += line;
+    }
+    if (next == std::string::npos) {
+      break;
+    }
+    cursor = next + 1;
+  }
+  std::string trailingEntry = TrimHistoryLine(current);
+  if (!trailingEntry.empty()) {
+    g_historyEntries.push_back(trailingEntry);
+  }
 }
 
 void QueueUiCommand(const std::string &command, const std::string &data) {
@@ -119,6 +202,10 @@ void StartJournalRequest(const std::wstring &endpoint, const std::string &json,
 
 void RefreshHistory() {
   g_historyPendingFilter = "all";
+  if (g_historyList) {
+    g_historyList->removeAllItems();
+  }
+  g_historyEntries.clear();
   SetReadOnlyText(g_historyText, "Loading recent events...");
   StartJournalRequest(
       L"/ai_history",
@@ -127,6 +214,13 @@ void RefreshHistory() {
 }
 
 void OnHistoryRefreshClick(MyGUI::Widget *sender) { RefreshHistory(); }
+
+void OnHistoryEntrySelect(MyGUI::ListBox *sender, size_t index) {
+  if (index == MyGUI::ITEM_NONE || index >= g_historyEntries.size()) {
+    return;
+  }
+  SetReadOnlyText(g_historyText, g_historyEntries[index]);
+}
 
 void OnHistoryWindowButtonPressed(MyGUI::Window *sender,
                                   const std::string &name) {
@@ -149,7 +243,9 @@ void CloseRecentHistoryUI() {
     Log("UI_WARN: failed to destroy Recent History window.");
   }
   g_recentHistoryWindow = nullptr;
+  g_historyList = nullptr;
   g_historyText = nullptr;
+  g_historyEntries.clear();
   g_historyPendingFilter.clear();
 }
 
@@ -164,7 +260,22 @@ void SetRecentHistoryText(const std::string &data) {
     Log("UI: ignored stale history response filter=" + key);
     return;
   }
-  SetReadOnlyText(g_historyText, data.substr(split + 1));
+  PopulateHistoryEntries(data.substr(split + 1));
+  if (g_historyList) {
+    g_historyList->removeAllItems();
+    for (size_t i = 0; i < g_historyEntries.size(); ++i) {
+      g_historyList->addItem(
+          WideFromUtf8(BuildHistorySummary(g_historyEntries[i])).c_str());
+    }
+  }
+  if (g_historyEntries.empty()) {
+    SetReadOnlyText(g_historyText, "No recent events have been recorded.");
+    return;
+  }
+  if (g_historyList) {
+    g_historyList->setIndexSelected(0);
+  }
+  SetReadOnlyText(g_historyText, g_historyEntries[0]);
 }
 
 void CreateRecentHistoryUI() {
@@ -195,8 +306,14 @@ void CreateRecentHistoryUI() {
   refreshButton->eventMouseButtonClick +=
       MyGUI::newDelegate(OnHistoryRefreshClick);
 
+  g_historyList = client->createWidgetReal<MyGUI::ListBox>(
+      "Kenshi_ListBox", 0.03f, 0.12f, 0.44f, 0.74f,
+      MyGUI::Align::Default, "Stobe_HistoryList");
+  g_historyList->eventListChangePosition +=
+      MyGUI::newDelegate(OnHistoryEntrySelect);
+
   g_historyText = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.03f, 0.12f, 0.94f, 0.74f,
+      "Kenshi_EditBox", 0.49f, 0.12f, 0.48f, 0.74f,
       MyGUI::Align::Default, "Stobe_HistoryText");
   ConfigureReadOnlyText(g_historyText);
   RefreshHistory();
@@ -233,7 +350,7 @@ void UpdateStatusHud(GameWorld *world) {
 
   if (!g_statusHudWindow) {
     g_statusHudWindow = gui->createWidgetReal<MyGUI::Window>(
-        "Kenshi_WindowCX", 0.76f, 0.03f, 0.22f, 0.22f,
+        "Kenshi_WindowCX", 0.78f, 0.03f, 0.20f, 0.15f,
         MyGUI::Align::Right | MyGUI::Align::Top, "Popup",
         "Stobe_StatusHudWindow");
     if (!g_statusHudWindow) {
@@ -271,32 +388,23 @@ void UpdateStatusHud(GameWorld *world) {
     }
   }
 
-  std::vector<std::string> activatedActors = SnapshotActivatedAiActorNames();
-  std::string activatedActorText = "None";
-  if (!activatedActors.empty()) {
-    activatedActorText.clear();
-    const size_t visibleActorLimit = 6;
-    size_t visibleActors = std::min(activatedActors.size(), visibleActorLimit);
-    for (size_t i = 0; i < visibleActors; ++i) {
-      if (!activatedActorText.empty()) {
-        activatedActorText += ", ";
+  std::string targetedName = "None";
+  if (g_talkTargetHand.isValid() && g_talkTargetHand.serial != 0) {
+    Character *targeted = ResolveLiveCharacter(world, g_talkTargetHand);
+    if (targeted && reinterpret_cast<uintptr_t>(targeted) > 0x1000) {
+      try {
+        targetedName = targeted->getName();
+      } catch (...) {
+        targetedName = "Unavailable";
       }
-      activatedActorText += activatedActors[i];
-    }
-    if (activatedActors.size() > visibleActors) {
-      activatedActorText += " (+" +
-                            ToString(static_cast<unsigned int>(
-                                activatedActors.size() - visibleActors)) +
-                            " more)";
     }
   }
+
   std::string caption =
       "Mode: " + g_chatMode +
       "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
       "\nSelected: " + selectedName +
-      "\nActivated AI actors (" +
-      ToString(static_cast<unsigned int>(activatedActors.size())) +
-      "):\n" + activatedActorText;
+      "\nTargeted: " + targetedName;
   if (g_statusHudText) {
     g_statusHudText->setCaption(WideFromUtf8(caption).c_str());
   }

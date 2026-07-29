@@ -12465,7 +12465,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInventoryHand = hand();
       g_playerHand = hand();
       g_activatedAnimalSerials.clear();
-      g_activatedAiActorNames.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
