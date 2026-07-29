@@ -102,6 +102,7 @@
     <ClCompile Include="src\\Functions.cpp" />
     <ClCompile Include="src\Globals.cpp" />
     <ClCompile Include="src\KenshiAiCompat.cpp" />
+    <ClCompile Include="src\JournalWindow.cpp" />
     <ClCompile Include="src\KenshiRvaCompat.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
@@ -129,6 +130,7 @@
     <ClInclude Include="src\\Functions.h" />
     <ClInclude Include="src\Globals.h" />
     <ClInclude Include="src\KenshiAiCompat.h" />
+    <ClInclude Include="src\JournalWindow.h" />
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />

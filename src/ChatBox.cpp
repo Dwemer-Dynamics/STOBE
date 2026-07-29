@@ -64,8 +64,15 @@ bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
+LONG g_activeChatStreamCount = 0;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
+
+class ActiveChatStreamScope {
+public:
+  ActiveChatStreamScope() { InterlockedIncrement(&g_activeChatStreamCount); }
+  ~ActiveChatStreamScope() { InterlockedDecrement(&g_activeChatStreamCount); }
+};
 
 struct ChatTargetOption {
   std::string name;
@@ -3000,6 +3007,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
+  ActiveChatStreamScope activeStream;
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3070,6 +3078,10 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   }
   delete task;
   return 0;
+}
+
+bool IsAiRequestActive() {
+  return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
 }
 
 void OnChatInputChange(MyGUI::EditBox *sender) {
@@ -4131,9 +4143,32 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
 
 void OnWriteDiaryClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
-  std::string targetNpcName = TrimChatLine(g_chatTargetNameStr);
+  if (!world || !world->player ||
+      !world->player->selectedCharacter.isValid()) {
+    Log("DIARY: button trigger failed (no selected NPC).");
+    QueueUiNotifyAction("Diary: select an NPC first.");
+    CloseChatUI();
+    return;
+  }
+
+  hand selectedHandle = world->player->selectedCharacter;
+  Character *targetNpc = ResolveLiveCharacter(world, selectedHandle);
+  if (!targetNpc || (uintptr_t)targetNpc <= 0x1000) {
+    Log("DIARY: button trigger failed (selected NPC unavailable).");
+    QueueUiNotifyAction("Diary: the selected NPC is unavailable.");
+    CloseChatUI();
+    return;
+  }
+
+  std::string targetNpcName;
+  try {
+    targetNpcName = TrimChatLine(targetNpc->getName());
+  } catch (...) {
+    targetNpcName.clear();
+  }
   if (targetNpcName.empty()) {
-    Log("DIARY: button trigger failed (empty target NPC).");
+    Log("DIARY: button trigger failed (selected NPC has no name).");
+    QueueUiNotifyAction("Diary: the selected NPC has no name.");
     CloseChatUI();
     return;
   }
@@ -4147,9 +4182,7 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   if (playerName.empty()) {
     playerName = "Player";
   }
-  std::string targetHandle = TrimChatLine(g_chatTargetHandleStr);
-  Character *targetNpc =
-      ResolveChatTargetCharacter(world, targetNpcName, targetHandle);
+  std::string targetHandle = ToString(selectedHandle.serial);
   Character *bestSpeaker =
       ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
   if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
@@ -4185,8 +4218,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
       CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
   if (diaryThread) {
     CloseHandle(diaryThread);
-    Log("DIARY: manual diary trigger dispatched for '" + targetNpcName +
-        "' people_len=" + ToString((int)peopleJson.length()));
+    Log("DIARY: manual diary trigger dispatched for selected NPC '" +
+        targetNpcName + "' serial=" + targetHandle +
+        " people_len=" + ToString((int)peopleJson.length()));
   } else {
     delete task;
     Log("DIARY: failed to start manual diary response thread for '" +
@@ -4614,7 +4648,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
       ToWide(BuildStreamQueryData("init", eventData, ResolveCurrentGameTs())) +
       L"&mode=narrator" + L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
       L"&people=" + ToWide(UrlEncode(peopleJson));
-  AppendGeoQueryFromPlayer(endpoint, speaker);
+  // Save-load callbacks can still expose stale streamed objects. The first
+  // explicit interaction will attach a fully warmed-up location context.
 
   StreamChatTask *task = new StreamChatTask();
   task->endpoint = endpoint;

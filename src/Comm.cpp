@@ -746,8 +746,14 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
-  if (endpoint == L"/ai_diaries/list" || endpoint == L"/ai_diaries/detail") {
+  if (endpoint == L"/ai_diaries/list" || endpoint == L"/ai_diaries/detail" ||
+      endpoint == L"/ai_diaries/entries" || endpoint == L"/ai_diaries/entry") {
     request.path = L"/StobeServer/ai_diaries.php";
+    return request;
+  }
+
+  if (endpoint == L"/ai_history") {
+    request.path = L"/StobeServer/ai_history.php";
     return request;
   }
 

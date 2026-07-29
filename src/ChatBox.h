@@ -38,6 +38,7 @@ void OnChatModeChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
+bool IsAiRequestActive();
 void RefreshChatModeControls();
 void OnBoredEventClick(MyGUI::Widget *sender);
 void OnWriteDiaryClick(MyGUI::Widget *sender);

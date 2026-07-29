@@ -80,6 +80,7 @@ add_library(Stobe SHARED
   src/Functions.cpp
   src/Globals.cpp
   src/KenshiAiCompat.cpp
+  src/JournalWindow.cpp
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiRvaCompat.cpp

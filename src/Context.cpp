@@ -948,13 +948,9 @@ std::string ResolveGameDataRefName(GameData *data, const char *key) {
   }
   for (size_t i = 0; i < refs->size(); ++i) {
     const GameDataReference &ref = refs->at(i);
-    std::string value = "";
-    if (ref.ptr) {
-      value = TrimCopy(ref.ptr->name);
-    }
-    if (value.empty()) {
-      value = TrimCopy(ref.sid);
-    }
+    // Runtime reference pointers can be stale for nearby streamed world objects.
+    // The persisted string ID remains valid without dereferencing that object.
+    std::string value = TrimCopy(ref.sid);
     if (!IsUnknownToken(value)) {
       return value;
     }
@@ -3887,7 +3883,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
     zoneName = ResolveTownZoneName(town);
     townRegionName = ResolveTownRegionName(town);
   }
-  ResolveNearbyTownAndZoneFallback(world, npc, town, townName, zoneName);
+  // LOCATION/TOWN sphere scans can return stale streamed objects after a load.
+  // Use the character's live town pointer instead of dereferencing those results.
   bool inTownWalls = IsNpcInsideTownContext(npc, town);
   std::string zonePromptName = "";
   if (inTownWalls) {
@@ -3910,12 +3907,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   }
   if (regionPromptName.empty()) {
     regionPromptName = ResolveMappedRegionFromTownName(zonePromptName);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestTownMappedRegion(world, npc);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestWorldZoneName(world, npc);
   }
   std::string cachedTraderInventoryJson = "[]";
   int cachedTraderInventoryCount = 0;
@@ -4068,16 +4059,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         std::string o_orders = BuildStandingOrderPayload(other);
         int o_bountyTotal = 0;
         std::string o_bountyPayload = BuildBountyPayload(other, o_bountyTotal);
-        std::string o_equip = GetVisibleEquipment(other);
-        std::string o_inventory = "[]";
-        std::string o_inventoryHash = "";
-        int o_inventoryCount = 0;
-        bool o_hasInventory = false;
-        if (BuildInventorySnapshot(other, o_inventory, o_inventoryHash,
-                                   o_inventoryCount) &&
-            o_inventoryCount > 0) {
-          o_hasInventory = true;
-        }
+        // Nearby sphere results can outlive nested inventory/equipment objects
+        // during streaming. Dedicated inventory sync supplies those details.
         std::string o_charState = "normal";
         try {
           if (other->isDead()) {
@@ -4143,11 +4126,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         }
         if (o_bountyPayload != "{}") {
           json += "\"bounty_info\":" + o_bountyPayload + ",";
-        }
-        json += "\"equipment\":\"" + EscapeJSON(o_equip) + "\",";
-        if (o_hasInventory) {
-          json += "\"inventory\":" + o_inventory + ",";
-          json += "\"inventory_item_count\":" + ToString(o_inventoryCount) + ",";
         }
         json += "\"drunk_level\": " + ToString(oDrunkLevel) + ",";
         json += "\"is_drunk\": " + std::string(oIsDrunk ? "true" : "false") +
@@ -4593,16 +4571,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
       }
     }
     nearbyUseObjectsJson += "],";
-
-    lektor<RootObject *> nearbyLocations;
-    world->getObjectsWithinSphere(nearbyLocations, npc->getPosition(), poiRange,
-                                  LOCATION, 48, (RootObject *)npc);
-    appendPoiResults(nearbyLocations, "location");
-
-    lektor<RootObject *> nearbyTowns;
-    world->getObjectsWithinSphere(nearbyTowns, npc->getPosition(), poiRange,
-                                  TOWN, 24, (RootObject *)npc);
-    appendPoiResults(nearbyTowns, "town");
 
     json += "],";
     json += nearbyUseObjectsJson;

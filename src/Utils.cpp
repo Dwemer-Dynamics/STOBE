@@ -558,6 +558,9 @@ void LoadStobeRuntimeConfig() {
   g_enableItemImageSync =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                         "EnableItemImageSync", 0) != 0;
+  g_enableStatusHud =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableStatusHud", 0) != 0;
   int boredEventIntervalHours = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
   if (boredEventIntervalHours < 1) {
@@ -621,7 +624,8 @@ void LoadStobeRuntimeConfig() {
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
       ", RegularDialogueCapture=" +
       (g_enableRegularDialogueCapture ? "true" : "false") +
-      ", ItemImageSync=" + (g_enableItemImageSync ? "true" : "false") +
+       ", ItemImageSync=" + (g_enableItemImageSync ? "true" : "false") +
+       ", StatusHud=" + (g_enableStatusHud ? "true" : "false") +
       ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
       ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
       "h" +
@@ -678,6 +682,9 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableItemImageSync",
                              g_enableItemImageSync ? "1" : "0",
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableStatusHud",
+                             g_enableStatusHud ? "1" : "0",
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
                              ToString(g_boredEventIntervalHours).c_str(),
