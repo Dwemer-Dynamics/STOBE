@@ -39,6 +39,7 @@ bool g_enableRegularDialogueCapture = false;
 bool g_enableItemImageSync = false;
 bool g_enableStatusHud = false;
 int g_dynamicProfileIntervalHours = 24;
+std::string g_narratorDisplayName = "The Narrator";
 
 std::string g_activeInventoryJson = "[]";
 hand g_lastInventoryHand;
@@ -47,6 +48,22 @@ hand g_lastSelectionHand;
 std::string g_playerInventoryJson = "[]";
 hand g_playerHand;
 CRITICAL_SECTION g_stateMutex;
+
+void SetNarratorDisplayName(const std::string &name) {
+  if (name.empty()) {
+    return;
+  }
+  EnterCriticalSection(&g_stateMutex);
+  g_narratorDisplayName = name;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+std::string GetNarratorDisplayName() {
+  EnterCriticalSection(&g_stateMutex);
+  std::string value = g_narratorDisplayName;
+  LeaveCriticalSection(&g_stateMutex);
+  return value.empty() ? "The Narrator" : value;
+}
 
 std::deque<GameEvent> g_gameEvents;
 CRITICAL_SECTION g_eventMutex;

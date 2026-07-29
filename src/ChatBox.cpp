@@ -1593,7 +1593,7 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     ChatTargetOption narratorOption;
     narratorOption.name = kNarratorName;
     narratorOption.handle.clear();
-    narratorOption.label = kNarratorName;
+    narratorOption.label = GetNarratorDisplayName();
     narratorOption.distance = -1.0f;
     narratorOption.isNarrator = true;
     options.push_back(narratorOption);
@@ -2898,7 +2898,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     std::string queueLine = "";
     std::string explicitTalkTargetToken = "";
     if (narratorSpeaker) {
-      queueLine = "NOTIFY:" + std::string(kNarratorName) + ": " + subtitle;
+      queueLine = "NARRATOR_NOTIFY:" + GetNarratorDisplayName() + ": " + subtitle;
     } else {
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       if (speakerHeader == actor) {
@@ -4196,6 +4196,54 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   CloseChatUI();
 }
 
+void OnWriteNarratorDiaryClick(MyGUI::Widget *sender) {
+  GameWorld *world = GetWorldSafe();
+  Character *player = nullptr;
+  if (world && world->player && world->player->playerCharacters.size() > 0) {
+    player = world->player->playerCharacters[0];
+  }
+  std::string playerName = TrimChatLine(g_chatPlayerNameStr);
+  if (playerName.empty() && player && (uintptr_t)player > 0x1000) {
+    try {
+      playerName = TrimChatLine(player->getName());
+    } catch (...) {
+      playerName.clear();
+    }
+  }
+  if (playerName.empty()) {
+    playerName = "Player";
+  }
+
+  std::string peopleJson =
+      "[\"" + EscapeJSON(playerName) + "\",\"" + kNarratorName + "\"]";
+  std::wstring endpoint =
+      L"/StobeServer/stream.php?DATA=" +
+      ToWide(BuildStreamQueryData("diary_narrator", kNarratorName,
+                                  ResolveCurrentGameTs())) +
+      L"&profile=" + ToWide(UrlEncode(kNarratorName)) +
+      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
+      L"&people=" + ToWide(UrlEncode(peopleJson));
+  AppendGeoQueryFromPlayer(endpoint, player);
+
+  ManualDiaryTask *task = new ManualDiaryTask();
+  task->endpoint = endpoint;
+  task->targetNpcName = GetNarratorDisplayName();
+  task->peopleJson = peopleJson;
+  task->requestStartTick = GetTickCount();
+  QueueUiNotifyAction("Diary: narrator request sent.");
+  HANDLE diaryThread =
+      CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
+  if (diaryThread) {
+    CloseHandle(diaryThread);
+    Log("DIARY: manual narrator diary trigger dispatched.");
+  } else {
+    delete task;
+    QueueUiNotifyAction("Diary: failed to start narrator request.");
+    Log("DIARY: failed to start manual narrator diary request.");
+  }
+  CloseChatUI();
+}
+
 bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName,
                        const std::string &preferredSpeakerSerial,
@@ -4729,12 +4777,13 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float topRowY = inputY + inputH + rowGap;
   const float bottomRowY = topRowY + rowH + rowGap;
   const float topRowLeftX = 0.05f;
-  const float topRowGap = 0.03f;
-  const float topBtnW = 0.20f;
+  const float topRowGap = 0.02f;
+  const float topBtnW = 0.16f;
   const float topAutoX = topRowLeftX;
   const float topBoredX = topAutoX + topBtnW + topRowGap;
   const float topDiaryX = topBoredX + topBtnW + topRowGap;
-  const float topRenameX = topDiaryX + topBtnW + topRowGap;
+  const float topNarratorDiaryX = topDiaryX + topBtnW + topRowGap;
+  const float topRenameX = topNarratorDiaryX + topBtnW + topRowGap;
   const float bottomRowLeftX = 0.05f;
   const float bottomRowGap = 0.02f;
   const float modeWidth = 0.20f;
@@ -4811,6 +4860,16 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       "Stobe_ChatDiaryBtn");
   writeDiaryBtn->setCaption(WideFromUtf8(T("Write Diary")).c_str());
   writeDiaryBtn->eventMouseButtonClick += MyGUI::newDelegate(OnWriteDiaryClick);
+
+  MyGUI::Button *writeNarratorDiaryBtn =
+      client->createWidgetReal<MyGUI::Button>(
+          "Kenshi_Button1", topNarratorDiaryX, topRowY, topBtnW, rowH,
+          MyGUI::Align::Top | MyGUI::Align::Left,
+          "Stobe_ChatNarratorDiaryBtn");
+  writeNarratorDiaryBtn->setCaption(
+      WideFromUtf8(T("Narrator Diary")).c_str());
+  writeNarratorDiaryBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnWriteNarratorDiaryClick);
 
   MyGUI::Button *renameBtn = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", topRenameX, topRowY, topBtnW, rowH,
