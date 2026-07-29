@@ -92,6 +92,7 @@ add_library(Stobe SHARED
   src/SettingsWindow.cpp
   src/Utils.cpp
   src/WelcomeWindow.cpp
+  src/WorldStateRuntime.cpp
 )
 
 target_include_directories(Stobe PRIVATE
