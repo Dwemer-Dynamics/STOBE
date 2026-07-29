@@ -140,11 +140,13 @@ void ConfigureReadOnlyText(MyGUI::EditBox *box) {
   if (!box) {
     return;
   }
-  box->setEditReadOnly(true);
   box->setEditMultiLine(true);
   box->setEditWordWrap(true);
+  box->setEditStatic(true);
+  box->setEditReadOnly(true);
   box->setVisibleVScroll(true);
   box->setVisibleHScroll(false);
+  box->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top);
   box->setNeedKeyFocus(false);
 }
 
@@ -156,7 +158,9 @@ void SetReadOnlyText(MyGUI::EditBox *box, const std::string &text) {
   if (!payload.empty() && payload[0] == ' ') {
     payload.erase(0, 1);
   }
-  box->setOnlyText(WideFromUtf8(payload).c_str());
+  box->setEditMultiLine(true);
+  box->setEditWordWrap(true);
+  box->setCaption(WideFromUtf8(payload).c_str());
   box->setVScrollPosition(0);
 }
 

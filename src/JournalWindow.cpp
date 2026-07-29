@@ -11,7 +11,6 @@
 #include <kenshi/PlayerInterface.h>
 #include <mygui/MyGUI_Button.h>
 #include <mygui/MyGUI_Delegate.h>
-#include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_ListBox.h>
 #include <mygui/MyGUI_TextBox.h>
@@ -35,7 +34,6 @@ struct JournalTask {
 };
 
 MyGUI::ListBox *g_historyList = nullptr;
-MyGUI::EditBox *g_historyText = nullptr;
 std::vector<std::string> g_historyEntries;
 std::string g_historyPendingFilter;
 
@@ -91,26 +89,6 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
-}
-
-void ConfigureReadOnlyText(MyGUI::EditBox *box) {
-  if (!box) {
-    return;
-  }
-  box->setEditReadOnly(true);
-  box->setEditMultiLine(true);
-  box->setEditWordWrap(true);
-  box->setVisibleVScroll(true);
-  box->setVisibleHScroll(false);
-  box->setNeedKeyFocus(false);
-}
-
-void SetReadOnlyText(MyGUI::EditBox *box, const std::string &text) {
-  if (!box) {
-    return;
-  }
-  box->setOnlyText(WideFromUtf8(text).c_str());
-  box->setVScrollPosition(0);
 }
 
 std::string TrimHistoryLine(const std::string &value) {
@@ -241,9 +219,9 @@ void RefreshHistory() {
   g_historyPendingFilter = "all";
   if (g_historyList) {
     g_historyList->removeAllItems();
+    g_historyList->addItem(WideFromUtf8("Loading recent events...").c_str());
   }
   g_historyEntries.clear();
-  SetReadOnlyText(g_historyText, "Loading recent events...");
   StartJournalRequest(
       L"/ai_history",
       "{\"filter\":\"" + g_historyPendingFilter + "\",\"limit\":60}",
@@ -251,13 +229,6 @@ void RefreshHistory() {
 }
 
 void OnHistoryRefreshClick(MyGUI::Widget *sender) { RefreshHistory(); }
-
-void OnHistoryEntrySelect(MyGUI::ListBox *sender, size_t index) {
-  if (index == MyGUI::ITEM_NONE || index >= g_historyEntries.size()) {
-    return;
-  }
-  SetReadOnlyText(g_historyText, g_historyEntries[index]);
-}
 
 void OnHistoryWindowButtonPressed(MyGUI::Window *sender,
                                   const std::string &name) {
@@ -281,7 +252,6 @@ void CloseRecentHistoryUI() {
   }
   g_recentHistoryWindow = nullptr;
   g_historyList = nullptr;
-  g_historyText = nullptr;
   g_historyEntries.clear();
   g_historyPendingFilter.clear();
 }
@@ -289,7 +259,10 @@ void CloseRecentHistoryUI() {
 void SetRecentHistoryText(const std::string &data) {
   size_t split = data.find('\n');
   if (split == std::string::npos) {
-    SetReadOnlyText(g_historyText, data);
+    if (g_historyList) {
+      g_historyList->removeAllItems();
+      g_historyList->addItem(WideFromUtf8(data).c_str());
+    }
     return;
   }
   std::string key = data.substr(0, split);
@@ -306,13 +279,11 @@ void SetRecentHistoryText(const std::string &data) {
     }
   }
   if (g_historyEntries.empty()) {
-    SetReadOnlyText(g_historyText, "No recent events have been recorded.");
-    return;
+    if (g_historyList) {
+      g_historyList->addItem(
+          WideFromUtf8("No recent events have been recorded.").c_str());
+    }
   }
-  if (g_historyList) {
-    g_historyList->setIndexSelected(0);
-  }
-  SetReadOnlyText(g_historyText, g_historyEntries[0]);
 }
 
 void CreateRecentHistoryUI() {
@@ -344,15 +315,8 @@ void CreateRecentHistoryUI() {
       MyGUI::newDelegate(OnHistoryRefreshClick);
 
   g_historyList = client->createWidgetReal<MyGUI::ListBox>(
-      "Kenshi_ListBox", 0.03f, 0.12f, 0.44f, 0.74f,
+      "Kenshi_ListBox", 0.03f, 0.12f, 0.94f, 0.84f,
       MyGUI::Align::Default, "Stobe_HistoryList");
-  g_historyList->eventListChangePosition +=
-      MyGUI::newDelegate(OnHistoryEntrySelect);
-
-  g_historyText = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.49f, 0.12f, 0.48f, 0.74f,
-      MyGUI::Align::Default, "Stobe_HistoryText");
-  ConfigureReadOnlyText(g_historyText);
   RefreshHistory();
 }
 

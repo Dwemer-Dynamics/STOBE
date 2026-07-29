@@ -154,7 +154,7 @@ void CreateStartingUI() {
   g_startingPausedGame = pausedByUs;
 
   g_startingWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.03f, 0.07f, 0.20f, 0.86f,
+      "Kenshi_WindowCX", 0.03f, 0.07f, 0.20f, 0.76f,
       MyGUI::Align::Left | MyGUI::Align::Top, "Popup", "Stobe_AIHub");
 
   if (!g_startingWindow) {
@@ -173,7 +173,7 @@ void CreateStartingUI() {
   }
 
   MyGUI::TextBox *hotkeyLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.02f, 0.9f, 0.13f,
+      "Kenshi_TextboxStandardText", 0.05f, 0.023f, 0.9f, 0.147f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHotkeys");
   hotkeyLabel->setCaption(WideFromUtf8("Menu Key [" + g_generalHotkeyStr +
                                        "]: Open/Close Menu\nChat Hotkey: " +
@@ -183,27 +183,27 @@ void CreateStartingUI() {
   hotkeyLabel->setTextAlign(MyGUI::Align::Center);
 
   MyGUI::Button *aiNpcsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.18f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.204f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiNpcsBtn");
   aiNpcsBtn->setCaption(WideFromUtf8(T("Stobe NPCs")).c_str());
   aiNpcsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingAiNpcsClick);
 
   MyGUI::Button *aiDiariesBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.285f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.323f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiDiariesBtn");
   aiDiariesBtn->setCaption(WideFromUtf8(T("Stobe Diaries")).c_str());
   aiDiariesBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingAiDiariesClick);
 
   MyGUI::Button *historyBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.39f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.441f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHistoryBtn");
   historyBtn->setCaption(WideFromUtf8(T("Recent History")).c_str());
   historyBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingHistoryClick);
 
   MyGUI::Button *pluginSettingsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.495f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.560f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
   pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
@@ -211,7 +211,7 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
   MyGUI::Button *statusHudBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.60f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.679f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingStatusHudBtn");
   statusHudBtn->setCaption(
@@ -222,7 +222,7 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingStatusHudClick);
 
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.705f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.798f, 0.9f, 0.096f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
