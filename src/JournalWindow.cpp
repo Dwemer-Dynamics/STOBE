@@ -4,6 +4,7 @@
 #include "Comm.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "StobeChatMode.h"
 #include "Utils.h"
 #include <algorithm>
 #include <kenshi/Character.h>
@@ -427,7 +428,7 @@ void UpdateStatusHud(GameWorld *world) {
   }
 
   std::string caption =
-      "Mode: " + g_chatMode +
+      "Mode: " + Stobe::ChatMode::DisplayLabel(g_chatMode) +
       "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
       "\nAI: " + aiStatus +
       "\nSelected: " + selectedName +

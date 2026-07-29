@@ -4,6 +4,7 @@
 #include "Context.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "StobeChatMode.h"
 #include "StobeTiming.h"
 #include "Utils.h"
 
@@ -587,35 +588,6 @@ bool ResolveSpeakerGiveItemMatch(Character *speaker, const std::string &rawQuery
     }
   }
   return false;
-}
-
-size_t ChatModeToIndex(const std::string &mode) {
-  if (mode == "whisper")
-    return 1;
-  if (mode == "shout")
-    return 2;
-  if (mode == "cheat")
-    return 3;
-  if (mode == "narrator")
-    return 4;
-  return 0; // chat
-}
-
-std::string NormalizeChatMode(const std::string &mode) {
-  std::string normalized = mode;
-  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                 ::tolower);
-  if (normalized == "whisper")
-    return "whisper";
-  if (normalized == "shout")
-    return "shout";
-  if (normalized == "cheat")
-    return "cheat";
-  if (normalized == "narrator")
-    return "narrator";
-  if (normalized == "talk" || normalized == "chat")
-    return "chat";
-  return "chat";
 }
 
 bool EqualsIgnoreCase(const std::string &lhs, const std::string &rhs) {
@@ -1564,7 +1536,7 @@ void RefreshChatHeaderLabel() {
 
   GameWorld *world = GetWorldSafe();
   std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
 
   if (selectedMode == "narrator") {
     Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
@@ -1604,7 +1576,7 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     return;
   }
 
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
   std::string preferredName = TrimChatLine(g_chatTargetNameStr);
   std::string preferredHandle = TrimChatLine(g_chatTargetHandleStr);
 
@@ -2336,8 +2308,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   if (!IsChatInterruptGenerationCurrent(currentTask.generation)) {
     return;
   }
-  if (currentTask.requestMode == "whisper" ||
-      currentTask.requestMode == "narrator") {
+  if (!Stobe::ChatMode::AllowsAutomaticRechat(currentTask.requestMode)) {
     Log("RECHAT: skipped (" + currentTask.requestMode + " mode)");
     return;
   }
@@ -3036,6 +3007,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     return 0;
   }
   if (parseState.lineCount == 0 && parseState.actionCount == 0) {
+    if (task->requestMode == "inject") {
+      Log("CHAT_THREAD: Event injection stored successfully.");
+      QueueUiNotifyAction("Event injected.");
+      delete task;
+      return 0;
+    }
     Log("CHAT_THREAD: Empty stream response from server.");
     delete task;
     return 0;
@@ -3190,25 +3167,14 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     text = sanitizedText;
   }
 
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
   bool narratorModeSelected = (selectedMode == "narrator");
   if (narratorModeSelected) {
     npcName = kNarratorName;
     handleStr = "";
   }
-  std::string mode = "talk";
-  bool cheatModeSelected = (selectedMode == "cheat");
-  if (cheatModeSelected) {
-    mode = "cheat";
-  } else if (narratorModeSelected) {
-    mode = "narrator";
-  } else if (g_autoChatEnabled) {
-    mode = "autochat";
-  } else if (selectedMode == "whisper") {
-    mode = "whisper";
-  } else if (selectedMode == "shout") {
-    mode = "shout";
-  }
+  std::string mode =
+      Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
 
   size_t selectedManualActionIndex = 0;
   if (g_chatActionCombo) {
@@ -3221,13 +3187,15 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       GetManualChatActionChoice(selectedManualActionIndex);
   bool manualActionSelected =
       (manualActionChoice.type != MANUAL_CHAT_ACTION_NONE);
-  if (narratorModeSelected && manualActionSelected) {
+  if (!Stobe::ChatMode::AllowsManualActions(selectedMode) &&
+      manualActionSelected) {
     if (world) {
       world->showPlayerAMessage_withLog(
-          "Chat blocked: Manual actions are unavailable in narrator mode.",
+          "Chat blocked: Manual actions are unavailable in " +
+              Stobe::ChatMode::DisplayLabel(selectedMode) + " mode.",
           true);
     }
-    Log("CHAT_GATE: blocked manual action in narrator mode");
+    Log("CHAT_GATE: blocked manual action in " + selectedMode + " mode");
     return;
   }
   std::string manualActionArgRaw =
@@ -3300,7 +3268,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
   Log("CHAT_SEND_STAGE: validate_target");
   std::string sendFailReason;
-  bool requireStrictTalkValidation = !manualActionSelected;
+  bool requireStrictTalkValidation =
+      !manualActionSelected && selectedMode != "inject";
   bool validationOk = true;
   if (narratorModeSelected) {
     validationOk = (narratorSpeakerNpc && (uintptr_t)narratorSpeakerNpc > 0x1000);
@@ -3741,7 +3710,7 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   CloseChatUI();
 
   bool shouldQueueLocalPlayerSpeech =
-      (mode != "autochat" && mode != "cheat" && mode != "narrator");
+      Stobe::ChatMode::ShouldQueueLocalPlayerSpeech(mode);
   if (shouldQueueLocalPlayerSpeech) {
     EnterCriticalSection(&g_msgMutex);
     g_messageQueue.push_back("PLAYER_SAY: " + text);
@@ -3749,14 +3718,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     Log("CHAT_TIMING: PLAYER_SAY queued immediately (no TTSDUR yet), text_len=" +
         ToString((int)text.length()) + " gen=" + ToString((int)chatGeneration));
   } else {
-    if (mode == "cheat") {
-      Log("CHAT_TIMING: PLAYER_SAY suppressed locally for cheat mode; "
-          "autochat ignored and request sent raw gen=" +
-          ToString((int)chatGeneration));
-    } else {
-      Log("CHAT_TIMING: PLAYER_SAY suppressed locally for autochat; awaiting "
-          "server rewrite gen=" + ToString((int)chatGeneration));
-    }
+    Log("CHAT_TIMING: PLAYER_SAY suppressed locally for " + mode +
+        " mode gen=" + ToString((int)chatGeneration));
   }
 
   if (!manualActionCommand.empty()) {
@@ -3822,7 +3785,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 
   std::wstring endpoint =
       L"/StobeServer/stream.php?DATA=" +
-      ToWide(BuildStreamQueryData("inputtext", eventData, gameTs)) +
+      ToWide(BuildStreamQueryData(Stobe::ChatMode::EventTypeForRequest(mode),
+                                  eventData, gameTs)) +
       L"&profile=" + ToWide(UrlEncode(profileName)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0");
@@ -4189,8 +4153,9 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
     player = bestSpeaker;
     playerName = bestSpeaker->getName();
   }
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
-  if (selectedMode == "narrator") {
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
+  if (selectedMode == "narrator" ||
+      Stobe::ChatMode::IsInjectionMode(selectedMode)) {
     selectedMode = "chat";
   }
   std::string peopleJson =
@@ -4789,6 +4754,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("cheat").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("narrator").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("inject").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
   g_chatModeCombo->eventComboAccept += MyGUI::newDelegate(OnChatModeChange);
   g_chatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatModeChange);
@@ -4857,8 +4824,8 @@ void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
     return;
 
   std::string selectedMode = sender->getItemNameAt(index);
-  g_chatMode = NormalizeChatMode(selectedMode);
-  g_lastChatModeIndex = ChatModeToIndex(g_chatMode);
+  g_chatMode = Stobe::ChatMode::Normalize(selectedMode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
 }
@@ -4904,25 +4871,49 @@ void OnChatActionChange(MyGUI::ComboBox *sender, size_t index) {
 }
 
 void OnAutoChatToggleClick(MyGUI::Widget *sender) {
+  if (Stobe::ChatMode::IsInjectionMode(g_chatMode)) {
+    return;
+  }
   g_autoChatEnabled = !g_autoChatEnabled;
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
 }
 
 void RefreshChatModeControls() {
+  g_chatMode = Stobe::ChatMode::Normalize(g_chatMode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   if (g_chatModeCombo) {
-    g_chatMode = NormalizeChatMode(g_chatMode);
-    g_lastChatModeIndex = ChatModeToIndex(g_chatMode);
     if (g_chatModeCombo->getIndexSelected() != g_lastChatModeIndex) {
       g_chatModeCombo->setIndexSelected(g_lastChatModeIndex);
     }
   }
 
+  const bool injectionMode = Stobe::ChatMode::IsInjectionMode(g_chatMode);
+  const bool manualActionsAllowed =
+      Stobe::ChatMode::AllowsManualActions(g_chatMode);
+  if (!manualActionsAllowed) {
+    if (g_chatActionCombo && g_chatActionCombo->getIndexSelected() != 0) {
+      g_chatActionCombo->setIndexSelected(0);
+    }
+    if (g_chatActionArgInput) {
+      g_chatActionArgInput->setCaption("");
+    }
+  }
+  if (g_chatActionCombo) {
+    g_chatActionCombo->setEnabled(manualActionsAllowed);
+  }
+  if (g_chatActionArgInput) {
+    g_chatActionArgInput->setEnabled(manualActionsAllowed);
+  }
+
   if (g_chatAutoChatToggle) {
-    g_chatAutoChatToggle->setCaption(
-        WideFromUtf8(std::string("Auto Chat: ") +
-                   (g_autoChatEnabled ? "[ON]" : "[OFF]"))
-            .c_str());
+    g_chatAutoChatToggle->setEnabled(!injectionMode);
+    const std::string autoChatCaption =
+        injectionMode
+            ? "Auto Chat: [N/A]"
+            : std::string("Auto Chat: ") +
+                  (g_autoChatEnabled ? "[ON]" : "[OFF]");
+    g_chatAutoChatToggle->setCaption(WideFromUtf8(autoChatCaption).c_str());
   }
   RefreshAvailableChatTargets(true);
   RefreshChatHeaderLabel();
