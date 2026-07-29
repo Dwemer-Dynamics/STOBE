@@ -362,8 +362,8 @@ void CreateAiNpcInfoUI() {
   ConfigureReadOnlyText(g_aiNpcInfoText);
   SetReadOnlyText(
       g_aiNpcInfoText,
-      T("Search or select an NPC to view their live status, equipment, "
-        "inventory, profile, goals, and relationships."));
+      T("Search or select an NPC to view their profile settings, biography, "
+        "live status, relationships, and recent events."));
 
   g_aiNpcInfoCloseButton = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", 0.84f, 0.88f, 0.14f, 0.08f,

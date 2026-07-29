@@ -16,7 +16,6 @@ bool IsAnyStobeMenuUIOpen();
 void OnStartingAiNpcsClick(MyGUI::Widget *sender);
 void OnStartingAiDiariesClick(MyGUI::Widget *sender);
 void OnStartingHistoryClick(MyGUI::Widget *sender);
-void OnStartingWorldClick(MyGUI::Widget *sender);
 void OnStartingPluginSettingsClick(MyGUI::Widget *sender);
 void OnStartingStatusHudClick(MyGUI::Widget *sender);
 void OnStartingWelcomeClick(MyGUI::Widget *sender);

@@ -1,5 +1,4 @@
 #include "StartingWindow.h"
-#include "Comm.h"
 #include "Globals.h"
 #include "AiNpcInfoWindow.h"
 #include "JournalWindow.h"
@@ -94,7 +93,6 @@ void CloseStobeChildWindows() {
   CloseAiNpcInfoUI();
   CloseAiDiaryUI();
   CloseRecentHistoryUI();
-  CloseWorldJournalUI();
   CloseSettingsUI();
   CloseWelcomeUI();
 }
@@ -106,8 +104,7 @@ void CloseAllStobeMenuUI() {
 
 bool IsAnyStobeMenuUIOpen() {
   return g_startingWindow || g_aiNpcInfoWindow || g_aiDiaryWindow ||
-         g_recentHistoryWindow || g_worldJournalWindow || g_settingsWindow ||
-         g_welcomeWindow;
+         g_recentHistoryWindow || g_settingsWindow || g_welcomeWindow;
 }
 
 void OnStartingAiNpcsClick(MyGUI::Widget *sender) {
@@ -121,10 +118,6 @@ void OnStartingAiDiariesClick(MyGUI::Widget *sender) {
 void OnStartingHistoryClick(MyGUI::Widget *sender) {
   CloseStobeChildWindows();
   CreateRecentHistoryUI();
-}
-void OnStartingWorldClick(MyGUI::Widget *sender) {
-  CloseStobeChildWindows();
-  CreateWorldJournalUI();
 }
 void OnStartingPluginSettingsClick(MyGUI::Widget *sender) {
   CloseStobeChildWindows();
@@ -209,15 +202,8 @@ void CreateStartingUI() {
   historyBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingHistoryClick);
 
-  MyGUI::Button *worldBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.495f, 0.9f, 0.085f,
-      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWorldBtn");
-  worldBtn->setCaption(WideFromUtf8(T("World Journal")).c_str());
-  worldBtn->eventMouseButtonClick +=
-      MyGUI::newDelegate(OnStartingWorldClick);
-
   MyGUI::Button *pluginSettingsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.60f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.495f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
   pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
@@ -225,7 +211,7 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
   MyGUI::Button *statusHudBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.705f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.60f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingStatusHudBtn");
   statusHudBtn->setCaption(
@@ -236,7 +222,7 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingStatusHudClick);
 
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.81f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.705f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
@@ -259,7 +245,6 @@ void RefreshStartingUI() {
   RefreshMap items[] = {{"Stobe_StartingAiNpcsBtn", "Stobe NPCs"},
                          {"Stobe_StartingAiDiariesBtn", "Stobe Diaries"},
                          {"Stobe_StartingHistoryBtn", "Recent History"},
-                         {"Stobe_StartingWorldBtn", "World Journal"},
                          {"Stobe_StartingPluginSetBtn", "Settings"},
                          {"Stobe_StartingWelBtn", "MOTD"}};
 

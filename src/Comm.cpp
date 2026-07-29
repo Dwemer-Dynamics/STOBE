@@ -757,11 +757,6 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
-  if (endpoint == L"/ai_world") {
-    request.path = L"/StobeServer/ai_world.php";
-    return request;
-  }
-
   if (endpoint == L"/settings" || endpoint == L"/test_llm" ||
       endpoint == L"/favorite" || endpoint == L"/characters" ||
       endpoint == L"/history" || endpoint == L"/synthesize" ||

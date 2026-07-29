@@ -8610,10 +8610,6 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiDiaryText(data);
           } else if (command == "SET_STOBE_HISTORY") {
             SetRecentHistoryText(data);
-          } else if (command == "POPULATE_STOBE_WORLD_LIST") {
-            PopulateWorldJournalList(data);
-          } else if (command == "SET_STOBE_WORLD_DETAIL") {
-            SetWorldJournalDetail(data);
           } else if (command == "SET_CONFIG") {
             size_t colon = data.find(":");
             if (colon != std::string::npos) {
@@ -12441,7 +12437,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_aiNpcInfoWindow = nullptr;
     g_aiDiaryWindow = nullptr;
     g_recentHistoryWindow = nullptr;
-    g_worldJournalWindow = nullptr;
     g_statusHudWindow = nullptr;
     return;
   }
@@ -12470,6 +12465,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInventoryHand = hand();
       g_playerHand = hand();
       g_activatedAnimalSerials.clear();
+      g_activatedAiActorNames.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
@@ -12852,11 +12848,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // Rename checks are now queued only for dialogue-tagged NPCs.
   // 4. Input Handling ??? Chat window hotkey
-  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow &&
-      !IsAnyStobeMenuUIOpen()) {
+  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow) {
     static DWORD lastTalkTick = 0;
     if (GetTickCount() - lastTalkTick > 500) {
       lastTalkTick = GetTickCount();
+      Log("UI: chat hotkey pressed [" + g_chatHotkeyStr + "].");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: closed STOBE menu before opening chat.");
+      }
       if (sel && (uintptr_t)sel > 0x1000) {
         Character *chatTarget = sel;
         if (sel->isPlayerCharacter()) {
@@ -12935,6 +12935,12 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
                                 : "Drifter";
         CreateChatUI(chatTarget->getName(), pName,
                      ToString(chatTarget->getHandle().serial));
+        Log("UI: CreateChatUI done target=" + chatTarget->getName());
+      } else {
+        EnterCriticalSection(&g_msgMutex);
+        g_messageQueue.push_back("NOTIFY:Select an NPC before opening chat.");
+        LeaveCriticalSection(&g_msgMutex);
+        Log("CHAT_OPEN: no selected character; chat open blocked");
       }
     }
   }

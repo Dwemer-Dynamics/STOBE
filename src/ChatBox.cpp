@@ -3002,6 +3002,10 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     return 0;
 
   LONG generation = task->generation;
+  unsigned int activatedActorSerial = 0;
+  if (TryParseSerial(task->handleStr, activatedActorSerial)) {
+    MarkAiActorActivated(activatedActorSerial, task->npcName);
+  }
   StreamChatParseState parseState;
   parseState.task = task;
   parseState.generation = generation;
