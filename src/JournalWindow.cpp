@@ -1,4 +1,6 @@
 #include "JournalWindow.h"
+#include "AudioPlayback.h"
+#include "ChatBox.h"
 #include "Comm.h"
 #include "Functions.h"
 #include "Globals.h"
@@ -39,6 +41,41 @@ std::string g_historyPendingFilter;
 
 MyGUI::TextBox *g_statusHudText = nullptr;
 DWORD g_statusHudLastUpdateTick = 0;
+
+std::string ResolveHudActorState(Character *character) {
+  if (!character || reinterpret_cast<uintptr_t>(character) <= 0x1000) {
+    return "Unavailable";
+  }
+  try {
+    if (character->isDead()) {
+      return "Dead";
+    }
+    if (character->isUnconcious()) {
+      return "Down";
+    }
+    if (character->isInCombatMode(true, true)) {
+      return "Combat";
+    }
+    if (character->getMovementSpeed() > 0.1f) {
+      return "Moving";
+    }
+    return "Idle";
+  } catch (...) {
+    return "Unavailable";
+  }
+}
+
+float ResolveHudActorDistance(Character *anchor, Character *target) {
+  if (!anchor || !target || reinterpret_cast<uintptr_t>(anchor) <= 0x1000 ||
+      reinterpret_cast<uintptr_t>(target) <= 0x1000) {
+    return -1.0f;
+  }
+  try {
+    return anchor->getPosition().distance(target->getPosition());
+  } catch (...) {
+    return -1.0f;
+  }
+}
 
 bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   if (!widget) {
@@ -375,36 +412,65 @@ void UpdateStatusHud(GameWorld *world) {
   }
   g_statusHudLastUpdateTick = now;
 
+  Character *selectedCharacter = nullptr;
   std::string selectedName = "None";
   if (world->player && world->player->selectedCharacter.isValid()) {
-    Character *selected =
+    selectedCharacter =
         ResolveLiveCharacter(world, world->player->selectedCharacter);
-    if (selected && reinterpret_cast<uintptr_t>(selected) > 0x1000) {
+    if (selectedCharacter &&
+        reinterpret_cast<uintptr_t>(selectedCharacter) > 0x1000) {
       try {
-        selectedName = selected->getName();
+        selectedName = selectedCharacter->getName();
       } catch (...) {
         selectedName = "Unavailable";
+        selectedCharacter = nullptr;
       }
     }
   }
 
-  std::string targetedName = "None";
+  std::string targetedSummary = "None";
   if (g_talkTargetHand.isValid() && g_talkTargetHand.serial != 0) {
     Character *targeted = ResolveLiveCharacter(world, g_talkTargetHand);
     if (targeted && reinterpret_cast<uintptr_t>(targeted) > 0x1000) {
+      std::string targetedName = "Unavailable";
       try {
         targetedName = targeted->getName();
       } catch (...) {
-        targetedName = "Unavailable";
+        targeted = nullptr;
+      }
+      if (targeted) {
+        Character *distanceAnchor = selectedCharacter;
+        if (!distanceAnchor && world->player &&
+            world->player->playerCharacters.size() > 0) {
+          distanceAnchor = world->player->playerCharacters[0];
+        }
+        targetedSummary = targetedName;
+        float distance = ResolveHudActorDistance(distanceAnchor, targeted);
+        if (distance >= 0.0f) {
+          targetedSummary +=
+              " | " + ToString(static_cast<int>(distance + 0.5f)) + "m";
+        }
+        targetedSummary += " | " + ResolveHudActorState(targeted);
       }
     }
+  }
+
+  std::string aiStatus = "Idle";
+  if (IsTtsPlaybackActive()) {
+    aiStatus = "Speaking";
+  } else if (IsAiRequestActive()) {
+    aiStatus = "Thinking";
   }
 
   std::string caption =
       "Mode: " + g_chatMode +
       "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
+      "\nAI: " + aiStatus +
       "\nSelected: " + selectedName +
-      "\nTargeted: " + targetedName;
+      "\nTargeted: " + targetedSummary;
+  if (g_autoChatEnabled) {
+    caption += "\nAuto Chat: On";
+  }
   if (g_statusHudText) {
     g_statusHudText->setCaption(WideFromUtf8(caption).c_str());
   }

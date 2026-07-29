@@ -64,8 +64,15 @@ bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
+LONG g_activeChatStreamCount = 0;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
+
+class ActiveChatStreamScope {
+public:
+  ActiveChatStreamScope() { InterlockedIncrement(&g_activeChatStreamCount); }
+  ~ActiveChatStreamScope() { InterlockedDecrement(&g_activeChatStreamCount); }
+};
 
 struct ChatTargetOption {
   std::string name;
@@ -3000,6 +3007,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
+  ActiveChatStreamScope activeStream;
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3070,6 +3078,10 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   }
   delete task;
   return 0;
+}
+
+bool IsAiRequestActive() {
+  return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
 }
 
 void OnChatInputChange(MyGUI::EditBox *sender) {
