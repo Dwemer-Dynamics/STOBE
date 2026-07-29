@@ -113,6 +113,7 @@
     <ClCompile Include="src\StartingWindow.cpp" />
     <ClCompile Include="src\Utils.cpp" />
     <ClCompile Include="src\WelcomeWindow.cpp" />
+    <ClCompile Include="src\WorldStateRuntime.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\AiNpcInfoWindow.h" />
@@ -141,6 +142,8 @@
     <ClInclude Include="src\StartingWindow.h" />
     <ClInclude Include="src\Utils.h" />
     <ClInclude Include="src\WelcomeWindow.h" />
+    <ClInclude Include="src\WorldStateCatalog.h" />
+    <ClInclude Include="src\WorldStateRuntime.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
