@@ -514,7 +514,8 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.225f, 0.06f, 0.55f, 0.86f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.3075f, 0.199f, 0.385f, 0.602f,
+      MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
@@ -567,7 +568,7 @@ void CreateSettingsUI() {
       MyGUI::newDelegate(OnHotkeyComboChanged);
   y += rowH + rowGap;
 
-  CreateLabel(client, labelX, y, labelW, rowH, "Default Chat Mode",
+  CreateLabel(client, labelX, y, labelW, rowH, "Default Mode",
               "Stobe_Plugin_ModeLabel");
   g_pluginChatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
       "Kenshi_ComboBox", fieldX, y, fieldW, rowH,
