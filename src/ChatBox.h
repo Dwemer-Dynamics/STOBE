@@ -42,6 +42,7 @@ bool IsAiRequestActive();
 void RefreshChatModeControls();
 void OnBoredEventClick(MyGUI::Widget *sender);
 void OnWriteDiaryClick(MyGUI::Widget *sender);
+void OnWriteNarratorDiaryClick(MyGUI::Widget *sender);
 bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName = "",
                        const std::string &preferredSpeakerSerial = "",

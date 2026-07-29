@@ -8572,6 +8572,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isPlayerSay = (msg.find("PLAYER_SAY: ") == 0);
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
       bool isNotify = (msg.find("NOTIFY:") == 0);
+      bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
       bool isRename = (msg.find("NPC_RENAME: ") == 0);
       bool speakerResolvedFromHeader = false;
@@ -8699,8 +8700,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             }
           }
         }
-      } else if (isNotify) {
-        std::string text = msg.substr(7);
+      } else if (isNotify || isNarratorNotify) {
+        std::string text = isNarratorNotify ? msg.substr(16) : msg.substr(7);
         int ttsDurationMs = ExtractTrailingTtsDurationMs(text);
         std::string ttsHash = ExtractTrailingTtsHash(text);
         if (!g_ttsEnabled) {

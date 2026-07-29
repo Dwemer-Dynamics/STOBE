@@ -50,6 +50,63 @@ struct AsyncPostDedupState {
 
 std::map<std::string, AsyncPostDedupState> g_asyncPostDedupByFingerprint;
 
+std::string DecodeBase64(const std::string &input) {
+  static const std::string alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string output;
+  unsigned int value = 0;
+  int bits = -8;
+  for (size_t i = 0; i < input.size(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(input[i]);
+    if (ch == '=') {
+      break;
+    }
+    size_t position = alphabet.find(static_cast<char>(ch));
+    if (position == std::string::npos) {
+      continue;
+    }
+    value = (value << 6) + static_cast<unsigned int>(position);
+    bits += 6;
+    if (bits >= 0) {
+      output.push_back(static_cast<char>((value >> bits) & 0xFF));
+      bits -= 8;
+    }
+  }
+  return output;
+}
+
+void UpdateNarratorDisplayNameFromResponse(HINTERNET request) {
+  DWORD headerSize = 0;
+  WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM,
+                      L"X-Narrator-Display-Name",
+                      WINHTTP_NO_OUTPUT_BUFFER, &headerSize,
+                      WINHTTP_NO_HEADER_INDEX);
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || headerSize < sizeof(wchar_t)) {
+    return;
+  }
+  std::vector<wchar_t> header((headerSize / sizeof(wchar_t)) + 1, L'\0');
+  if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM,
+                           L"X-Narrator-Display-Name", header.data(),
+                           &headerSize, WINHTTP_NO_HEADER_INDEX)) {
+    return;
+  }
+  std::wstring encodedWide(header.data());
+  std::string encoded(encodedWide.begin(), encodedWide.end());
+  std::string decoded = DecodeBase64(encoded);
+  decoded.erase(std::remove_if(decoded.begin(), decoded.end(),
+                               [](unsigned char ch) {
+                                 return ch < 0x20 || ch == 0x7F;
+                               }),
+                decoded.end());
+  if (decoded.empty() || decoded.size() > 256) {
+    return;
+  }
+  if (decoded != GetNarratorDisplayName()) {
+    SetNarratorDisplayName(decoded);
+    Log("NARRATOR: display name updated from server.");
+  }
+}
+
 struct RequestPlan {
   std::wstring method;
   std::wstring path;
@@ -519,6 +576,7 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   bool success = false;
   if (sendOk) {
     if (WinHttpReceiveResponse(hRequest, NULL)) {
+      UpdateNarratorDisplayNameFromResponse(hRequest);
       if (expectResponse) {
         bool readResult = true;
         if (lineCallback) {

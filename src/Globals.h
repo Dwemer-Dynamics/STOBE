@@ -47,6 +47,7 @@ extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;
 extern bool g_enableStatusHud;
 extern int g_dynamicProfileIntervalHours;
+extern std::string g_narratorDisplayName;
 
 // State tracking for inventory/debugger
 extern std::string g_activeInventoryJson;
@@ -195,6 +196,8 @@ GameWorld *GetWorldSafe();
 LONG BeginChatInterruptGeneration();
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
+void SetNarratorDisplayName(const std::string &name);
+std::string GetNarratorDisplayName();
 
 void SetFollowTarget(unsigned int followerSerial, const hand &target);
 void ClearFollowTarget(unsigned int followerSerial);
