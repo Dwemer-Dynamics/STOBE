@@ -7,13 +7,13 @@ namespace UI {
 
 extern MyGUI::Window *g_aiNpcInfoWindow;
 extern MyGUI::ListBox *g_aiNpcInfoList;
-extern MyGUI::EditBox *g_aiNpcInfoText;
+extern MyGUI::ListBox *g_aiNpcInfoText;
 extern MyGUI::Button *g_aiNpcInfoCloseButton;
 extern std::vector<std::string> g_aiNpcInfoStorageIds;
 extern MyGUI::Window *g_aiDiaryWindow;
 extern MyGUI::ListBox *g_aiDiaryList;
 extern MyGUI::ListBox *g_aiDiaryEntryList;
-extern MyGUI::EditBox *g_aiDiaryText;
+extern MyGUI::ListBox *g_aiDiaryText;
 extern MyGUI::Button *g_aiDiaryCloseButton;
 extern std::vector<std::string> g_aiDiaryKeys;
 extern std::vector<std::string> g_aiDiaryEntryIds;

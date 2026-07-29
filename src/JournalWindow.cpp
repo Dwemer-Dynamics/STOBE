@@ -216,7 +216,7 @@ void StartJournalRequest(const std::wstring &endpoint, const std::string &json,
 }
 
 void RefreshHistory() {
-  g_historyPendingFilter = "all";
+  g_historyPendingFilter = "default";
   if (g_historyList) {
     g_historyList->removeAllItems();
     g_historyList->addItem(WideFromUtf8("Loading recent events...").c_str());

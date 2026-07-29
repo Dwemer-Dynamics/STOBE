@@ -19,13 +19,13 @@ namespace UI {
 
 MyGUI::Window *g_aiNpcInfoWindow = nullptr;
 MyGUI::ListBox *g_aiNpcInfoList = nullptr;
-MyGUI::EditBox *g_aiNpcInfoText = nullptr;
+MyGUI::ListBox *g_aiNpcInfoText = nullptr;
 MyGUI::Button *g_aiNpcInfoCloseButton = nullptr;
 std::vector<std::string> g_aiNpcInfoStorageIds;
 MyGUI::Window *g_aiDiaryWindow = nullptr;
 MyGUI::ListBox *g_aiDiaryList = nullptr;
 MyGUI::ListBox *g_aiDiaryEntryList = nullptr;
-MyGUI::EditBox *g_aiDiaryText = nullptr;
+MyGUI::ListBox *g_aiDiaryText = nullptr;
 MyGUI::Button *g_aiDiaryCloseButton = nullptr;
 std::vector<std::string> g_aiDiaryKeys;
 std::vector<std::string> g_aiDiaryEntryIds;
@@ -136,32 +136,68 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   }
 }
 
-void ConfigureReadOnlyText(MyGUI::EditBox *box) {
-  if (!box) {
+// Render detail text as list rows because Kenshi's EditBox skin only shows
+// the first line of read-only multiline captions.
+void SetReadOnlyText(MyGUI::ListBox *list, const std::string &text) {
+  if (!list) {
     return;
   }
-  box->setEditMultiLine(true);
-  box->setEditWordWrap(true);
-  box->setEditStatic(true);
-  box->setEditReadOnly(true);
-  box->setVisibleVScroll(true);
-  box->setVisibleHScroll(false);
-  box->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top);
-  box->setNeedKeyFocus(false);
-}
 
-void SetReadOnlyText(MyGUI::EditBox *box, const std::string &text) {
-  if (!box) {
-    return;
-  }
   std::string payload = SanitizeUiText(text);
   if (!payload.empty() && payload[0] == ' ') {
     payload.erase(0, 1);
   }
-  box->setEditMultiLine(true);
-  box->setEditWordWrap(true);
-  box->setCaption(WideFromUtf8(payload).c_str());
-  box->setVScrollPosition(0);
+  std::replace(payload.begin(), payload.end(), '\t', ' ');
+
+  list->removeAllItems();
+  const size_t wrapColumns =
+      std::max<size_t>(24, static_cast<size_t>(list->getWidth()) / 9);
+  size_t cursor = 0;
+  do {
+    size_t next = payload.find('\n', cursor);
+    std::string line = next == std::string::npos
+                           ? payload.substr(cursor)
+                           : payload.substr(cursor, next - cursor);
+    if (!line.empty() && line[line.length() - 1] == '\r') {
+      line.erase(line.length() - 1);
+    }
+    TrimInline(line);
+
+    if (line.empty()) {
+      list->addItem(WideFromUtf8(" ").c_str());
+    } else {
+      while (line.length() > wrapColumns) {
+        size_t breakPosition = line.find_last_of(' ', wrapColumns);
+        if (breakPosition == std::string::npos || breakPosition == 0) {
+          breakPosition = line.find(' ', wrapColumns);
+        }
+        if (breakPosition == std::string::npos) {
+          break;
+        }
+
+        std::string wrappedLine = line.substr(0, breakPosition);
+        TrimInline(wrappedLine);
+        if (!wrappedLine.empty()) {
+          list->addItem(WideFromUtf8(wrappedLine).c_str());
+        }
+        line.erase(0, breakPosition + 1);
+        TrimInline(line);
+      }
+      if (!line.empty()) {
+        list->addItem(WideFromUtf8(line).c_str());
+      }
+    }
+
+    if (next == std::string::npos) {
+      break;
+    }
+    cursor = next + 1;
+  } while (cursor <= payload.length());
+
+  if (list->getItemCount() == 0) {
+    list->addItem(WideFromUtf8(" ").c_str());
+  }
+  list->setScrollPosition(0);
 }
 
 void QueueUiCommand(const std::string &command, const std::string &data) {
@@ -360,10 +396,9 @@ void CreateAiNpcInfoUI() {
   g_aiNpcInfoList->eventListChangePosition +=
       MyGUI::newDelegate(OnAiNpcInfoNPCSelect);
 
-  g_aiNpcInfoText = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.34f, 0.03f, 0.64f, 0.82f,
+  g_aiNpcInfoText = client->createWidgetReal<MyGUI::ListBox>(
+      "Kenshi_ListBox", 0.34f, 0.03f, 0.64f, 0.82f,
       MyGUI::Align::Default, "Stobe_AiNpcDetail");
-  ConfigureReadOnlyText(g_aiNpcInfoText);
   SetReadOnlyText(
       g_aiNpcInfoText,
       T("Search or select an NPC to view their profile settings, biography, "
@@ -592,10 +627,9 @@ void CreateAiDiaryUI() {
   g_aiDiaryEntryList->eventListChangePosition +=
       MyGUI::newDelegate(OnAiDiaryEntrySelect);
 
-  g_aiDiaryText = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.60f, 0.08f, 0.38f, 0.77f,
+  g_aiDiaryText = client->createWidgetReal<MyGUI::ListBox>(
+      "Kenshi_ListBox", 0.60f, 0.08f, 0.38f, 0.77f,
       MyGUI::Align::Default, "Stobe_AiDiaryDetail");
-  ConfigureReadOnlyText(g_aiDiaryText);
   SetReadOnlyText(g_aiDiaryText,
                   T("Select an NPC, then select a dated diary entry."));
 
