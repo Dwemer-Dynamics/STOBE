@@ -8702,6 +8702,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         }
       } else if (isNotify || isNarratorNotify) {
         std::string text = isNarratorNotify ? msg.substr(16) : msg.substr(7);
+        std::string utteranceId = ExtractTrailingUtteranceId(text);
         int ttsDurationMs = ExtractTrailingTtsDurationMs(text);
         std::string ttsHash = ExtractTrailingTtsHash(text);
         if (!g_ttsEnabled) {
@@ -8715,7 +8716,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         act.target = hand();
         act.message = text;
         act.ttsHash = ttsHash;
+        act.utteranceId = utteranceId;
         act.taskValue = ttsDurationMs;
+        act.narratorNotification = isNarratorNotify;
         g_uiActionQueue.push_back(act);
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {

@@ -132,11 +132,12 @@ struct QueuedAction {
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
+  bool narratorNotification; // Queue narrator popups with speech timing.
   std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
       : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
-        proximityMoveIssued(false) {}
+        proximityMoveIssued(false), narratorNotification(false) {}
 };
 
 struct PendingAutonomyCatalogMessage {

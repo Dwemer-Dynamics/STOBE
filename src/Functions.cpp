@@ -5485,7 +5485,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       DWORD nowTick = GetTickCount();
       const QueuedAction &nextAction = g_uiActionQueue.front();
       bool nextActionIsSpeech =
-          nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS;
+          nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS ||
+          (nextAction.type == ACT_NOTIFY &&
+           nextAction.narratorNotification);
       if (nextActionIsSpeech && g_nextSpeechActionTick != 0 &&
           nowTick < g_nextSpeechActionTick) {
         break;
@@ -5512,7 +5514,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
       if (act.type == ACT_NOTIFY) {
         bool narratorPopupShown = false;
-        if (IsNarratorTimedPopupMessage(act.message)) {
+        if (act.narratorNotification ||
+            IsNarratorTimedPopupMessage(act.message)) {
           narratorPopupShown =
               ShowNarratorTimedPopup(act.message, ResolveSpeechQueueDelayMs(act));
         }
@@ -5531,15 +5534,32 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               " tts_dur_ms=" + ToString(act.taskValue) +
               " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
         }
+        if (act.narratorNotification) {
+          Log("ACTION_TIMING: NARRATOR_NOTIFY text_len=" +
+              ToString((int)act.message.length()) +
+              " utterance_id=" + act.utteranceId +
+              " tts_hash=" +
+              (hasTtsClip ? act.ttsHash.substr(0, 8) : "") +
+              " tts_dur_ms=" + ToString(act.taskValue) +
+              " popup_shown=" +
+              std::string(narratorPopupShown ? "1" : "0") +
+              " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
+        }
         if (playbackQueued) {
           blockSpeechQueue = true;
           holdForTtsPlayback = true;
           activeSpeechTarget = hand();
           activeSpeechTargetSerial = 0;
           speechDelayMs = 250;
+        } else if (act.narratorNotification) {
+          blockSpeechQueue = true;
+          speechDelayMs = ResolveSpeechQueueDelayMs(act);
         } else if (act.taskValue > 0) {
           blockSpeechQueue = true;
           speechDelayMs = static_cast<DWORD>(act.taskValue) + 120;
+        }
+        if (act.narratorNotification && !act.utteranceId.empty()) {
+          PostSpeechDeliveryState(act.utteranceId, "spoken");
         }
       } else if (act.type == ACT_SAY && target &&
                  !IsCharacterUnavailableForDialogue(target)) {
