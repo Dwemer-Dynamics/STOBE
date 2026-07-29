@@ -1,6 +1,7 @@
 #include "AutonomySafetyProbePolicy.h"
 #include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
+#include "StobeChatMode.h"
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
 #include "StobeTiming.h"
@@ -92,6 +93,14 @@ int main() {
   using Stobe::IdentityRename::ParseBatchStatus;
   using Stobe::Timing::ResolveRechatDispatchDelayMs;
   using Stobe::Timing::ShouldWaitForPlaybackBeforeRechatDispatch;
+  using Stobe::ChatMode::AllowsAutomaticRechat;
+  using Stobe::ChatMode::AllowsManualActions;
+  using Stobe::ChatMode::DisplayLabel;
+  using Stobe::ChatMode::EventTypeForRequest;
+  using Stobe::ChatMode::Normalize;
+  using Stobe::ChatMode::ResolveRequestMode;
+  using Stobe::ChatMode::ShouldQueueLocalPlayerSpeech;
+  using Stobe::ChatMode::ToIndex;
   using Stobe::Text::EscapeJSON;
   using Stobe::Text::JsonReadField;
   using Stobe::Text::SanitizeDialogueForEventStream;
@@ -923,6 +932,37 @@ int main() {
                                     prospectScan, 60000)
                                     .outcome),
       static_cast<unsigned int>(MONITOR_COMPLETED));
+
+  ExpectEq("Inject display alias normalizes", Normalize("Inject & Chat"),
+           "inject_chat");
+  ExpectEq("Legacy injection alias normalizes", Normalize("injection_log"),
+           "inject");
+  ExpectUInt32("Inject mode index", static_cast<unsigned int>(ToIndex("inject")),
+               5);
+  ExpectUInt32("Inject and chat mode index",
+               static_cast<unsigned int>(ToIndex("inject_chat")), 6);
+  ExpectEq("Inject and chat display label", DisplayLabel("inject_chat"),
+           "inject & chat");
+  ExpectEq("Inject overrides auto chat",
+           ResolveRequestMode("inject", true), "inject");
+  ExpectEq("Inject and chat overrides auto chat",
+           ResolveRequestMode("inject_chat", true), "inject_chat");
+  ExpectEq("Standard chat still resolves auto chat",
+           ResolveRequestMode("chat", true), "autochat");
+  ExpectBool("Inject blocks manual actions", AllowsManualActions("inject"),
+             false);
+  ExpectBool("Inject and chat blocks manual actions",
+             AllowsManualActions("inject_chat"), false);
+  ExpectBool("Inject suppresses local player speech",
+             ShouldQueueLocalPlayerSpeech("inject"), false);
+  ExpectBool("Inject and chat suppresses local player speech",
+             ShouldQueueLocalPlayerSpeech("inject_chat"), false);
+  ExpectBool("Inject and chat suppresses automatic rechat",
+             AllowsAutomaticRechat("inject_chat"), false);
+  ExpectEq("Inject uses injection event", EventTypeForRequest("inject"),
+           "injection");
+  ExpectEq("Standard chat uses input event", EventTypeForRequest("talk"),
+           "inputtext");
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";

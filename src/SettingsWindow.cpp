@@ -4,6 +4,7 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "JournalWindow.h"
+#include "StobeChatMode.h"
 #include "Utils.h"
 
 #include <shellapi.h>
@@ -17,7 +18,6 @@
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
-#include <algorithm>
 #include <cstdlib>
 
 namespace Stobe {
@@ -73,20 +73,6 @@ int ParseIntOrDefault(const std::string &value, int fallback) {
     return fallback;
   }
   return static_cast<int>(parsed);
-}
-
-std::string NormalizeChatModeValue(const std::string &modeRaw) {
-  std::string mode = modeRaw;
-  std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-  if (mode == "whisper")
-    return "whisper";
-  if (mode == "shout")
-    return "shout";
-  if (mode == "cheat")
-    return "cheat";
-  if (mode == "narrator")
-    return "narrator";
-  return "chat";
 }
 
 bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
@@ -187,18 +173,11 @@ void PopulateChatModeCombo() {
   g_pluginChatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("cheat").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("narrator").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("inject").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
 
-  std::string currentMode = NormalizeChatModeValue(g_chatMode);
-  size_t selected = 0;
-  if (currentMode == "whisper")
-    selected = 1;
-  else if (currentMode == "shout")
-    selected = 2;
-  else if (currentMode == "cheat")
-    selected = 3;
-  else if (currentMode == "narrator")
-    selected = 4;
-  g_pluginChatModeCombo->setIndexSelected(selected);
+  g_pluginChatModeCombo->setIndexSelected(
+      Stobe::ChatMode::ToIndex(g_chatMode));
 }
 
 void OnHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -217,17 +196,8 @@ void OnGeneralHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
 void OnPluginModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
   if (!sender || index == MyGUI::ITEM_NONE)
     return;
-  g_chatMode = NormalizeChatModeValue(sender->getItemNameAt(index));
-  if (g_chatMode == "whisper")
-    g_lastChatModeIndex = 1;
-  else if (g_chatMode == "shout")
-    g_lastChatModeIndex = 2;
-  else if (g_chatMode == "cheat")
-    g_lastChatModeIndex = 3;
-  else if (g_chatMode == "narrator")
-    g_lastChatModeIndex = 4;
-  else
-    g_lastChatModeIndex = 0;
+  g_chatMode = Stobe::ChatMode::Normalize(sender->getItemNameAt(index));
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
 }
 
 void OnSpeakerModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -307,21 +277,12 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
 
   if (g_pluginChatModeCombo &&
       g_pluginChatModeCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
-    g_chatMode = NormalizeChatModeValue(
+    g_chatMode = Stobe::ChatMode::Normalize(
         g_pluginChatModeCombo->getItemNameAt(
             g_pluginChatModeCombo->getIndexSelected()));
   }
 
-  if (g_chatMode == "whisper")
-    g_lastChatModeIndex = 1;
-  else if (g_chatMode == "shout")
-    g_lastChatModeIndex = 2;
-  else if (g_chatMode == "cheat")
-    g_lastChatModeIndex = 3;
-  else if (g_chatMode == "narrator")
-    g_lastChatModeIndex = 4;
-  else
-    g_lastChatModeIndex = 0;
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
 
   g_autoChatEnabled = g_pendingAutoChat;
   g_enableBoredEvents = g_pendingBoredEvents;

@@ -85,6 +85,7 @@ add_library(Stobe SHARED
   src/AiNpcInfoWindow.cpp
   src/KenshiRvaCompat.cpp
   src/StobeIdentityRename.cpp
+  src/StobeChatMode.cpp
   src/StobeText.cpp
   src/StobeTiming.cpp
   src/main.cpp

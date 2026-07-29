@@ -106,6 +106,7 @@
     <ClCompile Include="src\KenshiRvaCompat.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
+    <ClCompile Include="src\StobeChatMode.cpp" />
     <ClCompile Include="src\StobeIdentityRename.cpp" />
     <ClCompile Include="src\StobeText.cpp" />
     <ClCompile Include="src\StobeTiming.cpp" />
@@ -133,6 +134,7 @@
     <ClInclude Include="src\JournalWindow.h" />
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\SettingsWindow.h" />
+    <ClInclude Include="src\StobeChatMode.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />
     <ClInclude Include="src\StobeText.h" />
     <ClInclude Include="src\StobeTiming.h" />
