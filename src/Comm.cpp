@@ -794,6 +794,14 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint.find(L"/conf_opts?") == 0) {
+    request.method = L"GET";
+    request.path = L"/StobeServer/conf_opts.php" +
+                   endpoint.substr(std::wstring(L"/conf_opts").length());
+    request.body.clear();
+    return request;
+  }
+
   if (endpoint == L"/speech_delivery") {
     request.path = L"/StobeServer/speech_delivery.php";
     return request;

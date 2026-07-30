@@ -46,6 +46,7 @@ MyGUI::EditBox *g_chatInput = nullptr;
 MyGUI::ComboBox *g_chatModeCombo = nullptr;
 MyGUI::ComboBox *g_chatTargetCombo = nullptr;
 MyGUI::ComboBox *g_chatActionCombo = nullptr;
+MyGUI::ComboBox *g_chatProfileModelCombo = nullptr;
 MyGUI::EditBox *g_chatActionArgInput = nullptr;
 MyGUI::Button *g_chatAutoChatToggle = nullptr;
 MyGUI::TextBox *g_chatLabel = nullptr;
@@ -66,8 +67,15 @@ bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
 LONG g_activeChatStreamCount = 0;
+LONG g_profileModelSlot = 1;
+LONG g_profileModelRevision = 0;
+LONG g_profileModelRefreshInFlight = 0;
+DWORD g_profileModelLastRefreshTick = 0;
+bool g_profileModelComboRefreshInProgress = false;
 const float kWhisperRangeUnits = 20.0f;
 const char *kNarratorName = "The Narrator";
+const char *kProfileModelLabels[] = {
+    "Standard", "Fast", "Powerful", "Experimental"};
 
 class ActiveChatStreamScope {
 public:
@@ -81,6 +89,13 @@ struct ChatTargetOption {
   std::string label;
   float distance;
   bool isNarrator;
+};
+
+struct ProfileModelRequestTask {
+  bool write;
+  int requestedSlot;
+  int fallbackSlot;
+  LONG revision;
 };
 
 std::vector<ChatTargetOption> g_chatTargetOptions;
@@ -101,6 +116,135 @@ void OnRenameConfirmClick(MyGUI::Widget *sender);
 void OnRenameCancelClick(MyGUI::Widget *sender);
 void OnRenameWindowButtonPressed(MyGUI::Window *sender,
                                  const std::string &name);
+
+int NormalizeProfileModelSlot(int slot) {
+  return slot >= 1 && slot <= 4 ? slot : 1;
+}
+
+int GetActiveProfileModelSlot() {
+  return NormalizeProfileModelSlot(
+      static_cast<int>(InterlockedCompareExchange(&g_profileModelSlot, 0, 0)));
+}
+
+std::string GetActiveProfileModelLabel() {
+  return kProfileModelLabels[GetActiveProfileModelSlot() - 1];
+}
+
+void QueueProfileModelSlotUpdate(LONG revision, int slot) {
+  EnterCriticalSection(&g_msgMutex);
+  g_messageQueue.push_back("CMD: SET_PROFILE_MODEL:" + ToString((int)revision) +
+                           "|" + ToString(NormalizeProfileModelSlot(slot)));
+  LeaveCriticalSection(&g_msgMutex);
+}
+
+void QueueProfileModelNotification(const std::string &message) {
+  EnterCriticalSection(&g_msgMutex);
+  g_messageQueue.push_back("NOTIFY:" + message);
+  LeaveCriticalSection(&g_msgMutex);
+}
+
+// Confirms model-slot reads and writes off the game thread before updating UI.
+DWORD WINAPI ProfileModelRequestThread(LPVOID lpParam) {
+  ProfileModelRequestTask *task =
+      static_cast<ProfileModelRequestTask *>(lpParam);
+  if (!task) {
+    return 0;
+  }
+
+  std::string response;
+  if (task->write) {
+    const std::string payload =
+        "{\"id\":\"stobe_profile_model\",\"value\":\"" +
+        ToString(task->requestedSlot) + "\",\"only_if_changed\":true}";
+    response = PostToStobeWithResponse(L"/conf_opts", payload);
+  } else {
+    response = PostToStobeWithResponse(
+        L"/conf_opts?id=stobe_profile_model", "");
+  }
+
+  const std::string status = TrimChatLine(JsonReadField(response, "status"));
+  const int responseSlot =
+      atoi(TrimChatLine(JsonReadField(response, "value")).c_str());
+  const bool validResponse =
+      status == "ok" && responseSlot >= 1 && responseSlot <= 4 &&
+      (!task->write || responseSlot == task->requestedSlot);
+
+  if (validResponse) {
+    QueueProfileModelSlotUpdate(task->revision, responseSlot);
+    Log("PROFILE_MODEL: synchronized slot=" + ToString(responseSlot) +
+        " source=" + std::string(task->write ? "chatbox" : "server"));
+  } else if (task->write) {
+    QueueProfileModelSlotUpdate(task->revision, task->fallbackSlot);
+    QueueProfileModelNotification(
+        "Unable to change the response mode. Check StobeServer.");
+    Log("PROFILE_MODEL: change failed requested=" +
+        ToString(task->requestedSlot));
+  } else if (!response.empty()) {
+    Log("PROFILE_MODEL: ignored invalid server response");
+  }
+
+  if (!task->write) {
+    InterlockedExchange(&g_profileModelRefreshInFlight, 0);
+  }
+  delete task;
+  return 0;
+}
+
+bool StartProfileModelRequest(ProfileModelRequestTask *task) {
+  HANDLE thread =
+      CreateThread(NULL, 0, ProfileModelRequestThread, task, 0, NULL);
+  if (!thread) {
+    if (!task->write) {
+      InterlockedExchange(&g_profileModelRefreshInFlight, 0);
+    }
+    delete task;
+    Log("PROFILE_MODEL: failed to start request thread");
+    return false;
+  }
+  CloseHandle(thread);
+  return true;
+}
+
+void RequestProfileModelSlotRefresh(bool force) {
+  const DWORD now = GetTickCount();
+  if (!force && g_profileModelLastRefreshTick != 0 &&
+      now - g_profileModelLastRefreshTick < 30000) {
+    return;
+  }
+  if (InterlockedCompareExchange(&g_profileModelRefreshInFlight, 1, 0) != 0) {
+    return;
+  }
+
+  g_profileModelLastRefreshTick = now;
+  ProfileModelRequestTask *task = new ProfileModelRequestTask();
+  task->write = false;
+  task->requestedSlot = 0;
+  task->fallbackSlot = GetActiveProfileModelSlot();
+  task->revision =
+      InterlockedCompareExchange(&g_profileModelRevision, 0, 0);
+  StartProfileModelRequest(task);
+}
+
+void ApplyProfileModelSlotUpdate(const std::string &data) {
+  const size_t separator = data.find('|');
+  if (separator == std::string::npos) {
+    return;
+  }
+  const LONG revision = atol(data.substr(0, separator).c_str());
+  const int slot = atoi(data.substr(separator + 1).c_str());
+  if (slot < 1 || slot > 4 ||
+      revision !=
+          InterlockedCompareExchange(&g_profileModelRevision, 0, 0)) {
+    return;
+  }
+
+  InterlockedExchange(&g_profileModelSlot, slot);
+  if (g_chatProfileModelCombo) {
+    g_profileModelComboRefreshInProgress = true;
+    g_chatProfileModelCombo->setIndexSelected(static_cast<size_t>(slot - 1));
+    g_profileModelComboRefreshInProgress = false;
+  }
+}
 
 bool TryReleaseUserPauseSafe(GameWorld *world) {
   if (!world) {
@@ -1687,6 +1831,7 @@ void CloseChatUI() {
     g_chatModeCombo = nullptr;
     g_chatTargetCombo = nullptr;
     g_chatActionCombo = nullptr;
+    g_chatProfileModelCombo = nullptr;
     g_chatActionArgInput = nullptr;
     g_chatAutoChatToggle = nullptr;
     g_chatLabel = nullptr;
@@ -4710,6 +4855,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   SetActiveChatTarget(npcName, handleStr, true);
   g_chatJustOpened = true;
   g_chatPausedGame = false;
+  RequestProfileModelSlotRefresh(true);
 
   GameWorld *world = GetWorldSafe();
   if (world) {
@@ -4731,8 +4877,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
 
   // Identity renames are queued and handled asynchronously by
   // RenameWorker, so CreateChatUI never blocks on HTTP.
-  const float chatWindowW = 0.42f;
-  const float chatWindowH = 0.18f + ScreenPixelsToRealHeight(20);
+  const float chatWindowW = 0.46f;
+  const float chatWindowH = 0.24f + ScreenPixelsToRealHeight(20);
   const float chatWindowX = (1.0f - chatWindowW) * 0.5f;
   const float chatWindowY = (1.0f - chatWindowH) * 0.5f;
   g_chatWindow = gui->createWidgetReal<MyGUI::Window>(
@@ -4744,19 +4890,19 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatWindowButtonPressed);
   MyGUI::Widget *client = g_chatWindow->getClientWidget();
   g_chatLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.08f, 0.44f, 0.16f,
+      "Kenshi_TextboxStandardText", 0.05f, 0.04f, 0.44f, 0.13f,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatLabel");
   g_chatLabel->setCaption(WideFromUtf8("Speaker: " + g_chatPlayerNameStr).c_str());
-  const float targetComboHeight = 0.16f + ParentPixelsToRealHeight(client, 20);
+  const float targetComboHeight = 0.13f + ParentPixelsToRealHeight(client, 20);
   g_chatTargetCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", 0.53f, 0.08f, 0.42f, targetComboHeight,
+      "Kenshi_ComboBox", 0.53f, 0.04f, 0.42f, targetComboHeight,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatTargetCombo");
   g_chatTargetCombo->setComboModeDrop(true);
   g_chatTargetCombo->eventComboAccept += MyGUI::newDelegate(OnChatTargetChange);
   g_chatTargetCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatTargetChange);
   g_chatInput = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.05f, 0.28f, 0.9f, 0.211f,
+      "Kenshi_EditBox", 0.05f, 0.22f, 0.9f, 0.18f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatInput");
 
   // Single-line style input.
@@ -4770,32 +4916,40 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatInput->eventEditSelectAccept += MyGUI::newDelegate(OnChatInputAccept);
   MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatInput);
 
-  const float inputY = 0.28f;
-  const float inputH = 0.211f;
-  const float rowGap = 0.03f;
-  const float rowH = 0.20f;
-  const float topRowY = inputY + inputH + rowGap;
-  const float bottomRowY = topRowY + rowH + rowGap;
-  const float topRowLeftX = 0.05f;
-  const float topRowGap = 0.02f;
-  const float topBtnW = 0.16f;
-  const float topAutoX = topRowLeftX;
-  const float topBoredX = topAutoX + topBtnW + topRowGap;
-  const float topDiaryX = topBoredX + topBtnW + topRowGap;
-  const float topNarratorDiaryX = topDiaryX + topBtnW + topRowGap;
-  const float topRenameX = topNarratorDiaryX + topBtnW + topRowGap;
-  const float bottomRowLeftX = 0.05f;
-  const float bottomRowGap = 0.02f;
+  const float inputY = 0.22f;
+  const float inputH = 0.18f;
+  const float rowGap = 0.025f;
+  const float rowH = 0.16f;
+  const float primaryRowY = inputY + inputH + rowGap;
+  const float secondaryRowY = primaryRowY + rowH + rowGap;
+  const float controlRowY = secondaryRowY + rowH + rowGap;
+  const float primaryRowLeftX = 0.05f;
+  const float primaryRowGap = 0.02f;
+  const float primaryBtnW = 0.29f;
+  const float primaryAutoX = primaryRowLeftX;
+  const float primaryBoredX = primaryAutoX + primaryBtnW + primaryRowGap;
+  const float primaryRenameX = primaryBoredX + primaryBtnW + primaryRowGap;
+  const float secondaryRowLeftX = 0.05f;
+  const float secondaryRowGap = 0.02f;
+  const float secondaryDiaryW = 0.28f;
+  const float secondaryDiaryX = secondaryRowLeftX;
+  const float secondaryNarratorDiaryX =
+      secondaryDiaryX + secondaryDiaryW + secondaryRowGap;
+  const float profileModelX =
+      secondaryNarratorDiaryX + secondaryDiaryW + secondaryRowGap;
+  const float profileModelW = 0.31f;
+  const float controlRowLeftX = 0.05f;
+  const float controlRowGap = 0.02f;
   const float modeWidth = 0.20f;
   const float actionWidth = 0.30f;
   const float actionArgWidth = 0.14f;
   const float sendWidth = 0.20f;
-  const float actionX = bottomRowLeftX + modeWidth + bottomRowGap;
-  const float actionArgX = actionX + actionWidth + bottomRowGap;
-  const float sendX = actionArgX + actionArgWidth + bottomRowGap;
+  const float actionX = controlRowLeftX + modeWidth + controlRowGap;
+  const float actionArgX = actionX + actionWidth + controlRowGap;
+  const float sendX = actionArgX + actionArgWidth + controlRowGap;
 
   g_chatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", bottomRowLeftX, bottomRowY, modeWidth, rowH,
+      "Kenshi_ComboBox", controlRowLeftX, controlRowY, modeWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatModeCombo");
   g_chatModeCombo->setComboModeDrop(true);
   g_chatModeCombo->addItem(WideFromUtf8("chat").c_str());
@@ -4810,7 +4964,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatModeChange);
 
   g_chatActionCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", actionX, bottomRowY, actionWidth, rowH,
+      "Kenshi_ComboBox", actionX, controlRowY, actionWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatActionCombo");
   g_chatActionCombo->setComboModeDrop(true);
   for (size_t i = 0; i < ManualChatActionChoiceCount(); ++i) {
@@ -4823,7 +4977,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatActionChange);
 
   g_chatActionArgInput = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", actionArgX, bottomRowY, actionArgWidth, rowH,
+      "Kenshi_EditBox", actionArgX, controlRowY, actionArgWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatActionArgInput");
   g_chatActionArgInput->setEditMultiLine(false);
   g_chatActionArgInput->setEditWordWrap(false);
@@ -4834,7 +4988,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   OnChatActionChange(g_chatActionCombo, g_chatActionCombo->getIndexSelected());
 
   g_chatAutoChatToggle = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topAutoX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryAutoX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatAutoToggle");
   g_chatAutoChatToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnAutoChatToggleClick);
@@ -4842,20 +4996,20 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   RefreshChatModeControls();
 
   MyGUI::Button *sendBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", sendX, bottomRowY, sendWidth, rowH,
+      "Kenshi_Button1", sendX, controlRowY, sendWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatSendBtn");
   sendBtn->setCaption(WideFromUtf8(T("Send")).c_str());
   sendBtn->eventMouseButtonClick += MyGUI::newDelegate(OnChatSendClick);
 
   MyGUI::Button *boredEventBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topBoredX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryBoredX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatBoredBtn");
   boredEventBtn->setCaption(WideFromUtf8(T("Continue Chat")).c_str());
   boredEventBtn->eventMouseButtonClick += MyGUI::newDelegate(OnBoredEventClick);
 
   MyGUI::Button *writeDiaryBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topDiaryX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", secondaryDiaryX, secondaryRowY, secondaryDiaryW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatDiaryBtn");
   writeDiaryBtn->setCaption(WideFromUtf8(T("Write Diary")).c_str());
@@ -4863,7 +5017,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
 
   MyGUI::Button *writeNarratorDiaryBtn =
       client->createWidgetReal<MyGUI::Button>(
-          "Kenshi_Button1", topNarratorDiaryX, topRowY, topBtnW, rowH,
+          "Kenshi_Button1", secondaryNarratorDiaryX, secondaryRowY,
+          secondaryDiaryW, rowH,
           MyGUI::Align::Top | MyGUI::Align::Left,
           "Stobe_ChatNarratorDiaryBtn");
   writeNarratorDiaryBtn->setCaption(
@@ -4872,10 +5027,28 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnWriteNarratorDiaryClick);
 
   MyGUI::Button *renameBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topRenameX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryRenameX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatRenameBtn");
   renameBtn->setCaption(WideFromUtf8("Rename").c_str());
   renameBtn->eventMouseButtonClick += MyGUI::newDelegate(OnRenameClick);
+
+  g_chatProfileModelCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", profileModelX, secondaryRowY, profileModelW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_ChatProfileModelCombo");
+  g_chatProfileModelCombo->setComboModeDrop(true);
+  for (int slot = 1; slot <= 4; ++slot) {
+    g_chatProfileModelCombo->addItem(
+        WideFromUtf8("Response: " +
+                     std::string(kProfileModelLabels[slot - 1]))
+            .c_str());
+  }
+  g_chatProfileModelCombo->setIndexSelected(
+      static_cast<size_t>(GetActiveProfileModelSlot() - 1));
+  g_chatProfileModelCombo->eventComboAccept +=
+      MyGUI::newDelegate(OnChatProfileModelChange);
+  g_chatProfileModelCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnChatProfileModelChange);
 }
 
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
@@ -4887,6 +5060,33 @@ void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
   g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
+}
+
+void OnChatProfileModelChange(MyGUI::ComboBox *sender, size_t index) {
+  if (g_profileModelComboRefreshInProgress || !sender ||
+      index == MyGUI::ITEM_NONE || index >= 4) {
+    return;
+  }
+
+  const int requestedSlot = static_cast<int>(index) + 1;
+  const int previousSlot = GetActiveProfileModelSlot();
+  if (requestedSlot == previousSlot) {
+    return;
+  }
+
+  const LONG revision = InterlockedIncrement(&g_profileModelRevision);
+  InterlockedExchange(&g_profileModelSlot, requestedSlot);
+
+  ProfileModelRequestTask *task = new ProfileModelRequestTask();
+  task->write = true;
+  task->requestedSlot = requestedSlot;
+  task->fallbackSlot = previousSlot;
+  task->revision = revision;
+  if (!StartProfileModelRequest(task)) {
+    QueueProfileModelSlotUpdate(revision, previousSlot);
+    QueueProfileModelNotification(
+        "Unable to change the response mode. Check StobeServer.");
+  }
 }
 
 void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index) {

@@ -345,6 +345,7 @@ void UpdateStatusHud(GameWorld *world) {
     CloseStatusHud();
     return;
   }
+  RequestProfileModelSlotRefresh();
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
   if (!gui || !world) {
     return;
@@ -429,6 +430,7 @@ void UpdateStatusHud(GameWorld *world) {
 
   std::string caption =
       "Mode: " + Stobe::ChatMode::DisplayLabel(g_chatMode) +
+      "\nResponse: " + GetActiveProfileModelLabel() +
       "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
       "\nAI: " + aiStatus +
       "\nSelected: " + selectedName +
