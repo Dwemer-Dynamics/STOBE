@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 0.9.3 LANGUAGES CXX)
+project(Stobe VERSION 0.9.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,16 +80,19 @@ add_library(Stobe SHARED
   src/Functions.cpp
   src/Globals.cpp
   src/KenshiAiCompat.cpp
+  src/JournalWindow.cpp
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiRvaCompat.cpp
   src/StobeIdentityRename.cpp
+  src/StobeChatMode.cpp
   src/StobeText.cpp
   src/StobeTiming.cpp
   src/main.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
   src/WelcomeWindow.cpp
+  src/WorldStateRuntime.cpp
 )
 
 target_include_directories(Stobe PRIVATE

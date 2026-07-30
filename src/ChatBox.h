@@ -12,6 +12,7 @@ extern MyGUI::EditBox *g_chatInput;
 extern MyGUI::ComboBox *g_chatModeCombo;
 extern MyGUI::ComboBox *g_chatTargetCombo;
 extern MyGUI::ComboBox *g_chatActionCombo;
+extern MyGUI::ComboBox *g_chatProfileModelCombo;
 extern MyGUI::EditBox *g_chatActionArgInput;
 extern MyGUI::Button *g_chatAutoChatToggle;
 extern MyGUI::TextBox *g_chatLabel;
@@ -35,12 +36,19 @@ void OnChatInputAccept(MyGUI::EditBox *sender);
 void OnChatSendClick(MyGUI::Widget *sender);
 void OnChatCancelClick(MyGUI::Widget *sender);
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index);
+void OnChatProfileModelChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
+bool IsAiRequestActive();
 void RefreshChatModeControls();
 void OnBoredEventClick(MyGUI::Widget *sender);
 void OnWriteDiaryClick(MyGUI::Widget *sender);
+void OnWriteNarratorDiaryClick(MyGUI::Widget *sender);
+int GetActiveProfileModelSlot();
+std::string GetActiveProfileModelLabel();
+void RequestProfileModelSlotRefresh(bool force = false);
+void ApplyProfileModelSlotUpdate(const std::string &data);
 bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerName = "",
                        const std::string &preferredSpeakerSerial = "",

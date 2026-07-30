@@ -26,6 +26,7 @@
 #include "KenshiTownCompat.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
+#include "WorldStateRuntime.h"
 
 #include <kenshi/CharStats.h>
 #include <kenshi/Character.h>
@@ -690,20 +691,6 @@ static std::string TrimCopy(const std::string &value) {
   return value.substr(start, end - start + 1);
 }
 
-struct WorldStateSerializeStats {
-  int queryCount;
-  int npcAreCount;
-  int npcAreNotCount;
-  int townCount;
-  int allyCount;
-  int enemyCount;
-  bool truncated;
-
-  WorldStateSerializeStats()
-      : queryCount(0), npcAreCount(0), npcAreNotCount(0), townCount(0),
-        allyCount(0), enemyCount(0), truncated(false) {}
-};
-
 static int ResolveCurrentGameTsSafe(GameWorld *world) {
   if (!world || (uintptr_t)world <= 0x1000) {
     return 0;
@@ -715,52 +702,6 @@ static int ResolveCurrentGameTsSafe(GameWorld *world) {
       return 0;
     }
     return gameTs;
-  } catch (...) {
-    return 0;
-  }
-}
-
-static const char *WorldStateEnumToText(WorldStateEnum state) {
-  switch (state) {
-  case DEAD:
-    return "dead";
-  case ALIVE:
-    return "alive";
-  case IMPRISONED:
-    return "imprisoned";
-  default:
-    return "unknown";
-  }
-}
-
-static std::string SafeGameDataName(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return "";
-  }
-  try {
-    return TrimCopy(data->name);
-  } catch (...) {
-    return "";
-  }
-}
-
-static std::string SafeGameDataStringId(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return "";
-  }
-  try {
-    return TrimCopy(data->stringID);
-  } catch (...) {
-    return "";
-  }
-}
-
-static int SafeGameDataNumericId(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return 0;
-  }
-  try {
-    return (int)data->id;
   } catch (...) {
     return 0;
   }
@@ -884,264 +825,6 @@ static bool IsFactionRelationEntryDifferent(
     return true;
   }
   return false;
-}
-
-static std::string BuildWorldStateEntityRulesJson(
-    const ogre_unordered_map<GameData *, WorldStateEnum>::type &source,
-    int &counter, bool &truncated) {
-  static const size_t kRuleHardCap = 8192;
-  std::string json = "[";
-  bool first = true;
-  size_t seen = 0;
-  for (auto it = source.begin(); it != source.end(); ++it) {
-    if (seen >= kRuleHardCap) {
-      truncated = true;
-      break;
-    }
-    ++seen;
-    GameData *data = it->first;
-    if (!data || (uintptr_t)data <= 0x1000) {
-      continue;
-    }
-    std::string name = SafeGameDataName(data);
-    std::string sid = SafeGameDataStringId(data);
-    int numericId = SafeGameDataNumericId(data);
-    if (name.empty() && sid.empty() && numericId <= 0) {
-      continue;
-    }
-    if (!first) {
-      json += ",";
-    }
-    first = false;
-    json += "{";
-    json += "\"name\":\"" + EscapeJSON(name) + "\",";
-    json += "\"string_id\":\"" + EscapeJSON(sid) + "\",";
-    json += "\"numeric_id\":" + ToString(numericId) + ",";
-    json += "\"state\":\"" +
-            std::string(WorldStateEnumToText((WorldStateEnum)it->second)) + "\"";
-    json += "}";
-    counter += 1;
-  }
-  json += "]";
-  return json;
-}
-
-static std::string BuildWorldStateFactionRulesJson(
-    const ogre_unordered_map<Faction *, bool>::type &source,
-    const std::string &valueKey, int &counter, bool &truncated) {
-  static const size_t kRuleHardCap = 8192;
-  std::string json = "[";
-  bool first = true;
-  size_t seen = 0;
-  for (auto it = source.begin(); it != source.end(); ++it) {
-    if (seen >= kRuleHardCap) {
-      truncated = true;
-      break;
-    }
-    ++seen;
-    Faction *faction = it->first;
-    if (!faction || (uintptr_t)faction <= 0x1000) {
-      continue;
-    }
-    std::string factionName = SafeFactionName(faction);
-    if (factionName.empty()) {
-      continue;
-    }
-    if (!first) {
-      json += ",";
-    }
-    first = false;
-    json += "{";
-    json += "\"name\":\"" + EscapeJSON(factionName) + "\",";
-    json += "\"" + EscapeJSON(valueKey) + "\":" +
-            std::string(it->second ? "true" : "false");
-    json += "}";
-    counter += 1;
-  }
-  json += "]";
-  return json;
-}
-
-static std::vector<GameData *> g_worldStateQuerySources;
-static DWORD g_lastWorldStateSourceScanTick = 0;
-
-static void RefreshWorldStateQuerySources(GameWorld *world, bool forceRefresh) {
-  const DWORD now = GetTickCount();
-  const DWORD kScanIntervalMs = 180000;
-  if (!forceRefresh && !g_worldStateQuerySources.empty() &&
-      now - g_lastWorldStateSourceScanTick < kScanIntervalMs) {
-    return;
-  }
-  g_lastWorldStateSourceScanTick = now;
-
-  g_worldStateQuerySources.clear();
-  if (!world || (uintptr_t)world <= 0x1000) {
-    return;
-  }
-
-  size_t scanned = 0;
-  size_t matched = 0;
-  bool truncated = false;
-  static const size_t kDataScanHardCap = 50000;
-  std::set<uintptr_t> seen;
-  try {
-    const ogre_unordered_map<int, GameData *>::type &allData =
-        world->gamedata._getAllData();
-    for (auto it = allData.begin(); it != allData.end(); ++it) {
-      if (scanned >= kDataScanHardCap) {
-        truncated = true;
-        break;
-      }
-      ++scanned;
-      GameData *data = it->second;
-      if (!data || (uintptr_t)data <= 0x1000) {
-        continue;
-      }
-
-      WorldEventStateQuery *query = nullptr;
-      try {
-        query = WorldEventStateQuery::getFromData(data);
-      } catch (...) {
-        query = nullptr;
-      }
-      if (!query || (uintptr_t)query <= 0x1000) {
-        continue;
-      }
-
-      uintptr_t key = (uintptr_t)data;
-      if (seen.insert(key).second) {
-        g_worldStateQuerySources.push_back(data);
-        matched += 1;
-      }
-    }
-  } catch (...) {
-    truncated = true;
-  }
-
-  Log("WORLD_STATE_SYNC: source_scan scanned=" + ToString((int)scanned) +
-      " matched=" + ToString((int)matched) +
-      " truncated=" + std::string(truncated ? "1" : "0"));
-}
-
-static std::string BuildWorldStateSnapshotJson(GameWorld *world,
-                                               WorldStateSerializeStats &stats) {
-  stats = WorldStateSerializeStats();
-  std::string json = "{";
-  json += "\"source\":\"world_event_state_query\",";
-  json += "\"game_ts\":" + ToString(ResolveCurrentGameTsSafe(world)) + ",";
-  json += "\"queries\":[";
-
-  bool firstQuery = true;
-  static const size_t kQueryHardCap = 8192;
-  size_t querySeen = 0;
-
-  RefreshWorldStateQuerySources(world, false);
-  if (g_worldStateQuerySources.empty()) {
-    RefreshWorldStateQuerySources(world, true);
-  }
-
-  try {
-    for (auto it = g_worldStateQuerySources.begin();
-         it != g_worldStateQuerySources.end(); ++it) {
-      if (querySeen >= kQueryHardCap) {
-        stats.truncated = true;
-        break;
-      }
-      ++querySeen;
-
-      GameData *queryData = *it;
-      if (!queryData || (uintptr_t)queryData <= 0x1000) {
-        continue;
-      }
-      WorldEventStateQuery *query = nullptr;
-      try {
-        query = WorldEventStateQuery::getFromData(queryData);
-      } catch (...) {
-        query = nullptr;
-      }
-      if (!query || (uintptr_t)query <= 0x1000) {
-        continue;
-      }
-
-      std::string queryName = SafeGameDataName(queryData);
-      std::string querySid = SafeGameDataStringId(queryData);
-      int queryNumericId = SafeGameDataNumericId(queryData);
-
-      std::string uniqueNpcAre = "[]";
-      std::string uniqueNpcAreNot = "[]";
-      std::string towns = "[]";
-      std::string allyOf = "[]";
-      std::string enemyOf = "[]";
-
-      try {
-        uniqueNpcAre = BuildWorldStateEntityRulesJson(query->uniqueNPCsAre,
-                                                      stats.npcAreCount,
-                                                      stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        uniqueNpcAreNot = BuildWorldStateEntityRulesJson(query->uniqueNPCsAreNot,
-                                                         stats.npcAreNotCount,
-                                                         stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        towns = BuildWorldStateEntityRulesJson(query->towns, stats.townCount,
-                                               stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        allyOf = BuildWorldStateFactionRulesJson(query->isAllyOf, "is_ally",
-                                                 stats.allyCount,
-                                                 stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        enemyOf = BuildWorldStateFactionRulesJson(query->isEnemyOf, "is_enemy",
-                                                  stats.enemyCount,
-                                                  stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-
-      if (!firstQuery) {
-        json += ",";
-      }
-      firstQuery = false;
-
-      json += "{";
-      json += "\"query_name\":\"" + EscapeJSON(queryName) + "\",";
-      json += "\"query_string_id\":\"" + EscapeJSON(querySid) + "\",";
-      json += "\"query_numeric_id\":" + ToString(queryNumericId) + ",";
-      json += "\"player_involvement\":" +
-              std::string(query->playerInvolvement ? "true" : "false") + ",";
-      json += "\"unique_npcs_are\":" + uniqueNpcAre + ",";
-      json += "\"unique_npcs_are_not\":" + uniqueNpcAreNot + ",";
-      json += "\"towns\":" + towns + ",";
-      json += "\"is_ally_of\":" + allyOf + ",";
-      json += "\"is_enemy_of\":" + enemyOf;
-      json += "}";
-      stats.queryCount += 1;
-    }
-  } catch (...) {
-    stats.truncated = true;
-  }
-
-  json += "],";
-  json += "\"query_count\":" + ToString(stats.queryCount) + ",";
-  json += "\"npc_are_count\":" + ToString(stats.npcAreCount) + ",";
-  json += "\"npc_are_not_count\":" + ToString(stats.npcAreNotCount) + ",";
-  json += "\"town_count\":" + ToString(stats.townCount) + ",";
-  json += "\"ally_count\":" + ToString(stats.allyCount) + ",";
-  json += "\"enemy_count\":" + ToString(stats.enemyCount) + ",";
-  json += "\"truncated\":" + std::string(stats.truncated ? "true" : "false");
-  json += "}";
-
-  return json;
 }
 
 static bool LooksLikeDialogueTemplateToken(const std::string &value) {
@@ -1826,13 +1509,13 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.9.3";
-static const char *kStobePluginReleaseDate = "2026-07-20";
+static const char *kStobePluginVersion = "0.9.5";
+static const char *kStobePluginReleaseDate = "2026-07-29";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
 static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
-static const DWORD kNpcWorldEventWarmupMs = 10 * 1000;
+static const DWORD kNpcWorldEventWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
@@ -7524,7 +7207,7 @@ static void RunTownKnowledgeSync(GameWorld *world) {
       " changed=" + std::string(changed ? "1" : "0"));
 }
 
-static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
   }
@@ -8064,6 +7747,22 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   }
 }
 
+static volatile LONG g_npcWorldEventSweepSehCount = 0;
+static DWORD g_npcWorldEventSweepLastSehCode = 0;
+
+static int NpcWorldEventSweepSehFilter(unsigned int code) {
+  g_npcWorldEventSweepLastSehCode = code;
+  InterlockedIncrement(&g_npcWorldEventSweepSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+  __try {
+    RunNpcWorldEventSweepUnsafe(world, selection);
+  } __except (NpcWorldEventSweepSehFilter(GetExceptionCode())) {
+  }
+}
+
 static void RunInventorySyncSweep(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
@@ -8556,6 +8255,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isPlayerSay = (msg.find("PLAYER_SAY: ") == 0);
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
       bool isNotify = (msg.find("NOTIFY:") == 0);
+      bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
       bool isRename = (msg.find("NPC_RENAME: ") == 0);
       bool speakerResolvedFromHeader = false;
@@ -8588,8 +8288,14 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiNpcInfoText(data);
           } else if (command == "POPULATE_AIDIARIES") {
             PopulateAiDiaryUI(data);
+          } else if (command == "POPULATE_AIDIARY_ENTRIES") {
+            PopulateAiDiaryEntries(data);
           } else if (command == "SET_AIDIARY_TEXT") {
             SetAiDiaryText(data);
+          } else if (command == "SET_STOBE_HISTORY") {
+            SetRecentHistoryText(data);
+          } else if (command == "SET_PROFILE_MODEL") {
+            ApplyProfileModelSlotUpdate(data);
           } else if (command == "SET_CONFIG") {
             size_t colon = data.find(":");
             if (colon != std::string::npos) {
@@ -8679,8 +8385,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             }
           }
         }
-      } else if (isNotify) {
-        std::string text = msg.substr(7);
+      } else if (isNotify || isNarratorNotify) {
+        std::string text = isNarratorNotify ? msg.substr(16) : msg.substr(7);
+        std::string utteranceId = ExtractTrailingUtteranceId(text);
         int ttsDurationMs = ExtractTrailingTtsDurationMs(text);
         std::string ttsHash = ExtractTrailingTtsHash(text);
         if (!g_ttsEnabled) {
@@ -8694,7 +8401,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         act.target = hand();
         act.message = text;
         act.ttsHash = ttsHash;
+        act.utteranceId = utteranceId;
         act.taskValue = ttsDurationMs;
+        act.narratorNotification = isNarratorNotify;
         g_uiActionQueue.push_back(act);
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {
@@ -12393,6 +12102,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
   static bool loadInitEventDispatched = false;
+  static bool postLoadPipelineProbed = false;
+  static bool heavySyncPipelineProbed = false;
   bool worldStable = IsWorldStableForUI(worldUi);
   if (tracePostLoadHook) {
     Log(std::string("HOOK_LOAD_PROBE: stability check returned stable=") +
@@ -12414,6 +12125,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_welcomeWindow = nullptr;
     g_aiNpcInfoWindow = nullptr;
     g_aiDiaryWindow = nullptr;
+    g_recentHistoryWindow = nullptr;
+    g_statusHudWindow = nullptr;
     return;
   }
 
@@ -12457,24 +12170,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       ResetTownKnowledgeSyncState();
+      Stobe::WorldStateRuntime::Reset();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
       loadInitEventDispatched = false;
+      postLoadPipelineProbed = false;
+      heavySyncPipelineProbed = false;
       Log("INV_SYNC: state reset on world transition.");
       Log("PORTRAIT_SYNC: state reset on world transition.");
     }
-    if (g_settingsWindow)
-      CloseSettingsUI();
-    if (g_startingWindow)
-      CloseStartingUI();
-    if (g_welcomeWindow)
-      CloseWelcomeUI();
-    if (g_aiNpcInfoWindow)
-      CloseAiNpcInfoUI();
-    if (g_aiDiaryWindow)
-      CloseAiDiaryUI();
+    if (IsAnyStobeMenuUIOpen())
+      CloseAllStobeMenuUI();
+    if (g_statusHudWindow)
+      CloseStatusHud();
     if (g_chatWindow)
       CloseChatUI();
     return;
@@ -12493,11 +12203,14 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_lastSelectionContextPushedTick = 0;
     g_lastSelectionContextPushedSerial = 0;
     LeaveCriticalSection(&g_stateMutex);
+    Stobe::WorldStateRuntime::Reset();
     heavySweepPrimed = false;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
     loadInitEventDispatched = false;
+    postLoadPipelineProbed = false;
+    heavySyncPipelineProbed = false;
     InterlockedExchange(&postLoadHookProbe, 1);
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
@@ -12529,8 +12242,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         motdAutoOpenDeadlineTick = 0;
         Log("UI: MOTD auto-open skipped (startup quiet window expired).");
       } else if ((LONG)(now - motdAutoOpenTick) >= 0 &&
-                 !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
-                 !g_startingWindow && !g_settingsWindow) {
+                  !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
+                  !IsAnyStobeMenuUIOpen()) {
         try {
           CreateWelcomeUI();
           g_welcomeShown = true;
@@ -12555,14 +12268,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     if (now - lastSettingsTick > 500) {
       lastSettingsTick = now;
       Log("UI: general hotkey pressed [" + g_generalHotkeyStr + "].");
-      if (g_startingWindow) {
-        CloseStartingUI();
-        Log("UI: CloseStartingUI done.");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: CloseAllStobeMenuUI done.");
       } else {
         CreateStartingUI();
         Log("UI: CreateStartingUI done.");
       }
     }
+  }
+
+  UpdateStatusHud(worldUi);
+
+  bool probePostLoadPipeline = !postLoadPipelineProbed;
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: entering warmed post-load pipeline");
   }
 
   // 1. Core Selection Tracking
@@ -12599,9 +12319,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (selectionChanged && hasSelectionHandle && sel &&
       (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
-      SyncInventoryForCharacter(sel, true, "selection_change");
-      SyncPortraitForCharacter(sel, false, "selection_change");
-      QueueSelectionContextPush(currentSelectionHand);
+      if (GetTickCount() - worldBecameStableTick >= kHookHeavySyncWarmupMs) {
+        SyncInventoryForCharacter(sel, true, "selection_change");
+        SyncPortraitForCharacter(sel, false, "selection_change");
+      } else {
+        Log("HOOK_LOAD_PROBE: deferred initial selection inventory and portrait sync");
+      }
+      // Full context snapshots can traverse stale nearby objects immediately
+      // after a save load. Dialogue and action paths still build them on demand.
+      ClearPendingSelectionContextPush();
     } else {
       ClearPendingSelectionContextPush();
       Log("ANIMAL_TALKS: ignoring selection context sync for inactive animal.");
@@ -12609,14 +12335,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   } else if (selectionChanged) {
     ClearPendingSelectionContextPush();
   }
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: selection stage complete");
+  }
 
   // 2. Message queue + queued actions
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    Stobe::WorldStateRuntime::Update(world, worldBecameStableTick);
     UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage starting");
+      }
       bool dispatchedViaStream =
           TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));
       if (!dispatchedViaStream) {
@@ -12643,8 +12376,14 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
             initActor + " serial=" + ToString((int)initActorSerial));
       }
       loadInitEventDispatched = true;
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage complete");
+      }
     }
 
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage starting");
+    }
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
@@ -12652,6 +12391,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
     RunPendingSelectionContextPush(sel, worldBecameStableTick);
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage complete");
+    }
 
     DWORD nowTick = GetTickCount();
     if (!heavySweepPrimed) {
@@ -12666,16 +12408,59 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
     bool npcEventSyncReady =
         (nowTick - worldBecameStableTick) >= kNpcWorldEventWarmupMs;
+    bool probeHeavySyncPipeline = heavySyncReady && !heavySyncPipelineProbed;
     if (npcEventSyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep starting");
+      }
+      LONG sweepSehBefore =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
       RunNpcWorldEventSweep(world, sel);
+      LONG sweepSehAfter =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
+      if (sweepSehAfter != sweepSehBefore) {
+        Log("NPC_WORLD_EVENT: skipped unsafe sweep after engine fault code=" +
+            ToString((int)g_npcWorldEventSweepLastSehCode));
+      }
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep complete");
+      }
     }
     if (heavySyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep starting");
+      }
       RunInventorySyncSweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep complete");
+        Log("HOOK_LOAD_PROBE: portrait sweep starting");
+      }
       RunPlayerFactionPortraitSweep(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: portrait sweep complete");
+        Log("HOOK_LOAD_PROBE: info telemetry sweep starting");
+      }
       RunInfoTelemetrySweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: info telemetry sweep complete");
+        Log("HOOK_LOAD_PROBE: faction relation sync starting");
+      }
       RunFactionRelationSync(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: faction relation sync complete");
+        Log("HOOK_LOAD_PROBE: town knowledge sync starting");
+      }
       RunTownKnowledgeSync(world);
+      if (probeHeavySyncPipeline) {
+        heavySyncPipelineProbed = true;
+        Log("HOOK_LOAD_PROBE: town knowledge sync complete");
+        Log("HOOK_LOAD_PROBE: heavy sync pipeline complete");
+      }
     }
+  }
+  if (probePostLoadPipeline) {
+    postLoadPipelineProbed = true;
+    Log("HOOK_LOAD_PROBE: warmed post-load pipeline complete");
   }
 
   if (world && worldFrameStable && g_enableBoredEvents) {
@@ -12754,11 +12539,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // Rename checks are now queued only for dialogue-tagged NPCs.
   // 4. Input Handling ??? Chat window hotkey
-  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow &&
-      !g_aiNpcInfoWindow) {
+  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow) {
     static DWORD lastTalkTick = 0;
     if (GetTickCount() - lastTalkTick > 500) {
       lastTalkTick = GetTickCount();
+      Log("UI: chat hotkey pressed [" + g_chatHotkeyStr + "].");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: closed STOBE menu before opening chat.");
+      }
       if (sel && (uintptr_t)sel > 0x1000) {
         Character *chatTarget = sel;
         if (sel->isPlayerCharacter()) {
@@ -12837,6 +12626,12 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
                                 : "Drifter";
         CreateChatUI(chatTarget->getName(), pName,
                      ToString(chatTarget->getHandle().serial));
+        Log("UI: CreateChatUI done target=" + chatTarget->getName());
+      } else {
+        EnterCriticalSection(&g_msgMutex);
+        g_messageQueue.push_back("NOTIFY:Select an NPC before opening chat.");
+        LeaveCriticalSection(&g_msgMutex);
+        Log("CHAT_OPEN: no selected character; chat open blocked");
       }
     }
   }

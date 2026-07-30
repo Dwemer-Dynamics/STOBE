@@ -102,15 +102,18 @@
     <ClCompile Include="src\\Functions.cpp" />
     <ClCompile Include="src\Globals.cpp" />
     <ClCompile Include="src\KenshiAiCompat.cpp" />
+    <ClCompile Include="src\JournalWindow.cpp" />
     <ClCompile Include="src\KenshiRvaCompat.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
+    <ClCompile Include="src\StobeChatMode.cpp" />
     <ClCompile Include="src\StobeIdentityRename.cpp" />
     <ClCompile Include="src\StobeText.cpp" />
     <ClCompile Include="src\StobeTiming.cpp" />
     <ClCompile Include="src\StartingWindow.cpp" />
     <ClCompile Include="src\Utils.cpp" />
     <ClCompile Include="src\WelcomeWindow.cpp" />
+    <ClCompile Include="src\WorldStateRuntime.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\AiNpcInfoWindow.h" />
@@ -129,14 +132,18 @@
     <ClInclude Include="src\\Functions.h" />
     <ClInclude Include="src\Globals.h" />
     <ClInclude Include="src\KenshiAiCompat.h" />
+    <ClInclude Include="src\JournalWindow.h" />
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\SettingsWindow.h" />
+    <ClInclude Include="src\StobeChatMode.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />
     <ClInclude Include="src\StobeText.h" />
     <ClInclude Include="src\StobeTiming.h" />
     <ClInclude Include="src\StartingWindow.h" />
     <ClInclude Include="src\Utils.h" />
     <ClInclude Include="src\WelcomeWindow.h" />
+    <ClInclude Include="src\WorldStateCatalog.h" />
+    <ClInclude Include="src\WorldStateRuntime.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

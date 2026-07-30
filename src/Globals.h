@@ -45,7 +45,9 @@ extern bool g_ttsEnabled;
 extern bool g_speedDialogue;
 extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;
+extern bool g_enableStatusHud;
 extern int g_dynamicProfileIntervalHours;
+extern std::string g_narratorDisplayName;
 
 // State tracking for inventory/debugger
 extern std::string g_activeInventoryJson;
@@ -130,11 +132,12 @@ struct QueuedAction {
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
+  bool narratorNotification; // Queue narrator popups with speech timing.
   std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
       : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
-        proximityMoveIssued(false) {}
+        proximityMoveIssued(false), narratorNotification(false) {}
 };
 
 struct PendingAutonomyCatalogMessage {
@@ -194,6 +197,8 @@ GameWorld *GetWorldSafe();
 LONG BeginChatInterruptGeneration();
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
+void SetNarratorDisplayName(const std::string &name);
+std::string GetNarratorDisplayName();
 
 void SetFollowTarget(unsigned int followerSerial, const hand &target);
 void ClearFollowTarget(unsigned int followerSerial);
