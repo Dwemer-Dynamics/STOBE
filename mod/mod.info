@@ -1,5 +1,5 @@
 name=Stobe
-version=0.9.3
+version=0.9.5
 author=Dwemer Dynamics
 category=Immersion
 description=LLM-powered NPC interaction for Kenshi via StobeServer. Requires RE_Kenshi.
