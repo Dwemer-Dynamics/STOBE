@@ -8294,6 +8294,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiDiaryText(data);
           } else if (command == "SET_STOBE_HISTORY") {
             SetRecentHistoryText(data);
+          } else if (command == "SET_PROFILE_MODEL") {
+            ApplyProfileModelSlotUpdate(data);
           } else if (command == "SET_CONFIG") {
             size_t colon = data.find(":");
             if (colon != std::string::npos) {
