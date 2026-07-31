@@ -20,3 +20,14 @@ bool ReadTownInstanceIdentity(void *townPointer, char *uid, size_t uidCapacity,
   *modIndex = static_cast<int>(identity.modIndex);
   return uid[0] != '\0';
 }
+
+bool ReadTownRuntimeStatus(void *townPointer, int *alarmState, float *radius) {
+  if (!townPointer || !alarmState || !radius) {
+    return false;
+  }
+
+  Town *town = static_cast<Town *>(townPointer);
+  *alarmState = static_cast<int>(town->getAlarmState());
+  *radius = town->getRadius();
+  return true;
+}

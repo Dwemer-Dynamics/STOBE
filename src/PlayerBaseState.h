@@ -8,6 +8,58 @@ class GameWorld;
 namespace Stobe {
 namespace PlayerBase {
 
+struct BaseDetails {
+  bool available;
+  bool scanTruncated;
+  std::string alarmState;
+  int hostilesInside;
+  int gatesTotal;
+  int damagedDefenses;
+  int destroyedDefenses;
+  int turretsTotal;
+  int turretsManned;
+  int turretsUnpowered;
+
+  int infrastructureTotal;
+  int storageBuildings;
+  int productionBuildings;
+  int farms;
+  int researchBenches;
+  int generators;
+  int batteries;
+  int beds;
+  int cages;
+  int damagedBuildings;
+  int destroyedBuildings;
+  int brokenBuildings;
+  int unpoweredBuildings;
+
+  int food;
+  int medicine;
+  int buildingMaterials;
+  int ironPlates;
+  int fuel;
+  int water;
+  int ammunition;
+
+  int productionTotal;
+  int productionActive;
+  int productionInputBlocked;
+  int productionOutputBlocked;
+  int productionUnpowered;
+  int productionStaffed;
+
+  int farmTotal;
+  int farmActive;
+  int farmNeedsWater;
+  int farmOutputFull;
+  int farmUnpowered;
+  int farmStaffed;
+
+  BaseDetails();
+  void Clear();
+};
+
 struct Snapshot {
   bool inside;
   std::string baseId;
@@ -26,6 +78,7 @@ struct Snapshot {
   bool hasGates;
   bool gatesClosed;
   int gameTs;
+  BaseDetails details;
 
   Snapshot();
   void Clear();
