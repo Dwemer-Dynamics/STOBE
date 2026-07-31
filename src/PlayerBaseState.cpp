@@ -2,6 +2,7 @@
 
 #include "Comm.h"
 #include "KenshiBuildingCompat.h"
+#include "KenshiBuildingStatus.h"
 #include "KenshiTownIdentity.h"
 #include "KenshiTownCompat.h"
 #include "Utils.h"
@@ -45,6 +46,7 @@ const DWORD kDetailsRefreshMs = 5000;
 const int kMaxBaseBuildings = 512;
 const int kMaxBaseCharacters = 256;
 const int kMaxSupplyItems = 2048;
+const size_t kMaxNamedGroups = 24;
 
 bool IsUsablePointer(const void *value) {
   return value && reinterpret_cast<uintptr_t>(value) > 0x1000;
@@ -69,6 +71,14 @@ int AddClamped(int current, int amount) {
 
 float SafeMetric(float value) {
   return _finite(value) && value > 0.0f ? value : 0.0f;
+}
+
+int AveragePercent(float total, int count, int maximum) {
+  if (count <= 0 || !_finite(total) || total <= 0.0f) {
+    return 0;
+  }
+  const int value = static_cast<int>((total / count) * 100.0f + 0.5f);
+  return std::max(0, std::min(maximum, value));
 }
 
 int ResolveGameTs(GameWorld *world) {
@@ -161,15 +171,36 @@ const char *AlarmStateName(int state) {
   }
 }
 
-bool IsInfrastructure(BuildingClassType classType,
-                      BuildingFunction functionType) {
-  if (classType != BCTYPE_FLUFF && classType != BCTYPE_DOOR &&
-      classType != BCTYPE_LIGHT) {
-    return true;
+std::string BuildingGroupName(const char *name,
+                              const std::string &fallback) {
+  if (name && name[0] != '\0') {
+    return name;
   }
-  return functionType != BF_ANY && functionType != BF_DOOR &&
-         functionType != BF_LIGHT && functionType != BF_TABLE &&
-         functionType != BF_CHAIR && functionType != BF_FLUFF;
+  return fallback;
+}
+
+template <typename T>
+T &NamedGroup(std::vector<T> &groups, const std::string &name) {
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (groups[i].name == name) {
+      return groups[i];
+    }
+  }
+
+  if (groups.size() < kMaxNamedGroups - 1) {
+    groups.push_back(T());
+    groups.back().name = name;
+    return groups.back();
+  }
+
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (groups[i].name == "Other") {
+      return groups[i];
+    }
+  }
+  groups.push_back(T());
+  groups.back().name = "Other";
+  return groups.back();
 }
 
 bool HasSupplyInventory(BuildingClassType classType,
@@ -182,9 +213,9 @@ bool HasSupplyInventory(BuildingClassType classType,
          functionType == BF_LIQUID_TANK || functionType == BF_GENERATOR;
 }
 
-void CaptureSupplyItem(Item *item, BaseDetails &details) {
+int CaptureSupplyItem(Item *item, BaseDetails &details) {
   if (!IsUsablePointer(item)) {
-    return;
+    return 0;
   }
 
   const int quantity = item->quantity > 0 ? item->quantity : 1;
@@ -217,6 +248,7 @@ void CaptureSupplyItem(Item *item, BaseDetails &details) {
   if (ContainsToken(identity, "water")) {
     details.water = AddClamped(details.water, quantity);
   }
+  return quantity;
 }
 
 bool IsBuildingInsideBase(Building *building, TownBase *base) {
@@ -228,42 +260,56 @@ bool IsBuildingInsideBase(Building *building, TownBase *base) {
          base->withinBordersRange(building->getPosition(), 1.05f);
 }
 
-void CaptureProductionStatus(Building *building, BuildingClassType classType,
+void CaptureProductionStatus(Building *building, const std::string &name,
                              bool destroyed, bool broken,
                              BaseDetails &details) {
-  ProductionBuilding *production = building->_NV_getProductionBuilding();
-  if (!IsUsablePointer(production)) {
+  ProductionRuntimeStatus status = {};
+  if (!ReadProductionRuntimeStatus(building, &status) || !status.available) {
     return;
   }
 
-  UseableStuff *usable = production->_NV_getUseableStuff();
-  const bool inputBlocked = production->_NV_isAnyInputsEmpty();
-  const bool outputBlocked = production->_NV_isProductionFull();
-  const bool unpowered =
-      IsUsablePointer(usable) && usable->_NV_isOutOfPower() > 0.0f;
-  const bool staffed =
-      IsUsablePointer(usable) && usable->getOccupant().isValid();
-  const bool idle =
-      IsUsablePointer(usable) && usable->_NV_dontNeedWorkRightNow();
-  const bool active = !destroyed && !broken && !inputBlocked &&
-                      !outputBlocked && !unpowered && !idle;
+  const bool active = !destroyed && !broken && !status.inputBlocked &&
+                      !status.outputBlocked && !status.unpowered &&
+                      !status.idle;
 
-  if (classType == BCTYPE_FARM) {
+  if (status.farm) {
     ++details.farmTotal;
     details.farmActive += active ? 1 : 0;
-    details.farmNeedsWater += inputBlocked ? 1 : 0;
-    details.farmOutputFull += outputBlocked ? 1 : 0;
-    details.farmUnpowered += unpowered ? 1 : 0;
-    details.farmStaffed += staffed ? 1 : 0;
+    details.farmNeedsWater += status.inputBlocked ? 1 : 0;
+    details.farmOutputFull += status.outputBlocked ? 1 : 0;
+    details.farmUnpowered += status.unpowered ? 1 : 0;
+    details.farmStaffed += status.staffed ? 1 : 0;
+    details.farmHydroponic += status.hydroponic ? 1 : 0;
+    details.farmYieldTotal += status.yield;
+
+    FarmGroup &group = NamedGroup(details.farmGroups, name);
+    ++group.total;
+    group.active += active ? 1 : 0;
+    group.needsWater += status.inputBlocked ? 1 : 0;
+    group.outputFull += status.outputBlocked ? 1 : 0;
+    group.unpowered += status.unpowered ? 1 : 0;
+    group.staffed += status.staffed ? 1 : 0;
+    group.hydroponic += status.hydroponic ? 1 : 0;
+    group.yieldTotal += status.yield;
     return;
   }
 
   ++details.productionTotal;
   details.productionActive += active ? 1 : 0;
-  details.productionInputBlocked += inputBlocked ? 1 : 0;
-  details.productionOutputBlocked += outputBlocked ? 1 : 0;
-  details.productionUnpowered += unpowered ? 1 : 0;
-  details.productionStaffed += staffed ? 1 : 0;
+  details.productionInputBlocked += status.inputBlocked ? 1 : 0;
+  details.productionOutputBlocked += status.outputBlocked ? 1 : 0;
+  details.productionUnpowered += status.unpowered ? 1 : 0;
+  details.productionStaffed += status.staffed ? 1 : 0;
+  details.productionEfficiencyTotal += status.efficiency;
+
+  ProductionGroup &group = NamedGroup(details.productionGroups, name);
+  ++group.total;
+  group.active += active ? 1 : 0;
+  group.inputBlocked += status.inputBlocked ? 1 : 0;
+  group.outputBlocked += status.outputBlocked ? 1 : 0;
+  group.unpowered += status.unpowered ? 1 : 0;
+  group.staffed += status.staffed ? 1 : 0;
+  group.efficiencyTotal += status.efficiency;
 }
 
 // Performs the expensive loaded-base scan behind a separate SEH boundary.
@@ -332,36 +378,61 @@ bool CaptureDetailsUnsafe(GameWorld *world, Character *actor, Town *town,
     const bool destroyed = building->_NV_isDestroyed();
     const bool broken = building->_NV_isBroken();
     const bool damaged = building->_NV_isDamaged();
-    UseableStuff *usable = building->_NV_getUseableStuff();
-    const bool unpowered =
-        IsUsablePointer(usable) && usable->_NV_isOutOfPower() > 0.0f;
+    char buildingNameBuffer[256] = {};
+    BuildingRuntimeStatus runtime = {};
+    ReadBuildingRuntimeStatus(building, buildingNameBuffer,
+                              sizeof(buildingNameBuffer), &runtime);
+    const std::string buildingName =
+        BuildingGroupName(buildingNameBuffer, "Unknown Structure");
+    const bool unpowered = runtime.useableAvailable && runtime.outOfPower;
+    const bool constructionComplete =
+        !runtime.constructionAvailable || runtime.constructionComplete;
 
-    const bool infrastructure = IsInfrastructure(classType, functionType);
-    if (infrastructure) {
-      ++details.infrastructureTotal;
+    if (runtime.constructionAvailable && !runtime.constructionComplete &&
+        !runtime.constructionDismantled) {
+      ++details.constructionTotal;
+      details.constructionPaused += runtime.constructionPaused ? 1 : 0;
+      details.constructionMissingMaterials +=
+          runtime.constructionMissingMaterials ? 1 : 0;
+      details.constructionProgressTotal += runtime.constructionProgress;
+      ConstructionGroup &group =
+          NamedGroup(details.constructionGroups, buildingName);
+      ++group.count;
+      group.paused += runtime.constructionPaused ? 1 : 0;
+      group.missingMaterials +=
+          runtime.constructionMissingMaterials ? 1 : 0;
+      group.progressTotal += runtime.constructionProgress;
+    }
+
+    if (constructionComplete) {
       details.damagedBuildings += damaged ? 1 : 0;
       details.destroyedBuildings += destroyed ? 1 : 0;
       details.brokenBuildings += broken ? 1 : 0;
       details.unpoweredBuildings += unpowered ? 1 : 0;
+      if (damaged || destroyed || broken || unpowered) {
+        InfrastructureIssueGroup &issue =
+            NamedGroup(details.infrastructureIssues, buildingName);
+        ++issue.count;
+        issue.damaged += damaged ? 1 : 0;
+        issue.destroyed += destroyed ? 1 : 0;
+        issue.broken += broken ? 1 : 0;
+        issue.unpowered += unpowered ? 1 : 0;
+      }
     }
-    details.storageBuildings +=
-        (classType == BCTYPE_STORAGE ||
-         functionType == BF_RESOURCE_STORAGE ||
-         functionType == BF_GENERAL_STORAGE)
-            ? 1
-            : 0;
-    details.productionBuildings +=
-        (classType == BCTYPE_PRODUCTION || classType == BCTYPE_CRAFTING ||
-         classType == BCTYPE_ITEM_FURNACE)
-            ? 1
-            : 0;
-    details.farms += classType == BCTYPE_FARM ? 1 : 0;
-    details.researchBenches += classType == BCTYPE_RESEARCH ? 1 : 0;
-    details.generators += functionType == BF_GENERATOR ? 1 : 0;
-    details.batteries += functionType == BF_BATTERY ? 1 : 0;
-    details.beds +=
-        (functionType == BF_BED || functionType == BF_SKELETON_BED) ? 1 : 0;
-    details.cages += functionType == BF_CAGE ? 1 : 0;
+
+    if (runtime.useableAvailable && runtime.needsPower) {
+      ++details.powerConsumers;
+      details.powerUnpowered += runtime.outOfPower ? 1 : 0;
+      details.powerSwitchedOff += !runtime.powerOn ? 1 : 0;
+    }
+    if (functionType == BF_GENERATOR) {
+      ++details.generatorsTotal;
+      details.generatorsActive +=
+          runtime.useableAvailable && runtime.powerOn &&
+                  !runtime.outOfPower && runtime.powerOutput > 0.0f
+              ? 1
+              : 0;
+    }
 
     const bool isGate =
         classType == BCTYPE_GATEWAY || functionType == BF_GATE;
@@ -379,11 +450,29 @@ bool CaptureDetailsUnsafe(GameWorld *world, Character *actor, Town *town,
     if (classType == BCTYPE_TURRET || functionType == BF_TURRET) {
       ++details.turretsTotal;
       details.turretsUnpowered += unpowered ? 1 : 0;
-      details.turretsManned +=
-          IsUsablePointer(usable) && usable->getOccupant().isValid() ? 1 : 0;
+      details.turretsManned += runtime.occupied ? 1 : 0;
     }
 
-    CaptureProductionStatus(building, classType, destroyed, broken, details);
+    if (functionType != BF_GENERATOR) {
+      CaptureProductionStatus(building, buildingName, destroyed, broken,
+                              details);
+    }
+
+    const bool dedicatedStorage =
+        classType == BCTYPE_STORAGE ||
+        functionType == BF_RESOURCE_STORAGE ||
+        functionType == BF_GENERAL_STORAGE ||
+        functionType == BF_LIQUID_TANK;
+    if (dedicatedStorage) {
+      ++details.storageTotal;
+      StorageGroup &storage =
+          NamedGroup(details.storageGroups, buildingName);
+      ++storage.total;
+      const bool storageFull =
+          runtime.storageAvailable && runtime.storageFull;
+      details.storageFull += storageFull ? 1 : 0;
+      storage.full += storageFull ? 1 : 0;
+    }
 
     if (!HasSupplyInventory(classType, functionType) ||
         supplyItemsScanned >= kMaxSupplyItems) {
@@ -394,13 +483,25 @@ bool CaptureDetailsUnsafe(GameWorld *world, Character *actor, Town *town,
       continue;
     }
     const lektor<Item *> &items = inventory->getAllItems();
+    int buildingItemUnits = 0;
     for (uint32_t itemIndex = 0; itemIndex < items.size(); ++itemIndex) {
       if (supplyItemsScanned >= kMaxSupplyItems) {
         details.scanTruncated = true;
         break;
       }
-      CaptureSupplyItem(items[itemIndex], details);
+      buildingItemUnits = AddClamped(
+          buildingItemUnits, CaptureSupplyItem(items[itemIndex], details));
       ++supplyItemsScanned;
+    }
+    if (dedicatedStorage) {
+      StorageGroup &storage =
+          NamedGroup(details.storageGroups, buildingName);
+      const bool storageEmpty = items.size() == 0;
+      details.storageEmpty += storageEmpty ? 1 : 0;
+      details.storageItemUnits =
+          AddClamped(details.storageItemUnits, buildingItemUnits);
+      storage.empty += storageEmpty ? 1 : 0;
+      storage.itemUnits = AddClamped(storage.itemUnits, buildingItemUnits);
     }
   }
 
@@ -567,9 +668,12 @@ std::string BuildDigest(const Snapshot &snapshot) {
          << (snapshot.details.available ? 1 : 0) << "|"
          << snapshot.details.alarmState << "|"
          << snapshot.details.hostilesInside << "|"
-         << snapshot.details.infrastructureTotal << "|"
          << snapshot.details.damagedBuildings << "|"
+         << snapshot.details.constructionTotal << "|"
+         << snapshot.details.constructionMissingMaterials << "|"
+         << snapshot.details.powerUnpowered << "|"
          << snapshot.details.food << "|" << snapshot.details.medicine << "|"
+         << snapshot.details.storageFull << "|"
          << snapshot.details.productionActive << "|"
          << snapshot.details.productionInputBlocked << "|"
          << snapshot.details.productionOutputBlocked << "|"
@@ -589,6 +693,23 @@ std::string BuildPresenceJson(const Snapshot &snapshot) {
 }
 } // namespace
 
+InfrastructureIssueGroup::InfrastructureIssueGroup()
+    : count(0), damaged(0), destroyed(0), broken(0), unpowered(0) {}
+
+ConstructionGroup::ConstructionGroup()
+    : count(0), paused(0), missingMaterials(0), progressTotal(0.0f) {}
+
+ProductionGroup::ProductionGroup()
+    : total(0), active(0), inputBlocked(0), outputBlocked(0), unpowered(0),
+      staffed(0), efficiencyTotal(0.0f) {}
+
+FarmGroup::FarmGroup()
+    : total(0), active(0), needsWater(0), outputFull(0), unpowered(0),
+      staffed(0), hydroponic(0), yieldTotal(0.0f) {}
+
+StorageGroup::StorageGroup()
+    : total(0), empty(0), full(0), itemUnits(0) {}
+
 BaseDetails::BaseDetails() { Clear(); }
 
 void BaseDetails::Clear() {
@@ -602,19 +723,21 @@ void BaseDetails::Clear() {
   turretsTotal = 0;
   turretsManned = 0;
   turretsUnpowered = 0;
-  infrastructureTotal = 0;
-  storageBuildings = 0;
-  productionBuildings = 0;
-  farms = 0;
-  researchBenches = 0;
-  generators = 0;
-  batteries = 0;
-  beds = 0;
-  cages = 0;
   damagedBuildings = 0;
   destroyedBuildings = 0;
   brokenBuildings = 0;
   unpoweredBuildings = 0;
+  infrastructureIssues.clear();
+  constructionTotal = 0;
+  constructionPaused = 0;
+  constructionMissingMaterials = 0;
+  constructionProgressTotal = 0.0f;
+  constructionGroups.clear();
+  powerConsumers = 0;
+  powerUnpowered = 0;
+  powerSwitchedOff = 0;
+  generatorsTotal = 0;
+  generatorsActive = 0;
   food = 0;
   medicine = 0;
   buildingMaterials = 0;
@@ -622,18 +745,28 @@ void BaseDetails::Clear() {
   fuel = 0;
   water = 0;
   ammunition = 0;
+  storageTotal = 0;
+  storageEmpty = 0;
+  storageFull = 0;
+  storageItemUnits = 0;
+  storageGroups.clear();
   productionTotal = 0;
   productionActive = 0;
   productionInputBlocked = 0;
   productionOutputBlocked = 0;
   productionUnpowered = 0;
   productionStaffed = 0;
+  productionEfficiencyTotal = 0.0f;
+  productionGroups.clear();
   farmTotal = 0;
   farmActive = 0;
   farmNeedsWater = 0;
   farmOutputFull = 0;
   farmUnpowered = 0;
   farmStaffed = 0;
+  farmHydroponic = 0;
+  farmYieldTotal = 0.0f;
+  farmGroups.clear();
 }
 
 Snapshot::Snapshot() { Clear(); }
@@ -705,20 +838,50 @@ std::string BuildJson(const Snapshot &snapshot) {
        << ",\"turrets_total\":" << snapshot.details.turretsTotal
        << ",\"turrets_manned\":" << snapshot.details.turretsManned
        << ",\"turrets_unpowered\":" << snapshot.details.turretsUnpowered
-       << "},\"infrastructure\":{\"total\":"
-       << snapshot.details.infrastructureTotal
-       << ",\"storage\":" << snapshot.details.storageBuildings
-       << ",\"production\":" << snapshot.details.productionBuildings
-       << ",\"farms\":" << snapshot.details.farms
-       << ",\"research\":" << snapshot.details.researchBenches
-       << ",\"generators\":" << snapshot.details.generators
-       << ",\"batteries\":" << snapshot.details.batteries
-       << ",\"beds\":" << snapshot.details.beds
-       << ",\"cages\":" << snapshot.details.cages
-       << ",\"damaged\":" << snapshot.details.damagedBuildings
+       << "},\"infrastructure\":{\"damaged\":"
+       << snapshot.details.damagedBuildings
        << ",\"destroyed\":" << snapshot.details.destroyedBuildings
        << ",\"broken\":" << snapshot.details.brokenBuildings
        << ",\"unpowered\":" << snapshot.details.unpoweredBuildings
+       << ",\"issues\":[";
+  for (size_t i = 0; i < snapshot.details.infrastructureIssues.size(); ++i) {
+    const InfrastructureIssueGroup &group =
+        snapshot.details.infrastructureIssues[i];
+    if (i > 0) {
+      json << ",";
+    }
+    json << "{\"name\":\"" << EscapeJSON(group.name)
+         << "\",\"count\":" << group.count
+         << ",\"damaged\":" << group.damaged
+         << ",\"destroyed\":" << group.destroyed
+         << ",\"broken\":" << group.broken
+         << ",\"unpowered\":" << group.unpowered << "}";
+  }
+  json << "]},\"construction\":{\"total\":"
+       << snapshot.details.constructionTotal
+       << ",\"paused\":" << snapshot.details.constructionPaused
+       << ",\"missing_materials\":"
+       << snapshot.details.constructionMissingMaterials
+       << ",\"average_progress\":"
+       << AveragePercent(snapshot.details.constructionProgressTotal,
+                         snapshot.details.constructionTotal, 100)
+       << ",\"groups\":[";
+  for (size_t i = 0; i < snapshot.details.constructionGroups.size(); ++i) {
+    const ConstructionGroup &group = snapshot.details.constructionGroups[i];
+    if (i > 0) {
+      json << ",";
+    }
+    json << "{\"name\":\"" << EscapeJSON(group.name)
+         << "\",\"count\":" << group.count << ",\"paused\":" << group.paused
+         << ",\"missing_materials\":" << group.missingMaterials
+         << ",\"average_progress\":"
+         << AveragePercent(group.progressTotal, group.count, 100) << "}";
+  }
+  json << "]},\"power\":{\"consumers\":" << snapshot.details.powerConsumers
+       << ",\"unpowered\":" << snapshot.details.powerUnpowered
+       << ",\"switched_off\":" << snapshot.details.powerSwitchedOff
+       << ",\"generators_total\":" << snapshot.details.generatorsTotal
+       << ",\"generators_active\":" << snapshot.details.generatorsActive
        << "},\"supplies\":{\"food\":" << snapshot.details.food
        << ",\"medicine\":" << snapshot.details.medicine
        << ",\"building_materials\":" << snapshot.details.buildingMaterials
@@ -726,19 +889,73 @@ std::string BuildJson(const Snapshot &snapshot) {
        << ",\"fuel\":" << snapshot.details.fuel
        << ",\"water\":" << snapshot.details.water
        << ",\"ammunition\":" << snapshot.details.ammunition
+       << "},\"storage\":{\"total\":" << snapshot.details.storageTotal
+       << ",\"empty\":" << snapshot.details.storageEmpty
+       << ",\"full\":" << snapshot.details.storageFull
+       << ",\"item_units\":" << snapshot.details.storageItemUnits
+       << ",\"groups\":[";
+  for (size_t i = 0; i < snapshot.details.storageGroups.size(); ++i) {
+    const StorageGroup &group = snapshot.details.storageGroups[i];
+    if (i > 0) {
+      json << ",";
+    }
+    json << "{\"name\":\"" << EscapeJSON(group.name)
+         << "\",\"total\":" << group.total << ",\"empty\":" << group.empty
+         << ",\"full\":" << group.full
+         << ",\"item_units\":" << group.itemUnits << "}";
+  }
+  json << "]"
        << "},\"production\":{\"total\":" << snapshot.details.productionTotal
        << ",\"active\":" << snapshot.details.productionActive
        << ",\"input_blocked\":" << snapshot.details.productionInputBlocked
        << ",\"output_blocked\":" << snapshot.details.productionOutputBlocked
        << ",\"unpowered\":" << snapshot.details.productionUnpowered
        << ",\"staffed\":" << snapshot.details.productionStaffed
-       << "},\"farms\":{\"total\":" << snapshot.details.farmTotal
+       << ",\"average_efficiency\":"
+       << AveragePercent(snapshot.details.productionEfficiencyTotal,
+                         snapshot.details.productionTotal, 1000)
+       << ",\"groups\":[";
+  for (size_t i = 0; i < snapshot.details.productionGroups.size(); ++i) {
+    const ProductionGroup &group = snapshot.details.productionGroups[i];
+    if (i > 0) {
+      json << ",";
+    }
+    json << "{\"name\":\"" << EscapeJSON(group.name)
+         << "\",\"total\":" << group.total << ",\"active\":" << group.active
+         << ",\"input_blocked\":" << group.inputBlocked
+         << ",\"output_blocked\":" << group.outputBlocked
+         << ",\"unpowered\":" << group.unpowered
+         << ",\"staffed\":" << group.staffed
+         << ",\"average_efficiency\":"
+         << AveragePercent(group.efficiencyTotal, group.total, 1000) << "}";
+  }
+  json << "]},\"farms\":{\"total\":" << snapshot.details.farmTotal
        << ",\"active\":" << snapshot.details.farmActive
        << ",\"needs_water\":" << snapshot.details.farmNeedsWater
        << ",\"output_full\":" << snapshot.details.farmOutputFull
        << ",\"unpowered\":" << snapshot.details.farmUnpowered
        << ",\"staffed\":" << snapshot.details.farmStaffed
-       << "}},\"observed_game_ts\":" << snapshot.gameTs << "}";
+       << ",\"hydroponic\":" << snapshot.details.farmHydroponic
+       << ",\"average_yield\":"
+       << AveragePercent(snapshot.details.farmYieldTotal,
+                         snapshot.details.farmTotal, 100)
+       << ",\"groups\":[";
+  for (size_t i = 0; i < snapshot.details.farmGroups.size(); ++i) {
+    const FarmGroup &group = snapshot.details.farmGroups[i];
+    if (i > 0) {
+      json << ",";
+    }
+    json << "{\"name\":\"" << EscapeJSON(group.name)
+         << "\",\"total\":" << group.total << ",\"active\":" << group.active
+         << ",\"needs_water\":" << group.needsWater
+         << ",\"output_full\":" << group.outputFull
+         << ",\"unpowered\":" << group.unpowered
+         << ",\"staffed\":" << group.staffed
+         << ",\"hydroponic\":" << group.hydroponic
+         << ",\"average_yield\":"
+         << AveragePercent(group.yieldTotal, group.total, 100) << "}";
+  }
+  json << "]}},\"observed_game_ts\":" << snapshot.gameTs << "}";
   return json.str();
 }
 

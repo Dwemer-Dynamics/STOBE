@@ -1,12 +1,71 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 class Character;
 class GameWorld;
 
 namespace Stobe {
 namespace PlayerBase {
+
+struct InfrastructureIssueGroup {
+  std::string name;
+  int count;
+  int damaged;
+  int destroyed;
+  int broken;
+  int unpowered;
+
+  InfrastructureIssueGroup();
+};
+
+struct ConstructionGroup {
+  std::string name;
+  int count;
+  int paused;
+  int missingMaterials;
+  float progressTotal;
+
+  ConstructionGroup();
+};
+
+struct ProductionGroup {
+  std::string name;
+  int total;
+  int active;
+  int inputBlocked;
+  int outputBlocked;
+  int unpowered;
+  int staffed;
+  float efficiencyTotal;
+
+  ProductionGroup();
+};
+
+struct FarmGroup {
+  std::string name;
+  int total;
+  int active;
+  int needsWater;
+  int outputFull;
+  int unpowered;
+  int staffed;
+  int hydroponic;
+  float yieldTotal;
+
+  FarmGroup();
+};
+
+struct StorageGroup {
+  std::string name;
+  int total;
+  int empty;
+  int full;
+  int itemUnits;
+
+  StorageGroup();
+};
 
 struct BaseDetails {
   bool available;
@@ -20,19 +79,23 @@ struct BaseDetails {
   int turretsManned;
   int turretsUnpowered;
 
-  int infrastructureTotal;
-  int storageBuildings;
-  int productionBuildings;
-  int farms;
-  int researchBenches;
-  int generators;
-  int batteries;
-  int beds;
-  int cages;
   int damagedBuildings;
   int destroyedBuildings;
   int brokenBuildings;
   int unpoweredBuildings;
+  std::vector<InfrastructureIssueGroup> infrastructureIssues;
+
+  int constructionTotal;
+  int constructionPaused;
+  int constructionMissingMaterials;
+  float constructionProgressTotal;
+  std::vector<ConstructionGroup> constructionGroups;
+
+  int powerConsumers;
+  int powerUnpowered;
+  int powerSwitchedOff;
+  int generatorsTotal;
+  int generatorsActive;
 
   int food;
   int medicine;
@@ -42,12 +105,20 @@ struct BaseDetails {
   int water;
   int ammunition;
 
+  int storageTotal;
+  int storageEmpty;
+  int storageFull;
+  int storageItemUnits;
+  std::vector<StorageGroup> storageGroups;
+
   int productionTotal;
   int productionActive;
   int productionInputBlocked;
   int productionOutputBlocked;
   int productionUnpowered;
   int productionStaffed;
+  float productionEfficiencyTotal;
+  std::vector<ProductionGroup> productionGroups;
 
   int farmTotal;
   int farmActive;
@@ -55,6 +126,9 @@ struct BaseDetails {
   int farmOutputFull;
   int farmUnpowered;
   int farmStaffed;
+  int farmHydroponic;
+  float farmYieldTotal;
+  std::vector<FarmGroup> farmGroups;
 
   BaseDetails();
   void Clear();

@@ -83,6 +83,7 @@ add_library(Stobe SHARED
   src/JournalWindow.cpp
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
+  src/KenshiBuildingStatus.cpp
   src/KenshiRvaCompat.cpp
   src/KenshiTownIdentity.cpp
   src/PlayerBaseState.cpp
