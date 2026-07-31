@@ -20,6 +20,7 @@ enum BuildingClassType {
   BCTYPE_FARM
 };
 
+class ProductionBuilding;
 class StorageBuilding;
 class UseableStuff;
 
@@ -27,10 +28,12 @@ class Building : public RootObject {
 public:
   BuildingFunction _NV_getSpecialFunction() const;
   bool _NV_isBroken() const;
+  bool _NV_isDamaged();
   bool _NV_isDestroyed() const;
   BuildingClassType _NV_getBuildingClass() const;
   TaskType _NV_getDefaultTask();
   StorageBuilding *_NV_getFunctionStuff();
+  ProductionBuilding *_NV_getProductionBuilding();
   UseableStuff *_NV_getUseableStuff();
   bool _NV_isPowerOn() const;
   void forceValidUsageNodesValidation();
@@ -41,9 +44,12 @@ class UseableStuff : public Building {
 public:
   UseableStuff *_NV_getUseableStuff();
   bool _NV_dontNeedWorkRightNow() const;
+  float _NV_isOutOfPower() const;
+  bool _NV_needPowerRightNow() const;
   float _NV_getPowerOutput() const;
   bool _NV_isPowerOn() const;
   TaskType _NV_getDefaultTask();
+  const hand &getOccupant() const;
 };
 
 class StorageBuilding : public UseableStuff {
