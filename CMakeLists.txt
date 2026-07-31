@@ -84,6 +84,8 @@ add_library(Stobe SHARED
   src/StartingWindow.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiRvaCompat.cpp
+  src/KenshiTownIdentity.cpp
+  src/PlayerBaseState.cpp
   src/StobeIdentityRename.cpp
   src/StobeChatMode.cpp
   src/StobeText.cpp
