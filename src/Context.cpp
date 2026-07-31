@@ -2,6 +2,7 @@
 #include "Functions.h"
 #include "Globals.h"
 #include "KenshiBuildingCompat.h"
+#include "PlayerBaseState.h"
 #include "KenshiWeatherCompat.h"
 #include "Utils.h"
 #include <kenshi/CharStats.h>
@@ -3571,6 +3572,10 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   std::string json = "{";
   // Write 'type' first so server routing can distinguish player vs NPC context
   json += "\"type\": \"" + type + "\",";
+  Stobe::PlayerBase::Snapshot playerBase;
+  Stobe::PlayerBase::Capture(world, npc, playerBase);
+  json += "\"player_base\":" +
+          Stobe::PlayerBase::BuildJson(playerBase) + ",";
   bool isPlayerCharacter = false;
   bool isAnimal = false;
   try {

@@ -4,6 +4,7 @@
 #include "Comm.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "PlayerBaseState.h"
 #include "StobeChatMode.h"
 #include "Utils.h"
 #include <algorithm>
@@ -433,11 +434,25 @@ void UpdateStatusHud(GameWorld *world) {
       "\nResponse: " + GetActiveProfileModelLabel() +
       "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
       "\nAI: " + aiStatus +
-      "\nSelected: " + selectedName +
-      "\nTargeted: " + targetedSummary;
+       "\nSelected: " + selectedName +
+       "\nTargeted: " + targetedSummary;
+  Stobe::PlayerBase::Snapshot playerBase;
+  const bool showPlayerBase =
+      Stobe::PlayerBase::GetSelectedSnapshot(playerBase) && playerBase.inside;
+  if (showPlayerBase) {
+    caption += "\nBase: " + playerBase.name + " | Power " +
+               ToString(static_cast<int>(playerBase.powerGenerated + 0.5f)) +
+               "/" +
+               ToString(static_cast<int>(playerBase.powerRequired + 0.5f));
+  }
   if (g_autoChatEnabled) {
     caption += "\nAuto Chat: On";
   }
+  g_statusHudWindow->setSize(
+      g_statusHudWindow->getWidth(),
+      showPlayerBase || g_autoChatEnabled
+          ? static_cast<int>(g_statusHudWindow->getParentSize().height * 0.19f)
+          : static_cast<int>(g_statusHudWindow->getParentSize().height * 0.17f));
   if (g_statusHudText) {
     g_statusHudText->setCaption(WideFromUtf8(caption).c_str());
   }

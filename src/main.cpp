@@ -24,6 +24,7 @@
 #include "AutonomySafetyProbe.h"
 #include "Globals.h"
 #include "KenshiTownCompat.h"
+#include "PlayerBaseState.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
 #include "WorldStateRuntime.h"
@@ -12170,6 +12171,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       ResetTownKnowledgeSyncState();
+      Stobe::PlayerBase::Reset();
       Stobe::WorldStateRuntime::Reset();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
@@ -12204,6 +12206,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_lastSelectionContextPushedSerial = 0;
     LeaveCriticalSection(&g_stateMutex);
     Stobe::WorldStateRuntime::Reset();
+    Stobe::PlayerBase::Reset();
     heavySweepPrimed = false;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
@@ -12278,8 +12281,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
   }
 
-  UpdateStatusHud(worldUi);
-
   bool probePostLoadPipeline = !postLoadPipelineProbed;
   if (probePostLoadPipeline) {
     Log("HOOK_LOAD_PROBE: entering warmed post-load pipeline");
@@ -12287,6 +12288,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::PlayerBase::Update(worldUi, sel);
+  UpdateStatusHud(worldUi);
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
