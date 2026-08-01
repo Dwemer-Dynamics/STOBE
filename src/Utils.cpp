@@ -527,6 +527,9 @@ void LoadStobeRuntimeConfig() {
   g_ttsEnabled =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "TtsEnabled", 1) !=
       0;
+  g_enableDialogueMenuTts =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableDialogueMenuTTS", 1) != 0;
   g_speedDialogue = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                                       "Speed Dialogue", 1) != 0;
   g_enableRegularDialogueCapture =
@@ -597,7 +600,8 @@ void LoadStobeRuntimeConfig() {
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
       ", ServerHost=" + g_serverHost +
       ", ServerPort=" + ToString(g_serverPort) +
-      ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+       ", DialogueMenuTTS=" + (g_enableDialogueMenuTts ? "true" : "false") +
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
       ", RegularDialogueCapture=" +
       (g_enableRegularDialogueCapture ? "true" : "false") +
@@ -651,7 +655,10 @@ void SaveStobeRuntimeConfig() {
                              ToString(g_ttsVolumePercent).c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "TtsEnabled",
-                             g_ttsEnabled ? "1" : "0", iniPath.c_str());
+                              g_ttsEnabled ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableDialogueMenuTTS",
+                             g_enableDialogueMenuTts ? "1" : "0",
+                             iniPath.c_str());
   WritePrivateProfileStringA("Settings", "Speed Dialogue",
                              g_speedDialogue ? "1" : "0", iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableRegularDialogueCapture",
