@@ -2518,7 +2518,9 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
 
   RaceData *race = npc->getRace() ? npc->getRace() : npc->myRace;
   std::string raceName = "Unknown";
+  bool raceIsRobot = false;
   if (race && (uintptr_t)race > 0x1000) {
+    raceIsRobot = race->robot;
     if (race->data && !race->data->name.empty()) {
       raceName = race->data->name;
     } else if (race->data && !race->data->stringID.empty()) {
@@ -2615,6 +2617,8 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
     json += "\"game_ts\":" + ToString(gameTs) + ",";
   }
   json += "\"race\":\"" + EscapeJSON(raceName) + "\",";
+  json += "\"race_is_robot\":" +
+          std::string(raceIsRobot ? "true" : "false") + ",";
   json += "\"faction\":\"" + EscapeJSON(factionName) + "\",";
   json += "\"factionID\":\"" + EscapeJSON(factionID) + "\",";
   json += "\"faction_id\":\"" + EscapeJSON(factionID) + "\",";
@@ -3779,13 +3783,17 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   }
 
   std::string raceName = "Unknown";
+  bool raceIsRobot = false;
   if (race && (uintptr_t)race > 0x1000) {
+    raceIsRobot = race->robot;
     if (race->data && !race->data->name.empty())
       raceName = race->data->name;
     else if (race->data && !race->data->stringID.empty())
       raceName = race->data->stringID;
   }
   json += "\"race\": \"" + EscapeJSON(raceName) + "\",";
+  json += "\"race_is_robot\": " +
+          std::string(raceIsRobot ? "true" : "false") + ",";
 
   // Robust Gender
   std::string gender = "male";
@@ -3964,7 +3972,9 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         // Robust Race Name
         RaceData *o_race = other->getRace() ? other->getRace() : other->myRace;
         std::string o_rn = "Unknown";
+        bool o_raceIsRobot = false;
         if (o_race && (uintptr_t)o_race > 0x1000) {
+          o_raceIsRobot = o_race->robot;
           if (o_race->data && !o_race->data->name.empty())
             o_rn = o_race->data->name;
           else if (o_race->data && !o_race->data->stringID.empty())
@@ -4101,6 +4111,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
 
         json += "{\"name\":\"" + EscapeJSON(o_name) + "\",";
         json += "\"race\":\"" + EscapeJSON(o_rn) + "\",";
+        json += "\"race_is_robot\":" +
+                std::string(o_raceIsRobot ? "true" : "false") + ",";
         json += "\"faction\":\"" + EscapeJSON(o_fn) + "\",";
         json += "\"factionID\":\"" + EscapeJSON(o_fid) + "\",";
         json += "\"faction_id\":\"" + EscapeJSON(o_fid) + "\",";
