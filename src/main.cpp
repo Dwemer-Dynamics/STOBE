@@ -15,6 +15,7 @@
 
 #include "Comm.h"
 #include "Context.h"
+#include "DialogueMenuTts.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? Kenshi engine writes MUST occur on the main thread inside hooks.
 #include <core/Functions.h>
@@ -11793,6 +11794,7 @@ void dialogueSayText_hook(Dialogue *dialogue, const std::string &line,
 
 void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
   std::string replyText = ResolveDialogueReplyTextByIndexSafe(dialogue, index);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedInt_orig) {
     dialogueReplyClickedInt_orig(dialogue, index);
   }
@@ -11804,6 +11806,7 @@ void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
 void dialogueReplyClickedString_hook(Dialogue *dialogue,
                                      const std::string &indexToken) {
   std::string replyText = ResolveDialogueReplyTextByTokenSafe(dialogue, indexToken);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedString_orig) {
     dialogueReplyClickedString_orig(dialogue, indexToken);
   }
@@ -12120,6 +12123,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
+    Stobe::DialogueMenuTts::Reset("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
@@ -12134,6 +12138,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!worldStable) {
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
+    Stobe::DialogueMenuTts::Reset("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12288,6 +12293,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
 

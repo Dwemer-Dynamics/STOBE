@@ -2,6 +2,7 @@
 #include "AudioPlayback.h"
 #include "ChatBox.h"
 #include "Comm.h"
+#include "DialogueMenuTts.h"
 #include "Globals.h"
 #include "JournalWindow.h"
 #include "StobeChatMode.h"
@@ -40,6 +41,7 @@ MyGUI::Button *g_autoChatToggle = nullptr;
 MyGUI::Button *g_boredEventsToggle = nullptr;
 MyGUI::Button *g_animalTalksToggle = nullptr;
 MyGUI::Button *g_ttsToggle = nullptr;
+MyGUI::Button *g_dialogueMenuTtsToggle = nullptr;
 MyGUI::Button *g_speedDialogueToggle = nullptr;
 MyGUI::Button *g_regularDialogueToggle = nullptr;
 MyGUI::Button *g_itemImageSyncToggle = nullptr;
@@ -50,6 +52,7 @@ bool g_pendingBoredEvents = true;
 bool g_pendingAnimalTalks = false;
 bool g_pendingNearestSpeaker = true;
 bool g_pendingTtsEnabled = true;
+bool g_pendingDialogueMenuTts = true;
 bool g_pendingSpeedDialogue = true;
 bool g_pendingRegularDialogueCapture = true;
 bool g_pendingItemImageSync = true;
@@ -212,6 +215,7 @@ void LoadPendingFromRuntime() {
   g_pendingAnimalTalks = g_enableAnimalTalks;
   g_pendingNearestSpeaker = g_useNearestPlayerSpeaker;
   g_pendingTtsEnabled = g_ttsEnabled;
+  g_pendingDialogueMenuTts = g_enableDialogueMenuTts;
   g_pendingSpeedDialogue = g_speedDialogue;
   g_pendingRegularDialogueCapture = g_enableRegularDialogueCapture;
   g_pendingItemImageSync = g_enableItemImageSync;
@@ -252,6 +256,8 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_boredEventsToggle, "Bored Events", g_pendingBoredEvents);
   SetToggleCaption(g_animalTalksToggle, "Animal Talks", g_pendingAnimalTalks);
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
+  SetToggleCaption(g_dialogueMenuTtsToggle, "RPG Dialogue TTS",
+                   g_pendingDialogueMenuTts);
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
                    g_pendingSpeedDialogue);
   SetToggleCaption(g_regularDialogueToggle, "Regular Dialogue",
@@ -289,7 +295,9 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   g_enableAnimalTalks = g_pendingAnimalTalks;
   g_useNearestPlayerSpeaker = g_pendingNearestSpeaker;
   bool previousTtsEnabled = g_ttsEnabled;
+  bool previousDialogueMenuTts = g_enableDialogueMenuTts;
   g_ttsEnabled = g_pendingTtsEnabled;
+  g_enableDialogueMenuTts = g_pendingDialogueMenuTts;
   g_speedDialogue = g_pendingSpeedDialogue;
   g_enableRegularDialogueCapture = g_pendingRegularDialogueCapture;
   g_enableItemImageSync = g_pendingItemImageSync;
@@ -323,6 +331,9 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   if (previousTtsEnabled && !g_ttsEnabled) {
     InterruptTtsPlayback();
     Log("CONFIG: TTS disabled from settings; active playback interrupted.");
+  }
+  if (previousDialogueMenuTts && !g_enableDialogueMenuTts) {
+    Stobe::DialogueMenuTts::Reset("setting_disabled");
   }
   RefreshChatModeControls();
   if (g_enableStatusHud) {
@@ -359,6 +370,12 @@ void OnPluginAnimalTalksToggleClick(MyGUI::Widget *sender) {
 void OnPluginTtsToggleClick(MyGUI::Widget *sender) {
   g_pendingTtsEnabled = !g_pendingTtsEnabled;
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
+}
+
+void OnPluginDialogueMenuTtsToggleClick(MyGUI::Widget *sender) {
+  g_pendingDialogueMenuTts = !g_pendingDialogueMenuTts;
+  SetToggleCaption(g_dialogueMenuTtsToggle, "RPG Dialogue TTS",
+                   g_pendingDialogueMenuTts);
 }
 
 void OnPluginSpeedDialogueToggleClick(MyGUI::Widget *sender) {
@@ -451,6 +468,7 @@ void CloseSettingsUI() {
   g_boredEventsToggle = nullptr;
   g_animalTalksToggle = nullptr;
   g_ttsToggle = nullptr;
+  g_dialogueMenuTtsToggle = nullptr;
   g_speedDialogueToggle = nullptr;
   g_regularDialogueToggle = nullptr;
   g_itemImageSyncToggle = nullptr;
@@ -657,6 +675,13 @@ void CreateSettingsUI() {
       "Stobe_Plugin_StatusHudToggle");
   g_statusHudToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginStatusHudToggleClick);
+
+  g_dialogueMenuTtsToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.67f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_DialogueMenuTtsToggle");
+  g_dialogueMenuTtsToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginDialogueMenuTtsToggleClick);
   y += toggleRowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Speaker Mode",

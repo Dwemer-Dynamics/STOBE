@@ -42,6 +42,7 @@ extern float g_speechBubbleLife;
 extern int g_rechatDispatchCooldownMs;
 extern int g_ttsVolumePercent;
 extern bool g_ttsEnabled;
+extern bool g_enableDialogueMenuTts;
 extern bool g_speedDialogue;
 extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;

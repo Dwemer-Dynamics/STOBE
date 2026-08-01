@@ -77,6 +77,7 @@ add_library(Stobe SHARED
   src/ChatBox.cpp
   src/Comm.cpp
   src/Context.cpp
+  src/DialogueMenuTts.cpp
   src/Functions.cpp
   src/Globals.cpp
   src/KenshiAiCompat.cpp
