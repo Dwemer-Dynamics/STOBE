@@ -256,7 +256,7 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_boredEventsToggle, "Bored Events", g_pendingBoredEvents);
   SetToggleCaption(g_animalTalksToggle, "Animal Talks", g_pendingAnimalTalks);
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
-  SetToggleCaption(g_dialogueMenuTtsToggle, "RPG Dialogue TTS",
+  SetToggleCaption(g_dialogueMenuTtsToggle, "Menu Dialogue TTS",
                    g_pendingDialogueMenuTts);
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
                    g_pendingSpeedDialogue);
@@ -374,7 +374,7 @@ void OnPluginTtsToggleClick(MyGUI::Widget *sender) {
 
 void OnPluginDialogueMenuTtsToggleClick(MyGUI::Widget *sender) {
   g_pendingDialogueMenuTts = !g_pendingDialogueMenuTts;
-  SetToggleCaption(g_dialogueMenuTtsToggle, "RPG Dialogue TTS",
+  SetToggleCaption(g_dialogueMenuTtsToggle, "Menu Dialogue TTS",
                    g_pendingDialogueMenuTts);
 }
 
