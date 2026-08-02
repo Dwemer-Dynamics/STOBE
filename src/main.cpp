@@ -12621,6 +12621,25 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         QueueIdentityRenameCandidate(chatTarget, "chat_open_target");
         SyncInventoryForCharacter(chatTarget, true, "chat_open");
 
+        bool chatTargetIsTrader = false;
+        try {
+          chatTargetIsTrader = !chatTarget->isPlayerCharacter() &&
+                               chatTarget->isATrader();
+        } catch (...) {
+          chatTargetIsTrader = false;
+        }
+        if (chatTargetIsTrader) {
+          bool capturedTraderInventory =
+              CaptureTraderInventorySnapshot(chatTarget, "chat_open");
+          Log("TRADER_INVENTORY_CAPTURE: chat-open target=" +
+              ResolveCharacterNameSafe(chatTarget) + " success=" +
+              std::string(capturedTraderInventory ? "1" : "0"));
+          if (capturedTraderInventory) {
+            PushImmediateContextSnapshot(chatTarget,
+                                         "chat_open_trade_capture", true);
+          }
+        }
+
         // Suppress vanilla dialogue state to prevent "double dialogue"
         if (chatTarget->dialogue && (uintptr_t)chatTarget->dialogue > 0x1000) {
           try {
