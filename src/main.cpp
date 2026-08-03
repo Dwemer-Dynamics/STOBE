@@ -4747,20 +4747,51 @@ static Character *ResolveNearestNpcTargetForSelection(GameWorld *world,
     world->getCharactersWithinSphere(nearby, selectedPos, searchRadius, 0.0f,
                                      0.0f, 0x10, 0, selected);
 
-    for (uint32_t i = 0; i < nearby.size(); ++i) {
-      Character *candidate = (Character *)nearby.stuff[i];
+    auto considerCandidate = [&](Character *candidate) {
       if (!IsAliveConsciousCharacterForTargeting(candidate) ||
           candidate == selected) {
-        continue;
+        return;
+      }
+      bool candidateIsAnimal = IsAnimalCharacterSafe(candidate);
+      if (candidateIsAnimal && !g_enableAnimalTalks) {
+        return;
       }
       if (!IsTargetAreaCompatibleForSelection(selected, candidate)) {
-        continue;
+        return;
       }
       float dist = candidate->getPosition().distance(selectedPos);
+      if (dist > searchRadius) {
+        return;
+      }
       if (!best || dist < bestDist) {
         best = candidate;
         bestDist = dist;
       }
+    };
+
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      considerCandidate((Character *)nearby.stuff[i]);
+    }
+
+    if (g_enableAnimalTalks) {
+      // Kenshi's sphere query can omit wildlife, so include loaded nearby
+      // animals explicitly when the user has enabled Animal Talks.
+      const ogre_unordered_set<Character *>::type &activeCharacters =
+          world->getCharacterUpdateList();
+      for (ogre_unordered_set<Character *>::type::const_iterator it =
+               activeCharacters.begin();
+           it != activeCharacters.end(); ++it) {
+        Character *candidate = *it;
+        if (!IsAnimalCharacterSafe(candidate)) {
+          continue;
+        }
+        considerCandidate(candidate);
+      }
+    }
+
+    if (best && IsAnimalCharacterSafe(best)) {
+      Log("ANIMAL_TALKS: nearest enabled animal target name=" +
+          best->getName() + " distance=" + ToString(bestDist));
     }
   } catch (...) {
     return nullptr;
