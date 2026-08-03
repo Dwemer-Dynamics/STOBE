@@ -4,6 +4,7 @@
 #include "Comm.h"
 #include "Context.h"
 #include "Globals.h"
+#include "StobeChatMode.h"
 #include "StobeText.h"
 #include <fstream>
 #include <iomanip>
@@ -322,21 +323,6 @@ int ReadLayeredIniInt(const std::string &baseIniPath,
   return GetPrivateProfileIntA(section, key, baseValue, customIniPath.c_str());
 }
 
-std::string NormalizeIniChatMode(const std::string &rawMode) {
-  std::string mode = rawMode;
-  std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-  if (mode == "whisper")
-    return "whisper";
-  if (mode == "shout")
-    return "shout";
-  if (mode == "cheat")
-    return "cheat";
-  if (mode == "narrator")
-    return "narrator";
-  if (mode == "chat" || mode == "talk")
-    return "chat";
-  return "chat";
-}
 } // namespace
 
 std::string SanitizeDialogueForEventStream(const std::string &value) {
@@ -512,7 +498,7 @@ void LoadStobeRuntimeConfig() {
       baseIniPath, customIniPath, "Settings", "GeneralHotkey", "="));
   SetHotkeyFromString(ReadLayeredIniString(baseIniPath, customIniPath,
                                            "Settings", "ChatHotkey", "/"));
-  g_chatMode = NormalizeIniChatMode(ReadLayeredIniString(
+  g_chatMode = Stobe::ChatMode::Normalize(ReadLayeredIniString(
       baseIniPath, customIniPath, "Settings", "ChatMode", "chat"));
   g_autoChatEnabled =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "AutoChat", 0) !=
@@ -523,16 +509,7 @@ void LoadStobeRuntimeConfig() {
   g_useNearestPlayerSpeaker =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                         "UseNearestPlayerSpeaker", 1) != 0;
-  if (g_chatMode == "whisper")
-    g_lastChatModeIndex = 1;
-  else if (g_chatMode == "shout")
-    g_lastChatModeIndex = 2;
-  else if (g_chatMode == "cheat")
-    g_lastChatModeIndex = 3;
-  else if (g_chatMode == "narrator")
-    g_lastChatModeIndex = 4;
-  else
-    g_lastChatModeIndex = 0;
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
 
   g_boredEventRange = (float)ReadLayeredIniInt(baseIniPath, customIniPath,
                                                 "Settings", "BoredEventRange", 200);
@@ -550,6 +527,9 @@ void LoadStobeRuntimeConfig() {
   g_ttsEnabled =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings", "TtsEnabled", 1) !=
       0;
+  g_enableDialogueMenuTts =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableDialogueMenuTTS", 1) != 0;
   g_speedDialogue = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                                       "Speed Dialogue", 1) != 0;
   g_enableRegularDialogueCapture =
@@ -558,6 +538,9 @@ void LoadStobeRuntimeConfig() {
   g_enableItemImageSync =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                         "EnableItemImageSync", 0) != 0;
+  g_enableStatusHud =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableStatusHud", 0) != 0;
   int boredEventIntervalHours = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
   if (boredEventIntervalHours < 1) {
@@ -617,11 +600,13 @@ void LoadStobeRuntimeConfig() {
       ", TTSVolume=" + ToString(g_ttsVolumePercent) +
       ", ServerHost=" + g_serverHost +
       ", ServerPort=" + ToString(g_serverPort) +
-      ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+       ", TtsEnabled=" + (g_ttsEnabled ? "true" : "false") +
+       ", DialogueMenuTTS=" + (g_enableDialogueMenuTts ? "true" : "false") +
       ", SpeedDialogue=" + (g_speedDialogue ? "true" : "false") +
       ", RegularDialogueCapture=" +
       (g_enableRegularDialogueCapture ? "true" : "false") +
-      ", ItemImageSync=" + (g_enableItemImageSync ? "true" : "false") +
+       ", ItemImageSync=" + (g_enableItemImageSync ? "true" : "false") +
+       ", StatusHud=" + (g_enableStatusHud ? "true" : "false") +
       ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
       ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
       "h" +
@@ -670,7 +655,10 @@ void SaveStobeRuntimeConfig() {
                              ToString(g_ttsVolumePercent).c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "TtsEnabled",
-                             g_ttsEnabled ? "1" : "0", iniPath.c_str());
+                              g_ttsEnabled ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableDialogueMenuTTS",
+                             g_enableDialogueMenuTts ? "1" : "0",
+                             iniPath.c_str());
   WritePrivateProfileStringA("Settings", "Speed Dialogue",
                              g_speedDialogue ? "1" : "0", iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableRegularDialogueCapture",
@@ -678,6 +666,9 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableItemImageSync",
                              g_enableItemImageSync ? "1" : "0",
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableStatusHud",
+                             g_enableStatusHud ? "1" : "0",
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
                              ToString(g_boredEventIntervalHours).c_str(),

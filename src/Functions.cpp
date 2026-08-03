@@ -1,5 +1,6 @@
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomyController.h"
 #include "Comm.h"
 #include "Context.h"
 #include "Globals.h"
@@ -2738,6 +2739,11 @@ static CloseActionApproachResult TryDeferCloseActionUntilInRange(
   if (!IsCloseActionApproachRetryableReason(rangeReason)) {
     return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
   }
+  if (!act.autonomyDecisionId.empty()) {
+    // Autonomy actions are only valid at the observed close range. Do not
+    // create an unowned approach/follow order that cannot be safely cancelled.
+    return CLOSE_ACTION_APPROACH_NOT_APPLICABLE;
+  }
 
   DWORD nowTick = GetTickCount();
   if (act.proximityStartTick == 0 || nowTick < act.proximityStartTick) {
@@ -5286,6 +5292,72 @@ std::string ToggleActionLabel(const std::string &command) {
   return "toggle";
 }
 
+bool EvaluateAutonomyQueuedActionPostcondition(
+    const QueuedAction &action, Character *actor, Character *target,
+    bool &successOut, std::string &reasonOut) {
+  successOut = false;
+  reasonOut = "action_postcondition_failed";
+  if (action.autonomyDecisionId.empty()) {
+    return false;
+  }
+  if (!actor || (uintptr_t)actor <= 0x1000) {
+    reasonOut = "selected_npc_not_loaded";
+    return true;
+  }
+  if (!target || (uintptr_t)target <= 0x1000) {
+    reasonOut = "target_not_loaded";
+    return true;
+  }
+  try {
+    if (action.type == ACT_KNOCKOUT) {
+      successOut = target->isUnconcious();
+      reasonOut =
+          successOut ? "target_unconscious" : "knockout_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_KILL) {
+      successOut = target->isDead();
+      reasonOut = successOut ? "target_dead" : "kill_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_REMOVE_LIMB) {
+      RobotLimbs::Limb limb = RobotLimbs::NULL_LIMB;
+      std::string limbName;
+      if (!ResolveRobotLimbFromCode(action.taskValue, limb, limbName) ||
+          limb == RobotLimbs::NULL_LIMB) {
+        reasonOut = "invalid_limb_code";
+        return true;
+      }
+      MedicalSystem *medical = target->getMedical();
+      if (!medical || (uintptr_t)medical <= 0x1000) {
+        reasonOut = "target_medical_unavailable";
+        return true;
+      }
+      const LimbState state = medical->getLimbState(limb);
+      successOut = state == LIMB_STUMP || state == LIMB_CRUSHED;
+      reasonOut = successOut ? "limb_removal_verified"
+                             : "limb_removal_postcondition_failed";
+      return true;
+    }
+    if (action.type == ACT_CUT_HORNS) {
+      float average = 0.0f;
+      std::string hornReason;
+      successOut = TryGetCharacterHornAverageInternal(
+                       target, average, hornReason) &&
+                   average >= kHornCutOffThreshold;
+      reasonOut =
+          successOut ? "horn_removal_verified"
+                     : (hornReason.empty() ? "horn_removal_postcondition_failed"
+                                           : hornReason);
+      return true;
+    }
+  } catch (...) {
+    reasonOut = "action_postcondition_exception";
+    return true;
+  }
+  return false;
+}
+
 void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static bool holdForTtsPlayback = false;
   static hand activeSpeechTarget;
@@ -5413,7 +5485,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       DWORD nowTick = GetTickCount();
       const QueuedAction &nextAction = g_uiActionQueue.front();
       bool nextActionIsSpeech =
-          nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS;
+          nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS ||
+          (nextAction.type == ACT_NOTIFY &&
+           nextAction.narratorNotification);
       if (nextActionIsSpeech && g_nextSpeechActionTick != 0 &&
           nowTick < g_nextSpeechActionTick) {
         break;
@@ -5440,7 +5514,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
       if (act.type == ACT_NOTIFY) {
         bool narratorPopupShown = false;
-        if (IsNarratorTimedPopupMessage(act.message)) {
+        if (act.narratorNotification ||
+            IsNarratorTimedPopupMessage(act.message)) {
           narratorPopupShown =
               ShowNarratorTimedPopup(act.message, ResolveSpeechQueueDelayMs(act));
         }
@@ -5459,19 +5534,40 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               " tts_dur_ms=" + ToString(act.taskValue) +
               " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
         }
+        if (act.narratorNotification) {
+          Log("ACTION_TIMING: NARRATOR_NOTIFY text_len=" +
+              ToString((int)act.message.length()) +
+              " utterance_id=" + act.utteranceId +
+              " tts_hash=" +
+              (hasTtsClip ? act.ttsHash.substr(0, 8) : "") +
+              " tts_dur_ms=" + ToString(act.taskValue) +
+              " popup_shown=" +
+              std::string(narratorPopupShown ? "1" : "0") +
+              " playbackQueued=" + std::string(playbackQueued ? "1" : "0"));
+        }
         if (playbackQueued) {
           blockSpeechQueue = true;
           holdForTtsPlayback = true;
           activeSpeechTarget = hand();
           activeSpeechTargetSerial = 0;
           speechDelayMs = 250;
+        } else if (act.narratorNotification) {
+          blockSpeechQueue = true;
+          speechDelayMs = ResolveSpeechQueueDelayMs(act);
         } else if (act.taskValue > 0) {
           blockSpeechQueue = true;
           speechDelayMs = static_cast<DWORD>(act.taskValue) + 120;
         }
+        if (act.narratorNotification && !act.utteranceId.empty()) {
+          PostSpeechDeliveryState(act.utteranceId, "spoken");
+        }
       } else if (act.type == ACT_SAY && target &&
-                 !IsCharacterUnavailableForDialogue(target)) {
+                 (act.allowUnavailableSpeech ||
+                  !IsCharacterUnavailableForDialogue(target))) {
         bool isPC = target->isPlayerCharacter();
+        bool forcedUnavailableSpeech =
+            act.allowUnavailableSpeech &&
+            IsCharacterUnavailableForDialogue(target);
         float appliedBubbleDuration = 0.0f;
         bool forcedSayFallback = false;
         bool speechExecuted = false;
@@ -5485,28 +5581,38 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           listenerForFacing = ResolveSpeechListenerForFacing(target);
         }
         Log("ACTION_EXEC: SAY [" + target->getName() + "]: " + act.message +
-            (isPC ? " (PC)" : " (NPC)"));
+            (isPC ? " (PC)" : " (NPC)") +
+            (forcedUnavailableSpeech ? " forced_unavailable=1" : ""));
         try {
           // If npc is in vanilla dialogue state, bubbles are often suppressed.
           // Force a reset if they seem stuck.
-          if (!isPC && target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
+          if (!forcedUnavailableSpeech && !isPC && target->dialogue &&
+              (uintptr_t)target->dialogue > 0x1000) {
             target->dialogue->endDialogue(true);
             target->dialogue->setInDialog(false);
           }
-          if (listenerForFacing) {
+          if (!forcedUnavailableSpeech && listenerForFacing) {
             TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
           }
 
-          // Primary method: sayALine (supports multiple lines/delays)
-          target->sayALine(act.message, !isPC);
-          speechExecuted = true;
-          if (listenerForFacing) {
-            TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+          if (forcedUnavailableSpeech) {
+            // Limb-removal reactions must survive the knockout caused by the
+            // action, but should not run normal conscious-dialogue behavior.
+            target->say(act.message);
+            speechExecuted = true;
+            forcedSayFallback = true;
+          } else {
+            // Primary method: sayALine (supports multiple lines/delays)
+            target->sayALine(act.message, !isPC);
+            speechExecuted = true;
+            if (listenerForFacing) {
+              TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+            }
+            // Force native floating text path as well. This is the most reliable
+            // way to surface overhead speech bubbles across player and NPC actors.
+            target->say(act.message);
+            forcedSayFallback = true;
           }
-          // Force native floating text path as well. This is the most reliable
-          // way to surface overhead speech bubbles across player and NPC actors.
-          target->say(act.message);
-          forcedSayFallback = true;
 
           // Keep bubble lifetime aligned to the dialogue line. Queue/audio
           // pacing is scaled separately by current game speed.
@@ -5569,6 +5675,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 " target_serial=" + ToString((int)act.target.serial) +
                 " camera_dist=" + ToString(ttsCameraDistance));
           }
+        }
+        if (forcedUnavailableSpeech && playbackQueued) {
+          speechExecuted = true;
         }
         Log("ACTION_TIMING: SAY target=" + target->getName() +
             " msg_len=" + ToString((int)act.message.length()) +
@@ -8945,6 +9054,14 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       }
       if (lockReacquired) {
         LeaveCriticalSection(&g_uiMutex);
+      }
+      if (!queueDeferredAction && !act.autonomyDecisionId.empty()) {
+        bool success = true;
+        std::string reason = "catalog_action_executed";
+        EvaluateAutonomyQueuedActionPostcondition(act, npc, target, success,
+                                                  reason);
+        ReportAutonomyActionExecutionResult(act.autonomyDecisionId, success,
+                                            reason);
       }
       if (blockSpeechQueue || deferActionQueue) {
         break;

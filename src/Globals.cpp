@@ -8,6 +8,7 @@
 GameWorld **ppWorld = nullptr;
 CRITICAL_SECTION g_LogMutex;
 std::deque<std::string> g_messageQueue;
+std::deque<PendingAutonomyCatalogMessage> g_pendingAutonomyCatalogMessages;
 CRITICAL_SECTION g_msgMutex;
 hand g_talkTargetHand;
 DWORD g_mainThreadId = 0;
@@ -33,10 +34,13 @@ float g_speechBubbleLife = 5.0f;
 int g_rechatDispatchCooldownMs = 350;
 int g_ttsVolumePercent = 100;
 bool g_ttsEnabled = true;
+bool g_enableDialogueMenuTts = true;
 bool g_speedDialogue = true;
 bool g_enableRegularDialogueCapture = false;
 bool g_enableItemImageSync = false;
+bool g_enableStatusHud = false;
 int g_dynamicProfileIntervalHours = 24;
+std::string g_narratorDisplayName = "The Narrator";
 
 std::string g_activeInventoryJson = "[]";
 hand g_lastInventoryHand;
@@ -46,6 +50,22 @@ std::string g_playerInventoryJson = "[]";
 hand g_playerHand;
 CRITICAL_SECTION g_stateMutex;
 
+void SetNarratorDisplayName(const std::string &name) {
+  if (name.empty()) {
+    return;
+  }
+  EnterCriticalSection(&g_stateMutex);
+  g_narratorDisplayName = name;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+std::string GetNarratorDisplayName() {
+  EnterCriticalSection(&g_stateMutex);
+  std::string value = g_narratorDisplayName;
+  LeaveCriticalSection(&g_stateMutex);
+  return value.empty() ? "The Narrator" : value;
+}
+
 std::deque<GameEvent> g_gameEvents;
 CRITICAL_SECTION g_eventMutex;
 
@@ -53,6 +73,75 @@ std::deque<QueuedAction> g_uiActionQueue;
 CRITICAL_SECTION g_uiMutex;
 std::map<unsigned int, hand> g_followTargets;
 std::map<unsigned int, TravelTarget> g_travelTargets;
+
+void RegisterPendingAutonomyCatalogMessage(const std::string &message,
+                                           const std::string &decisionId) {
+  if (message.empty() || decisionId.empty()) {
+    return;
+  }
+  PendingAutonomyCatalogMessage pending;
+  pending.message = message;
+  pending.decisionId = decisionId;
+  EnterCriticalSection(&g_msgMutex);
+  g_pendingAutonomyCatalogMessages.push_back(pending);
+  while (g_pendingAutonomyCatalogMessages.size() > 16) {
+    g_pendingAutonomyCatalogMessages.pop_front();
+  }
+  LeaveCriticalSection(&g_msgMutex);
+}
+
+bool ClaimPendingAutonomyCatalogMessageLocked(const std::string &message,
+                                              std::string &decisionIdOut) {
+  decisionIdOut.clear();
+  for (std::deque<PendingAutonomyCatalogMessage>::iterator it =
+           g_pendingAutonomyCatalogMessages.begin();
+       it != g_pendingAutonomyCatalogMessages.end(); ++it) {
+    if (it->message == message) {
+      decisionIdOut = it->decisionId;
+      g_pendingAutonomyCatalogMessages.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+void CancelPendingAutonomyCatalogDecision(const std::string &decisionId) {
+  if (decisionId.empty()) {
+    return;
+  }
+
+  EnterCriticalSection(&g_msgMutex);
+  for (std::deque<PendingAutonomyCatalogMessage>::iterator it =
+           g_pendingAutonomyCatalogMessages.begin();
+       it != g_pendingAutonomyCatalogMessages.end();) {
+    if (it->decisionId != decisionId) {
+      ++it;
+      continue;
+    }
+    const std::string message = it->message;
+    it = g_pendingAutonomyCatalogMessages.erase(it);
+    for (std::deque<std::string>::iterator messageIt = g_messageQueue.begin();
+         messageIt != g_messageQueue.end();) {
+      if (*messageIt == message) {
+        messageIt = g_messageQueue.erase(messageIt);
+      } else {
+        ++messageIt;
+      }
+    }
+  }
+  LeaveCriticalSection(&g_msgMutex);
+
+  EnterCriticalSection(&g_uiMutex);
+  for (std::deque<QueuedAction>::iterator it = g_uiActionQueue.begin();
+       it != g_uiActionQueue.end();) {
+    if (it->autonomyDecisionId == decisionId) {
+      it = g_uiActionQueue.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  LeaveCriticalSection(&g_uiMutex);
+}
 
 int g_chatHotkey = VK_OEM_2; // '/' by default
 std::string g_chatHotkeyStr = "/";
@@ -250,6 +339,7 @@ LONG BeginChatInterruptGeneration() {
                        return shouldRemove;
                      }),
       g_messageQueue.end());
+  g_pendingAutonomyCatalogMessages.clear();
   LeaveCriticalSection(&g_msgMutex);
 
   EnterCriticalSection(&g_uiMutex);

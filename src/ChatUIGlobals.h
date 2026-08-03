@@ -21,10 +21,13 @@ struct ChatTask {
 struct AiNpcInfoTask {
   std::string npcName;
   std::string json;
+  std::string requestKey;
 };
 
 struct AiDiaryTask {
   std::string json;
+  std::string requestKey;
+  std::string action;
 };
 
 // Shared across modules (e.g., Welcome and Settings share these)

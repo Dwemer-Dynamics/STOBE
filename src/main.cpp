@@ -15,14 +15,20 @@
 
 #include "Comm.h"
 #include "Context.h"
+#include "DialogueMenuTts.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? Kenshi engine writes MUST occur on the main thread inside hooks.
 #include <core/Functions.h>
 #include "Functions.h"
 #include "AudioPlayback.h"
+#include "AutonomyController.h"
+#include "AutonomySafetyProbe.h"
 #include "Globals.h"
+#include "KenshiTownCompat.h"
+#include "PlayerBaseState.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
+#include "WorldStateRuntime.h"
 
 #include <kenshi/CharStats.h>
 #include <kenshi/Character.h>
@@ -49,6 +55,8 @@
 #include <kenshi/RaceData.h>
 #include <kenshi/RootObject.h>
 #include <kenshi/RootObjectBase.h>
+#include <kenshi/SharedKing.h>
+#include <kenshi/Globals.h>
 #include <kenshi/WorldEventStateQuery.h>
 
 // Helper to safely get faction names for logging
@@ -685,20 +693,6 @@ static std::string TrimCopy(const std::string &value) {
   return value.substr(start, end - start + 1);
 }
 
-struct WorldStateSerializeStats {
-  int queryCount;
-  int npcAreCount;
-  int npcAreNotCount;
-  int townCount;
-  int allyCount;
-  int enemyCount;
-  bool truncated;
-
-  WorldStateSerializeStats()
-      : queryCount(0), npcAreCount(0), npcAreNotCount(0), townCount(0),
-        allyCount(0), enemyCount(0), truncated(false) {}
-};
-
 static int ResolveCurrentGameTsSafe(GameWorld *world) {
   if (!world || (uintptr_t)world <= 0x1000) {
     return 0;
@@ -710,52 +704,6 @@ static int ResolveCurrentGameTsSafe(GameWorld *world) {
       return 0;
     }
     return gameTs;
-  } catch (...) {
-    return 0;
-  }
-}
-
-static const char *WorldStateEnumToText(WorldStateEnum state) {
-  switch (state) {
-  case DEAD:
-    return "dead";
-  case ALIVE:
-    return "alive";
-  case IMPRISONED:
-    return "imprisoned";
-  default:
-    return "unknown";
-  }
-}
-
-static std::string SafeGameDataName(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return "";
-  }
-  try {
-    return TrimCopy(data->name);
-  } catch (...) {
-    return "";
-  }
-}
-
-static std::string SafeGameDataStringId(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return "";
-  }
-  try {
-    return TrimCopy(data->stringID);
-  } catch (...) {
-    return "";
-  }
-}
-
-static int SafeGameDataNumericId(GameData *data) {
-  if (!data || (uintptr_t)data <= 0x1000) {
-    return 0;
-  }
-  try {
-    return (int)data->id;
   } catch (...) {
     return 0;
   }
@@ -879,264 +827,6 @@ static bool IsFactionRelationEntryDifferent(
     return true;
   }
   return false;
-}
-
-static std::string BuildWorldStateEntityRulesJson(
-    const ogre_unordered_map<GameData *, WorldStateEnum>::type &source,
-    int &counter, bool &truncated) {
-  static const size_t kRuleHardCap = 8192;
-  std::string json = "[";
-  bool first = true;
-  size_t seen = 0;
-  for (auto it = source.begin(); it != source.end(); ++it) {
-    if (seen >= kRuleHardCap) {
-      truncated = true;
-      break;
-    }
-    ++seen;
-    GameData *data = it->first;
-    if (!data || (uintptr_t)data <= 0x1000) {
-      continue;
-    }
-    std::string name = SafeGameDataName(data);
-    std::string sid = SafeGameDataStringId(data);
-    int numericId = SafeGameDataNumericId(data);
-    if (name.empty() && sid.empty() && numericId <= 0) {
-      continue;
-    }
-    if (!first) {
-      json += ",";
-    }
-    first = false;
-    json += "{";
-    json += "\"name\":\"" + EscapeJSON(name) + "\",";
-    json += "\"string_id\":\"" + EscapeJSON(sid) + "\",";
-    json += "\"numeric_id\":" + ToString(numericId) + ",";
-    json += "\"state\":\"" +
-            std::string(WorldStateEnumToText((WorldStateEnum)it->second)) + "\"";
-    json += "}";
-    counter += 1;
-  }
-  json += "]";
-  return json;
-}
-
-static std::string BuildWorldStateFactionRulesJson(
-    const ogre_unordered_map<Faction *, bool>::type &source,
-    const std::string &valueKey, int &counter, bool &truncated) {
-  static const size_t kRuleHardCap = 8192;
-  std::string json = "[";
-  bool first = true;
-  size_t seen = 0;
-  for (auto it = source.begin(); it != source.end(); ++it) {
-    if (seen >= kRuleHardCap) {
-      truncated = true;
-      break;
-    }
-    ++seen;
-    Faction *faction = it->first;
-    if (!faction || (uintptr_t)faction <= 0x1000) {
-      continue;
-    }
-    std::string factionName = SafeFactionName(faction);
-    if (factionName.empty()) {
-      continue;
-    }
-    if (!first) {
-      json += ",";
-    }
-    first = false;
-    json += "{";
-    json += "\"name\":\"" + EscapeJSON(factionName) + "\",";
-    json += "\"" + EscapeJSON(valueKey) + "\":" +
-            std::string(it->second ? "true" : "false");
-    json += "}";
-    counter += 1;
-  }
-  json += "]";
-  return json;
-}
-
-static std::vector<GameData *> g_worldStateQuerySources;
-static DWORD g_lastWorldStateSourceScanTick = 0;
-
-static void RefreshWorldStateQuerySources(GameWorld *world, bool forceRefresh) {
-  const DWORD now = GetTickCount();
-  const DWORD kScanIntervalMs = 180000;
-  if (!forceRefresh && !g_worldStateQuerySources.empty() &&
-      now - g_lastWorldStateSourceScanTick < kScanIntervalMs) {
-    return;
-  }
-  g_lastWorldStateSourceScanTick = now;
-
-  g_worldStateQuerySources.clear();
-  if (!world || (uintptr_t)world <= 0x1000) {
-    return;
-  }
-
-  size_t scanned = 0;
-  size_t matched = 0;
-  bool truncated = false;
-  static const size_t kDataScanHardCap = 50000;
-  std::set<uintptr_t> seen;
-  try {
-    const ogre_unordered_map<int, GameData *>::type &allData =
-        world->gamedata._getAllData();
-    for (auto it = allData.begin(); it != allData.end(); ++it) {
-      if (scanned >= kDataScanHardCap) {
-        truncated = true;
-        break;
-      }
-      ++scanned;
-      GameData *data = it->second;
-      if (!data || (uintptr_t)data <= 0x1000) {
-        continue;
-      }
-
-      WorldEventStateQuery *query = nullptr;
-      try {
-        query = WorldEventStateQuery::getFromData(data);
-      } catch (...) {
-        query = nullptr;
-      }
-      if (!query || (uintptr_t)query <= 0x1000) {
-        continue;
-      }
-
-      uintptr_t key = (uintptr_t)data;
-      if (seen.insert(key).second) {
-        g_worldStateQuerySources.push_back(data);
-        matched += 1;
-      }
-    }
-  } catch (...) {
-    truncated = true;
-  }
-
-  Log("WORLD_STATE_SYNC: source_scan scanned=" + ToString((int)scanned) +
-      " matched=" + ToString((int)matched) +
-      " truncated=" + std::string(truncated ? "1" : "0"));
-}
-
-static std::string BuildWorldStateSnapshotJson(GameWorld *world,
-                                               WorldStateSerializeStats &stats) {
-  stats = WorldStateSerializeStats();
-  std::string json = "{";
-  json += "\"source\":\"world_event_state_query\",";
-  json += "\"game_ts\":" + ToString(ResolveCurrentGameTsSafe(world)) + ",";
-  json += "\"queries\":[";
-
-  bool firstQuery = true;
-  static const size_t kQueryHardCap = 8192;
-  size_t querySeen = 0;
-
-  RefreshWorldStateQuerySources(world, false);
-  if (g_worldStateQuerySources.empty()) {
-    RefreshWorldStateQuerySources(world, true);
-  }
-
-  try {
-    for (auto it = g_worldStateQuerySources.begin();
-         it != g_worldStateQuerySources.end(); ++it) {
-      if (querySeen >= kQueryHardCap) {
-        stats.truncated = true;
-        break;
-      }
-      ++querySeen;
-
-      GameData *queryData = *it;
-      if (!queryData || (uintptr_t)queryData <= 0x1000) {
-        continue;
-      }
-      WorldEventStateQuery *query = nullptr;
-      try {
-        query = WorldEventStateQuery::getFromData(queryData);
-      } catch (...) {
-        query = nullptr;
-      }
-      if (!query || (uintptr_t)query <= 0x1000) {
-        continue;
-      }
-
-      std::string queryName = SafeGameDataName(queryData);
-      std::string querySid = SafeGameDataStringId(queryData);
-      int queryNumericId = SafeGameDataNumericId(queryData);
-
-      std::string uniqueNpcAre = "[]";
-      std::string uniqueNpcAreNot = "[]";
-      std::string towns = "[]";
-      std::string allyOf = "[]";
-      std::string enemyOf = "[]";
-
-      try {
-        uniqueNpcAre = BuildWorldStateEntityRulesJson(query->uniqueNPCsAre,
-                                                      stats.npcAreCount,
-                                                      stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        uniqueNpcAreNot = BuildWorldStateEntityRulesJson(query->uniqueNPCsAreNot,
-                                                         stats.npcAreNotCount,
-                                                         stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        towns = BuildWorldStateEntityRulesJson(query->towns, stats.townCount,
-                                               stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        allyOf = BuildWorldStateFactionRulesJson(query->isAllyOf, "is_ally",
-                                                 stats.allyCount,
-                                                 stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-      try {
-        enemyOf = BuildWorldStateFactionRulesJson(query->isEnemyOf, "is_enemy",
-                                                  stats.enemyCount,
-                                                  stats.truncated);
-      } catch (...) {
-        stats.truncated = true;
-      }
-
-      if (!firstQuery) {
-        json += ",";
-      }
-      firstQuery = false;
-
-      json += "{";
-      json += "\"query_name\":\"" + EscapeJSON(queryName) + "\",";
-      json += "\"query_string_id\":\"" + EscapeJSON(querySid) + "\",";
-      json += "\"query_numeric_id\":" + ToString(queryNumericId) + ",";
-      json += "\"player_involvement\":" +
-              std::string(query->playerInvolvement ? "true" : "false") + ",";
-      json += "\"unique_npcs_are\":" + uniqueNpcAre + ",";
-      json += "\"unique_npcs_are_not\":" + uniqueNpcAreNot + ",";
-      json += "\"towns\":" + towns + ",";
-      json += "\"is_ally_of\":" + allyOf + ",";
-      json += "\"is_enemy_of\":" + enemyOf;
-      json += "}";
-      stats.queryCount += 1;
-    }
-  } catch (...) {
-    stats.truncated = true;
-  }
-
-  json += "],";
-  json += "\"query_count\":" + ToString(stats.queryCount) + ",";
-  json += "\"npc_are_count\":" + ToString(stats.npcAreCount) + ",";
-  json += "\"npc_are_not_count\":" + ToString(stats.npcAreNotCount) + ",";
-  json += "\"town_count\":" + ToString(stats.townCount) + ",";
-  json += "\"ally_count\":" + ToString(stats.allyCount) + ",";
-  json += "\"enemy_count\":" + ToString(stats.enemyCount) + ",";
-  json += "\"truncated\":" + std::string(stats.truncated ? "true" : "false");
-  json += "}";
-
-  return json;
 }
 
 static bool LooksLikeDialogueTemplateToken(const std::string &value) {
@@ -1821,13 +1511,13 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.9.1";
-static const char *kStobePluginReleaseDate = "2026-06-11";
+static const char *kStobePluginVersion = "1.0.0";
+static const char *kStobePluginReleaseDate = "2026-08-01";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
 static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
-static const DWORD kNpcWorldEventWarmupMs = 10 * 1000;
+static const DWORD kNpcWorldEventWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
 static bool g_dynamicProfileIntervalSyncHasValue = false;
@@ -1859,6 +1549,12 @@ static std::map<std::string, FactionRelationSnapshotEntry>
 static DWORD g_lastFactionRelationSyncTick = 0;
 static const DWORD kFactionRelationSyncIntervalMs = 30 * 1000;
 static const size_t kFactionRelationSyncHardCap = 262144;
+static DWORD g_lastTownKnowledgeScanTick = 0;
+static DWORD g_lastTownKnowledgeSentTick = 0;
+static std::string g_lastTownKnowledgeDigest = "";
+static const DWORD kTownKnowledgeScanIntervalMs = 30 * 1000;
+static const DWORD kTownKnowledgeResendIntervalMs = 5 * 60 * 1000;
+static const size_t kTownKnowledgeHardCap = 512;
 
 const char *GetStobePluginVersion() {
   return kStobePluginVersion ? kStobePluginVersion : "";
@@ -2711,6 +2407,14 @@ static void ResetFactionRelationSyncState() {
   EnterCriticalSection(&g_stateMutex);
   g_factionRelationStateByKey.clear();
   g_lastFactionRelationSyncTick = 0;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+static void ResetTownKnowledgeSyncState() {
+  EnterCriticalSection(&g_stateMutex);
+  g_lastTownKnowledgeScanTick = 0;
+  g_lastTownKnowledgeSentTick = 0;
+  g_lastTownKnowledgeDigest = "";
   LeaveCriticalSection(&g_stateMutex);
 }
 
@@ -4867,6 +4571,21 @@ static bool IsAliveConsciousCharacterForTargeting(Character *npc) {
   return true;
 }
 
+static float ResolveTargetingDistance(Character *anchor, Character *candidate) {
+  float distance = anchor->getPosition().distance(candidate->getPosition());
+  if (!IsAnimalCharacterSafe(candidate)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = anchor->getRadius() + candidate->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
+}
+
 static Character *ResolveFirstAliveConsciousPlayerCharacter(GameWorld *world) {
   if (!world || !world->player) {
     return nullptr;
@@ -5019,6 +4738,11 @@ static bool IsTargetAreaCompatibleForSelection(Character *anchor,
   if (candidateHasBuilding) {
     return false;
   }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate)) {
+    // Outdoor wildlife can report terrain levels as floors. Use distance when
+    // both actors are outside instead of rejecting the animal as another level.
+    return true;
+  }
   if (candidateFloor > anchorFloor + 1) {
     return false;
   }
@@ -5043,20 +4767,51 @@ static Character *ResolveNearestNpcTargetForSelection(GameWorld *world,
     world->getCharactersWithinSphere(nearby, selectedPos, searchRadius, 0.0f,
                                      0.0f, 0x10, 0, selected);
 
-    for (uint32_t i = 0; i < nearby.size(); ++i) {
-      Character *candidate = (Character *)nearby.stuff[i];
+    auto considerCandidate = [&](Character *candidate) {
       if (!IsAliveConsciousCharacterForTargeting(candidate) ||
           candidate == selected) {
-        continue;
+        return;
+      }
+      bool candidateIsAnimal = IsAnimalCharacterSafe(candidate);
+      if (candidateIsAnimal && !g_enableAnimalTalks) {
+        return;
       }
       if (!IsTargetAreaCompatibleForSelection(selected, candidate)) {
-        continue;
+        return;
       }
-      float dist = candidate->getPosition().distance(selectedPos);
+      float dist = ResolveTargetingDistance(selected, candidate);
+      if (dist > searchRadius) {
+        return;
+      }
       if (!best || dist < bestDist) {
         best = candidate;
         bestDist = dist;
       }
+    };
+
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      considerCandidate((Character *)nearby.stuff[i]);
+    }
+
+    if (g_enableAnimalTalks) {
+      // Kenshi's sphere query can omit wildlife, so include loaded nearby
+      // animals explicitly when the user has enabled Animal Talks.
+      const ogre_unordered_set<Character *>::type &activeCharacters =
+          world->getCharacterUpdateList();
+      for (ogre_unordered_set<Character *>::type::const_iterator it =
+               activeCharacters.begin();
+           it != activeCharacters.end(); ++it) {
+        Character *candidate = *it;
+        if (!IsAnimalCharacterSafe(candidate)) {
+          continue;
+        }
+        considerCandidate(candidate);
+      }
+    }
+
+    if (best && IsAnimalCharacterSafe(best)) {
+      Log("ANIMAL_TALKS: nearest enabled animal target name=" +
+          best->getName() + " distance=" + ToString(bestDist));
     }
   } catch (...) {
     return nullptr;
@@ -7409,7 +7164,103 @@ static void RunFactionRelationSync(GameWorld *world) {
       " truncated=" + std::string(truncated ? "1" : "0"));
 }
 
-static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+static void RunTownKnowledgeSync(GameWorld *world) {
+  if (!world || (uintptr_t)world < 0x1000 || !shou ||
+      (uintptr_t)shou < 0x1000 || !shou->townList ||
+      (uintptr_t)shou->townList < 0x1000) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  if (g_lastTownKnowledgeScanTick != 0 &&
+      (nowTick - g_lastTownKnowledgeScanTick) <
+          kTownKnowledgeScanIntervalMs) {
+    return;
+  }
+  g_lastTownKnowledgeScanTick = nowTick;
+
+  if (!HasRecentDwemerDistroConnection(kRecentServerSuccessGraceMs)) {
+    return;
+  }
+
+  lektor<RootObject *> *allTowns = nullptr;
+  try {
+    allTowns = &shou->townList->getAllTowns();
+  } catch (...) {
+    allTowns = nullptr;
+  }
+  if (!allTowns) {
+    return;
+  }
+
+  std::string townsJson = "[";
+  size_t emitted = 0;
+  const uint32_t count = allTowns->count;
+  for (uint32_t i = 0; i < count && emitted < kTownKnowledgeHardCap; ++i) {
+    RootObject *object = allTowns->stuff[i];
+    if (!object || (uintptr_t)object < 0x1000) {
+      continue;
+    }
+
+    TownBase *townBase = nullptr;
+    bool discovered = false;
+    bool explored = false;
+    std::string name;
+    Ogre::Vector3 position = Ogre::Vector3::ZERO;
+    try {
+      if (object->getDataType() != TOWN) {
+        continue;
+      }
+      townBase = static_cast<TownBase *>(object);
+      discovered = townBase->_NV_isDiscovered();
+      explored = townBase->_NV_isExplored();
+      if (!discovered) {
+        continue;
+      }
+      name = TrimCopy(townBase->getKnownName());
+      if (name.empty()) {
+        continue;
+      }
+      position = object->getPosition();
+    } catch (...) {
+      continue;
+    }
+
+    if (emitted > 0) {
+      townsJson += ",";
+    }
+    townsJson += "{\"name\":\"" + EscapeJSON(name) + "\",";
+    townsJson += "\"x\":" + ToString(position.x) + ",";
+    townsJson += "\"y\":" + ToString(position.y) + ",";
+    townsJson += "\"z\":" + ToString(position.z) + ",";
+    townsJson += "\"discovered\":true,";
+    townsJson +=
+        "\"explored\":" + std::string(explored ? "true" : "false") + "}";
+    ++emitted;
+  }
+  townsJson += "]";
+
+  const bool changed = townsJson != g_lastTownKnowledgeDigest;
+  const bool resendDue = g_lastTownKnowledgeSentTick == 0 ||
+                         (nowTick - g_lastTownKnowledgeSentTick) >=
+                             kTownKnowledgeResendIntervalMs;
+  if (!changed && !resendDue) {
+    return;
+  }
+
+  const int gameTs = ResolveCurrentGameTsSafe(world);
+  std::string payload = "{\"source\":\"kenshi_town_list\",";
+  payload += "\"game_ts\":" + ToString(gameTs) + ",";
+  payload += "\"towns\":" + townsJson + "}";
+  AsyncPostToStobe(L"/town_knowledge", payload);
+  g_lastTownKnowledgeDigest = townsJson;
+  g_lastTownKnowledgeSentTick = nowTick;
+  Log("TOWN_KNOWLEDGE_SYNC: sent discovered=" + ToString((int)emitted) +
+      " scanned=" + ToString((int)count) +
+      " changed=" + std::string(changed ? "1" : "0"));
+}
+
+static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
   }
@@ -7949,6 +7800,22 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   }
 }
 
+static volatile LONG g_npcWorldEventSweepSehCount = 0;
+static DWORD g_npcWorldEventSweepLastSehCode = 0;
+
+static int NpcWorldEventSweepSehFilter(unsigned int code) {
+  g_npcWorldEventSweepLastSehCode = code;
+  InterlockedIncrement(&g_npcWorldEventSweepSehCount);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
+  __try {
+    RunNpcWorldEventSweepUnsafe(world, selection);
+  } __except (NpcWorldEventSweepSehFilter(GetExceptionCode())) {
+  }
+}
+
 static void RunInventorySyncSweep(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
@@ -8425,6 +8292,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
     while (!g_messageQueue.empty()) {
       std::string msg = g_messageQueue.front();
       g_messageQueue.pop_front();
+      std::string autonomyDecisionId;
+      const bool autonomyCatalogMessage =
+          ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);
+      size_t autonomyQueueSizeBefore = 0;
+      if (autonomyCatalogMessage) {
+        EnterCriticalSection(&g_uiMutex);
+        autonomyQueueSizeBefore = g_uiActionQueue.size();
+        LeaveCriticalSection(&g_uiMutex);
+      }
       Log("HOOK_MSG_PROC: Processing: " + msg);
 
       bool isNPCAction = (msg.find("NPC_ACTION: ") == 0);
@@ -8432,6 +8308,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isPlayerSay = (msg.find("PLAYER_SAY: ") == 0);
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
       bool isNotify = (msg.find("NOTIFY:") == 0);
+      bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
       bool isRename = (msg.find("NPC_RENAME: ") == 0);
       bool speakerResolvedFromHeader = false;
@@ -8464,8 +8341,14 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiNpcInfoText(data);
           } else if (command == "POPULATE_AIDIARIES") {
             PopulateAiDiaryUI(data);
+          } else if (command == "POPULATE_AIDIARY_ENTRIES") {
+            PopulateAiDiaryEntries(data);
           } else if (command == "SET_AIDIARY_TEXT") {
             SetAiDiaryText(data);
+          } else if (command == "SET_STOBE_HISTORY") {
+            SetRecentHistoryText(data);
+          } else if (command == "SET_PROFILE_MODEL") {
+            ApplyProfileModelSlotUpdate(data);
           } else if (command == "SET_CONFIG") {
             size_t colon = data.find(":");
             if (colon != std::string::npos) {
@@ -8555,8 +8438,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             }
           }
         }
-      } else if (isNotify) {
-        std::string text = msg.substr(7);
+      } else if (isNotify || isNarratorNotify) {
+        std::string text = isNarratorNotify ? msg.substr(16) : msg.substr(7);
+        std::string utteranceId = ExtractTrailingUtteranceId(text);
         int ttsDurationMs = ExtractTrailingTtsDurationMs(text);
         std::string ttsHash = ExtractTrailingTtsHash(text);
         if (!g_ttsEnabled) {
@@ -8570,7 +8454,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         act.target = hand();
         act.message = text;
         act.ttsHash = ttsHash;
+        act.utteranceId = utteranceId;
         act.taskValue = ttsDurationMs;
+        act.narratorNotification = isNarratorNotify;
         g_uiActionQueue.push_back(act);
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {
@@ -11055,6 +10941,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         // Normal dialogue bubble
         std::string bubbleContent =
             isPlayerSay ? msg.substr(12) : (isNPCSay ? msg.substr(9) : "");
+        const std::string unavailableSpeechMarker =
+            " [ALLOW_UNAVAILABLE_SPEECH]";
+        bool allowUnavailableSpeech = false;
+        size_t unavailableSpeechPos = bubbleContent.rfind(unavailableSpeechMarker);
+        if (unavailableSpeechPos != std::string::npos &&
+            unavailableSpeechPos + unavailableSpeechMarker.length() ==
+                bubbleContent.length()) {
+          bubbleContent.erase(unavailableSpeechPos);
+          allowUnavailableSpeech = true;
+        }
         std::string structuredMessage =
             ExtractDialogueMessageFromStructuredText(bubbleContent);
         if (!structuredMessage.empty()) {
@@ -11214,6 +11110,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.targetToken = talkTargetToken;
             act.ttsHash = ttsHash;
             act.utteranceId = utteranceId;
+            act.allowUnavailableSpeech = allowUnavailableSpeech;
             int speechTimingMs = ttsDurationMs;
             if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
                 ttsDurationMs <= 0) {
@@ -11230,7 +11127,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 " tts_hash=" + (ttsHash.empty() ? "" : ttsHash.substr(0, 8)) +
                 " tts_dur_ms=" + ToString(ttsDurationMs) +
                 " player_tts_wait_hint=" +
-                std::string(speechTimingMs < 0 ? "1" : "0"));
+                std::string(speechTimingMs < 0 ? "1" : "0") +
+                " allow_unavailable=" +
+                std::string(allowUnavailableSpeech ? "1" : "0"));
           } else {
             if (!utteranceId.empty()) {
               PostSpeechDeliveryState(utteranceId, "cancelled");
@@ -11238,6 +11137,25 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             Log("HOOK_MSG_PROC: SAY fallback logged without target hand actor=" +
                 std::string(tc ? tc->getName() : "Unknown"));
           }
+        }
+      }
+      if (autonomyCatalogMessage) {
+        size_t tagged = 0;
+        EnterCriticalSection(&g_uiMutex);
+        if (g_uiActionQueue.size() > autonomyQueueSizeBefore) {
+          for (size_t index = autonomyQueueSizeBefore;
+               index < g_uiActionQueue.size(); ++index) {
+            g_uiActionQueue[index].autonomyDecisionId = autonomyDecisionId;
+            ++tagged;
+          }
+        }
+        LeaveCriticalSection(&g_uiMutex);
+        if (tagged > 0) {
+          Log("AUTONOMY_PHASE3_ADAPTER: decision=" + autonomyDecisionId +
+              " queued_actions=" + ToString(static_cast<int>(tagged)));
+        } else {
+          ReportAutonomyActionExecutionResult(
+              autonomyDecisionId, false, "catalog_adapter_no_queued_action");
         }
       }
     }
@@ -11940,6 +11858,7 @@ void dialogueSayText_hook(Dialogue *dialogue, const std::string &line,
 
 void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
   std::string replyText = ResolveDialogueReplyTextByIndexSafe(dialogue, index);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedInt_orig) {
     dialogueReplyClickedInt_orig(dialogue, index);
   }
@@ -11951,6 +11870,7 @@ void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
 void dialogueReplyClickedString_hook(Dialogue *dialogue,
                                      const std::string &indexToken) {
   std::string replyText = ResolveDialogueReplyTextByTokenSafe(dialogue, indexToken);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedString_orig) {
     dialogueReplyClickedString_orig(dialogue, indexToken);
   }
@@ -12218,6 +12138,7 @@ static bool IsSpeechSystemBusyForMOTD() {
 
 
 void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
+  static LONG postLoadHookProbe = 0;
   if (!thisptr || reinterpret_cast<uintptr_t>(thisptr) < 0x10000) {
     static bool loggedInvalidThis = false;
     if (!loggedInvalidThis) {
@@ -12227,10 +12148,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     return;
   }
 
+  const bool tracePostLoadHook =
+      InterlockedCompareExchange(&postLoadHookProbe, 2, 1) == 1;
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: entering first post-stable PlayerInterface::update");
+  }
   if (playerUpdate_orig)
     playerUpdate_orig(thisptr);
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: original PlayerInterface::update returned");
+  }
 
   GameWorld *worldUi = GetWorldSafe();
+  if (tracePostLoadHook) {
+    Log("HOOK_LOAD_PROBE: GameWorld lookup returned");
+  }
   static bool worldWasStable = false;
   static DWORD worldBecameStableTick = 0;
   static bool heavySweepPrimed = false;
@@ -12238,21 +12170,39 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   static DWORD motdAutoOpenTick = 0;
   static DWORD motdAutoOpenDeadlineTick = 0;
   static bool loadInitEventDispatched = false;
+  static bool postLoadPipelineProbed = false;
+  static bool heavySyncPipelineProbed = false;
   bool worldStable = IsWorldStableForUI(worldUi);
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: stability check returned stable=") +
+        (worldStable ? "1" : "0"));
+  }
 
   MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (tracePostLoadHook) {
+    Log(std::string("HOOK_LOAD_PROBE: GUI lookup returned available=") +
+        (gui ? "1" : "0"));
+  }
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    ResetAutonomyController("gui_unavailable");
+    ResetAutonomySafetyProbe("gui_unavailable");
+    Stobe::DialogueMenuTts::Reset("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
     g_welcomeWindow = nullptr;
     g_aiNpcInfoWindow = nullptr;
     g_aiDiaryWindow = nullptr;
+    g_recentHistoryWindow = nullptr;
+    g_statusHudWindow = nullptr;
     return;
   }
 
   if (!worldStable) {
+    ResetAutonomyController("world_unstable");
+    ResetAutonomySafetyProbe("world_unstable");
+    Stobe::DialogueMenuTts::Reset("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12289,24 +12239,23 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
+      ResetTownKnowledgeSyncState();
+      Stobe::PlayerBase::Reset();
+      Stobe::WorldStateRuntime::Reset();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
       motdAutoOpenTick = 0;
       motdAutoOpenDeadlineTick = 0;
       loadInitEventDispatched = false;
+      postLoadPipelineProbed = false;
+      heavySyncPipelineProbed = false;
       Log("INV_SYNC: state reset on world transition.");
       Log("PORTRAIT_SYNC: state reset on world transition.");
     }
-    if (g_settingsWindow)
-      CloseSettingsUI();
-    if (g_startingWindow)
-      CloseStartingUI();
-    if (g_welcomeWindow)
-      CloseWelcomeUI();
-    if (g_aiNpcInfoWindow)
-      CloseAiNpcInfoUI();
-    if (g_aiDiaryWindow)
-      CloseAiDiaryUI();
+    if (IsAnyStobeMenuUIOpen())
+      CloseAllStobeMenuUI();
+    if (g_statusHudWindow)
+      CloseStatusHud();
     if (g_chatWindow)
       CloseChatUI();
     return;
@@ -12325,11 +12274,16 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_lastSelectionContextPushedTick = 0;
     g_lastSelectionContextPushedSerial = 0;
     LeaveCriticalSection(&g_stateMutex);
+    Stobe::WorldStateRuntime::Reset();
+    Stobe::PlayerBase::Reset();
     heavySweepPrimed = false;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
     motdAutoOpenDeadlineTick = 0;
     loadInitEventDispatched = false;
+    postLoadPipelineProbed = false;
+    heavySyncPipelineProbed = false;
+    InterlockedExchange(&postLoadHookProbe, 1);
     Log("HOOK: world stable; delaying UI hook logic.");
     return;
   }
@@ -12360,8 +12314,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         motdAutoOpenDeadlineTick = 0;
         Log("UI: MOTD auto-open skipped (startup quiet window expired).");
       } else if ((LONG)(now - motdAutoOpenTick) >= 0 &&
-                 !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
-                 !g_startingWindow && !g_settingsWindow) {
+                  !IsSpeechSystemBusyForMOTD() && !g_chatWindow &&
+                  !IsAnyStobeMenuUIOpen()) {
         try {
           CreateWelcomeUI();
           g_welcomeShown = true;
@@ -12386,9 +12340,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     if (now - lastSettingsTick > 500) {
       lastSettingsTick = now;
       Log("UI: general hotkey pressed [" + g_generalHotkeyStr + "].");
-      if (g_startingWindow) {
-        CloseStartingUI();
-        Log("UI: CloseStartingUI done.");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: CloseAllStobeMenuUI done.");
       } else {
         CreateStartingUI();
         Log("UI: CreateStartingUI done.");
@@ -12396,8 +12350,16 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
   }
 
+  bool probePostLoadPipeline = !postLoadPipelineProbed;
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: entering warmed post-load pipeline");
+  }
+
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::DialogueMenuTts::Update();
+  Stobe::PlayerBase::Update(worldUi, sel);
+  UpdateStatusHud(worldUi);
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
@@ -12430,9 +12392,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (selectionChanged && hasSelectionHandle && sel &&
       (uintptr_t)sel > 0x1000) {
     if (ShouldProcessAnimalCharacter(sel)) {
-      SyncInventoryForCharacter(sel, true, "selection_change");
-      SyncPortraitForCharacter(sel, false, "selection_change");
-      QueueSelectionContextPush(currentSelectionHand);
+      if (GetTickCount() - worldBecameStableTick >= kHookHeavySyncWarmupMs) {
+        SyncInventoryForCharacter(sel, true, "selection_change");
+        SyncPortraitForCharacter(sel, false, "selection_change");
+      } else {
+        Log("HOOK_LOAD_PROBE: deferred initial selection inventory and portrait sync");
+      }
+      // Full context snapshots can traverse stale nearby objects immediately
+      // after a save load. Dialogue and action paths still build them on demand.
+      ClearPendingSelectionContextPush();
     } else {
       ClearPendingSelectionContextPush();
       Log("ANIMAL_TALKS: ignoring selection context sync for inactive animal.");
@@ -12440,12 +12408,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   } else if (selectionChanged) {
     ClearPendingSelectionContextPush();
   }
+  if (probePostLoadPipeline) {
+    Log("HOOK_LOAD_PROBE: selection stage complete");
+  }
 
   // 2. Message queue + queued actions
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    Stobe::WorldStateRuntime::Update(world, worldBecameStableTick);
+    UpdateAutonomyController(world);
+    UpdateAutonomySafetyProbe(world, sel);
     if (!loadInitEventDispatched) {
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage starting");
+      }
       bool dispatchedViaStream =
           TriggerNarratorWelcomeOnLoad(world, ResolvePlayerSpeakerForCurrentTalk(world));
       if (!dispatchedViaStream) {
@@ -12472,8 +12449,14 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
             initActor + " serial=" + ToString((int)initActorSerial));
       }
       loadInitEventDispatched = true;
+      if (probePostLoadPipeline) {
+        Log("HOOK_LOAD_PROBE: narrator init stage complete");
+      }
     }
 
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage starting");
+    }
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
@@ -12481,6 +12464,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
     RunPendingSelectionContextPush(sel, worldBecameStableTick);
+    if (probePostLoadPipeline) {
+      Log("HOOK_LOAD_PROBE: message and action stage complete");
+    }
 
     DWORD nowTick = GetTickCount();
     if (!heavySweepPrimed) {
@@ -12495,15 +12481,59 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     bool heavySyncReady = (nowTick - worldBecameStableTick) >= kHookHeavySyncWarmupMs;
     bool npcEventSyncReady =
         (nowTick - worldBecameStableTick) >= kNpcWorldEventWarmupMs;
+    bool probeHeavySyncPipeline = heavySyncReady && !heavySyncPipelineProbed;
     if (npcEventSyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep starting");
+      }
+      LONG sweepSehBefore =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
       RunNpcWorldEventSweep(world, sel);
+      LONG sweepSehAfter =
+          InterlockedCompareExchange(&g_npcWorldEventSweepSehCount, 0, 0);
+      if (sweepSehAfter != sweepSehBefore) {
+        Log("NPC_WORLD_EVENT: skipped unsafe sweep after engine fault code=" +
+            ToString((int)g_npcWorldEventSweepLastSehCode));
+      }
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: NPC world event sweep complete");
+      }
     }
     if (heavySyncReady) {
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep starting");
+      }
       RunInventorySyncSweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: inventory sweep complete");
+        Log("HOOK_LOAD_PROBE: portrait sweep starting");
+      }
       RunPlayerFactionPortraitSweep(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: portrait sweep complete");
+        Log("HOOK_LOAD_PROBE: info telemetry sweep starting");
+      }
       RunInfoTelemetrySweep(world, sel);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: info telemetry sweep complete");
+        Log("HOOK_LOAD_PROBE: faction relation sync starting");
+      }
       RunFactionRelationSync(world);
+      if (probeHeavySyncPipeline) {
+        Log("HOOK_LOAD_PROBE: faction relation sync complete");
+        Log("HOOK_LOAD_PROBE: town knowledge sync starting");
+      }
+      RunTownKnowledgeSync(world);
+      if (probeHeavySyncPipeline) {
+        heavySyncPipelineProbed = true;
+        Log("HOOK_LOAD_PROBE: town knowledge sync complete");
+        Log("HOOK_LOAD_PROBE: heavy sync pipeline complete");
+      }
     }
+  }
+  if (probePostLoadPipeline) {
+    postLoadPipelineProbed = true;
+    Log("HOOK_LOAD_PROBE: warmed post-load pipeline complete");
   }
 
   if (world && worldFrameStable && g_enableBoredEvents) {
@@ -12582,11 +12612,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // Rename checks are now queued only for dialogue-tagged NPCs.
   // 4. Input Handling ??? Chat window hotkey
-  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow &&
-      !g_aiNpcInfoWindow) {
+  if ((GetAsyncKeyState(g_chatHotkey) & 0x8000) && !g_chatWindow) {
     static DWORD lastTalkTick = 0;
     if (GetTickCount() - lastTalkTick > 500) {
       lastTalkTick = GetTickCount();
+      Log("UI: chat hotkey pressed [" + g_chatHotkeyStr + "].");
+      if (IsAnyStobeMenuUIOpen()) {
+        CloseAllStobeMenuUI();
+        Log("UI: closed STOBE menu before opening chat.");
+      }
       if (sel && (uintptr_t)sel > 0x1000) {
         Character *chatTarget = sel;
         if (sel->isPlayerCharacter()) {
@@ -12651,6 +12685,25 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         QueueIdentityRenameCandidate(chatTarget, "chat_open_target");
         SyncInventoryForCharacter(chatTarget, true, "chat_open");
 
+        bool chatTargetIsTrader = false;
+        try {
+          chatTargetIsTrader = !chatTarget->isPlayerCharacter() &&
+                               chatTarget->isATrader();
+        } catch (...) {
+          chatTargetIsTrader = false;
+        }
+        if (chatTargetIsTrader) {
+          bool capturedTraderInventory =
+              CaptureTraderInventorySnapshot(chatTarget, "chat_open");
+          Log("TRADER_INVENTORY_CAPTURE: chat-open target=" +
+              ResolveCharacterNameSafe(chatTarget) + " success=" +
+              std::string(capturedTraderInventory ? "1" : "0"));
+          if (capturedTraderInventory) {
+            PushImmediateContextSnapshot(chatTarget,
+                                         "chat_open_trade_capture", true);
+          }
+        }
+
         // Suppress vanilla dialogue state to prevent "double dialogue"
         if (chatTarget->dialogue && (uintptr_t)chatTarget->dialogue > 0x1000) {
           try {
@@ -12665,6 +12718,12 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
                                 : "Drifter";
         CreateChatUI(chatTarget->getName(), pName,
                      ToString(chatTarget->getHandle().serial));
+        Log("UI: CreateChatUI done target=" + chatTarget->getName());
+      } else {
+        EnterCriticalSection(&g_msgMutex);
+        g_messageQueue.push_back("NOTIFY:Select an NPC before opening chat.");
+        LeaveCriticalSection(&g_msgMutex);
+        Log("CHAT_OPEN: no selected character; chat open blocked");
       }
     }
   }
@@ -12876,6 +12935,7 @@ __declspec(dllexport) void startPlugin() {
   Log(std::string("STARTUP: Stobe plugin version ") + kStobePluginVersion);
   Log(std::string("STARTUP: Stobe plugin release date ") + kStobePluginReleaseDate);
   Log("UI: MOTD auto-popup enabled when EnableMOTD is ON.");
+  StartAutonomyController();
 
   HMODULE hLib = GetModuleHandleA("KenshiLib.dll");
   if (!hLib) {

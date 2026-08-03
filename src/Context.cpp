@@ -2,6 +2,8 @@
 #include "Functions.h"
 #include "Globals.h"
 #include "KenshiBuildingCompat.h"
+#include "PlayerBaseState.h"
+#include "KenshiWeatherCompat.h"
 #include "Utils.h"
 #include <kenshi/CharStats.h>
 #include <kenshi/CharMovement.h>
@@ -73,6 +75,109 @@ std::string SlotToString(AttachSlot slot) {
 }
 
 namespace {
+const char *WeatherEffectTypeName(EffectType::Enum type) {
+  switch (type) {
+  case EffectType::CAMERA:
+    return "camera";
+  case EffectType::POINT:
+    return "point";
+  case EffectType::WANDERING:
+    return "wandering";
+  case EffectType::GLOBAL:
+    return "global";
+  case EffectType::CAMERA_RAIN:
+    return "rain";
+  case EffectType::CAMERA_ACID_RAIN:
+    return "acid_rain";
+  case EffectType::POINT_LIGHTING:
+    return "lighting";
+  case EffectType::WANDERING_STORM:
+    return "storm";
+  case EffectType::WANDERING_GAS:
+    return "gas";
+  case EffectType::GLOBAL_POINT:
+    return "global_point";
+  default:
+    return "none";
+  }
+}
+
+std::string BuildNamedWeatherContext(Character *npc,
+                                     const Ogre::Vector3 &position) {
+  std::string weatherName;
+  float weatherStrength = 0.0f;
+  float windSpeed = 0.0f;
+  Ogre::Vector3 windDirection = Ogre::Vector3::ZERO;
+  float wetness = 0.0f;
+  std::string effectsJson = "[";
+  size_t effectCount = 0;
+
+  try {
+    WeatherSystem *weatherSystem = WeatherSystem::getInstance();
+    if (weatherSystem && (uintptr_t)weatherSystem > 0x1000) {
+      WeatherRegion *region = weatherSystem->ActiveRegionWeather;
+      WeatherInstance *instance =
+          region && (uintptr_t)region > 0x1000
+              ? region->getWeatherInstance()
+              : nullptr;
+      if (instance && (uintptr_t)instance > 0x1000) {
+        Weather *weather = instance->getWeather();
+        if (weather && (uintptr_t)weather > 0x1000) {
+          weatherName = weather->getName();
+        }
+        weatherStrength = instance->getWeatherStrength();
+        windSpeed = instance->getWindSpeed();
+        windDirection = instance->getWindDirection();
+        wetness = instance->getWetness();
+      }
+
+      const auto &effects = weatherSystem->getPositionGlobalEffects(position);
+      for (size_t i = 0; i < effects.size() && effectCount < 16; ++i) {
+        if (effects[i].second <= 0.0f) {
+          continue;
+        }
+        if (effectCount > 0) {
+          effectsJson += ",";
+        }
+        effectsJson += "{\"type\":\"";
+        effectsJson += WeatherEffectTypeName(effects[i].first);
+        effectsJson += "\",\"type_id\":" +
+                       ToString(static_cast<int>(effects[i].first)) + ",";
+        effectsJson += "\"strength\":" + ToString(effects[i].second) + "}";
+        ++effectCount;
+      }
+    }
+  } catch (...) {
+    weatherName.clear();
+    weatherStrength = 0.0f;
+    windSpeed = 0.0f;
+    windDirection = Ogre::Vector3::ZERO;
+    wetness = 0.0f;
+    effectsJson = "[";
+  }
+  effectsJson += "]";
+
+  float affectStrength = 0.0f;
+  try {
+    affectStrength = npc ? npc->getCurrentWeatherAffectStrength() : 0.0f;
+  } catch (...) {
+    affectStrength = 0.0f;
+  }
+
+  std::string fields;
+  fields += "\"weather_name\":\"" + EscapeJSON(weatherName) + "\",";
+  fields += "\"weather_strength\":" + ToString(weatherStrength) + ",";
+  fields += "\"weather_affect_strength\":" + ToString(affectStrength) + ",";
+  fields += "\"wind_speed\":" + ToString(windSpeed) + ",";
+  fields += "\"wind_direction\":{";
+  fields += "\"x\":" + ToString(windDirection.x) + ",";
+  fields += "\"y\":" + ToString(windDirection.y) + ",";
+  fields += "\"z\":" + ToString(windDirection.z) + "},";
+  fields += "\"wetness\":" + ToString(wetness) + ",";
+  fields += "\"active_environmental_effects\":" + effectsJson;
+  return fields;
+}
+
 bool IsIndoorsHandleValid(const hand &indoorsHandle) {
   return indoorsHandle.isValid() && !indoorsHandle.isNull();
 }
@@ -844,13 +949,9 @@ std::string ResolveGameDataRefName(GameData *data, const char *key) {
   }
   for (size_t i = 0; i < refs->size(); ++i) {
     const GameDataReference &ref = refs->at(i);
-    std::string value = "";
-    if (ref.ptr) {
-      value = TrimCopy(ref.ptr->name);
-    }
-    if (value.empty()) {
-      value = TrimCopy(ref.sid);
-    }
+    // Runtime reference pointers can be stale for nearby streamed world objects.
+    // The persisted string ID remains valid without dereferencing that object.
+    std::string value = TrimCopy(ref.sid);
     if (!IsUnknownToken(value)) {
       return value;
     }
@@ -2417,7 +2518,9 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
 
   RaceData *race = npc->getRace() ? npc->getRace() : npc->myRace;
   std::string raceName = "Unknown";
+  bool raceIsRobot = false;
   if (race && (uintptr_t)race > 0x1000) {
+    raceIsRobot = race->robot;
     if (race->data && !race->data->name.empty()) {
       raceName = race->data->name;
     } else if (race->data && !race->data->stringID.empty()) {
@@ -2514,6 +2617,8 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
     json += "\"game_ts\":" + ToString(gameTs) + ",";
   }
   json += "\"race\":\"" + EscapeJSON(raceName) + "\",";
+  json += "\"race_is_robot\":" +
+          std::string(raceIsRobot ? "true" : "false") + ",";
   json += "\"faction\":\"" + EscapeJSON(factionName) + "\",";
   json += "\"factionID\":\"" + EscapeJSON(factionID) + "\",";
   json += "\"faction_id\":\"" + EscapeJSON(factionID) + "\",";
@@ -3471,6 +3576,10 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   std::string json = "{";
   // Write 'type' first so server routing can distinguish player vs NPC context
   json += "\"type\": \"" + type + "\",";
+  Stobe::PlayerBase::Snapshot playerBase;
+  Stobe::PlayerBase::Capture(world, npc, playerBase);
+  json += "\"player_base\":" +
+          Stobe::PlayerBase::BuildJson(playerBase) + ",";
   bool isPlayerCharacter = false;
   bool isAnimal = false;
   try {
@@ -3674,13 +3783,17 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   }
 
   std::string raceName = "Unknown";
+  bool raceIsRobot = false;
   if (race && (uintptr_t)race > 0x1000) {
+    raceIsRobot = race->robot;
     if (race->data && !race->data->name.empty())
       raceName = race->data->name;
     else if (race->data && !race->data->stringID.empty())
       raceName = race->data->stringID;
   }
   json += "\"race\": \"" + EscapeJSON(raceName) + "\",";
+  json += "\"race_is_robot\": " +
+          std::string(raceIsRobot ? "true" : "false") + ",";
 
   // Robust Gender
   std::string gender = "male";
@@ -3783,7 +3896,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
     zoneName = ResolveTownZoneName(town);
     townRegionName = ResolveTownRegionName(town);
   }
-  ResolveNearbyTownAndZoneFallback(world, npc, town, townName, zoneName);
+  // LOCATION/TOWN sphere scans can return stale streamed objects after a load.
+  // Use the character's live town pointer instead of dereferencing those results.
   bool inTownWalls = IsNpcInsideTownContext(npc, town);
   std::string zonePromptName = "";
   if (inTownWalls) {
@@ -3806,12 +3920,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   }
   if (regionPromptName.empty()) {
     regionPromptName = ResolveMappedRegionFromTownName(zonePromptName);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestTownMappedRegion(world, npc);
-  }
-  if (regionPromptName.empty()) {
-    regionPromptName = ResolveNearestWorldZoneName(world, npc);
   }
   std::string cachedTraderInventoryJson = "[]";
   int cachedTraderInventoryCount = 0;
@@ -3864,7 +3972,9 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         // Robust Race Name
         RaceData *o_race = other->getRace() ? other->getRace() : other->myRace;
         std::string o_rn = "Unknown";
+        bool o_raceIsRobot = false;
         if (o_race && (uintptr_t)o_race > 0x1000) {
+          o_raceIsRobot = o_race->robot;
           if (o_race->data && !o_race->data->name.empty())
             o_rn = o_race->data->name;
           else if (o_race->data && !o_race->data->stringID.empty())
@@ -3964,16 +4074,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         std::string o_orders = BuildStandingOrderPayload(other);
         int o_bountyTotal = 0;
         std::string o_bountyPayload = BuildBountyPayload(other, o_bountyTotal);
-        std::string o_equip = GetVisibleEquipment(other);
-        std::string o_inventory = "[]";
-        std::string o_inventoryHash = "";
-        int o_inventoryCount = 0;
-        bool o_hasInventory = false;
-        if (BuildInventorySnapshot(other, o_inventory, o_inventoryHash,
-                                   o_inventoryCount) &&
-            o_inventoryCount > 0) {
-          o_hasInventory = true;
-        }
+        // Nearby sphere results can outlive nested inventory/equipment objects
+        // during streaming. Dedicated inventory sync supplies those details.
         std::string o_charState = "normal";
         try {
           if (other->isDead()) {
@@ -4009,6 +4111,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
 
         json += "{\"name\":\"" + EscapeJSON(o_name) + "\",";
         json += "\"race\":\"" + EscapeJSON(o_rn) + "\",";
+        json += "\"race_is_robot\":" +
+                std::string(o_raceIsRobot ? "true" : "false") + ",";
         json += "\"faction\":\"" + EscapeJSON(o_fn) + "\",";
         json += "\"factionID\":\"" + EscapeJSON(o_fid) + "\",";
         json += "\"faction_id\":\"" + EscapeJSON(o_fid) + "\",";
@@ -4039,11 +4143,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
         }
         if (o_bountyPayload != "{}") {
           json += "\"bounty_info\":" + o_bountyPayload + ",";
-        }
-        json += "\"equipment\":\"" + EscapeJSON(o_equip) + "\",";
-        if (o_hasInventory) {
-          json += "\"inventory\":" + o_inventory + ",";
-          json += "\"inventory_item_count\":" + ToString(o_inventoryCount) + ",";
         }
         json += "\"drunk_level\": " + ToString(oDrunkLevel) + ",";
         json += "\"is_drunk\": " + std::string(oIsDrunk ? "true" : "false") +
@@ -4490,16 +4589,6 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
     }
     nearbyUseObjectsJson += "],";
 
-    lektor<RootObject *> nearbyLocations;
-    world->getObjectsWithinSphere(nearbyLocations, npc->getPosition(), poiRange,
-                                  LOCATION, 48, (RootObject *)npc);
-    appendPoiResults(nearbyLocations, "location");
-
-    lektor<RootObject *> nearbyTowns;
-    world->getObjectsWithinSphere(nearbyTowns, npc->getPosition(), poiRange,
-                                  TOWN, 24, (RootObject *)npc);
-    appendPoiResults(nearbyTowns, "town");
-
     json += "],";
     json += nearbyUseObjectsJson;
   }
@@ -4563,7 +4652,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
   json += "\"x\": " + ToString(npcPos.x) + ",";
   json += "\"y\": " + ToString(npcPos.y) + ",";
   json += "\"z\": " + ToString(npcPos.z) + ",";
-  json += "\"weather\": " + ToString((int)npc->getCurrentWeatherAffectStatus());
+  json += "\"weather\": " + ToString((int)npc->getCurrentWeatherAffectStatus()) + ",";
+  json += BuildNamedWeatherContext(npc, npcPos);
   json += "},";
   json += "\"town\": \"" + EscapeJSON(townName) + "\",";
   json += "\"zone\": \"" + EscapeJSON(zonePromptName) + "\",";

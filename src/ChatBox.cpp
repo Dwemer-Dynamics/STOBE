@@ -4,6 +4,7 @@
 #include "Context.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "StobeChatMode.h"
 #include "StobeTiming.h"
 #include "Utils.h"
 
@@ -45,6 +46,7 @@ MyGUI::EditBox *g_chatInput = nullptr;
 MyGUI::ComboBox *g_chatModeCombo = nullptr;
 MyGUI::ComboBox *g_chatTargetCombo = nullptr;
 MyGUI::ComboBox *g_chatActionCombo = nullptr;
+MyGUI::ComboBox *g_chatProfileModelCombo = nullptr;
 MyGUI::EditBox *g_chatActionArgInput = nullptr;
 MyGUI::Button *g_chatAutoChatToggle = nullptr;
 MyGUI::TextBox *g_chatLabel = nullptr;
@@ -64,8 +66,23 @@ bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
+LONG g_activeChatStreamCount = 0;
+LONG g_profileModelSlot = 1;
+LONG g_profileModelRevision = 0;
+LONG g_profileModelRefreshInFlight = 0;
+DWORD g_profileModelLastRefreshTick = 0;
+bool g_profileModelComboRefreshInProgress = false;
 const float kWhisperRangeUnits = 20.0f;
+const float kCheatRangeUnits = 100.0f;
 const char *kNarratorName = "The Narrator";
+const char *kProfileModelLabels[] = {
+    "Standard", "Fast", "Powerful", "Experimental"};
+
+class ActiveChatStreamScope {
+public:
+  ActiveChatStreamScope() { InterlockedIncrement(&g_activeChatStreamCount); }
+  ~ActiveChatStreamScope() { InterlockedDecrement(&g_activeChatStreamCount); }
+};
 
 struct ChatTargetOption {
   std::string name;
@@ -73,6 +90,13 @@ struct ChatTargetOption {
   std::string label;
   float distance;
   bool isNarrator;
+};
+
+struct ProfileModelRequestTask {
+  bool write;
+  int requestedSlot;
+  int fallbackSlot;
+  LONG revision;
 };
 
 std::vector<ChatTargetOption> g_chatTargetOptions;
@@ -93,6 +117,135 @@ void OnRenameConfirmClick(MyGUI::Widget *sender);
 void OnRenameCancelClick(MyGUI::Widget *sender);
 void OnRenameWindowButtonPressed(MyGUI::Window *sender,
                                  const std::string &name);
+
+int NormalizeProfileModelSlot(int slot) {
+  return slot >= 1 && slot <= 4 ? slot : 1;
+}
+
+int GetActiveProfileModelSlot() {
+  return NormalizeProfileModelSlot(
+      static_cast<int>(InterlockedCompareExchange(&g_profileModelSlot, 0, 0)));
+}
+
+std::string GetActiveProfileModelLabel() {
+  return kProfileModelLabels[GetActiveProfileModelSlot() - 1];
+}
+
+void QueueProfileModelSlotUpdate(LONG revision, int slot) {
+  EnterCriticalSection(&g_msgMutex);
+  g_messageQueue.push_back("CMD: SET_PROFILE_MODEL:" + ToString((int)revision) +
+                           "|" + ToString(NormalizeProfileModelSlot(slot)));
+  LeaveCriticalSection(&g_msgMutex);
+}
+
+void QueueProfileModelNotification(const std::string &message) {
+  EnterCriticalSection(&g_msgMutex);
+  g_messageQueue.push_back("NOTIFY:" + message);
+  LeaveCriticalSection(&g_msgMutex);
+}
+
+// Confirms model-slot reads and writes off the game thread before updating UI.
+DWORD WINAPI ProfileModelRequestThread(LPVOID lpParam) {
+  ProfileModelRequestTask *task =
+      static_cast<ProfileModelRequestTask *>(lpParam);
+  if (!task) {
+    return 0;
+  }
+
+  std::string response;
+  if (task->write) {
+    const std::string payload =
+        "{\"id\":\"stobe_profile_model\",\"value\":\"" +
+        ToString(task->requestedSlot) + "\",\"only_if_changed\":true}";
+    response = PostToStobeWithResponse(L"/conf_opts", payload);
+  } else {
+    response = PostToStobeWithResponse(
+        L"/conf_opts?id=stobe_profile_model", "");
+  }
+
+  const std::string status = TrimChatLine(JsonReadField(response, "status"));
+  const int responseSlot =
+      atoi(TrimChatLine(JsonReadField(response, "value")).c_str());
+  const bool validResponse =
+      status == "ok" && responseSlot >= 1 && responseSlot <= 4 &&
+      (!task->write || responseSlot == task->requestedSlot);
+
+  if (validResponse) {
+    QueueProfileModelSlotUpdate(task->revision, responseSlot);
+    Log("PROFILE_MODEL: synchronized slot=" + ToString(responseSlot) +
+        " source=" + std::string(task->write ? "chatbox" : "server"));
+  } else if (task->write) {
+    QueueProfileModelSlotUpdate(task->revision, task->fallbackSlot);
+    QueueProfileModelNotification(
+        "Unable to change the response mode. Check StobeServer.");
+    Log("PROFILE_MODEL: change failed requested=" +
+        ToString(task->requestedSlot));
+  } else if (!response.empty()) {
+    Log("PROFILE_MODEL: ignored invalid server response");
+  }
+
+  if (!task->write) {
+    InterlockedExchange(&g_profileModelRefreshInFlight, 0);
+  }
+  delete task;
+  return 0;
+}
+
+bool StartProfileModelRequest(ProfileModelRequestTask *task) {
+  HANDLE thread =
+      CreateThread(NULL, 0, ProfileModelRequestThread, task, 0, NULL);
+  if (!thread) {
+    if (!task->write) {
+      InterlockedExchange(&g_profileModelRefreshInFlight, 0);
+    }
+    delete task;
+    Log("PROFILE_MODEL: failed to start request thread");
+    return false;
+  }
+  CloseHandle(thread);
+  return true;
+}
+
+void RequestProfileModelSlotRefresh(bool force) {
+  const DWORD now = GetTickCount();
+  if (!force && g_profileModelLastRefreshTick != 0 &&
+      now - g_profileModelLastRefreshTick < 30000) {
+    return;
+  }
+  if (InterlockedCompareExchange(&g_profileModelRefreshInFlight, 1, 0) != 0) {
+    return;
+  }
+
+  g_profileModelLastRefreshTick = now;
+  ProfileModelRequestTask *task = new ProfileModelRequestTask();
+  task->write = false;
+  task->requestedSlot = 0;
+  task->fallbackSlot = GetActiveProfileModelSlot();
+  task->revision =
+      InterlockedCompareExchange(&g_profileModelRevision, 0, 0);
+  StartProfileModelRequest(task);
+}
+
+void ApplyProfileModelSlotUpdate(const std::string &data) {
+  const size_t separator = data.find('|');
+  if (separator == std::string::npos) {
+    return;
+  }
+  const LONG revision = atol(data.substr(0, separator).c_str());
+  const int slot = atoi(data.substr(separator + 1).c_str());
+  if (slot < 1 || slot > 4 ||
+      revision !=
+          InterlockedCompareExchange(&g_profileModelRevision, 0, 0)) {
+    return;
+  }
+
+  InterlockedExchange(&g_profileModelSlot, slot);
+  if (g_chatProfileModelCombo) {
+    g_profileModelComboRefreshInProgress = true;
+    g_chatProfileModelCombo->setIndexSelected(static_cast<size_t>(slot - 1));
+    g_profileModelComboRefreshInProgress = false;
+  }
+}
 
 bool TryReleaseUserPauseSafe(GameWorld *world) {
   if (!world) {
@@ -582,35 +735,6 @@ bool ResolveSpeakerGiveItemMatch(Character *speaker, const std::string &rawQuery
   return false;
 }
 
-size_t ChatModeToIndex(const std::string &mode) {
-  if (mode == "whisper")
-    return 1;
-  if (mode == "shout")
-    return 2;
-  if (mode == "cheat")
-    return 3;
-  if (mode == "narrator")
-    return 4;
-  return 0; // chat
-}
-
-std::string NormalizeChatMode(const std::string &mode) {
-  std::string normalized = mode;
-  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                 ::tolower);
-  if (normalized == "whisper")
-    return "whisper";
-  if (normalized == "shout")
-    return "shout";
-  if (normalized == "cheat")
-    return "cheat";
-  if (normalized == "narrator")
-    return "narrator";
-  if (normalized == "talk" || normalized == "chat")
-    return "chat";
-  return "chat";
-}
-
 bool EqualsIgnoreCase(const std::string &lhs, const std::string &rhs) {
   if (lhs.length() != rhs.length()) {
     return false;
@@ -655,6 +779,25 @@ bool ShouldIncludeAnimalForTalk(Character *character) {
     return false;
   }
   return IsAnimalActivated(serial);
+}
+
+float ResolveChatInteractionDistance(Character *speaker, Character *target) {
+  if (!speaker || !target || (uintptr_t)speaker <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return -1.0f;
+  }
+  float distance = speaker->getPosition().distance(target->getPosition());
+  if (!IsAnimalCharacterSafe(target, nullptr)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = speaker->getRadius() + target->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
 }
 
 bool IsCharacterUnavailableForConversation(Character *character) {
@@ -751,6 +894,8 @@ float GetSearchRadiusForMode(const std::string &mode) {
     return kWhisperRangeUnits;
   if (mode == "shout")
     return g_shoutRadius;
+  if (mode == "cheat")
+    return kCheatRangeUnits;
   return g_proximityRadius;
 }
 
@@ -825,6 +970,11 @@ bool IsConversationAreaCompatible(Character *anchor, Character *candidate) {
 
   if (candidateHasBuilding) {
     return false;
+  }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate, nullptr)) {
+    // Outdoor wildlife can report terrain levels as floors. Distance remains
+    // authoritative when neither participant is inside a building.
+    return true;
   }
   // Outdoors: ignore NPCs on a higher floor/level than the speaker.
   if (candidateFloor > anchorFloor + 1) {
@@ -1376,7 +1526,14 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   }
 
   if (selectedMode == "cheat") {
-    Log("CHAT_VALIDATE: bypass spatial/range checks for cheat mode");
+    float dist = ResolveChatInteractionDistance(player, target);
+    Log("CHAT_VALIDATE: cheat distance_check dist=" + ToString(dist) +
+        " allowed=" + ToString((int)kCheatRangeUnits));
+    if (dist > kCheatRangeUnits) {
+      failReason = "Target is out of range for cheat mode (100m maximum).";
+      return false;
+    }
+    Log("CHAT_VALIDATE: bypass area checks for cheat mode within 100m");
     return true;
   }
 
@@ -1394,7 +1551,7 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
     allowedRange = 1.0f;
   }
   Log("CHAT_VALIDATE: distance_check begin allowed=" + ToString((int)allowedRange));
-  float dist = player->getPosition().distance(target->getPosition());
+  float dist = ResolveChatInteractionDistance(player, target);
   Log("CHAT_VALIDATE: distance_check end dist=" + ToString(dist));
   if (dist > allowedRange) {
     failReason = "Target is out of range for " + selectedMode + ".";
@@ -1487,17 +1644,21 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
   }
 
   try {
-    distanceOut = speaker->getPosition().distance(target->getPosition());
+    distanceOut = ResolveChatInteractionDistance(speaker, target);
   } catch (...) {
     distanceOut = -1.0f;
     return false;
   }
 
   if (selectedMode == "cheat") {
-    return true;
+    return distanceOut <= kCheatRangeUnits;
   }
 
-  if (!IsConversationAreaCompatible(speaker, target)) {
+  bool areaCompatible = IsConversationAreaCompatible(speaker, target);
+  if (!areaCompatible) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected area name=" + target->getName());
+    }
     return false;
   }
 
@@ -1506,7 +1667,17 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
     allowedRange = 1.0f;
   }
   if (distanceOut > allowedRange) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected range name=" + target->getName() +
+          " surface_distance=" + ToString(distanceOut) +
+          " allowed=" + ToString(allowedRange));
+    }
     return false;
+  }
+
+  if (targetIsAnimal) {
+    Log("ANIMAL_TALKS: dropdown eligible name=" + target->getName() +
+        " surface_distance=" + ToString(distanceOut));
   }
 
   return true;
@@ -1557,7 +1728,7 @@ void RefreshChatHeaderLabel() {
 
   GameWorld *world = GetWorldSafe();
   std::string speakerName = g_chatPlayerNameStr.empty() ? "Player" : g_chatPlayerNameStr;
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
 
   if (selectedMode == "narrator") {
     Character *selectedSpeakerNpc = ResolveSelectedChatSpeaker(world);
@@ -1597,7 +1768,7 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     return;
   }
 
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
   std::string preferredName = TrimChatLine(g_chatTargetNameStr);
   std::string preferredHandle = TrimChatLine(g_chatTargetHandleStr);
 
@@ -1614,7 +1785,7 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     ChatTargetOption narratorOption;
     narratorOption.name = kNarratorName;
     narratorOption.handle.clear();
-    narratorOption.label = kNarratorName;
+    narratorOption.label = GetNarratorDisplayName();
     narratorOption.distance = -1.0f;
     narratorOption.isNarrator = true;
     options.push_back(narratorOption);
@@ -1622,20 +1793,50 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     GameWorld *world = GetWorldSafe();
     if (world) {
       std::set<std::string> seenTargets;
-      const ogre_unordered_set<Character *>::type &chars =
-          world->getCharacterUpdateList();
-      for (auto it = chars.begin(); it != chars.end(); ++it) {
+      auto appendCandidate = [&](Character *candidate) {
         ChatTargetOption option;
-        if (!TryBuildChatTargetOption(world, *it, selectedMode, option)) {
-          continue;
+        if (!TryBuildChatTargetOption(world, candidate, selectedMode, option)) {
+          return;
         }
         std::string targetKey =
             option.handle.empty() ? option.name : option.handle;
         if (targetKey.empty() || seenTargets.count(targetKey) > 0) {
-          continue;
+          return;
         }
         seenTargets.insert(targetKey);
         options.push_back(option);
+      };
+
+      if (selectedMode == "cheat") {
+        Character *speaker =
+            ResolveSelectedOrConfiguredPlayerSpeaker(world, nullptr);
+        if (speaker && (uintptr_t)speaker > 0x1000) {
+          lektor<RootObject *> nearbyResults;
+          world->getCharactersWithinSphere(
+              nearbyResults, speaker->getPosition(), kCheatRangeUnits, 0.0f,
+              0.0f, 0x10, 0, speaker);
+          for (uint32_t i = 0; i < nearbyResults.size(); ++i) {
+            appendCandidate((Character *)nearbyResults.stuff[i]);
+          }
+        }
+      } else {
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          appendCandidate(*it);
+        }
+      }
+
+      if (g_enableAnimalTalks && selectedMode == "cheat") {
+        // Sphere queries used by cheat mode can omit wildlife.
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          unsigned int animalSerial = 0;
+          if (IsAnimalCharacterSafe(*it, &animalSerial)) {
+            appendCandidate(*it);
+          }
+        }
       }
     }
 
@@ -1708,6 +1909,7 @@ void CloseChatUI() {
     g_chatModeCombo = nullptr;
     g_chatTargetCombo = nullptr;
     g_chatActionCombo = nullptr;
+    g_chatProfileModelCombo = nullptr;
     g_chatActionArgInput = nullptr;
     g_chatAutoChatToggle = nullptr;
     g_chatLabel = nullptr;
@@ -1855,6 +2057,7 @@ struct StreamChatTask {
   std::string requestMode;
   LONG generation;
   int rechatDepth;
+  bool allowUnavailableTargetSpeech;
 };
 
 struct PlayerTtsTask {
@@ -2329,8 +2532,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   if (!IsChatInterruptGenerationCurrent(currentTask.generation)) {
     return;
   }
-  if (currentTask.requestMode == "whisper" ||
-      currentTask.requestMode == "narrator") {
+  if (!Stobe::ChatMode::AllowsAutomaticRechat(currentTask.requestMode)) {
     Log("RECHAT: skipped (" + currentTask.requestMode + " mode)");
     return;
   }
@@ -2485,6 +2687,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   nextTask->requestMode = currentTask.requestMode;
   nextTask->generation = currentTask.generation;
   nextTask->rechatDepth = nextRechatDepth;
+  nextTask->allowUnavailableTargetSpeech = false;
 
   HANDLE followupThread =
       CreateThread(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
@@ -2920,7 +3123,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     std::string queueLine = "";
     std::string explicitTalkTargetToken = "";
     if (narratorSpeaker) {
-      queueLine = "NOTIFY:" + std::string(kNarratorName) + ": " + subtitle;
+      queueLine = "NARRATOR_NOTIFY:" + GetNarratorDisplayName() + ": " + subtitle;
     } else {
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       if (speakerHeader == actor) {
@@ -2957,6 +3160,10 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     }
     if (!utteranceId.empty()) {
       queueLine += " [UTTERANCEID:" + utteranceId + "]";
+    }
+    if (!narratorSpeaker && state->task->allowUnavailableTargetSpeech &&
+        EqualsIgnoreCase(actor, state->task->npcName)) {
+      queueLine += " [ALLOW_UNAVAILABLE_SPEECH]";
     }
     Log("CHAT_TIMING: STREAM_LINE actor=" + actor +
         " subtitle_len=" + ToString((int)subtitle.length()) +
@@ -3000,6 +3207,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
+  ActiveChatStreamScope activeStream;
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3028,6 +3236,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     return 0;
   }
   if (parseState.lineCount == 0 && parseState.actionCount == 0) {
+    if (task->requestMode == "inject") {
+      Log("CHAT_THREAD: Event injection stored successfully.");
+      QueueUiNotifyAction("Event injected.");
+      delete task;
+      return 0;
+    }
     Log("CHAT_THREAD: Empty stream response from server.");
     delete task;
     return 0;
@@ -3070,6 +3284,10 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   }
   delete task;
   return 0;
+}
+
+bool IsAiRequestActive() {
+  return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
 }
 
 void OnChatInputChange(MyGUI::EditBox *sender) {
@@ -3178,25 +3396,14 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     text = sanitizedText;
   }
 
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
   bool narratorModeSelected = (selectedMode == "narrator");
   if (narratorModeSelected) {
     npcName = kNarratorName;
     handleStr = "";
   }
-  std::string mode = "talk";
-  bool cheatModeSelected = (selectedMode == "cheat");
-  if (cheatModeSelected) {
-    mode = "cheat";
-  } else if (narratorModeSelected) {
-    mode = "narrator";
-  } else if (g_autoChatEnabled) {
-    mode = "autochat";
-  } else if (selectedMode == "whisper") {
-    mode = "whisper";
-  } else if (selectedMode == "shout") {
-    mode = "shout";
-  }
+  std::string mode =
+      Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
 
   size_t selectedManualActionIndex = 0;
   if (g_chatActionCombo) {
@@ -3209,13 +3416,15 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       GetManualChatActionChoice(selectedManualActionIndex);
   bool manualActionSelected =
       (manualActionChoice.type != MANUAL_CHAT_ACTION_NONE);
-  if (narratorModeSelected && manualActionSelected) {
+  if (!Stobe::ChatMode::AllowsManualActions(selectedMode) &&
+      manualActionSelected) {
     if (world) {
       world->showPlayerAMessage_withLog(
-          "Chat blocked: Manual actions are unavailable in narrator mode.",
+          "Chat blocked: Manual actions are unavailable in " +
+              Stobe::ChatMode::DisplayLabel(selectedMode) + " mode.",
           true);
     }
-    Log("CHAT_GATE: blocked manual action in narrator mode");
+    Log("CHAT_GATE: blocked manual action in " + selectedMode + " mode");
     return;
   }
   std::string manualActionArgRaw =
@@ -3288,7 +3497,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
   Log("CHAT_SEND_STAGE: validate_target");
   std::string sendFailReason;
-  bool requireStrictTalkValidation = !manualActionSelected;
+  bool requireStrictTalkValidation =
+      !manualActionSelected && selectedMode != "inject";
   bool validationOk = true;
   if (narratorModeSelected) {
     validationOk = (narratorSpeakerNpc && (uintptr_t)narratorSpeakerNpc > 0x1000);
@@ -3729,7 +3939,7 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   CloseChatUI();
 
   bool shouldQueueLocalPlayerSpeech =
-      (mode != "autochat" && mode != "cheat" && mode != "narrator");
+      Stobe::ChatMode::ShouldQueueLocalPlayerSpeech(mode);
   if (shouldQueueLocalPlayerSpeech) {
     EnterCriticalSection(&g_msgMutex);
     g_messageQueue.push_back("PLAYER_SAY: " + text);
@@ -3737,14 +3947,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     Log("CHAT_TIMING: PLAYER_SAY queued immediately (no TTSDUR yet), text_len=" +
         ToString((int)text.length()) + " gen=" + ToString((int)chatGeneration));
   } else {
-    if (mode == "cheat") {
-      Log("CHAT_TIMING: PLAYER_SAY suppressed locally for cheat mode; "
-          "autochat ignored and request sent raw gen=" +
-          ToString((int)chatGeneration));
-    } else {
-      Log("CHAT_TIMING: PLAYER_SAY suppressed locally for autochat; awaiting "
-          "server rewrite gen=" + ToString((int)chatGeneration));
-    }
+    Log("CHAT_TIMING: PLAYER_SAY suppressed locally for " + mode +
+        " mode gen=" + ToString((int)chatGeneration));
   }
 
   if (!manualActionCommand.empty()) {
@@ -3810,7 +4014,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
 
   std::wstring endpoint =
       L"/StobeServer/stream.php?DATA=" +
-      ToWide(BuildStreamQueryData("inputtext", eventData, gameTs)) +
+      ToWide(BuildStreamQueryData(Stobe::ChatMode::EventTypeForRequest(mode),
+                                  eventData, gameTs)) +
       L"&profile=" + ToWide(UrlEncode(profileName)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0");
@@ -3855,6 +4060,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   streamTask->requestMode = mode;
   streamTask->generation = chatGeneration;
   streamTask->rechatDepth = 0;
+  streamTask->allowUnavailableTargetSpeech =
+      manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
   HANDLE chatThread =
       CreateThread(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
@@ -4131,9 +4338,32 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
 
 void OnWriteDiaryClick(MyGUI::Widget *sender) {
   GameWorld *world = GetWorldSafe();
-  std::string targetNpcName = TrimChatLine(g_chatTargetNameStr);
+  if (!world || !world->player ||
+      !world->player->selectedCharacter.isValid()) {
+    Log("DIARY: button trigger failed (no selected NPC).");
+    QueueUiNotifyAction("Diary: select an NPC first.");
+    CloseChatUI();
+    return;
+  }
+
+  hand selectedHandle = world->player->selectedCharacter;
+  Character *targetNpc = ResolveLiveCharacter(world, selectedHandle);
+  if (!targetNpc || (uintptr_t)targetNpc <= 0x1000) {
+    Log("DIARY: button trigger failed (selected NPC unavailable).");
+    QueueUiNotifyAction("Diary: the selected NPC is unavailable.");
+    CloseChatUI();
+    return;
+  }
+
+  std::string targetNpcName;
+  try {
+    targetNpcName = TrimChatLine(targetNpc->getName());
+  } catch (...) {
+    targetNpcName.clear();
+  }
   if (targetNpcName.empty()) {
-    Log("DIARY: button trigger failed (empty target NPC).");
+    Log("DIARY: button trigger failed (selected NPC has no name).");
+    QueueUiNotifyAction("Diary: the selected NPC has no name.");
     CloseChatUI();
     return;
   }
@@ -4147,17 +4377,16 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   if (playerName.empty()) {
     playerName = "Player";
   }
-  std::string targetHandle = TrimChatLine(g_chatTargetHandleStr);
-  Character *targetNpc =
-      ResolveChatTargetCharacter(world, targetNpcName, targetHandle);
+  std::string targetHandle = ToString(selectedHandle.serial);
   Character *bestSpeaker =
       ResolveSelectedOrConfiguredPlayerSpeaker(world, targetNpc);
   if (bestSpeaker && (uintptr_t)bestSpeaker > 0x1000) {
     player = bestSpeaker;
     playerName = bestSpeaker->getName();
   }
-  std::string selectedMode = NormalizeChatMode(g_chatMode);
-  if (selectedMode == "narrator") {
+  std::string selectedMode = Stobe::ChatMode::Normalize(g_chatMode);
+  if (selectedMode == "narrator" ||
+      Stobe::ChatMode::IsInjectionMode(selectedMode)) {
     selectedMode = "chat";
   }
   std::string peopleJson =
@@ -4185,14 +4414,63 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
       CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
   if (diaryThread) {
     CloseHandle(diaryThread);
-    Log("DIARY: manual diary trigger dispatched for '" + targetNpcName +
-        "' people_len=" + ToString((int)peopleJson.length()));
+    Log("DIARY: manual diary trigger dispatched for selected NPC '" +
+        targetNpcName + "' serial=" + targetHandle +
+        " people_len=" + ToString((int)peopleJson.length()));
   } else {
     delete task;
     Log("DIARY: failed to start manual diary response thread for '" +
         targetNpcName + "'");
     QueueUiNotifyAction("Diary: failed to start request for " + targetNpcName +
                         ".");
+  }
+  CloseChatUI();
+}
+
+void OnWriteNarratorDiaryClick(MyGUI::Widget *sender) {
+  GameWorld *world = GetWorldSafe();
+  Character *player = nullptr;
+  if (world && world->player && world->player->playerCharacters.size() > 0) {
+    player = world->player->playerCharacters[0];
+  }
+  std::string playerName = TrimChatLine(g_chatPlayerNameStr);
+  if (playerName.empty() && player && (uintptr_t)player > 0x1000) {
+    try {
+      playerName = TrimChatLine(player->getName());
+    } catch (...) {
+      playerName.clear();
+    }
+  }
+  if (playerName.empty()) {
+    playerName = "Player";
+  }
+
+  std::string peopleJson =
+      "[\"" + EscapeJSON(playerName) + "\",\"" + kNarratorName + "\"]";
+  std::wstring endpoint =
+      L"/StobeServer/stream.php?DATA=" +
+      ToWide(BuildStreamQueryData("diary_narrator", kNarratorName,
+                                  ResolveCurrentGameTs())) +
+      L"&profile=" + ToWide(UrlEncode(kNarratorName)) +
+      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
+      L"&people=" + ToWide(UrlEncode(peopleJson));
+  AppendGeoQueryFromPlayer(endpoint, player);
+
+  ManualDiaryTask *task = new ManualDiaryTask();
+  task->endpoint = endpoint;
+  task->targetNpcName = GetNarratorDisplayName();
+  task->peopleJson = peopleJson;
+  task->requestStartTick = GetTickCount();
+  QueueUiNotifyAction("Diary: narrator request sent.");
+  HANDLE diaryThread =
+      CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
+  if (diaryThread) {
+    CloseHandle(diaryThread);
+    Log("DIARY: manual narrator diary trigger dispatched.");
+  } else {
+    delete task;
+    QueueUiNotifyAction("Diary: failed to start narrator request.");
+    Log("DIARY: failed to start manual narrator diary request.");
   }
   CloseChatUI();
 }
@@ -4556,6 +4834,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
@@ -4614,7 +4893,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
       ToWide(BuildStreamQueryData("init", eventData, ResolveCurrentGameTs())) +
       L"&mode=narrator" + L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
       L"&people=" + ToWide(UrlEncode(peopleJson));
-  AppendGeoQueryFromPlayer(endpoint, speaker);
+  // Save-load callbacks can still expose stale streamed objects. The first
+  // explicit interaction will attach a fully warmed-up location context.
 
   StreamChatTask *task = new StreamChatTask();
   task->endpoint = endpoint;
@@ -4629,6 +4909,7 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
@@ -4662,6 +4943,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   SetActiveChatTarget(npcName, handleStr, true);
   g_chatJustOpened = true;
   g_chatPausedGame = false;
+  RequestProfileModelSlotRefresh(true);
 
   GameWorld *world = GetWorldSafe();
   if (world) {
@@ -4683,8 +4965,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
 
   // Identity renames are queued and handled asynchronously by
   // RenameWorker, so CreateChatUI never blocks on HTTP.
-  const float chatWindowW = 0.42f;
-  const float chatWindowH = 0.18f + ScreenPixelsToRealHeight(20);
+  const float chatWindowW = 0.46f;
+  const float chatWindowH = 0.24f + ScreenPixelsToRealHeight(20);
   const float chatWindowX = (1.0f - chatWindowW) * 0.5f;
   const float chatWindowY = (1.0f - chatWindowH) * 0.5f;
   g_chatWindow = gui->createWidgetReal<MyGUI::Window>(
@@ -4696,19 +4978,19 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatWindowButtonPressed);
   MyGUI::Widget *client = g_chatWindow->getClientWidget();
   g_chatLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.08f, 0.44f, 0.16f,
+      "Kenshi_TextboxStandardText", 0.05f, 0.04f, 0.44f, 0.13f,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatLabel");
   g_chatLabel->setCaption(WideFromUtf8("Speaker: " + g_chatPlayerNameStr).c_str());
-  const float targetComboHeight = 0.16f + ParentPixelsToRealHeight(client, 20);
+  const float targetComboHeight = 0.13f + ParentPixelsToRealHeight(client, 20);
   g_chatTargetCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", 0.53f, 0.08f, 0.42f, targetComboHeight,
+      "Kenshi_ComboBox", 0.53f, 0.04f, 0.42f, targetComboHeight,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatTargetCombo");
   g_chatTargetCombo->setComboModeDrop(true);
   g_chatTargetCombo->eventComboAccept += MyGUI::newDelegate(OnChatTargetChange);
   g_chatTargetCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatTargetChange);
   g_chatInput = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.05f, 0.28f, 0.9f, 0.211f,
+      "Kenshi_EditBox", 0.05f, 0.22f, 0.9f, 0.18f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatInput");
 
   // Single-line style input.
@@ -4722,31 +5004,40 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatInput->eventEditSelectAccept += MyGUI::newDelegate(OnChatInputAccept);
   MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatInput);
 
-  const float inputY = 0.28f;
-  const float inputH = 0.211f;
-  const float rowGap = 0.03f;
-  const float rowH = 0.20f;
-  const float topRowY = inputY + inputH + rowGap;
-  const float bottomRowY = topRowY + rowH + rowGap;
-  const float topRowLeftX = 0.05f;
-  const float topRowGap = 0.03f;
-  const float topBtnW = 0.20f;
-  const float topAutoX = topRowLeftX;
-  const float topBoredX = topAutoX + topBtnW + topRowGap;
-  const float topDiaryX = topBoredX + topBtnW + topRowGap;
-  const float topRenameX = topDiaryX + topBtnW + topRowGap;
-  const float bottomRowLeftX = 0.05f;
-  const float bottomRowGap = 0.02f;
+  const float inputY = 0.22f;
+  const float inputH = 0.18f;
+  const float rowGap = 0.025f;
+  const float rowH = 0.16f;
+  const float primaryRowY = inputY + inputH + rowGap;
+  const float secondaryRowY = primaryRowY + rowH + rowGap;
+  const float controlRowY = secondaryRowY + rowH + rowGap;
+  const float primaryRowLeftX = 0.05f;
+  const float primaryRowGap = 0.02f;
+  const float primaryBtnW = 0.29f;
+  const float primaryAutoX = primaryRowLeftX;
+  const float primaryBoredX = primaryAutoX + primaryBtnW + primaryRowGap;
+  const float primaryRenameX = primaryBoredX + primaryBtnW + primaryRowGap;
+  const float secondaryRowLeftX = 0.05f;
+  const float secondaryRowGap = 0.02f;
+  const float secondaryDiaryW = 0.28f;
+  const float secondaryDiaryX = secondaryRowLeftX;
+  const float secondaryNarratorDiaryX =
+      secondaryDiaryX + secondaryDiaryW + secondaryRowGap;
+  const float profileModelX =
+      secondaryNarratorDiaryX + secondaryDiaryW + secondaryRowGap;
+  const float profileModelW = 0.31f;
+  const float controlRowLeftX = 0.05f;
+  const float controlRowGap = 0.02f;
   const float modeWidth = 0.20f;
   const float actionWidth = 0.30f;
   const float actionArgWidth = 0.14f;
   const float sendWidth = 0.20f;
-  const float actionX = bottomRowLeftX + modeWidth + bottomRowGap;
-  const float actionArgX = actionX + actionWidth + bottomRowGap;
-  const float sendX = actionArgX + actionArgWidth + bottomRowGap;
+  const float actionX = controlRowLeftX + modeWidth + controlRowGap;
+  const float actionArgX = actionX + actionWidth + controlRowGap;
+  const float sendX = actionArgX + actionArgWidth + controlRowGap;
 
   g_chatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", bottomRowLeftX, bottomRowY, modeWidth, rowH,
+      "Kenshi_ComboBox", controlRowLeftX, controlRowY, modeWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatModeCombo");
   g_chatModeCombo->setComboModeDrop(true);
   g_chatModeCombo->addItem(WideFromUtf8("chat").c_str());
@@ -4754,12 +5045,14 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("cheat").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("narrator").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("inject").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
   g_chatModeCombo->eventComboAccept += MyGUI::newDelegate(OnChatModeChange);
   g_chatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatModeChange);
 
   g_chatActionCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", actionX, bottomRowY, actionWidth, rowH,
+      "Kenshi_ComboBox", actionX, controlRowY, actionWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatActionCombo");
   g_chatActionCombo->setComboModeDrop(true);
   for (size_t i = 0; i < ManualChatActionChoiceCount(); ++i) {
@@ -4772,7 +5065,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatActionChange);
 
   g_chatActionArgInput = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", actionArgX, bottomRowY, actionArgWidth, rowH,
+      "Kenshi_EditBox", actionArgX, controlRowY, actionArgWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatActionArgInput");
   g_chatActionArgInput->setEditMultiLine(false);
   g_chatActionArgInput->setEditWordWrap(false);
@@ -4783,7 +5076,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   OnChatActionChange(g_chatActionCombo, g_chatActionCombo->getIndexSelected());
 
   g_chatAutoChatToggle = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topAutoX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryAutoX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatAutoToggle");
   g_chatAutoChatToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnAutoChatToggleClick);
@@ -4791,30 +5084,59 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   RefreshChatModeControls();
 
   MyGUI::Button *sendBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", sendX, bottomRowY, sendWidth, rowH,
+      "Kenshi_Button1", sendX, controlRowY, sendWidth, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatSendBtn");
   sendBtn->setCaption(WideFromUtf8(T("Send")).c_str());
   sendBtn->eventMouseButtonClick += MyGUI::newDelegate(OnChatSendClick);
 
   MyGUI::Button *boredEventBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topBoredX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryBoredX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatBoredBtn");
   boredEventBtn->setCaption(WideFromUtf8(T("Continue Chat")).c_str());
   boredEventBtn->eventMouseButtonClick += MyGUI::newDelegate(OnBoredEventClick);
 
   MyGUI::Button *writeDiaryBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topDiaryX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", secondaryDiaryX, secondaryRowY, secondaryDiaryW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_ChatDiaryBtn");
   writeDiaryBtn->setCaption(WideFromUtf8(T("Write Diary")).c_str());
   writeDiaryBtn->eventMouseButtonClick += MyGUI::newDelegate(OnWriteDiaryClick);
 
+  MyGUI::Button *writeNarratorDiaryBtn =
+      client->createWidgetReal<MyGUI::Button>(
+          "Kenshi_Button1", secondaryNarratorDiaryX, secondaryRowY,
+          secondaryDiaryW, rowH,
+          MyGUI::Align::Top | MyGUI::Align::Left,
+          "Stobe_ChatNarratorDiaryBtn");
+  writeNarratorDiaryBtn->setCaption(
+      WideFromUtf8(T("Narrator Diary")).c_str());
+  writeNarratorDiaryBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnWriteNarratorDiaryClick);
+
   MyGUI::Button *renameBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", topRenameX, topRowY, topBtnW, rowH,
+      "Kenshi_Button1", primaryRenameX, primaryRowY, primaryBtnW, rowH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatRenameBtn");
   renameBtn->setCaption(WideFromUtf8("Rename").c_str());
   renameBtn->eventMouseButtonClick += MyGUI::newDelegate(OnRenameClick);
+
+  g_chatProfileModelCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", profileModelX, secondaryRowY, profileModelW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_ChatProfileModelCombo");
+  g_chatProfileModelCombo->setComboModeDrop(true);
+  for (int slot = 1; slot <= 4; ++slot) {
+    g_chatProfileModelCombo->addItem(
+        WideFromUtf8("Response: " +
+                     std::string(kProfileModelLabels[slot - 1]))
+            .c_str());
+  }
+  g_chatProfileModelCombo->setIndexSelected(
+      static_cast<size_t>(GetActiveProfileModelSlot() - 1));
+  g_chatProfileModelCombo->eventComboAccept +=
+      MyGUI::newDelegate(OnChatProfileModelChange);
+  g_chatProfileModelCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnChatProfileModelChange);
 }
 
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
@@ -4822,10 +5144,37 @@ void OnChatModeChange(MyGUI::ComboBox *sender, size_t index) {
     return;
 
   std::string selectedMode = sender->getItemNameAt(index);
-  g_chatMode = NormalizeChatMode(selectedMode);
-  g_lastChatModeIndex = ChatModeToIndex(g_chatMode);
+  g_chatMode = Stobe::ChatMode::Normalize(selectedMode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
+}
+
+void OnChatProfileModelChange(MyGUI::ComboBox *sender, size_t index) {
+  if (g_profileModelComboRefreshInProgress || !sender ||
+      index == MyGUI::ITEM_NONE || index >= 4) {
+    return;
+  }
+
+  const int requestedSlot = static_cast<int>(index) + 1;
+  const int previousSlot = GetActiveProfileModelSlot();
+  if (requestedSlot == previousSlot) {
+    return;
+  }
+
+  const LONG revision = InterlockedIncrement(&g_profileModelRevision);
+  InterlockedExchange(&g_profileModelSlot, requestedSlot);
+
+  ProfileModelRequestTask *task = new ProfileModelRequestTask();
+  task->write = true;
+  task->requestedSlot = requestedSlot;
+  task->fallbackSlot = previousSlot;
+  task->revision = revision;
+  if (!StartProfileModelRequest(task)) {
+    QueueProfileModelSlotUpdate(revision, previousSlot);
+    QueueProfileModelNotification(
+        "Unable to change the response mode. Check StobeServer.");
+  }
 }
 
 void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index) {
@@ -4869,25 +5218,49 @@ void OnChatActionChange(MyGUI::ComboBox *sender, size_t index) {
 }
 
 void OnAutoChatToggleClick(MyGUI::Widget *sender) {
+  if (Stobe::ChatMode::IsInjectionMode(g_chatMode)) {
+    return;
+  }
   g_autoChatEnabled = !g_autoChatEnabled;
   SaveStobeRuntimeConfig();
   RefreshChatModeControls();
 }
 
 void RefreshChatModeControls() {
+  g_chatMode = Stobe::ChatMode::Normalize(g_chatMode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   if (g_chatModeCombo) {
-    g_chatMode = NormalizeChatMode(g_chatMode);
-    g_lastChatModeIndex = ChatModeToIndex(g_chatMode);
     if (g_chatModeCombo->getIndexSelected() != g_lastChatModeIndex) {
       g_chatModeCombo->setIndexSelected(g_lastChatModeIndex);
     }
   }
 
+  const bool injectionMode = Stobe::ChatMode::IsInjectionMode(g_chatMode);
+  const bool manualActionsAllowed =
+      Stobe::ChatMode::AllowsManualActions(g_chatMode);
+  if (!manualActionsAllowed) {
+    if (g_chatActionCombo && g_chatActionCombo->getIndexSelected() != 0) {
+      g_chatActionCombo->setIndexSelected(0);
+    }
+    if (g_chatActionArgInput) {
+      g_chatActionArgInput->setCaption("");
+    }
+  }
+  if (g_chatActionCombo) {
+    g_chatActionCombo->setEnabled(manualActionsAllowed);
+  }
+  if (g_chatActionArgInput) {
+    g_chatActionArgInput->setEnabled(manualActionsAllowed);
+  }
+
   if (g_chatAutoChatToggle) {
-    g_chatAutoChatToggle->setCaption(
-        WideFromUtf8(std::string("Auto Chat: ") +
-                   (g_autoChatEnabled ? "[ON]" : "[OFF]"))
-            .c_str());
+    g_chatAutoChatToggle->setEnabled(!injectionMode);
+    const std::string autoChatCaption =
+        injectionMode
+            ? "Auto Chat: [N/A]"
+            : std::string("Auto Chat: ") +
+                  (g_autoChatEnabled ? "[ON]" : "[OFF]");
+    g_chatAutoChatToggle->setCaption(WideFromUtf8(autoChatCaption).c_str());
   }
   RefreshAvailableChatTargets(true);
   RefreshChatHeaderLabel();

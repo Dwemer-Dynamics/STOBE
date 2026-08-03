@@ -2,7 +2,10 @@
 #include "AudioPlayback.h"
 #include "ChatBox.h"
 #include "Comm.h"
+#include "DialogueMenuTts.h"
 #include "Globals.h"
+#include "JournalWindow.h"
+#include "StobeChatMode.h"
 #include "Utils.h"
 
 #include <shellapi.h>
@@ -16,7 +19,6 @@
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
-#include <algorithm>
 #include <cstdlib>
 
 namespace Stobe {
@@ -39,18 +41,22 @@ MyGUI::Button *g_autoChatToggle = nullptr;
 MyGUI::Button *g_boredEventsToggle = nullptr;
 MyGUI::Button *g_animalTalksToggle = nullptr;
 MyGUI::Button *g_ttsToggle = nullptr;
+MyGUI::Button *g_dialogueMenuTtsToggle = nullptr;
 MyGUI::Button *g_speedDialogueToggle = nullptr;
 MyGUI::Button *g_regularDialogueToggle = nullptr;
 MyGUI::Button *g_itemImageSyncToggle = nullptr;
+MyGUI::Button *g_statusHudToggle = nullptr;
 
 bool g_pendingAutoChat = false;
 bool g_pendingBoredEvents = true;
 bool g_pendingAnimalTalks = false;
 bool g_pendingNearestSpeaker = true;
 bool g_pendingTtsEnabled = true;
+bool g_pendingDialogueMenuTts = true;
 bool g_pendingSpeedDialogue = true;
 bool g_pendingRegularDialogueCapture = true;
 bool g_pendingItemImageSync = true;
+bool g_pendingStatusHud = false;
 
 int ClampInt(int value, int minValue, int maxValue) {
   if (value < minValue)
@@ -70,20 +76,6 @@ int ParseIntOrDefault(const std::string &value, int fallback) {
     return fallback;
   }
   return static_cast<int>(parsed);
-}
-
-std::string NormalizeChatModeValue(const std::string &modeRaw) {
-  std::string mode = modeRaw;
-  std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-  if (mode == "whisper")
-    return "whisper";
-  if (mode == "shout")
-    return "shout";
-  if (mode == "cheat")
-    return "cheat";
-  if (mode == "narrator")
-    return "narrator";
-  return "chat";
 }
 
 bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
@@ -184,18 +176,11 @@ void PopulateChatModeCombo() {
   g_pluginChatModeCombo->addItem(WideFromUtf8("shout").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("cheat").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("narrator").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("inject").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
 
-  std::string currentMode = NormalizeChatModeValue(g_chatMode);
-  size_t selected = 0;
-  if (currentMode == "whisper")
-    selected = 1;
-  else if (currentMode == "shout")
-    selected = 2;
-  else if (currentMode == "cheat")
-    selected = 3;
-  else if (currentMode == "narrator")
-    selected = 4;
-  g_pluginChatModeCombo->setIndexSelected(selected);
+  g_pluginChatModeCombo->setIndexSelected(
+      Stobe::ChatMode::ToIndex(g_chatMode));
 }
 
 void OnHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -214,17 +199,8 @@ void OnGeneralHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
 void OnPluginModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
   if (!sender || index == MyGUI::ITEM_NONE)
     return;
-  g_chatMode = NormalizeChatModeValue(sender->getItemNameAt(index));
-  if (g_chatMode == "whisper")
-    g_lastChatModeIndex = 1;
-  else if (g_chatMode == "shout")
-    g_lastChatModeIndex = 2;
-  else if (g_chatMode == "cheat")
-    g_lastChatModeIndex = 3;
-  else if (g_chatMode == "narrator")
-    g_lastChatModeIndex = 4;
-  else
-    g_lastChatModeIndex = 0;
+  g_chatMode = Stobe::ChatMode::Normalize(sender->getItemNameAt(index));
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
 }
 
 void OnSpeakerModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -239,9 +215,11 @@ void LoadPendingFromRuntime() {
   g_pendingAnimalTalks = g_enableAnimalTalks;
   g_pendingNearestSpeaker = g_useNearestPlayerSpeaker;
   g_pendingTtsEnabled = g_ttsEnabled;
+  g_pendingDialogueMenuTts = g_enableDialogueMenuTts;
   g_pendingSpeedDialogue = g_speedDialogue;
   g_pendingRegularDialogueCapture = g_enableRegularDialogueCapture;
   g_pendingItemImageSync = g_enableItemImageSync;
+  g_pendingStatusHud = g_enableStatusHud;
 }
 
 void RefreshPluginSettingsUI() {
@@ -278,12 +256,15 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_boredEventsToggle, "Bored Events", g_pendingBoredEvents);
   SetToggleCaption(g_animalTalksToggle, "Animal Talks", g_pendingAnimalTalks);
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
+  SetToggleCaption(g_dialogueMenuTtsToggle, "Menu Dialogue TTS",
+                   g_pendingDialogueMenuTts);
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
                    g_pendingSpeedDialogue);
   SetToggleCaption(g_regularDialogueToggle, "Regular Dialogue",
                    g_pendingRegularDialogueCapture);
   SetToggleCaption(g_itemImageSyncToggle, "Image Sync",
                    g_pendingItemImageSync);
+  SetToggleCaption(g_statusHudToggle, "Status HUD", g_pendingStatusHud);
 }
 
 void OnSettingsSaveClick(MyGUI::Widget *sender) {
@@ -302,31 +283,25 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
 
   if (g_pluginChatModeCombo &&
       g_pluginChatModeCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
-    g_chatMode = NormalizeChatModeValue(
+    g_chatMode = Stobe::ChatMode::Normalize(
         g_pluginChatModeCombo->getItemNameAt(
             g_pluginChatModeCombo->getIndexSelected()));
   }
 
-  if (g_chatMode == "whisper")
-    g_lastChatModeIndex = 1;
-  else if (g_chatMode == "shout")
-    g_lastChatModeIndex = 2;
-  else if (g_chatMode == "cheat")
-    g_lastChatModeIndex = 3;
-  else if (g_chatMode == "narrator")
-    g_lastChatModeIndex = 4;
-  else
-    g_lastChatModeIndex = 0;
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
 
   g_autoChatEnabled = g_pendingAutoChat;
   g_enableBoredEvents = g_pendingBoredEvents;
   g_enableAnimalTalks = g_pendingAnimalTalks;
   g_useNearestPlayerSpeaker = g_pendingNearestSpeaker;
   bool previousTtsEnabled = g_ttsEnabled;
+  bool previousDialogueMenuTts = g_enableDialogueMenuTts;
   g_ttsEnabled = g_pendingTtsEnabled;
+  g_enableDialogueMenuTts = g_pendingDialogueMenuTts;
   g_speedDialogue = g_pendingSpeedDialogue;
   g_enableRegularDialogueCapture = g_pendingRegularDialogueCapture;
   g_enableItemImageSync = g_pendingItemImageSync;
+  g_enableStatusHud = g_pendingStatusHud;
 
   int talkRadius = ParseIntOrDefault(
       g_talkRadiusEdit ? g_talkRadiusEdit->getCaption() : "", (int)g_proximityRadius);
@@ -357,7 +332,15 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
     InterruptTtsPlayback();
     Log("CONFIG: TTS disabled from settings; active playback interrupted.");
   }
+  if (previousDialogueMenuTts && !g_enableDialogueMenuTts) {
+    Stobe::DialogueMenuTts::Reset("setting_disabled");
+  }
   RefreshChatModeControls();
+  if (g_enableStatusHud) {
+    UpdateStatusHud(GetWorldSafe());
+  } else {
+    CloseStatusHud();
+  }
   RefreshPluginSettingsUI();
 
   if (sender && sender->castType<MyGUI::Button>(false)) {
@@ -389,6 +372,12 @@ void OnPluginTtsToggleClick(MyGUI::Widget *sender) {
   SetToggleCaption(g_ttsToggle, "TTS", g_pendingTtsEnabled);
 }
 
+void OnPluginDialogueMenuTtsToggleClick(MyGUI::Widget *sender) {
+  g_pendingDialogueMenuTts = !g_pendingDialogueMenuTts;
+  SetToggleCaption(g_dialogueMenuTtsToggle, "Menu Dialogue TTS",
+                   g_pendingDialogueMenuTts);
+}
+
 void OnPluginSpeedDialogueToggleClick(MyGUI::Widget *sender) {
   g_pendingSpeedDialogue = !g_pendingSpeedDialogue;
   SetToggleCaption(g_speedDialogueToggle, "Speed Dialogue",
@@ -408,6 +397,11 @@ void OnPluginItemImageSyncToggleClick(MyGUI::Widget *sender) {
   SetToggleCaption(g_itemImageSyncToggle, "Image Sync", g_pendingItemImageSync);
   Log("CONFIG: ItemImageSync toggled to " +
       std::string(g_enableItemImageSync ? "ON" : "OFF") + " (saved)");
+}
+
+void OnPluginStatusHudToggleClick(MyGUI::Widget *sender) {
+  g_pendingStatusHud = !g_pendingStatusHud;
+  SetToggleCaption(g_statusHudToggle, "Status HUD", g_pendingStatusHud);
 }
 
 void OnSettingsOpenConfigClick(MyGUI::Widget *sender) {
@@ -474,9 +468,11 @@ void CloseSettingsUI() {
   g_boredEventsToggle = nullptr;
   g_animalTalksToggle = nullptr;
   g_ttsToggle = nullptr;
+  g_dialogueMenuTtsToggle = nullptr;
   g_speedDialogueToggle = nullptr;
   g_regularDialogueToggle = nullptr;
   g_itemImageSyncToggle = nullptr;
+  g_statusHudToggle = nullptr;
 }
 
 void OnSettingsWindowButtonPressed(MyGUI::Window *sender,
@@ -497,7 +493,8 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.225f, 0.08f, 0.55f, 0.68f, MyGUI::Align::Center,
+      "Kenshi_WindowCX", 0.3075f, 0.199f, 0.385f, 0.602f,
+      MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
   g_settingsWindow->eventWindowButtonPressed +=
@@ -509,15 +506,22 @@ void CreateSettingsUI() {
   const float fieldX = 0.52f;
   const float labelW = 0.45f;
   const float fieldW = 0.43f;
-  const float rowH = 0.05f;
+  const float rowH = 0.045f;
   const float rowGap = 0.004f;
-  const float rangeHintH = 0.035f;
-  const float rangeHintGap = 0.04f;
-  const float sectionGap = 0.01f;
-  const float toggleH = 0.06f;
+  const float rangeHintH = 0.03f;
+  const float rangeHintGap = 0.034f;
+  const float sectionGap = 0.006f;
+  const float toggleH = 0.052f;
   const float actionBtnH = 0.07f;
-  const float toggleRowGap = 0.07f;
-  float y = 0.03f;
+  const float toggleRowGap = 0.06f;
+  const float sectionHeaderH = 0.038f;
+  float y = 0.02f;
+
+  MyGUI::TextBox *controlsHeader =
+      CreateLabel(client, labelX, y, 0.90f, sectionHeaderH, "Controls",
+                  "Stobe_Plugin_ControlsHeader");
+  controlsHeader->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.35f));
+  y += sectionHeaderH;
 
   CreateLabel(client, labelX, y, labelW, rowH, "STOBE Settings Key",
               "Stobe_Plugin_GeneralHotkeyLabel");
@@ -543,7 +547,7 @@ void CreateSettingsUI() {
       MyGUI::newDelegate(OnHotkeyComboChanged);
   y += rowH + rowGap;
 
-  CreateLabel(client, labelX, y, labelW, rowH, "Default Chat Mode",
+  CreateLabel(client, labelX, y, labelW, rowH, "Default Mode",
               "Stobe_Plugin_ModeLabel");
   g_pluginChatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
       "Kenshi_ComboBox", fieldX, y, fieldW, rowH,
@@ -554,6 +558,12 @@ void CreateSettingsUI() {
   g_pluginChatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnPluginModeComboChanged);
   y += rowH + rowGap;
+
+  MyGUI::TextBox *rangesHeader =
+      CreateLabel(client, labelX, y, 0.90f, sectionHeaderH, "Ranges & Timing",
+                  "Stobe_Plugin_RangesHeader");
+  rangesHeader->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.35f));
+  y += sectionHeaderH;
 
   MyGUI::TextBox *rangeHint = CreateLabel(
       client, labelX, y, 0.90f, rangeHintH,
@@ -606,6 +616,12 @@ void CreateSettingsUI() {
       "Stobe_Plugin_DynProfileIntervalEdit");
   y += rowH + sectionGap;
 
+  MyGUI::TextBox *featuresHeader =
+      CreateLabel(client, labelX, y, 0.90f, sectionHeaderH, "Features",
+                  "Stobe_Plugin_FeaturesHeader");
+  featuresHeader->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.35f));
+  y += sectionHeaderH;
+
   g_autoChatToggle = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", 0.05f, y, 0.28f, toggleH,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_Plugin_AutoChatToggle");
@@ -652,6 +668,20 @@ void CreateSettingsUI() {
       "Stobe_Plugin_ItemImageSyncToggle");
   g_itemImageSyncToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginItemImageSyncToggleClick);
+
+  g_statusHudToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.36f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_StatusHudToggle");
+  g_statusHudToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginStatusHudToggleClick);
+
+  g_dialogueMenuTtsToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.67f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_DialogueMenuTtsToggle");
+  g_dialogueMenuTtsToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginDialogueMenuTtsToggleClick);
   y += toggleRowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Speaker Mode",

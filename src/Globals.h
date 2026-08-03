@@ -42,10 +42,13 @@ extern float g_speechBubbleLife;
 extern int g_rechatDispatchCooldownMs;
 extern int g_ttsVolumePercent;
 extern bool g_ttsEnabled;
+extern bool g_enableDialogueMenuTts;
 extern bool g_speedDialogue;
 extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;
+extern bool g_enableStatusHud;
 extern int g_dynamicProfileIntervalHours;
+extern std::string g_narratorDisplayName;
 
 // State tracking for inventory/debugger
 extern std::string g_activeInventoryJson;
@@ -130,11 +133,31 @@ struct QueuedAction {
   int taskValue;       // For ACT_SET_TASK, money amounts, or Relation Change
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
+  bool narratorNotification; // Queue narrator popups with speech timing.
+  bool allowUnavailableSpeech; // Preserve reactions to forced limb removal.
+  std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
       : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
-        proximityMoveIssued(false) {}
+        proximityMoveIssued(false), narratorNotification(false),
+        allowUnavailableSpeech(false) {}
 };
+
+struct PendingAutonomyCatalogMessage {
+  std::string message;
+  std::string decisionId;
+};
+
+extern std::deque<PendingAutonomyCatalogMessage>
+    g_pendingAutonomyCatalogMessages;
+
+// Register acquires g_msgMutex. Claim is called only while ProcessMessageQueue
+// already owns g_msgMutex.
+void RegisterPendingAutonomyCatalogMessage(const std::string &message,
+                                           const std::string &decisionId);
+bool ClaimPendingAutonomyCatalogMessageLocked(const std::string &message,
+                                              std::string &decisionIdOut);
+void CancelPendingAutonomyCatalogDecision(const std::string &decisionId);
 
 extern std::deque<QueuedAction> g_uiActionQueue;
 extern CRITICAL_SECTION g_uiMutex;
@@ -177,6 +200,8 @@ GameWorld *GetWorldSafe();
 LONG BeginChatInterruptGeneration();
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
+void SetNarratorDisplayName(const std::string &name);
+std::string GetNarratorDisplayName();
 
 void SetFollowTarget(unsigned int followerSerial, const hand &target);
 void ClearFollowTarget(unsigned int followerSerial);
