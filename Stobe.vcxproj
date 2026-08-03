@@ -104,7 +104,11 @@
     <ClCompile Include="src\KenshiAiCompat.cpp" />
     <ClCompile Include="src\JournalWindow.cpp" />
     <ClCompile Include="src\KenshiRvaCompat.cpp" />
+    <ClCompile Include="src\KenshiTownIdentity.cpp">
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include\ogre;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\PlayerBaseState.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
     <ClCompile Include="src\StobeChatMode.cpp" />
     <ClCompile Include="src\StobeIdentityRename.cpp" />
@@ -134,6 +138,8 @@
     <ClInclude Include="src\KenshiAiCompat.h" />
     <ClInclude Include="src\JournalWindow.h" />
     <ClInclude Include="src\KenshiRvaCompat.h" />
+    <ClInclude Include="src\KenshiTownIdentity.h" />
+    <ClInclude Include="src\PlayerBaseState.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\StobeChatMode.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />

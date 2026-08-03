@@ -15,6 +15,7 @@
 
 #include "Comm.h"
 #include "Context.h"
+#include "DialogueMenuTts.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? Kenshi engine writes MUST occur on the main thread inside hooks.
 #include <core/Functions.h>
@@ -24,6 +25,7 @@
 #include "AutonomySafetyProbe.h"
 #include "Globals.h"
 #include "KenshiTownCompat.h"
+#include "PlayerBaseState.h"
 #include "StobeIdentityRename.h"
 #include "Utils.h"
 #include "WorldStateRuntime.h"
@@ -1509,8 +1511,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "0.9.5";
-static const char *kStobePluginReleaseDate = "2026-07-29";
+static const char *kStobePluginVersion = "1.0.0";
+static const char *kStobePluginReleaseDate = "2026-08-01";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -4569,6 +4571,21 @@ static bool IsAliveConsciousCharacterForTargeting(Character *npc) {
   return true;
 }
 
+static float ResolveTargetingDistance(Character *anchor, Character *candidate) {
+  float distance = anchor->getPosition().distance(candidate->getPosition());
+  if (!IsAnimalCharacterSafe(candidate)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = anchor->getRadius() + candidate->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
+}
+
 static Character *ResolveFirstAliveConsciousPlayerCharacter(GameWorld *world) {
   if (!world || !world->player) {
     return nullptr;
@@ -4721,6 +4738,11 @@ static bool IsTargetAreaCompatibleForSelection(Character *anchor,
   if (candidateHasBuilding) {
     return false;
   }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate)) {
+    // Outdoor wildlife can report terrain levels as floors. Use distance when
+    // both actors are outside instead of rejecting the animal as another level.
+    return true;
+  }
   if (candidateFloor > anchorFloor + 1) {
     return false;
   }
@@ -4745,20 +4767,51 @@ static Character *ResolveNearestNpcTargetForSelection(GameWorld *world,
     world->getCharactersWithinSphere(nearby, selectedPos, searchRadius, 0.0f,
                                      0.0f, 0x10, 0, selected);
 
-    for (uint32_t i = 0; i < nearby.size(); ++i) {
-      Character *candidate = (Character *)nearby.stuff[i];
+    auto considerCandidate = [&](Character *candidate) {
       if (!IsAliveConsciousCharacterForTargeting(candidate) ||
           candidate == selected) {
-        continue;
+        return;
+      }
+      bool candidateIsAnimal = IsAnimalCharacterSafe(candidate);
+      if (candidateIsAnimal && !g_enableAnimalTalks) {
+        return;
       }
       if (!IsTargetAreaCompatibleForSelection(selected, candidate)) {
-        continue;
+        return;
       }
-      float dist = candidate->getPosition().distance(selectedPos);
+      float dist = ResolveTargetingDistance(selected, candidate);
+      if (dist > searchRadius) {
+        return;
+      }
       if (!best || dist < bestDist) {
         best = candidate;
         bestDist = dist;
       }
+    };
+
+    for (uint32_t i = 0; i < nearby.size(); ++i) {
+      considerCandidate((Character *)nearby.stuff[i]);
+    }
+
+    if (g_enableAnimalTalks) {
+      // Kenshi's sphere query can omit wildlife, so include loaded nearby
+      // animals explicitly when the user has enabled Animal Talks.
+      const ogre_unordered_set<Character *>::type &activeCharacters =
+          world->getCharacterUpdateList();
+      for (ogre_unordered_set<Character *>::type::const_iterator it =
+               activeCharacters.begin();
+           it != activeCharacters.end(); ++it) {
+        Character *candidate = *it;
+        if (!IsAnimalCharacterSafe(candidate)) {
+          continue;
+        }
+        considerCandidate(candidate);
+      }
+    }
+
+    if (best && IsAnimalCharacterSafe(best)) {
+      Log("ANIMAL_TALKS: nearest enabled animal target name=" +
+          best->getName() + " distance=" + ToString(bestDist));
     }
   } catch (...) {
     return nullptr;
@@ -10888,6 +10941,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         // Normal dialogue bubble
         std::string bubbleContent =
             isPlayerSay ? msg.substr(12) : (isNPCSay ? msg.substr(9) : "");
+        const std::string unavailableSpeechMarker =
+            " [ALLOW_UNAVAILABLE_SPEECH]";
+        bool allowUnavailableSpeech = false;
+        size_t unavailableSpeechPos = bubbleContent.rfind(unavailableSpeechMarker);
+        if (unavailableSpeechPos != std::string::npos &&
+            unavailableSpeechPos + unavailableSpeechMarker.length() ==
+                bubbleContent.length()) {
+          bubbleContent.erase(unavailableSpeechPos);
+          allowUnavailableSpeech = true;
+        }
         std::string structuredMessage =
             ExtractDialogueMessageFromStructuredText(bubbleContent);
         if (!structuredMessage.empty()) {
@@ -11047,6 +11110,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.targetToken = talkTargetToken;
             act.ttsHash = ttsHash;
             act.utteranceId = utteranceId;
+            act.allowUnavailableSpeech = allowUnavailableSpeech;
             int speechTimingMs = ttsDurationMs;
             if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
                 ttsDurationMs <= 0) {
@@ -11063,7 +11127,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 " tts_hash=" + (ttsHash.empty() ? "" : ttsHash.substr(0, 8)) +
                 " tts_dur_ms=" + ToString(ttsDurationMs) +
                 " player_tts_wait_hint=" +
-                std::string(speechTimingMs < 0 ? "1" : "0"));
+                std::string(speechTimingMs < 0 ? "1" : "0") +
+                " allow_unavailable=" +
+                std::string(allowUnavailableSpeech ? "1" : "0"));
           } else {
             if (!utteranceId.empty()) {
               PostSpeechDeliveryState(utteranceId, "cancelled");
@@ -11792,6 +11858,7 @@ void dialogueSayText_hook(Dialogue *dialogue, const std::string &line,
 
 void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
   std::string replyText = ResolveDialogueReplyTextByIndexSafe(dialogue, index);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedInt_orig) {
     dialogueReplyClickedInt_orig(dialogue, index);
   }
@@ -11803,6 +11870,7 @@ void dialogueReplyClickedInt_hook(Dialogue *dialogue, int index) {
 void dialogueReplyClickedString_hook(Dialogue *dialogue,
                                      const std::string &indexToken) {
   std::string replyText = ResolveDialogueReplyTextByTokenSafe(dialogue, indexToken);
+  Stobe::DialogueMenuTts::NotifySelection();
   if (dialogueReplyClickedString_orig) {
     dialogueReplyClickedString_orig(dialogue, indexToken);
   }
@@ -12119,6 +12187,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
+    Stobe::DialogueMenuTts::Reset("gui_unavailable");
     CloseChatUI();
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
@@ -12133,6 +12202,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!worldStable) {
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
+    Stobe::DialogueMenuTts::Reset("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12170,6 +12240,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       ResetTownKnowledgeSyncState();
+      Stobe::PlayerBase::Reset();
       Stobe::WorldStateRuntime::Reset();
       heavySweepPrimed = false;
       motdAutoOpenQueued = false;
@@ -12204,6 +12275,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_lastSelectionContextPushedSerial = 0;
     LeaveCriticalSection(&g_stateMutex);
     Stobe::WorldStateRuntime::Reset();
+    Stobe::PlayerBase::Reset();
     heavySweepPrimed = false;
     motdAutoOpenQueued = false;
     motdAutoOpenTick = 0;
@@ -12278,8 +12350,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     }
   }
 
-  UpdateStatusHud(worldUi);
-
   bool probePostLoadPipeline = !postLoadPipelineProbed;
   if (probePostLoadPipeline) {
     Log("HOOK_LOAD_PROBE: entering warmed post-load pipeline");
@@ -12287,6 +12357,9 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::DialogueMenuTts::Update();
+  Stobe::PlayerBase::Update(worldUi, sel);
+  UpdateStatusHud(worldUi);
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
@@ -12611,6 +12684,25 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         g_talkTargetHand = chatTarget->getHandle();
         QueueIdentityRenameCandidate(chatTarget, "chat_open_target");
         SyncInventoryForCharacter(chatTarget, true, "chat_open");
+
+        bool chatTargetIsTrader = false;
+        try {
+          chatTargetIsTrader = !chatTarget->isPlayerCharacter() &&
+                               chatTarget->isATrader();
+        } catch (...) {
+          chatTargetIsTrader = false;
+        }
+        if (chatTargetIsTrader) {
+          bool capturedTraderInventory =
+              CaptureTraderInventorySnapshot(chatTarget, "chat_open");
+          Log("TRADER_INVENTORY_CAPTURE: chat-open target=" +
+              ResolveCharacterNameSafe(chatTarget) + " success=" +
+              std::string(capturedTraderInventory ? "1" : "0"));
+          if (capturedTraderInventory) {
+            PushImmediateContextSnapshot(chatTarget,
+                                         "chat_open_trade_capture", true);
+          }
+        }
 
         // Suppress vanilla dialogue state to prevent "double dialogue"
         if (chatTarget->dialogue && (uintptr_t)chatTarget->dialogue > 0x1000) {

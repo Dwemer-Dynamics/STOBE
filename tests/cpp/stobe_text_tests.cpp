@@ -941,8 +941,10 @@ int main() {
                5);
   ExpectUInt32("Inject and chat mode index",
                static_cast<unsigned int>(ToIndex("inject_chat")), 6);
+  ExpectEq("Chat display label", DisplayLabel("chat"), "Chat");
+  ExpectEq("Whisper display label", DisplayLabel("whisper"), "Whisper");
   ExpectEq("Inject and chat display label", DisplayLabel("inject_chat"),
-           "inject & chat");
+            "Inject & Chat");
   ExpectEq("Inject overrides auto chat",
            ResolveRequestMode("inject", true), "inject");
   ExpectEq("Inject and chat overrides auto chat",

@@ -73,6 +73,7 @@ LONG g_profileModelRefreshInFlight = 0;
 DWORD g_profileModelLastRefreshTick = 0;
 bool g_profileModelComboRefreshInProgress = false;
 const float kWhisperRangeUnits = 20.0f;
+const float kCheatRangeUnits = 100.0f;
 const char *kNarratorName = "The Narrator";
 const char *kProfileModelLabels[] = {
     "Standard", "Fast", "Powerful", "Experimental"};
@@ -780,6 +781,25 @@ bool ShouldIncludeAnimalForTalk(Character *character) {
   return IsAnimalActivated(serial);
 }
 
+float ResolveChatInteractionDistance(Character *speaker, Character *target) {
+  if (!speaker || !target || (uintptr_t)speaker <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return -1.0f;
+  }
+  float distance = speaker->getPosition().distance(target->getPosition());
+  if (!IsAnimalCharacterSafe(target, nullptr)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = speaker->getRadius() + target->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
+}
+
 bool IsCharacterUnavailableForConversation(Character *character) {
   if (!character || (uintptr_t)character <= 0x1000) {
     return true;
@@ -874,6 +894,8 @@ float GetSearchRadiusForMode(const std::string &mode) {
     return kWhisperRangeUnits;
   if (mode == "shout")
     return g_shoutRadius;
+  if (mode == "cheat")
+    return kCheatRangeUnits;
   return g_proximityRadius;
 }
 
@@ -948,6 +970,11 @@ bool IsConversationAreaCompatible(Character *anchor, Character *candidate) {
 
   if (candidateHasBuilding) {
     return false;
+  }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate, nullptr)) {
+    // Outdoor wildlife can report terrain levels as floors. Distance remains
+    // authoritative when neither participant is inside a building.
+    return true;
   }
   // Outdoors: ignore NPCs on a higher floor/level than the speaker.
   if (candidateFloor > anchorFloor + 1) {
@@ -1499,7 +1526,14 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   }
 
   if (selectedMode == "cheat") {
-    Log("CHAT_VALIDATE: bypass spatial/range checks for cheat mode");
+    float dist = ResolveChatInteractionDistance(player, target);
+    Log("CHAT_VALIDATE: cheat distance_check dist=" + ToString(dist) +
+        " allowed=" + ToString((int)kCheatRangeUnits));
+    if (dist > kCheatRangeUnits) {
+      failReason = "Target is out of range for cheat mode (100m maximum).";
+      return false;
+    }
+    Log("CHAT_VALIDATE: bypass area checks for cheat mode within 100m");
     return true;
   }
 
@@ -1517,7 +1551,7 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
     allowedRange = 1.0f;
   }
   Log("CHAT_VALIDATE: distance_check begin allowed=" + ToString((int)allowedRange));
-  float dist = player->getPosition().distance(target->getPosition());
+  float dist = ResolveChatInteractionDistance(player, target);
   Log("CHAT_VALIDATE: distance_check end dist=" + ToString(dist));
   if (dist > allowedRange) {
     failReason = "Target is out of range for " + selectedMode + ".";
@@ -1610,17 +1644,21 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
   }
 
   try {
-    distanceOut = speaker->getPosition().distance(target->getPosition());
+    distanceOut = ResolveChatInteractionDistance(speaker, target);
   } catch (...) {
     distanceOut = -1.0f;
     return false;
   }
 
   if (selectedMode == "cheat") {
-    return true;
+    return distanceOut <= kCheatRangeUnits;
   }
 
-  if (!IsConversationAreaCompatible(speaker, target)) {
+  bool areaCompatible = IsConversationAreaCompatible(speaker, target);
+  if (!areaCompatible) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected area name=" + target->getName());
+    }
     return false;
   }
 
@@ -1629,7 +1667,17 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
     allowedRange = 1.0f;
   }
   if (distanceOut > allowedRange) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected range name=" + target->getName() +
+          " surface_distance=" + ToString(distanceOut) +
+          " allowed=" + ToString(allowedRange));
+    }
     return false;
+  }
+
+  if (targetIsAnimal) {
+    Log("ANIMAL_TALKS: dropdown eligible name=" + target->getName() +
+        " surface_distance=" + ToString(distanceOut));
   }
 
   return true;
@@ -1745,20 +1793,50 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     GameWorld *world = GetWorldSafe();
     if (world) {
       std::set<std::string> seenTargets;
-      const ogre_unordered_set<Character *>::type &chars =
-          world->getCharacterUpdateList();
-      for (auto it = chars.begin(); it != chars.end(); ++it) {
+      auto appendCandidate = [&](Character *candidate) {
         ChatTargetOption option;
-        if (!TryBuildChatTargetOption(world, *it, selectedMode, option)) {
-          continue;
+        if (!TryBuildChatTargetOption(world, candidate, selectedMode, option)) {
+          return;
         }
         std::string targetKey =
             option.handle.empty() ? option.name : option.handle;
         if (targetKey.empty() || seenTargets.count(targetKey) > 0) {
-          continue;
+          return;
         }
         seenTargets.insert(targetKey);
         options.push_back(option);
+      };
+
+      if (selectedMode == "cheat") {
+        Character *speaker =
+            ResolveSelectedOrConfiguredPlayerSpeaker(world, nullptr);
+        if (speaker && (uintptr_t)speaker > 0x1000) {
+          lektor<RootObject *> nearbyResults;
+          world->getCharactersWithinSphere(
+              nearbyResults, speaker->getPosition(), kCheatRangeUnits, 0.0f,
+              0.0f, 0x10, 0, speaker);
+          for (uint32_t i = 0; i < nearbyResults.size(); ++i) {
+            appendCandidate((Character *)nearbyResults.stuff[i]);
+          }
+        }
+      } else {
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          appendCandidate(*it);
+        }
+      }
+
+      if (g_enableAnimalTalks && selectedMode == "cheat") {
+        // Sphere queries used by cheat mode can omit wildlife.
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          unsigned int animalSerial = 0;
+          if (IsAnimalCharacterSafe(*it, &animalSerial)) {
+            appendCandidate(*it);
+          }
+        }
       }
     }
 
@@ -1979,6 +2057,7 @@ struct StreamChatTask {
   std::string requestMode;
   LONG generation;
   int rechatDepth;
+  bool allowUnavailableTargetSpeech;
 };
 
 struct PlayerTtsTask {
@@ -2608,6 +2687,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   nextTask->requestMode = currentTask.requestMode;
   nextTask->generation = currentTask.generation;
   nextTask->rechatDepth = nextRechatDepth;
+  nextTask->allowUnavailableTargetSpeech = false;
 
   HANDLE followupThread =
       CreateThread(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
@@ -3080,6 +3160,10 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     }
     if (!utteranceId.empty()) {
       queueLine += " [UTTERANCEID:" + utteranceId + "]";
+    }
+    if (!narratorSpeaker && state->task->allowUnavailableTargetSpeech &&
+        EqualsIgnoreCase(actor, state->task->npcName)) {
+      queueLine += " [ALLOW_UNAVAILABLE_SPEECH]";
     }
     Log("CHAT_TIMING: STREAM_LINE actor=" + actor +
         " subtitle_len=" + ToString((int)subtitle.length()) +
@@ -3976,6 +4060,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   streamTask->requestMode = mode;
   streamTask->generation = chatGeneration;
   streamTask->rechatDepth = 0;
+  streamTask->allowUnavailableTargetSpeech =
+      manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
   HANDLE chatThread =
       CreateThread(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
@@ -4748,6 +4834,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
@@ -4822,6 +4909,7 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {

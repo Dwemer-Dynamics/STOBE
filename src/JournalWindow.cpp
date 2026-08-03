@@ -353,7 +353,7 @@ void UpdateStatusHud(GameWorld *world) {
 
   if (!g_statusHudWindow) {
     g_statusHudWindow = gui->createWidgetReal<MyGUI::Window>(
-        "Kenshi_WindowCX", 0.78f, 0.03f, 0.20f, 0.17f,
+        "Kenshi_WindowCX", 0.78f, 0.03f, 0.20f, 0.15f,
         MyGUI::Align::Right | MyGUI::Align::Top, "Popup",
         "Stobe_StatusHudWindow");
     if (!g_statusHudWindow) {
@@ -431,13 +431,16 @@ void UpdateStatusHud(GameWorld *world) {
   std::string caption =
       "Mode: " + Stobe::ChatMode::DisplayLabel(g_chatMode) +
       "\nResponse: " + GetActiveProfileModelLabel() +
-      "\nTTS: " + (g_ttsEnabled ? "ON" : "OFF") +
       "\nAI: " + aiStatus +
-      "\nSelected: " + selectedName +
-      "\nTargeted: " + targetedSummary;
+       "\nSelected: " + selectedName +
+       "\nTargeted: " + targetedSummary;
   if (g_autoChatEnabled) {
     caption += "\nAuto Chat: On";
   }
+  g_statusHudWindow->setSize(
+      g_statusHudWindow->getWidth(),
+      static_cast<int>(g_statusHudWindow->getParentSize().height *
+                       (g_autoChatEnabled ? 0.17f : 0.15f)));
   if (g_statusHudText) {
     g_statusHudText->setCaption(WideFromUtf8(caption).c_str());
   }

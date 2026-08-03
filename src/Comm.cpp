@@ -789,6 +789,16 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/player_base_state") {
+    request.path = L"/StobeServer/player_base_state.php";
+    return request;
+  }
+
+  if (endpoint == L"/dialogue_tts") {
+    request.path = L"/StobeServer/dialogue_tts.php";
+    return request;
+  }
+
   if (endpoint == L"/conf_opts") {
     request.path = L"/StobeServer/conf_opts.php";
     return request;

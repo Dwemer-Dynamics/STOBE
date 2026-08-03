@@ -34,6 +34,7 @@ float g_speechBubbleLife = 5.0f;
 int g_rechatDispatchCooldownMs = 350;
 int g_ttsVolumePercent = 100;
 bool g_ttsEnabled = true;
+bool g_enableDialogueMenuTts = true;
 bool g_speedDialogue = true;
 bool g_enableRegularDialogueCapture = false;
 bool g_enableItemImageSync = false;

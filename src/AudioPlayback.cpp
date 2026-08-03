@@ -20,10 +20,12 @@ struct TtsPlaybackTask {
   int volumePercentOverride;
   unsigned int speakerSerial;
   float playbackSpeedMultiplier;
+  int owner;
 };
 
 LONG g_ttsPlaybackBusy = 0;
 LONG g_ttsPlaybackGeneration = 1;
+LONG g_ttsPlaybackOwner = TTS_PLAYBACK_OWNER_DEFAULT;
 DWORD g_ttsPlaybackEndTick = 0;
 
 int RoundToInt(float value) {
@@ -36,6 +38,15 @@ long long RoundToLongLong(double value) {
 
 LONG CurrentTtsPlaybackGeneration() {
   return InterlockedCompareExchange(&g_ttsPlaybackGeneration, 0, 0);
+}
+
+void ReleasePlaybackSlot(LONG generation) {
+  if (generation != CurrentTtsPlaybackGeneration()) {
+    return;
+  }
+  g_ttsPlaybackEndTick = 0;
+  InterlockedExchange(&g_ttsPlaybackOwner, TTS_PLAYBACK_OWNER_DEFAULT);
+  InterlockedExchange(&g_ttsPlaybackBusy, 0);
 }
 
 unsigned int ReadLe32(const unsigned char *bytes) {
@@ -450,17 +461,15 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   int volumePercentOverride = task->volumePercentOverride;
   unsigned int speakerSerial = task->speakerSerial;
   float playbackSpeedMultiplier = task->playbackSpeedMultiplier;
+  int owner = task->owner;
   delete task;
   DWORD threadStartTick = GetTickCount();
 
   if (!IsHexHash(hash)) {
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
+    ReleasePlaybackSlot(generation);
     return 0;
   }
   if (generation != CurrentTtsPlaybackGeneration()) {
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
     return 0;
   }
 
@@ -468,30 +477,24 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   std::string wavData = PostToStobeWithResponse(endpoint, "");
   DWORD downloadMs = GetTickCount() - threadStartTick;
   if (generation != CurrentTtsPlaybackGeneration()) {
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
     return 0;
   }
   if (wavData.size() < 44 || wavData.compare(0, 4, "RIFF") != 0) {
     Log("TTS_PLAYBACK: invalid WAV payload hash=" + ShortHashForLog(hash) +
         " bytes=" + ToString((int)wavData.size()) +
         " download_ms=" + ToString((int)downloadMs));
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
+    ReleasePlaybackSlot(generation);
     return 0;
   }
 
   std::string filePath = ResolveTtsCacheFilePath(hash);
   if (filePath.empty()) {
     Log("TTS_PLAYBACK: Could not resolve cache path for hash " + hash);
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
+    ReleasePlaybackSlot(generation);
     return 0;
   }
 
   if (generation != CurrentTtsPlaybackGeneration()) {
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
     return 0;
   }
   if (!(playbackSpeedMultiplier > 0.0f)) {
@@ -520,8 +523,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   std::ofstream out(filePath.c_str(), std::ios::binary | std::ios::trunc);
   if (!out) {
     Log("TTS_PLAYBACK: Failed to open cache file " + filePath);
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
+    ReleasePlaybackSlot(generation);
     return 0;
   }
   out.write(wavData.data(), static_cast<std::streamsize>(wavData.size()));
@@ -535,6 +537,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " volume_pct=" + ToString(volumePercent) +
       " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
       " speed=" + ToString(playbackSpeedMultiplier) +
+      " owner=" + ToString(owner) +
       " speaker_serial=" + ToString((int)speakerSerial) +
       " download_ms=" + ToString((int)downloadMs));
 
@@ -544,8 +547,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 #endif
   if (!PlaySoundW(wideFilePath.c_str(), NULL, playFlags)) {
     Log("TTS_PLAYBACK: PlaySound failed for hash " + hash);
-    g_ttsPlaybackEndTick = 0;
-    InterlockedExchange(&g_ttsPlaybackBusy, 0);
+    ReleasePlaybackSlot(generation);
     return 0;
   }
 
@@ -573,15 +575,14 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " elapsed_ms=" + ToString((int)playbackElapsedMs) +
       " interrupted=" + std::string(interrupted ? "1" : "0"));
 
-  g_ttsPlaybackEndTick = 0;
-  InterlockedExchange(&g_ttsPlaybackBusy, 0);
+  ReleasePlaybackSlot(generation);
   return 0;
 }
 } // namespace
 
 bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
                       unsigned int speakerSerial,
-                      float playbackSpeedMultiplier) {
+                      float playbackSpeedMultiplier, int owner) {
   if (!IsHexHash(ttsHash)) {
     Log("TTS_PLAYBACK: rejected invalid hash");
     return false;
@@ -601,21 +602,24 @@ bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
   task->volumePercentOverride = volumePercentOverride;
   task->speakerSerial = speakerSerial;
   task->playbackSpeedMultiplier = playbackSpeedMultiplier;
+  task->owner = owner;
+  InterlockedExchange(&g_ttsPlaybackOwner, owner);
+  LONG taskGeneration = task->generation;
 
   HANDLE threadHandle = CreateThread(NULL, 0, PlaybackThreadProc, task, 0, NULL);
   if (threadHandle) {
     CloseHandle(threadHandle);
     Log("TTS_PLAYBACK: enqueued hash=" + ShortHashForLog(ttsHash) +
-        " generation=" + ToString((int)task->generation) +
+        " generation=" + ToString((int)taskGeneration) +
         " volume_override=" + std::string(volumePercentOverride >= 0 ? "1" : "0") +
         " speed=" + ToString(playbackSpeedMultiplier) +
-        " speaker_serial=" + ToString((int)speakerSerial));
+        " speaker_serial=" + ToString((int)speakerSerial) +
+        " owner=" + ToString(owner));
     return true;
   }
 
   delete task;
-  g_ttsPlaybackEndTick = 0;
-  InterlockedExchange(&g_ttsPlaybackBusy, 0);
+  ReleasePlaybackSlot(taskGeneration);
   Log("TTS_PLAYBACK: failed to create playback thread");
   return false;
 }
@@ -644,6 +648,15 @@ void InterruptTtsPlayback() {
   InterlockedIncrement(&g_ttsPlaybackGeneration);
   g_ttsPlaybackEndTick = 0;
   PlaySoundW(NULL, NULL, SND_ASYNC);
+  InterlockedExchange(&g_ttsPlaybackOwner, TTS_PLAYBACK_OWNER_DEFAULT);
   InterlockedExchange(&g_ttsPlaybackBusy, 0);
   Log("TTS_PLAYBACK: interrupted current playback");
+}
+
+bool InterruptTtsPlaybackIfOwner(int owner) {
+  if (InterlockedCompareExchange(&g_ttsPlaybackOwner, 0, 0) != owner) {
+    return false;
+  }
+  InterruptTtsPlayback();
+  return true;
 }

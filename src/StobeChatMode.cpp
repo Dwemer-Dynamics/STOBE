@@ -52,7 +52,19 @@ std::size_t ToIndex(const std::string &mode) {
 
 std::string DisplayLabel(const std::string &mode) {
   const std::string normalized = Normalize(mode);
-  return normalized == "inject_chat" ? "inject & chat" : normalized;
+  if (normalized == "inject_chat")
+    return "Inject & Chat";
+  if (normalized == "whisper")
+    return "Whisper";
+  if (normalized == "shout")
+    return "Shout";
+  if (normalized == "cheat")
+    return "Cheat";
+  if (normalized == "narrator")
+    return "Narrator";
+  if (normalized == "inject")
+    return "Inject";
+  return "Chat";
 }
 
 std::string ResolveRequestMode(const std::string &selectedMode,
