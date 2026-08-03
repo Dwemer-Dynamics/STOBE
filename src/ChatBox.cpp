@@ -952,6 +952,11 @@ bool IsConversationAreaCompatible(Character *anchor, Character *candidate) {
   if (candidateHasBuilding) {
     return false;
   }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate, nullptr)) {
+    // Outdoor wildlife can report terrain levels as floors. Distance remains
+    // authoritative when neither participant is inside a building.
+    return true;
+  }
   // Outdoors: ignore NPCs on a higher floor/level than the speaker.
   if (candidateFloor > anchorFloor + 1) {
     return false;
@@ -1630,7 +1635,11 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
     return distanceOut <= kCheatRangeUnits;
   }
 
-  if (!IsConversationAreaCompatible(speaker, target)) {
+  bool areaCompatible = IsConversationAreaCompatible(speaker, target);
+  if (!areaCompatible) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected area name=" + target->getName());
+    }
     return false;
   }
 
@@ -1639,7 +1648,17 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
     allowedRange = 1.0f;
   }
   if (distanceOut > allowedRange) {
+    if (targetIsAnimal) {
+      Log("ANIMAL_TALKS: dropdown rejected range name=" + target->getName() +
+          " distance=" + ToString(distanceOut) +
+          " allowed=" + ToString(allowedRange));
+    }
     return false;
+  }
+
+  if (targetIsAnimal) {
+    Log("ANIMAL_TALKS: dropdown eligible name=" + target->getName() +
+        " distance=" + ToString(distanceOut));
   }
 
   return true;
@@ -1786,6 +1805,18 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
             world->getCharacterUpdateList();
         for (auto it = chars.begin(); it != chars.end(); ++it) {
           appendCandidate(*it);
+        }
+      }
+
+      if (g_enableAnimalTalks && selectedMode == "cheat") {
+        // Sphere queries used by cheat mode can omit wildlife.
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          unsigned int animalSerial = 0;
+          if (IsAnimalCharacterSafe(*it, &animalSerial)) {
+            appendCandidate(*it);
+          }
         }
       }
     }

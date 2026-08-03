@@ -4723,6 +4723,11 @@ static bool IsTargetAreaCompatibleForSelection(Character *anchor,
   if (candidateHasBuilding) {
     return false;
   }
+  if (g_enableAnimalTalks && IsAnimalCharacterSafe(candidate)) {
+    // Outdoor wildlife can report terrain levels as floors. Use distance when
+    // both actors are outside instead of rejecting the animal as another level.
+    return true;
+  }
   if (candidateFloor > anchorFloor + 1) {
     return false;
   }
