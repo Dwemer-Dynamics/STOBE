@@ -73,6 +73,7 @@ LONG g_profileModelRefreshInFlight = 0;
 DWORD g_profileModelLastRefreshTick = 0;
 bool g_profileModelComboRefreshInProgress = false;
 const float kWhisperRangeUnits = 20.0f;
+const float kCheatRangeUnits = 100.0f;
 const char *kNarratorName = "The Narrator";
 const char *kProfileModelLabels[] = {
     "Standard", "Fast", "Powerful", "Experimental"};
@@ -874,6 +875,8 @@ float GetSearchRadiusForMode(const std::string &mode) {
     return kWhisperRangeUnits;
   if (mode == "shout")
     return g_shoutRadius;
+  if (mode == "cheat")
+    return kCheatRangeUnits;
   return g_proximityRadius;
 }
 
@@ -1499,7 +1502,14 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   }
 
   if (selectedMode == "cheat") {
-    Log("CHAT_VALIDATE: bypass spatial/range checks for cheat mode");
+    float dist = player->getPosition().distance(target->getPosition());
+    Log("CHAT_VALIDATE: cheat distance_check dist=" + ToString(dist) +
+        " allowed=" + ToString((int)kCheatRangeUnits));
+    if (dist > kCheatRangeUnits) {
+      failReason = "Target is out of range for cheat mode (100m maximum).";
+      return false;
+    }
+    Log("CHAT_VALIDATE: bypass area checks for cheat mode within 100m");
     return true;
   }
 
@@ -1617,7 +1627,7 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
   }
 
   if (selectedMode == "cheat") {
-    return true;
+    return distanceOut <= kCheatRangeUnits;
   }
 
   if (!IsConversationAreaCompatible(speaker, target)) {
@@ -1745,20 +1755,38 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
     GameWorld *world = GetWorldSafe();
     if (world) {
       std::set<std::string> seenTargets;
-      const ogre_unordered_set<Character *>::type &chars =
-          world->getCharacterUpdateList();
-      for (auto it = chars.begin(); it != chars.end(); ++it) {
+      auto appendCandidate = [&](Character *candidate) {
         ChatTargetOption option;
-        if (!TryBuildChatTargetOption(world, *it, selectedMode, option)) {
-          continue;
+        if (!TryBuildChatTargetOption(world, candidate, selectedMode, option)) {
+          return;
         }
         std::string targetKey =
             option.handle.empty() ? option.name : option.handle;
         if (targetKey.empty() || seenTargets.count(targetKey) > 0) {
-          continue;
+          return;
         }
         seenTargets.insert(targetKey);
         options.push_back(option);
+      };
+
+      if (selectedMode == "cheat") {
+        Character *speaker =
+            ResolveSelectedOrConfiguredPlayerSpeaker(world, nullptr);
+        if (speaker && (uintptr_t)speaker > 0x1000) {
+          lektor<RootObject *> nearbyResults;
+          world->getCharactersWithinSphere(
+              nearbyResults, speaker->getPosition(), kCheatRangeUnits, 0.0f,
+              0.0f, 0x10, 0, speaker);
+          for (uint32_t i = 0; i < nearbyResults.size(); ++i) {
+            appendCandidate((Character *)nearbyResults.stuff[i]);
+          }
+        }
+      } else {
+        const ogre_unordered_set<Character *>::type &chars =
+            world->getCharacterUpdateList();
+        for (auto it = chars.begin(); it != chars.end(); ++it) {
+          appendCandidate(*it);
+        }
       }
     }
 
