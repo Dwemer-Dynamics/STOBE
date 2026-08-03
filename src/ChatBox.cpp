@@ -781,6 +781,25 @@ bool ShouldIncludeAnimalForTalk(Character *character) {
   return IsAnimalActivated(serial);
 }
 
+float ResolveChatInteractionDistance(Character *speaker, Character *target) {
+  if (!speaker || !target || (uintptr_t)speaker <= 0x1000 ||
+      (uintptr_t)target <= 0x1000) {
+    return -1.0f;
+  }
+  float distance = speaker->getPosition().distance(target->getPosition());
+  if (!IsAnimalCharacterSafe(target, nullptr)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = speaker->getRadius() + target->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
+}
+
 bool IsCharacterUnavailableForConversation(Character *character) {
   if (!character || (uintptr_t)character <= 0x1000) {
     return true;
@@ -1507,7 +1526,7 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   }
 
   if (selectedMode == "cheat") {
-    float dist = player->getPosition().distance(target->getPosition());
+    float dist = ResolveChatInteractionDistance(player, target);
     Log("CHAT_VALIDATE: cheat distance_check dist=" + ToString(dist) +
         " allowed=" + ToString((int)kCheatRangeUnits));
     if (dist > kCheatRangeUnits) {
@@ -1532,7 +1551,7 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
     allowedRange = 1.0f;
   }
   Log("CHAT_VALIDATE: distance_check begin allowed=" + ToString((int)allowedRange));
-  float dist = player->getPosition().distance(target->getPosition());
+  float dist = ResolveChatInteractionDistance(player, target);
   Log("CHAT_VALIDATE: distance_check end dist=" + ToString(dist));
   if (dist > allowedRange) {
     failReason = "Target is out of range for " + selectedMode + ".";
@@ -1625,7 +1644,7 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
   }
 
   try {
-    distanceOut = speaker->getPosition().distance(target->getPosition());
+    distanceOut = ResolveChatInteractionDistance(speaker, target);
   } catch (...) {
     distanceOut = -1.0f;
     return false;
@@ -1650,7 +1669,7 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
   if (distanceOut > allowedRange) {
     if (targetIsAnimal) {
       Log("ANIMAL_TALKS: dropdown rejected range name=" + target->getName() +
-          " distance=" + ToString(distanceOut) +
+          " surface_distance=" + ToString(distanceOut) +
           " allowed=" + ToString(allowedRange));
     }
     return false;
@@ -1658,7 +1677,7 @@ bool IsDropdownTargetEligible(GameWorld *world, Character *speaker,
 
   if (targetIsAnimal) {
     Log("ANIMAL_TALKS: dropdown eligible name=" + target->getName() +
-        " distance=" + ToString(distanceOut));
+        " surface_distance=" + ToString(distanceOut));
   }
 
   return true;

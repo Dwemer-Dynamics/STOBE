@@ -4571,6 +4571,21 @@ static bool IsAliveConsciousCharacterForTargeting(Character *npc) {
   return true;
 }
 
+static float ResolveTargetingDistance(Character *anchor, Character *candidate) {
+  float distance = anchor->getPosition().distance(candidate->getPosition());
+  if (!IsAnimalCharacterSafe(candidate)) {
+    return distance;
+  }
+  try {
+    float combinedRadius = anchor->getRadius() + candidate->getRadius();
+    if (combinedRadius > 0.0f) {
+      distance -= combinedRadius;
+    }
+  } catch (...) {
+  }
+  return distance > 0.0f ? distance : 0.0f;
+}
+
 static Character *ResolveFirstAliveConsciousPlayerCharacter(GameWorld *world) {
   if (!world || !world->player) {
     return nullptr;
@@ -4764,7 +4779,7 @@ static Character *ResolveNearestNpcTargetForSelection(GameWorld *world,
       if (!IsTargetAreaCompatibleForSelection(selected, candidate)) {
         return;
       }
-      float dist = candidate->getPosition().distance(selectedPos);
+      float dist = ResolveTargetingDistance(selected, candidate);
       if (dist > searchRadius) {
         return;
       }
