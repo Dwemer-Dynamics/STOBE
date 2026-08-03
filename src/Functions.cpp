@@ -5562,8 +5562,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           PostSpeechDeliveryState(act.utteranceId, "spoken");
         }
       } else if (act.type == ACT_SAY && target &&
-                 !IsCharacterUnavailableForDialogue(target)) {
+                 (act.allowUnavailableSpeech ||
+                  !IsCharacterUnavailableForDialogue(target))) {
         bool isPC = target->isPlayerCharacter();
+        bool forcedUnavailableSpeech =
+            act.allowUnavailableSpeech &&
+            IsCharacterUnavailableForDialogue(target);
         float appliedBubbleDuration = 0.0f;
         bool forcedSayFallback = false;
         bool speechExecuted = false;
@@ -5577,28 +5581,38 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           listenerForFacing = ResolveSpeechListenerForFacing(target);
         }
         Log("ACTION_EXEC: SAY [" + target->getName() + "]: " + act.message +
-            (isPC ? " (PC)" : " (NPC)"));
+            (isPC ? " (PC)" : " (NPC)") +
+            (forcedUnavailableSpeech ? " forced_unavailable=1" : ""));
         try {
           // If npc is in vanilla dialogue state, bubbles are often suppressed.
           // Force a reset if they seem stuck.
-          if (!isPC && target->dialogue && (uintptr_t)target->dialogue > 0x1000) {
+          if (!forcedUnavailableSpeech && !isPC && target->dialogue &&
+              (uintptr_t)target->dialogue > 0x1000) {
             target->dialogue->endDialogue(true);
             target->dialogue->setInDialog(false);
           }
-          if (listenerForFacing) {
+          if (!forcedUnavailableSpeech && listenerForFacing) {
             TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
           }
 
-          // Primary method: sayALine (supports multiple lines/delays)
-          target->sayALine(act.message, !isPC);
-          speechExecuted = true;
-          if (listenerForFacing) {
-            TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+          if (forcedUnavailableSpeech) {
+            // Limb-removal reactions must survive the knockout caused by the
+            // action, but should not run normal conscious-dialogue behavior.
+            target->say(act.message);
+            speechExecuted = true;
+            forcedSayFallback = true;
+          } else {
+            // Primary method: sayALine (supports multiple lines/delays)
+            target->sayALine(act.message, !isPC);
+            speechExecuted = true;
+            if (listenerForFacing) {
+              TryFaceSpeakerTowardListenerForSpeech(target, listenerForFacing);
+            }
+            // Force native floating text path as well. This is the most reliable
+            // way to surface overhead speech bubbles across player and NPC actors.
+            target->say(act.message);
+            forcedSayFallback = true;
           }
-          // Force native floating text path as well. This is the most reliable
-          // way to surface overhead speech bubbles across player and NPC actors.
-          target->say(act.message);
-          forcedSayFallback = true;
 
           // Keep bubble lifetime aligned to the dialogue line. Queue/audio
           // pacing is scaled separately by current game speed.
@@ -5661,6 +5675,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 " target_serial=" + ToString((int)act.target.serial) +
                 " camera_dist=" + ToString(ttsCameraDistance));
           }
+        }
+        if (forcedUnavailableSpeech && playbackQueued) {
+          speechExecuted = true;
         }
         Log("ACTION_TIMING: SAY target=" + target->getName() +
             " msg_len=" + ToString((int)act.message.length()) +

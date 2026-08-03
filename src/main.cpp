@@ -10890,6 +10890,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         // Normal dialogue bubble
         std::string bubbleContent =
             isPlayerSay ? msg.substr(12) : (isNPCSay ? msg.substr(9) : "");
+        const std::string unavailableSpeechMarker =
+            " [ALLOW_UNAVAILABLE_SPEECH]";
+        bool allowUnavailableSpeech = false;
+        size_t unavailableSpeechPos = bubbleContent.rfind(unavailableSpeechMarker);
+        if (unavailableSpeechPos != std::string::npos &&
+            unavailableSpeechPos + unavailableSpeechMarker.length() ==
+                bubbleContent.length()) {
+          bubbleContent.erase(unavailableSpeechPos);
+          allowUnavailableSpeech = true;
+        }
         std::string structuredMessage =
             ExtractDialogueMessageFromStructuredText(bubbleContent);
         if (!structuredMessage.empty()) {
@@ -11049,6 +11059,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.targetToken = talkTargetToken;
             act.ttsHash = ttsHash;
             act.utteranceId = utteranceId;
+            act.allowUnavailableSpeech = allowUnavailableSpeech;
             int speechTimingMs = ttsDurationMs;
             if (isPlayerSay && g_ttsEnabled && ttsHash.empty() &&
                 ttsDurationMs <= 0) {
@@ -11065,7 +11076,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 " tts_hash=" + (ttsHash.empty() ? "" : ttsHash.substr(0, 8)) +
                 " tts_dur_ms=" + ToString(ttsDurationMs) +
                 " player_tts_wait_hint=" +
-                std::string(speechTimingMs < 0 ? "1" : "0"));
+                std::string(speechTimingMs < 0 ? "1" : "0") +
+                " allow_unavailable=" +
+                std::string(allowUnavailableSpeech ? "1" : "0"));
           } else {
             if (!utteranceId.empty()) {
               PostSpeechDeliveryState(utteranceId, "cancelled");

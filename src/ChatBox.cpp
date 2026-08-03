@@ -2007,6 +2007,7 @@ struct StreamChatTask {
   std::string requestMode;
   LONG generation;
   int rechatDepth;
+  bool allowUnavailableTargetSpeech;
 };
 
 struct PlayerTtsTask {
@@ -2636,6 +2637,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   nextTask->requestMode = currentTask.requestMode;
   nextTask->generation = currentTask.generation;
   nextTask->rechatDepth = nextRechatDepth;
+  nextTask->allowUnavailableTargetSpeech = false;
 
   HANDLE followupThread =
       CreateThread(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
@@ -3108,6 +3110,10 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     }
     if (!utteranceId.empty()) {
       queueLine += " [UTTERANCEID:" + utteranceId + "]";
+    }
+    if (!narratorSpeaker && state->task->allowUnavailableTargetSpeech &&
+        EqualsIgnoreCase(actor, state->task->npcName)) {
+      queueLine += " [ALLOW_UNAVAILABLE_SPEECH]";
     }
     Log("CHAT_TIMING: STREAM_LINE actor=" + actor +
         " subtitle_len=" + ToString((int)subtitle.length()) +
@@ -4004,6 +4010,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   streamTask->requestMode = mode;
   streamTask->generation = chatGeneration;
   streamTask->rechatDepth = 0;
+  streamTask->allowUnavailableTargetSpeech =
+      manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
   HANDLE chatThread =
       CreateThread(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
@@ -4776,6 +4784,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
@@ -4850,6 +4859,7 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
   task->generation = generationOverride > 0 ? generationOverride
                                              : GetChatInterruptGeneration();
   task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
 
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {

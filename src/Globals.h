@@ -134,11 +134,13 @@ struct QueuedAction {
   DWORD proximityStartTick; // Non-zero while waiting to enter close-action range.
   bool proximityMoveIssued; // True after at least one approach move order.
   bool narratorNotification; // Queue narrator popups with speech timing.
+  bool allowUnavailableSpeech; // Preserve reactions to forced limb removal.
   std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
       : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
-        proximityMoveIssued(false), narratorNotification(false) {}
+        proximityMoveIssued(false), narratorNotification(false),
+        allowUnavailableSpeech(false) {}
 };
 
 struct PendingAutonomyCatalogMessage {
