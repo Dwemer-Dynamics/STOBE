@@ -8345,6 +8345,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             PopulateAiDiaryEntries(data);
           } else if (command == "SET_AIDIARY_TEXT") {
             SetAiDiaryText(data);
+          } else if (command == "SET_AIDIARY_AUDIO_STATE") {
+            SetAiDiaryAudioState(data);
           } else if (command == "SET_STOBE_HISTORY") {
             SetRecentHistoryText(data);
           } else if (command == "SET_PROFILE_MODEL") {
@@ -12193,7 +12195,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_startingWindow = nullptr;
     g_welcomeWindow = nullptr;
     g_aiNpcInfoWindow = nullptr;
-    g_aiDiaryWindow = nullptr;
+    CloseAiDiaryUI(false);
     g_recentHistoryWindow = nullptr;
     g_statusHudWindow = nullptr;
     return;
