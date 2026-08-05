@@ -628,6 +628,11 @@ bool IsTtsPlaybackActive() {
   return InterlockedCompareExchange(&g_ttsPlaybackBusy, 0, 0) != 0;
 }
 
+bool IsTtsPlaybackActiveForOwner(int owner) {
+  return IsTtsPlaybackActive() &&
+         InterlockedCompareExchange(&g_ttsPlaybackOwner, 0, 0) == owner;
+}
+
 int GetTtsPlaybackRemainingMs() {
   if (!IsTtsPlaybackActive()) {
     return 0;

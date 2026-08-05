@@ -1,4 +1,5 @@
 #include "AiNpcInfoWindow.h"
+#include "AudioPlayback.h"
 #include "Comm.h"
 #include "Globals.h"
 #include "Utils.h"
@@ -26,6 +27,7 @@ MyGUI::Window *g_aiDiaryWindow = nullptr;
 MyGUI::ListBox *g_aiDiaryList = nullptr;
 MyGUI::ListBox *g_aiDiaryEntryList = nullptr;
 MyGUI::ListBox *g_aiDiaryText = nullptr;
+MyGUI::Button *g_aiDiaryAudioButton = nullptr;
 MyGUI::Button *g_aiDiaryCloseButton = nullptr;
 std::vector<std::string> g_aiDiaryKeys;
 std::vector<std::string> g_aiDiaryEntryIds;
@@ -37,6 +39,28 @@ std::vector<std::string> g_aiNpcAllStorageIds;
 std::string g_aiNpcPendingKey;
 std::string g_aiDiaryPendingPerson;
 std::string g_aiDiaryPendingEntry;
+LONG g_aiDiaryAudioGeneration = 1;
+int g_aiDiaryAudioState = 0;
+
+struct AiDiaryAudioTask {
+  std::string entryId;
+  LONG generation;
+};
+
+LONG CurrentAiDiaryAudioGeneration() {
+  return InterlockedCompareExchange(&g_aiDiaryAudioGeneration, 0, 0);
+}
+
+void CancelAiDiaryAudio(bool enableSelectedEntry) {
+  InterlockedIncrement(&g_aiDiaryAudioGeneration);
+  InterruptTtsPlaybackIfOwner(TTS_PLAYBACK_OWNER_DIARY);
+  g_aiDiaryAudioState = 0;
+  if (g_aiDiaryAudioButton) {
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Play Audio").c_str());
+    g_aiDiaryAudioButton->setEnabled(enableSelectedEntry &&
+                                     !g_aiDiaryPendingEntry.empty());
+  }
+}
 
 std::string SanitizeUiText(std::string input) {
   std::string out;
@@ -414,14 +438,17 @@ void CreateAiNpcInfoUI() {
   StartUiWorker(AiNpcInfoListThread, NULL, "NPC list");
 }
 
-void CloseAiDiaryUI() {
-  if (g_aiDiaryWindow && !TryDestroyWidgetSafe(g_aiDiaryWindow)) {
+void CloseAiDiaryUI(bool destroyWindow) {
+  CancelAiDiaryAudio(false);
+  if (destroyWindow && g_aiDiaryWindow &&
+      !TryDestroyWidgetSafe(g_aiDiaryWindow)) {
     Log("UI_WARN: CloseAiDiaryUI destroyWidget failed; clearing stale pointer.");
   }
   g_aiDiaryWindow = nullptr;
   g_aiDiaryList = nullptr;
   g_aiDiaryEntryList = nullptr;
   g_aiDiaryText = nullptr;
+  g_aiDiaryAudioButton = nullptr;
   g_aiDiaryCloseButton = nullptr;
   g_aiDiaryKeys.clear();
   g_aiDiaryEntryIds.clear();
@@ -470,6 +497,7 @@ void PopulateAiDiaryEntries(const std::string &data) {
   }
   if (g_aiDiaryEntryIds.empty()) {
     SetReadOnlyText(g_aiDiaryText, "No diary entries found for this NPC.");
+    CancelAiDiaryAudio(false);
   }
 }
 
@@ -487,11 +515,39 @@ void SetAiDiaryText(const std::string &data) {
   SetReadOnlyText(g_aiDiaryText, data);
 }
 
+void SetAiDiaryAudioState(const std::string &data) {
+  size_t split = data.find('\n');
+  if (split == std::string::npos || !g_aiDiaryWindow ||
+      !g_aiDiaryAudioButton) {
+    return;
+  }
+  std::string entryId = data.substr(0, split);
+  std::string state = data.substr(split + 1);
+  if (entryId != g_aiDiaryPendingEntry) {
+    return;
+  }
+
+  if (state == "ready" || state == "idle") {
+    g_aiDiaryAudioState = 0;
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Play Audio").c_str());
+    g_aiDiaryAudioButton->setEnabled(true);
+  } else if (state == "playing") {
+    g_aiDiaryAudioState = 2;
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Stop Audio").c_str());
+    g_aiDiaryAudioButton->setEnabled(true);
+  } else if (state == "error") {
+    g_aiDiaryAudioState = 0;
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Retry Audio").c_str());
+    g_aiDiaryAudioButton->setEnabled(true);
+  }
+}
+
 void OnAiDiarySelect(MyGUI::ListBox *sender, size_t index) {
   if (index == MyGUI::ITEM_NONE || index >= g_aiDiaryKeys.size()) {
     return;
   }
   std::string person = g_aiDiaryKeys[index];
+  CancelAiDiaryAudio(false);
   g_aiDiaryPendingPerson = person;
   g_aiDiaryPendingEntry.clear();
   SetDiaryEntriesLoading("Loading...");
@@ -510,9 +566,14 @@ void OnAiDiaryEntrySelect(MyGUI::ListBox *sender, size_t index) {
   if (index == MyGUI::ITEM_NONE || index >= g_aiDiaryEntryIds.size()) {
     return;
   }
+  CancelAiDiaryAudio(false);
   std::string entryId = g_aiDiaryEntryIds[index];
   g_aiDiaryPendingEntry = entryId;
   SetReadOnlyText(g_aiDiaryText, "Loading diary entry...");
+  if (g_aiDiaryAudioButton) {
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Loading...").c_str());
+    g_aiDiaryAudioButton->setEnabled(false);
+  }
 
   AiDiaryTask *task = new AiDiaryTask();
   task->requestKey = entryId;
@@ -567,6 +628,7 @@ DWORD WINAPI AiDiaryDetailThread(LPVOID lpParam) {
   }
 
   std::string content = JsonReadField(response, "text");
+  bool hasDiaryContent = !content.empty();
   if (content.empty()) {
     content = JsonReadField(response, "error");
   }
@@ -575,7 +637,81 @@ DWORD WINAPI AiDiaryDetailThread(LPVOID lpParam) {
                                : "The server returned an unreadable diary entry.";
   }
   QueueUiCommand("SET_AIDIARY_TEXT", key + "\n" + SanitizeUiText(content));
+  if (hasDiaryContent) {
+    QueueUiCommand("SET_AIDIARY_AUDIO_STATE", key + "\nready");
+  }
   return 0;
+}
+
+DWORD WINAPI AiDiaryAudioThread(LPVOID lpParam) {
+  AiDiaryAudioTask *task = static_cast<AiDiaryAudioTask *>(lpParam);
+  std::string entryId = task->entryId;
+  LONG generation = task->generation;
+  delete task;
+
+  std::string response = PostToStobeWithResponse(
+      L"/diary_audio", "{\"rowid\":" + entryId + "}");
+  if (generation != CurrentAiDiaryAudioGeneration()) {
+    return 0;
+  }
+
+  std::string ok = LowerAscii(JsonReadField(response, "ok"));
+  std::string hash = JsonReadField(response, "hash");
+  bool validHash = hash.length() == 32 &&
+                   std::all_of(hash.begin(), hash.end(), [](unsigned char ch) {
+                     return std::isxdigit(ch) != 0;
+                   });
+  if ((ok != "true" && ok != "1") || !validHash) {
+    std::string error = JsonReadField(response, "error");
+    Log("DIARY_AUDIO: generation failed entry=" + entryId +
+        " error=" + (error.empty() ? "unreadable_response" : error));
+    QueueUiCommand("SET_AIDIARY_AUDIO_STATE", entryId + "\nerror");
+    return 0;
+  }
+
+  InterruptTtsPlayback();
+  if (generation != CurrentAiDiaryAudioGeneration()) {
+    return 0;
+  }
+  if (!QueueTtsPlayback(hash, -1, 0, 1.0f, TTS_PLAYBACK_OWNER_DIARY)) {
+    QueueUiCommand("SET_AIDIARY_AUDIO_STATE", entryId + "\nerror");
+    return 0;
+  }
+
+  Log("DIARY_AUDIO: playback started entry=" + entryId);
+  QueueUiCommand("SET_AIDIARY_AUDIO_STATE", entryId + "\nplaying");
+  while (generation == CurrentAiDiaryAudioGeneration() &&
+         IsTtsPlaybackActiveForOwner(TTS_PLAYBACK_OWNER_DIARY)) {
+    Sleep(100);
+  }
+  if (generation == CurrentAiDiaryAudioGeneration()) {
+    Log("DIARY_AUDIO: playback finished entry=" + entryId);
+    QueueUiCommand("SET_AIDIARY_AUDIO_STATE", entryId + "\nidle");
+  }
+  return 0;
+}
+
+void OnAiDiaryAudioClick(MyGUI::Widget *sender) {
+  if (g_aiDiaryPendingEntry.empty()) {
+    return;
+  }
+  if (g_aiDiaryAudioState != 0) {
+    CancelAiDiaryAudio(true);
+    Log("DIARY_AUDIO: playback cancelled entry=" + g_aiDiaryPendingEntry);
+    return;
+  }
+
+  LONG generation = InterlockedIncrement(&g_aiDiaryAudioGeneration);
+  g_aiDiaryAudioState = 1;
+  if (g_aiDiaryAudioButton) {
+    g_aiDiaryAudioButton->setCaption(WideFromUtf8("Stop Audio").c_str());
+    g_aiDiaryAudioButton->setEnabled(true);
+  }
+
+  AiDiaryAudioTask *task = new AiDiaryAudioTask();
+  task->entryId = g_aiDiaryPendingEntry;
+  task->generation = generation;
+  StartUiWorker(AiDiaryAudioThread, task, "diary audio");
 }
 
 void OnAiDiaryCloseClick(MyGUI::Widget *sender) { CloseAiDiaryUI(); }
@@ -632,6 +768,14 @@ void CreateAiDiaryUI() {
       MyGUI::Align::Default, "Stobe_AiDiaryDetail");
   SetReadOnlyText(g_aiDiaryText,
                   T("Select an NPC, then select a dated diary entry."));
+
+  g_aiDiaryAudioButton = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.60f, 0.88f, 0.22f, 0.08f,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_AiDiaryAudioBtn");
+  g_aiDiaryAudioButton->setCaption(WideFromUtf8(T("Play Audio")).c_str());
+  g_aiDiaryAudioButton->setEnabled(false);
+  g_aiDiaryAudioButton->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnAiDiaryAudioClick);
 
   g_aiDiaryCloseButton = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", 0.84f, 0.88f, 0.14f, 0.08f,
