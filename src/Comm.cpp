@@ -799,6 +799,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/diary_audio") {
+    request.path = L"/StobeServer/diary_audio.php";
+    return request;
+  }
+
   if (endpoint == L"/conf_opts") {
     request.path = L"/StobeServer/conf_opts.php";
     return request;
