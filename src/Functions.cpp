@@ -2947,6 +2947,49 @@ bool InventoryTokensMatch(const std::string &itemToken,
          queryCompact.find(itemCompact) != std::string::npos;
 }
 
+// Item::getInventory() is the inventory an object owns, not its containing
+// inventory. Resolve membership explicitly so backpack items use the backpack.
+Inventory *FindCharacterItemSourceInventory(Character *character, Item *item) {
+  if (!character || (uintptr_t)character <= 0x1000 || !item ||
+      (uintptr_t)item <= 0x1000) {
+    return nullptr;
+  }
+
+  auto directlyContainsItem = [item](Inventory *inventory) -> bool {
+    if (!inventory || (uintptr_t)inventory <= 0x1000) {
+      return false;
+    }
+    std::vector<Item *> items;
+    try {
+      GetAllInventoryItemsFromInventory(inventory, items);
+    } catch (...) {
+      return false;
+    }
+    return std::find(items.begin(), items.end(), item) != items.end();
+  };
+
+  Inventory *characterInventory = nullptr;
+  try {
+    characterInventory = character->getInventory();
+    if (directlyContainsItem(characterInventory)) {
+      return characterInventory;
+    }
+  } catch (...) {
+    characterInventory = nullptr;
+  }
+
+  try {
+    ContainerItem *backpack = character->hasABackpackOn();
+    Inventory *backpackInventory = backpack ? backpack->inventory : nullptr;
+    if (directlyContainsItem(backpackInventory)) {
+      return backpackInventory;
+    }
+  } catch (...) {
+  }
+
+  return nullptr;
+}
+
 bool IsLikelyTraderStorageBuilding(Building *building) {
   if (!building || (uintptr_t)building <= 0x1000) {
     return false;
@@ -3045,21 +3088,10 @@ bool TryTransferItemFromInventoryByQuery(Inventory *sourceInventory,
       transferQuantity = maxQuantity;
     }
 
-    Inventory *itemInventory = nullptr;
-    try {
-      itemInventory = item->getInventory();
-    } catch (...) {
-      itemInventory = nullptr;
-    }
-    if (!itemInventory) {
-      itemInventory = sourceInventory;
-    }
-
     Item *detached = nullptr;
     try {
-      detached = itemInventory ? itemInventory->removeItemDontDestroy_returnsItem(
-                                    item, transferQuantity, false)
-                              : nullptr;
+      detached = sourceInventory->removeItemDontDestroy_returnsItem(
+          item, transferQuantity, false);
     } catch (...) {
       detached = nullptr;
     }
@@ -3375,19 +3407,7 @@ bool ConsumeSingleItemFromActor(Character *npc, Item *item) {
   } catch (...) {
   }
 
-  Inventory *inventory = nullptr;
-  try {
-    inventory = item->getInventory();
-  } catch (...) {
-    inventory = nullptr;
-  }
-  if (!inventory) {
-    try {
-      inventory = npc->getInventory();
-    } catch (...) {
-      inventory = nullptr;
-    }
-  }
+  Inventory *inventory = FindCharacterItemSourceInventory(npc, item);
   if (!inventory || (uintptr_t)inventory <= 0x1000) {
     return false;
   }
@@ -6663,19 +6683,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               transferQuantity = maxQuantity;
             }
 
-            Inventory *inv = nullptr;
-            try {
-              inv = item->getInventory();
-            } catch (...) {
-              inv = nullptr;
-            }
-            if (!inv) {
-              try {
-                inv = sourceCharacter->getInventory();
-              } catch (...) {
-                inv = nullptr;
-              }
-            }
+            Inventory *inv =
+                FindCharacterItemSourceInventory(sourceCharacter, item);
 
             Item *detached = nullptr;
             try {
@@ -7047,10 +7056,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 if (items[i]->isEquipped) {
                   npc->unequipItem(items[i]->inventorySection, items[i]);
                 }
-                Inventory *inv = items[i]->getInventory();
-                if (!inv) {
-                  inv = npc->getInventory();
-                }
+                Inventory *inv =
+                    FindCharacterItemSourceInventory(npc, items[i]);
                 Item *detached = inv ? inv->removeItemDontDestroy_returnsItem(
                                            items[i], transferQuantity, false)
                                      : nullptr;
