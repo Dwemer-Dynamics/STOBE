@@ -116,6 +116,7 @@
     <ClCompile Include="src\StobeTiming.cpp" />
     <ClCompile Include="src\StartingWindow.cpp" />
     <ClCompile Include="src\Utils.cpp" />
+    <ClCompile Include="src\VoiceCapture.cpp" />
     <ClCompile Include="src\WelcomeWindow.cpp" />
     <ClCompile Include="src\WorldStateRuntime.cpp" />
   </ItemGroup>
@@ -147,6 +148,7 @@
     <ClInclude Include="src\StobeTiming.h" />
     <ClInclude Include="src\StartingWindow.h" />
     <ClInclude Include="src\Utils.h" />
+    <ClInclude Include="src\VoiceCapture.h" />
     <ClInclude Include="src\WelcomeWindow.h" />
     <ClInclude Include="src\WorldStateCatalog.h" />
     <ClInclude Include="src\WorldStateRuntime.h" />

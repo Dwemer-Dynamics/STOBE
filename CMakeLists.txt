@@ -95,6 +95,7 @@ add_library(Stobe SHARED
   src/main.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
+  src/VoiceCapture.cpp
   src/WelcomeWindow.cpp
   src/WorldStateRuntime.cpp
 )

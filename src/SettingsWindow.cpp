@@ -29,6 +29,7 @@ MyGUI::Window *g_settingsWindow = nullptr;
 namespace {
 MyGUI::ComboBox *g_hotkeyCombo = nullptr;
 MyGUI::ComboBox *g_generalHotkeyCombo = nullptr;
+MyGUI::ComboBox *g_pushToTalkHotkeyCombo = nullptr;
 MyGUI::ComboBox *g_pluginChatModeCombo = nullptr;
 MyGUI::ComboBox *g_speakerModeCombo = nullptr;
 MyGUI::EditBox *g_talkRadiusEdit = nullptr;
@@ -167,6 +168,19 @@ void PopulateGeneralHotkeyCombo() {
   g_generalHotkeyCombo->setIndexSelected(selected);
 }
 
+void PopulatePushToTalkHotkeyCombo() {
+  if (!g_pushToTalkHotkeyCombo)
+    return;
+  g_pushToTalkHotkeyCombo->removeAllItems();
+  const char *keys[] = {"V", "B", "N", "M", "C", "X", "Z"};
+  size_t selected = 0;
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+    g_pushToTalkHotkeyCombo->addItem(WideFromUtf8(keys[i]).c_str());
+    if (g_pushToTalkHotkeyStr == keys[i]) selected = i;
+  }
+  g_pushToTalkHotkeyCombo->setIndexSelected(selected);
+}
+
 void PopulateChatModeCombo() {
   if (!g_pluginChatModeCombo)
     return;
@@ -194,6 +208,12 @@ void OnGeneralHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
   if (!sender || index == MyGUI::ITEM_NONE)
     return;
   SetGeneralHotkeyFromString(sender->getItemNameAt(index));
+}
+
+void OnPushToTalkHotkeyComboChanged(MyGUI::ComboBox *sender, size_t index) {
+  if (!sender || index == MyGUI::ITEM_NONE)
+    return;
+  SetPushToTalkHotkeyFromString(sender->getItemNameAt(index));
 }
 
 void OnPluginModeComboChanged(MyGUI::ComboBox *sender, size_t index) {
@@ -250,6 +270,7 @@ void RefreshPluginSettingsUI() {
 
   PopulateHotkeyCombo();
   PopulateGeneralHotkeyCombo();
+  PopulatePushToTalkHotkeyCombo();
   PopulateChatModeCombo();
   PopulateSpeakerModeCombo();
   SetToggleCaption(g_autoChatToggle, "Auto Chat", g_pendingAutoChat);
@@ -279,6 +300,11 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
       g_generalHotkeyCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
     SetGeneralHotkeyFromString(g_generalHotkeyCombo->getItemNameAt(
         g_generalHotkeyCombo->getIndexSelected()));
+  }
+  if (g_pushToTalkHotkeyCombo &&
+      g_pushToTalkHotkeyCombo->getIndexSelected() != MyGUI::ITEM_NONE) {
+    SetPushToTalkHotkeyFromString(g_pushToTalkHotkeyCombo->getItemNameAt(
+        g_pushToTalkHotkeyCombo->getIndexSelected()));
   }
 
   if (g_pluginChatModeCombo &&
@@ -456,6 +482,7 @@ void CloseSettingsUI() {
 
   g_hotkeyCombo = nullptr;
   g_generalHotkeyCombo = nullptr;
+  g_pushToTalkHotkeyCombo = nullptr;
   g_pluginChatModeCombo = nullptr;
   g_speakerModeCombo = nullptr;
   g_talkRadiusEdit = nullptr;
@@ -493,7 +520,7 @@ void CreateSettingsUI() {
   LoadPendingFromRuntime();
 
   g_settingsWindow = gui->createWidgetReal<MyGUI::Window>(
-      "Kenshi_WindowCX", 0.3075f, 0.199f, 0.385f, 0.602f,
+      "Kenshi_WindowCX", 0.3075f, 0.174f, 0.385f, 0.652f,
       MyGUI::Align::Center,
       "Overlapped", "Stobe_PluginSettingsWindow");
   g_settingsWindow->setCaption(WideFromUtf8("Plugin Settings").c_str());
@@ -545,6 +572,19 @@ void CreateSettingsUI() {
   g_hotkeyCombo->eventComboAccept += MyGUI::newDelegate(OnHotkeyComboChanged);
   g_hotkeyCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnHotkeyComboChanged);
+  y += rowH + rowGap;
+
+  CreateLabel(client, labelX, y, labelW, rowH, "Push-to-Talk Key",
+              "Stobe_Plugin_PushToTalkHotkeyLabel");
+  g_pushToTalkHotkeyCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", fieldX, y, fieldW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_PushToTalkHotkeyCombo");
+  g_pushToTalkHotkeyCombo->setComboModeDrop(true);
+  g_pushToTalkHotkeyCombo->eventComboAccept +=
+      MyGUI::newDelegate(OnPushToTalkHotkeyComboChanged);
+  g_pushToTalkHotkeyCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnPushToTalkHotkeyComboChanged);
   y += rowH + rowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Default Mode",

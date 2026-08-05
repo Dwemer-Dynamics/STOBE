@@ -58,6 +58,7 @@ std::string g_chatTargetNameStr = "";
 std::string g_chatLastRealTargetHandleStr = "";
 std::string g_chatLastRealTargetNameStr = "";
 std::string g_chatPlayerNameStr = "";
+std::string g_chatSpeakerHandleOverride = "";
 std::string g_renameTargetNameStr = "";
 std::string g_renameTargetHandleStr = "";
 std::string g_renameSpeakerNameStr = "";
@@ -1258,6 +1259,18 @@ Character *ResolveConfiguredPlayerSpeaker(GameWorld *world, Character *target) {
 
 Character *ResolveSelectedOrConfiguredPlayerSpeaker(GameWorld *world,
                                                     Character *target) {
+  if (!g_chatSpeakerHandleOverride.empty()) {
+    Character *requested = ResolveChatTargetCharacter(
+        world, g_chatPlayerNameStr, g_chatSpeakerHandleOverride);
+    if (requested && (uintptr_t)requested > 0x1000) {
+      try {
+        if (requested->isPlayerCharacter() &&
+            !IsCharacterUnavailableForConversation(requested))
+          return requested;
+      } catch (...) {
+      }
+    }
+  }
   Character *selected = ResolveSelectedChatSpeaker(world);
   if (selected && (uintptr_t)selected > 0x1000) {
     bool isPlayerCharacter = false;
@@ -3338,14 +3351,10 @@ void OnChatInputChange(MyGUI::EditBox *sender) {
 
 void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
-void OnChatSendClick(MyGUI::Widget *sender) {
-  if (!g_chatInput)
+void SubmitChatTextForCurrentContext(const std::string &submittedText) {
+  std::string text = submittedText;
+  if (text.empty())
     return;
-  std::string text = g_chatInput->getCaption().asUTF8();
-  if (text.empty()) {
-    CloseChatUI();
-    return;
-  }
 
   std::string npcName = g_chatTargetNameStr;
   std::string handleStr = g_chatTargetHandleStr;
@@ -3373,7 +3382,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       RefreshAvailableChatTargets(true);
       RefreshChatHeaderLabel();
 
-      g_chatInput->setCaption("");
+      if (g_chatInput)
+        g_chatInput->setCaption("");
       return;
     }
   }
@@ -4072,6 +4082,33 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
   Log("CHAT: dispatched inputtext event to StobeServer stream endpoint. people=" +
       peopleJson);
+}
+
+void SubmitVoiceChatText(const std::string &submittedText,
+                         const std::string &speakerName,
+                         const std::string &speakerSerial,
+                         const std::string &targetName,
+                         const std::string &targetSerial,
+                         const std::string &mode) {
+  g_chatPlayerNameStr = speakerName;
+  g_chatSpeakerHandleOverride = speakerSerial;
+  g_chatTargetNameStr = targetName;
+  g_chatTargetHandleStr = targetSerial;
+  g_chatMode = Stobe::ChatMode::Normalize(mode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
+  SubmitChatTextForCurrentContext(submittedText);
+  g_chatSpeakerHandleOverride.clear();
+}
+
+void OnChatSendClick(MyGUI::Widget *sender) {
+  if (!g_chatInput)
+    return;
+  std::string text = g_chatInput->getCaption().asUTF8();
+  if (text.empty()) {
+    CloseChatUI();
+    return;
+  }
+  SubmitChatTextForCurrentContext(text);
 }
 
 void OnChatCancelClick(MyGUI::Widget *sender) { CloseChatUI(); }

@@ -27,7 +27,9 @@
 #include "KenshiTownCompat.h"
 #include "PlayerBaseState.h"
 #include "StobeIdentityRename.h"
+#include "StobeChatMode.h"
 #include "Utils.h"
+#include "VoiceCapture.h"
 #include "WorldStateRuntime.h"
 
 #include <kenshi/CharStats.h>
@@ -8349,6 +8351,29 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             SetAiDiaryAudioState(data);
           } else if (command == "SET_STOBE_HISTORY") {
             SetRecentHistoryText(data);
+          } else if (command == "STT_TRANSCRIPT") {
+            Stobe::Voice::Context voiceContext;
+            std::string transcript;
+            std::string error;
+            if (Stobe::Voice::ConsumeResult(atoi(data.c_str()), voiceContext,
+                                            transcript, error)) {
+              if (!error.empty() || transcript.empty()) {
+                std::string message = error.empty() ? "No speech was detected." : error;
+                if (thisptr)
+                  thisptr->showPlayerAMessage_withLog(message, true);
+                Log("STT_RESULT: rejected reason=" + message);
+              } else {
+                Log("STT_RESULT: dispatching transcript mode=" + voiceContext.mode +
+                    " speaker=" + voiceContext.speakerName +
+                    " target=" + voiceContext.targetName +
+                    " text_len=" + ToString((int)transcript.length()));
+                SubmitVoiceChatText(transcript, voiceContext.speakerName,
+                                    voiceContext.speakerSerial,
+                                    voiceContext.targetName,
+                                    voiceContext.targetSerial,
+                                    voiceContext.mode);
+              }
+            }
           } else if (command == "SET_PROFILE_MODEL") {
             ApplyProfileModelSlotUpdate(data);
           } else if (command == "SET_CONFIG") {
@@ -12362,6 +12387,71 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
+
+  static bool pushToTalkWasDown = false;
+  bool pushToTalkDown = (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
+  if (pushToTalkDown && !pushToTalkWasDown && !IsAnyStobeMenuUIOpen()) {
+    Character *speaker = nullptr;
+    Character *target = nullptr;
+    bool selectedIsPlayer = false;
+    if (sel && (uintptr_t)sel > 0x1000) {
+      try { selectedIsPlayer = sel->isPlayerCharacter(); } catch (...) {}
+    }
+    if (selectedIsPlayer) {
+      speaker = sel;
+      target = ResolveNearestNpcTargetForSelection(worldUi, speaker);
+    } else if (sel && (uintptr_t)sel > 0x1000) {
+      target = sel;
+      speaker = ResolveNearestPlayerSpeakerForTarget(worldUi, target);
+    } else if (worldUi && worldUi->player &&
+               worldUi->player->playerCharacters.size() > 0) {
+      speaker = worldUi->player->playerCharacters[0];
+      target = ResolveNearestNpcTargetForSelection(worldUi, speaker);
+    }
+
+    bool targetIsAnimal = target && IsAnimalCharacterSafe(target);
+    if (targetIsAnimal && !g_enableAnimalTalks) {
+      target = nullptr;
+      if (worldUi)
+        worldUi->showPlayerAMessage_withLog(
+            "Animal Talks must be enabled to speak to this target.", true);
+    }
+    if (!speaker || (uintptr_t)speaker < 0x1000 ||
+        !target || (uintptr_t)target < 0x1000) {
+      if (worldUi)
+        worldUi->showPlayerAMessage_withLog(
+            "Push-to-talk needs a selected or nearby NPC target.", true);
+      Log("STT_CAPTURE: start blocked; no valid speaker/target");
+    } else {
+      Stobe::Voice::Context voiceContext;
+      try {
+        voiceContext.speakerName = speaker->getName();
+        voiceContext.speakerSerial = ToString(speaker->getHandle().serial);
+        voiceContext.targetName = target->getName();
+        voiceContext.targetSerial = ToString(target->getHandle().serial);
+      } catch (...) {
+      }
+      voiceContext.mode = Stobe::ChatMode::Normalize(g_chatMode);
+      g_talkTargetHand = target->getHandle();
+      SyncInventoryForCharacter(target, true, "stt_start");
+      if (targetIsAnimal) MarkAnimalActivated(target->getHandle().serial);
+      InterruptTtsPlayback();
+      if (Stobe::Voice::Start(voiceContext)) {
+        if (worldUi)
+          worldUi->showPlayerAMessage_withLog("Listening...", false);
+      } else if (worldUi) {
+        worldUi->showPlayerAMessage_withLog(
+            "Could not start the microphone.", true);
+      }
+    }
+  } else if (!pushToTalkDown && pushToTalkWasDown &&
+             Stobe::Voice::IsRecording()) {
+    Stobe::Voice::StopAndTranscribe();
+    if (worldUi)
+      worldUi->showPlayerAMessage_withLog("Transcribing...", false);
+  }
+  pushToTalkWasDown = pushToTalkDown;
+  Stobe::Voice::Update();
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
