@@ -95,6 +95,7 @@ add_library(Stobe SHARED
   src/main.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
+  src/VoiceCapture.cpp
   src/WelcomeWindow.cpp
   src/WorldStateRuntime.cpp
 )
@@ -117,6 +118,7 @@ target_link_libraries(Stobe PRIVATE
   "${OGRE_MAIN_LIBRARY}"
   winhttp.lib
   winmm.lib
+  ole32.lib
   ws2_32.lib
 )
 

@@ -18,6 +18,7 @@ bool PostToStobeWithResponseStream(const std::wstring &endpoint,
 std::string UploadCsvImportToStobe(const std::string &csvData,
                                    const std::string &filename,
                                    const std::string &importType);
+std::string UploadWavToStobe(const std::vector<unsigned char> &wavData);
 std::wstring ToWide(const std::string &value);
 std::string UrlEncode(const std::string &input);
 std::string BuildStreamQueryData(const std::string &eventType,

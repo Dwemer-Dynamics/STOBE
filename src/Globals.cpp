@@ -147,6 +147,8 @@ int g_chatHotkey = VK_OEM_2; // '/' by default
 std::string g_chatHotkeyStr = "/";
 int g_generalHotkey = VK_OEM_PLUS; // '=' by default
 std::string g_generalHotkeyStr = "=";
+int g_pushToTalkHotkey = 'V';
+std::string g_pushToTalkHotkeyStr = "V";
 std::string g_chatMode = "chat";
 bool g_autoChatEnabled = false;
 bool g_useNearestPlayerSpeaker = true;
