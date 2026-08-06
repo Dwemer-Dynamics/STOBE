@@ -34,10 +34,6 @@ struct Result {
   std::string error;
 };
 
-struct CaptureTask {
-  Context context;
-};
-
 struct CaptureSession {
   IAudioClient *audioClient;
   IAudioCaptureClient *captureClient;
@@ -62,10 +58,14 @@ DWORD g_startedAt = 0;
 LONG g_recording = 0;
 LONG g_cancelRequested = 0;
 LONG g_captureWorkerActive = 0;
+LONG g_captureWorkerStarted = 0;
 LONG g_initialized = 0;
 LONG g_nextResultId = 0;
+HANDLE g_captureStartEvent = NULL;
+HANDLE g_captureReadyEvent = NULL;
 CRITICAL_SECTION g_mutex;
 std::map<int, Result> g_results;
+Context g_pendingContext;
 
 void EnsureInitialized() {
   if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0)
@@ -213,7 +213,6 @@ bool OpenWasapiCaptureSessions(std::vector<CaptureSession *> &sessions) {
           __uuidof(IAudioCaptureClient),
           reinterpret_cast<void **>(&session->captureClient));
     }
-    if (SUCCEEDED(result)) result = session->audioClient->Start();
     endpoint->Release();
 
     if (FAILED(result)) {
@@ -223,7 +222,6 @@ bool OpenWasapiCaptureSessions(std::vector<CaptureSession *> &sessions) {
       delete session;
       continue;
     }
-    session->started = true;
     sessions.push_back(session);
   }
 
@@ -257,15 +255,37 @@ void ReadWasapiPackets(CaptureSession *session) {
 }
 
 bool CaptureWithWasapi(std::vector<CaptureSession *> &sessions) {
-  if (!OpenWasapiCaptureSessions(sessions)) return false;
+  if (sessions.empty() && !OpenWasapiCaptureSessions(sessions)) return false;
+
+  bool anyStarted = false;
+  for (size_t i = 0; i < sessions.size(); ++i) {
+    sessions[i]->audio.clear();
+    HRESULT result = sessions[i]->audioClient->Start();
+    sessions[i]->started = SUCCEEDED(result);
+    if (sessions[i]->started) {
+      anyStarted = true;
+    } else {
+      Log("STT_CAPTURE: could not start input=" + sessions[i]->name +
+          " error=" + ToString((int)result));
+    }
+  }
+  if (!anyStarted) {
+    CloseCaptureSessions(sessions);
+    return false;
+  }
+
   while (InterlockedCompareExchange(&g_recording, 0, 0) != 0 &&
          GetTickCount() - g_startedAt < kMaximumRecordingMs) {
     for (size_t i = 0; i < sessions.size(); ++i)
-      ReadWasapiPackets(sessions[i]);
+      if (sessions[i]->started) ReadWasapiPackets(sessions[i]);
     Sleep(5);
   }
-  for (size_t i = 0; i < sessions.size(); ++i)
+  for (size_t i = 0; i < sessions.size(); ++i) {
+    if (!sessions[i]->started) continue;
     ReadWasapiPackets(sessions[i]);
+    sessions[i]->audioClient->Stop();
+    sessions[i]->started = false;
+  }
   return true;
 }
 
@@ -376,88 +396,128 @@ std::string SignalLog(const CaptureSession &session, const SignalStats &stats) {
   return line.str();
 }
 
-DWORD WINAPI CaptureThread(LPVOID parameter) {
-  CaptureTask *task = static_cast<CaptureTask *>(parameter);
-  if (!task) {
-    InterlockedExchange(&g_captureWorkerActive, 0);
-    return 0;
-  }
-
+DWORD WINAPI CaptureWorkerThread(LPVOID) {
   HRESULT initResult = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   bool shouldUninitialize = SUCCEEDED(initResult);
   std::vector<CaptureSession *> sessions;
-  bool usedWasapi = false;
   if (SUCCEEDED(initResult) || initResult == RPC_E_CHANGED_MODE)
-    usedWasapi = CaptureWithWasapi(sessions);
+    OpenWasapiCaptureSessions(sessions);
+  SetEvent(g_captureReadyEvent);
 
-  CaptureSession winmmSession;
-  if (!usedWasapi) CaptureWithWinMM(winmmSession);
-  InterlockedExchange(&g_recording, 0);
+  for (;;) {
+    if (WaitForSingleObject(g_captureStartEvent, INFINITE) != WAIT_OBJECT_0)
+      break;
 
-  if (InterlockedCompareExchange(&g_cancelRequested, 0, 0) == 0) {
-    CaptureSession *winner = NULL;
-    double winnerScore = -1.0;
-    if (usedWasapi) {
-      for (size_t i = 0; i < sessions.size(); ++i) {
-        SignalStats stats = AnalyzeSignal(sessions[i]->audio);
-        Log(SignalLog(*sessions[i], stats));
-        double score = stats.rms + ((double)stats.peak * 0.02);
-        if (stats.valid && score > winnerScore) {
-          winner = sessions[i];
-          winnerScore = score;
+    Context context;
+    EnterCriticalSection(&g_mutex);
+    context = g_pendingContext;
+    LeaveCriticalSection(&g_mutex);
+
+    bool usedWasapi = false;
+    if (SUCCEEDED(initResult) || initResult == RPC_E_CHANGED_MODE)
+      usedWasapi = CaptureWithWasapi(sessions);
+
+    CaptureSession winmmSession;
+    if (!usedWasapi) CaptureWithWinMM(winmmSession);
+    InterlockedExchange(&g_recording, 0);
+
+    if (InterlockedCompareExchange(&g_cancelRequested, 0, 0) == 0) {
+      CaptureSession *winner = NULL;
+      double winnerScore = -1.0;
+      if (usedWasapi) {
+        for (size_t i = 0; i < sessions.size(); ++i) {
+          SignalStats stats = AnalyzeSignal(sessions[i]->audio);
+          Log(SignalLog(*sessions[i], stats));
+          double score = stats.rms + ((double)stats.peak * 0.02);
+          if (stats.valid && score > winnerScore) {
+            winner = sessions[i];
+            winnerScore = score;
+          }
         }
+      } else {
+        SignalStats stats = AnalyzeSignal(winmmSession.audio);
+        Log(SignalLog(winmmSession, stats));
+        if (stats.valid) winner = &winmmSession;
       }
-    } else {
-      SignalStats stats = AnalyzeSignal(winmmSession.audio);
-      Log(SignalLog(winmmSession, stats));
-      if (stats.valid) winner = &winmmSession;
+
+      DWORD duration = GetTickCount() - g_startedAt;
+      if (duration < 500) {
+        QueueResult(context, "", "Hold push-to-talk longer before releasing it.");
+      } else if (!winner) {
+        QueueResult(context, "",
+                    "No microphone signal was detected. Check your Windows input device.");
+      } else {
+        Log("STT_CAPTURE: selected input=" + winner->name +
+            " duration_ms=" + ToString((int)duration));
+        std::vector<unsigned char> wav = BuildWav(winner->audio);
+        std::string response = UploadWavToStobe(wav);
+        std::string text = JsonReadField(response, "text");
+        std::string error = JsonReadField(response, "error");
+        if (text.empty() && error.empty()) error = "Speech transcription failed.";
+        QueueResult(context, text, error);
+      }
     }
 
-    DWORD duration = GetTickCount() - g_startedAt;
-    if (duration < 500) {
-      QueueResult(task->context, "",
-                  "Hold push-to-talk longer before releasing it.");
-    } else if (!winner) {
-      QueueResult(task->context, "",
-                  "No microphone signal was detected. Check your Windows input device.");
-    } else {
-      Log("STT_CAPTURE: selected input=" + winner->name +
-          " duration_ms=" + ToString((int)duration));
-      std::vector<unsigned char> wav = BuildWav(winner->audio);
-      std::string response = UploadWavToStobe(wav);
-      std::string text = JsonReadField(response, "text");
-      std::string error = JsonReadField(response, "error");
-      if (text.empty() && error.empty()) error = "Speech transcription failed.";
-      QueueResult(task->context, text, error);
-    }
+    InterlockedExchange(&g_captureWorkerActive, 0);
   }
 
   CloseCaptureSessions(sessions);
   if (shouldUninitialize) CoUninitialize();
-  delete task;
-  InterlockedExchange(&g_captureWorkerActive, 0);
   return 0;
+}
+
+bool EnsureCaptureWorker(bool waitUntilReady) {
+  if (InterlockedCompareExchange(&g_captureWorkerStarted, 1, 0) == 0) {
+    g_captureStartEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_captureReadyEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_captureStartEvent || !g_captureReadyEvent) {
+      Log("STT_CAPTURE: could not create capture worker events");
+      if (g_captureStartEvent) CloseHandle(g_captureStartEvent);
+      if (g_captureReadyEvent) CloseHandle(g_captureReadyEvent);
+      g_captureStartEvent = NULL;
+      g_captureReadyEvent = NULL;
+      InterlockedExchange(&g_captureWorkerStarted, 0);
+      return false;
+    }
+    HANDLE thread = CreateThread(NULL, 0, CaptureWorkerThread, NULL, 0, NULL);
+    if (!thread) {
+      Log("STT_CAPTURE: could not start capture worker");
+      CloseHandle(g_captureStartEvent);
+      CloseHandle(g_captureReadyEvent);
+      g_captureStartEvent = NULL;
+      g_captureReadyEvent = NULL;
+      InterlockedExchange(&g_captureWorkerStarted, 0);
+      return false;
+    }
+    CloseHandle(thread);
+  }
+
+  if (!g_captureReadyEvent) return false;
+  if (!waitUntilReady) return true;
+  return WaitForSingleObject(g_captureReadyEvent, 2000) == WAIT_OBJECT_0;
 }
 
 } // namespace
 
 bool Start(const Context &context) {
   EnsureInitialized();
+  if (!EnsureCaptureWorker(true)) {
+    Log("STT_CAPTURE: microphone warmup did not complete");
+    return false;
+  }
   if (InterlockedCompareExchange(&g_captureWorkerActive, 1, 0) != 0)
     return false;
   InterlockedExchange(&g_cancelRequested, 0);
   InterlockedExchange(&g_recording, 1);
   g_startedAt = GetTickCount();
-  CaptureTask *task = new CaptureTask();
-  task->context = context;
-  HANDLE thread = CreateThread(NULL, 0, CaptureThread, task, 0, NULL);
-  if (!thread) {
-    delete task;
+  EnterCriticalSection(&g_mutex);
+  g_pendingContext = context;
+  LeaveCriticalSection(&g_mutex);
+  if (!SetEvent(g_captureStartEvent)) {
     InterlockedExchange(&g_recording, 0);
     InterlockedExchange(&g_captureWorkerActive, 0);
     return false;
   }
-  CloseHandle(thread);
   Log("STT_CAPTURE: recording started mode=" + context.mode +
       " speaker=" + context.speakerName + " target=" + context.targetName);
   return true;
@@ -476,6 +536,8 @@ void Cancel() {
 }
 
 void Update() {
+  EnsureInitialized();
+  EnsureCaptureWorker(false);
   if (IsRecording() && GetTickCount() - g_startedAt >= kMaximumRecordingMs)
     StopAndTranscribe();
 }
