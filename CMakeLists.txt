@@ -118,6 +118,7 @@ target_link_libraries(Stobe PRIVATE
   "${OGRE_MAIN_LIBRARY}"
   winhttp.lib
   winmm.lib
+  ole32.lib
   ws2_32.lib
 )
 

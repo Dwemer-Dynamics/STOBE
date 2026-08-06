@@ -4,8 +4,16 @@
 #include "Globals.h"
 #include "Utils.h"
 
+#include <audioclient.h>
+#include <propkey.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <mmdeviceapi.h>
 #include <mmsystem.h>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <vector>
 
 namespace Stobe {
@@ -14,8 +22,11 @@ namespace {
 
 const int kSampleRate = 16000;
 const int kBufferCount = 8;
-const int kBufferBytes = 3200;
+const int kBufferBytes = 4000;
 const DWORD kMaximumRecordingMs = 60000;
+const size_t kMaximumCaptureEndpoints = 12;
+const DWORD kAutoConvertPcmFlag = 0x80000000;
+const DWORD kSrcDefaultQualityFlag = 0x08000000;
 
 struct Result {
   Context context;
@@ -23,18 +34,34 @@ struct Result {
   std::string error;
 };
 
-struct UploadTask {
+struct CaptureTask {
   Context context;
-  std::vector<unsigned char> wav;
 };
 
-HWAVEIN g_waveIn = NULL;
-WAVEHDR g_headers[kBufferCount] = {};
-char g_buffers[kBufferCount][kBufferBytes] = {};
-std::vector<unsigned char> g_pcm;
-Context g_context;
+struct CaptureSession {
+  IAudioClient *audioClient;
+  IAudioCaptureClient *captureClient;
+  std::string name;
+  std::vector<short> audio;
+  bool started;
+
+  CaptureSession()
+      : audioClient(NULL), captureClient(NULL), started(false) {}
+};
+
+struct SignalStats {
+  int peak;
+  double rms;
+  double signalPercent;
+  bool valid;
+
+  SignalStats() : peak(0), rms(0.0), signalPercent(0.0), valid(false) {}
+};
+
 DWORD g_startedAt = 0;
 LONG g_recording = 0;
+LONG g_cancelRequested = 0;
+LONG g_captureWorkerActive = 0;
 LONG g_initialized = 0;
 LONG g_nextResultId = 0;
 CRITICAL_SECTION g_mutex;
@@ -43,6 +70,43 @@ std::map<int, Result> g_results;
 void EnsureInitialized() {
   if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0)
     InitializeCriticalSection(&g_mutex);
+}
+
+WAVEFORMATEX CreateRecordingFormat() {
+  WAVEFORMATEX format = {};
+  format.wFormatTag = WAVE_FORMAT_PCM;
+  format.nChannels = 1;
+  format.nSamplesPerSec = kSampleRate;
+  format.wBitsPerSample = 16;
+  format.nBlockAlign = 2;
+  format.nAvgBytesPerSec = kSampleRate * format.nBlockAlign;
+  return format;
+}
+
+std::string WideToUtf8(const wchar_t *value) {
+  if (!value || !value[0]) return "";
+  int required = WideCharToMultiByte(CP_UTF8, 0, value, -1, NULL, 0, NULL, NULL);
+  if (required <= 1) return "";
+  std::vector<char> converted((size_t)required);
+  WideCharToMultiByte(CP_UTF8, 0, value, -1, &converted[0], required, NULL, NULL);
+  return std::string(&converted[0]);
+}
+
+std::string GetEndpointFriendlyName(IMMDevice *endpoint) {
+  if (!endpoint) return "Unknown input";
+  IPropertyStore *store = NULL;
+  PROPVARIANT value;
+  PropVariantInit(&value);
+  std::string name = "Unknown input";
+  if (SUCCEEDED(endpoint->OpenPropertyStore(STGM_READ, &store)) && store &&
+      SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &value)) &&
+      value.vt == VT_LPWSTR) {
+    std::string converted = WideToUtf8(value.pwszVal);
+    if (!converted.empty()) name = converted;
+  }
+  PropVariantClear(&value);
+  if (store) store->Release();
+  return name;
 }
 
 void WriteLe16(std::vector<unsigned char> &out, unsigned short value) {
@@ -55,18 +119,27 @@ void WriteLe32(std::vector<unsigned char> &out, unsigned int value) {
     out.push_back((unsigned char)((value >> (i * 8)) & 0xff));
 }
 
-std::vector<unsigned char> BuildWav(const std::vector<unsigned char> &pcm) {
+std::vector<unsigned char> BuildWav(const std::vector<short> &samples) {
+  const unsigned int pcmBytes = (unsigned int)(samples.size() * sizeof(short));
   std::vector<unsigned char> wav;
-  wav.reserve(44 + pcm.size());
+  wav.reserve(44 + pcmBytes);
   const unsigned char riff[] = {'R','I','F','F'};
   const unsigned char waveFmt[] = {'W','A','V','E','f','m','t',' '};
   const unsigned char data[] = {'d','a','t','a'};
-  wav.insert(wav.end(), riff, riff + sizeof(riff)); WriteLe32(wav, (unsigned int)(36 + pcm.size()));
-  wav.insert(wav.end(), waveFmt, waveFmt + sizeof(waveFmt)); WriteLe32(wav, 16);
-  WriteLe16(wav, 1); WriteLe16(wav, 1); WriteLe32(wav, kSampleRate);
-  WriteLe32(wav, kSampleRate * 2); WriteLe16(wav, 2); WriteLe16(wav, 16);
-  wav.insert(wav.end(), data, data + sizeof(data)); WriteLe32(wav, (unsigned int)pcm.size());
-  wav.insert(wav.end(), pcm.begin(), pcm.end());
+  wav.insert(wav.end(), riff, riff + sizeof(riff));
+  WriteLe32(wav, 36 + pcmBytes);
+  wav.insert(wav.end(), waveFmt, waveFmt + sizeof(waveFmt));
+  WriteLe32(wav, 16);
+  WriteLe16(wav, 1);
+  WriteLe16(wav, 1);
+  WriteLe32(wav, kSampleRate);
+  WriteLe32(wav, kSampleRate * 2);
+  WriteLe16(wav, 2);
+  WriteLe16(wav, 16);
+  wav.insert(wav.end(), data, data + sizeof(data));
+  WriteLe32(wav, pcmBytes);
+  const unsigned char *pcm = reinterpret_cast<const unsigned char *>(&samples[0]);
+  wav.insert(wav.end(), pcm, pcm + pcmBytes);
   return wav;
 }
 
@@ -86,96 +159,319 @@ void QueueResult(const Context &context, const std::string &text,
   LeaveCriticalSection(&g_msgMutex);
 }
 
-DWORD WINAPI UploadThread(LPVOID parameter) {
-  UploadTask *task = static_cast<UploadTask *>(parameter);
-  if (!task) return 0;
-  std::string response = UploadWavToStobe(task->wav);
-  std::string text = JsonReadField(response, "text");
-  std::string error = JsonReadField(response, "error");
-  if (text.empty() && error.empty()) error = "Speech transcription failed.";
-  QueueResult(task->context, text, error);
-  delete task;
-  return 0;
+void CloseCaptureSession(CaptureSession *session) {
+  if (!session) return;
+  if (session->started && session->audioClient) session->audioClient->Stop();
+  if (session->captureClient) session->captureClient->Release();
+  if (session->audioClient) session->audioClient->Release();
+  session->captureClient = NULL;
+  session->audioClient = NULL;
+  session->started = false;
 }
 
-void CALLBACK WaveInCallback(HWAVEIN input, UINT message, DWORD_PTR,
-                             DWORD_PTR param1, DWORD_PTR) {
-  if (message != WIM_DATA || !param1) return;
-  WAVEHDR *header = reinterpret_cast<WAVEHDR *>(param1);
-  if (header->dwBytesRecorded > 0) {
-    EnsureInitialized();
-    EnterCriticalSection(&g_mutex);
-    const unsigned char *begin = reinterpret_cast<unsigned char *>(header->lpData);
-    g_pcm.insert(g_pcm.end(), begin, begin + header->dwBytesRecorded);
-    LeaveCriticalSection(&g_mutex);
+void CloseCaptureSessions(std::vector<CaptureSession *> &sessions) {
+  for (size_t i = 0; i < sessions.size(); ++i) {
+    CloseCaptureSession(sessions[i]);
+    delete sessions[i];
   }
-  if (InterlockedCompareExchange(&g_recording, 0, 0) != 0) {
-    header->dwBytesRecorded = 0;
-    waveInAddBuffer(input, header, sizeof(WAVEHDR));
+  sessions.clear();
+}
+
+bool OpenWasapiCaptureSessions(std::vector<CaptureSession *> &sessions) {
+  IMMDeviceEnumerator *enumerator = NULL;
+  IMMDeviceCollection *collection = NULL;
+  HRESULT result = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                    IID_PPV_ARGS(&enumerator));
+  if (FAILED(result) || !enumerator) return false;
+
+  result = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection);
+  if (FAILED(result) || !collection) {
+    enumerator->Release();
+    return false;
   }
+
+  UINT count = 0;
+  collection->GetCount(&count);
+  WAVEFORMATEX format = CreateRecordingFormat();
+  // These Windows 7 flags are missing from Kenshi's legacy SDK headers.
+  const DWORD flags = kAutoConvertPcmFlag | kSrcDefaultQualityFlag;
+  const REFERENCE_TIME bufferDuration = 10000000;
+  for (UINT i = 0; i < count && sessions.size() < kMaximumCaptureEndpoints; ++i) {
+    IMMDevice *endpoint = NULL;
+    if (FAILED(collection->Item(i, &endpoint)) || !endpoint) continue;
+
+    CaptureSession *session = new CaptureSession();
+    session->name = GetEndpointFriendlyName(endpoint);
+    result = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL,
+                                reinterpret_cast<void **>(&session->audioClient));
+    if (SUCCEEDED(result)) {
+      result = session->audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, flags,
+                                                bufferDuration, 0, &format, NULL);
+    }
+    if (SUCCEEDED(result)) {
+      result = session->audioClient->GetService(
+          __uuidof(IAudioCaptureClient),
+          reinterpret_cast<void **>(&session->captureClient));
+    }
+    if (SUCCEEDED(result)) result = session->audioClient->Start();
+    endpoint->Release();
+
+    if (FAILED(result)) {
+      Log("STT_CAPTURE: skipped input=" + session->name +
+          " error=" + ToString((int)result));
+      CloseCaptureSession(session);
+      delete session;
+      continue;
+    }
+    session->started = true;
+    sessions.push_back(session);
+  }
+
+  collection->Release();
+  enumerator->Release();
+  Log("STT_CAPTURE: WASAPI discovery opened inputs=" +
+      ToString((int)sessions.size()));
+  return !sessions.empty();
+}
+
+void ReadWasapiPackets(CaptureSession *session) {
+  if (!session || !session->captureClient) return;
+  UINT32 packetFrames = 0;
+  HRESULT result = session->captureClient->GetNextPacketSize(&packetFrames);
+  while (SUCCEEDED(result) && packetFrames > 0) {
+    BYTE *packetData = NULL;
+    UINT32 frames = 0;
+    DWORD flags = 0;
+    result = session->captureClient->GetBuffer(&packetData, &frames, &flags,
+                                                NULL, NULL);
+    if (FAILED(result)) break;
+    if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !packetData) {
+      session->audio.insert(session->audio.end(), frames, 0);
+    } else {
+      const short *samples = reinterpret_cast<const short *>(packetData);
+      session->audio.insert(session->audio.end(), samples, samples + frames);
+    }
+    session->captureClient->ReleaseBuffer(frames);
+    result = session->captureClient->GetNextPacketSize(&packetFrames);
+  }
+}
+
+bool CaptureWithWasapi(std::vector<CaptureSession *> &sessions) {
+  if (!OpenWasapiCaptureSessions(sessions)) return false;
+  while (InterlockedCompareExchange(&g_recording, 0, 0) != 0 &&
+         GetTickCount() - g_startedAt < kMaximumRecordingMs) {
+    for (size_t i = 0; i < sessions.size(); ++i)
+      ReadWasapiPackets(sessions[i]);
+    Sleep(5);
+  }
+  for (size_t i = 0; i < sessions.size(); ++i)
+    ReadWasapiPackets(sessions[i]);
+  return true;
+}
+
+std::string GetWaveInputName(HWAVEIN input) {
+  UINT deviceId = 0;
+  WAVEINCAPSW caps = {};
+  if (input && waveInGetID(input, &deviceId) == MMSYSERR_NOERROR &&
+      waveInGetDevCapsW(deviceId, &caps, sizeof(caps)) == MMSYSERR_NOERROR) {
+    std::string name = WideToUtf8(caps.szPname);
+    if (!name.empty()) return name;
+  }
+  return "Windows default";
+}
+
+bool CaptureWithWinMM(CaptureSession &session) {
+  WAVEFORMATEX format = CreateRecordingFormat();
+  HWAVEIN input = NULL;
+  MMRESULT result = waveInOpen(&input, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+  if (result != MMSYSERR_NOERROR) {
+    result = waveInOpen(&input, WAVE_MAPPER, &format, 0, 0,
+                        CALLBACK_NULL | WAVE_FORMAT_DIRECT);
+  }
+  if (result != MMSYSERR_NOERROR || !input) {
+    Log("STT_CAPTURE: WinMM fallback failed error=" + ToString((int)result));
+    return false;
+  }
+
+  session.name = GetWaveInputName(input);
+  char buffers[kBufferCount][kBufferBytes] = {};
+  WAVEHDR headers[kBufferCount] = {};
+  for (int i = 0; i < kBufferCount; ++i) {
+    headers[i].lpData = buffers[i];
+    headers[i].dwBufferLength = kBufferBytes;
+    if (waveInPrepareHeader(input, &headers[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR ||
+        waveInAddBuffer(input, &headers[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+      waveInReset(input);
+      for (int j = 0; j <= i; ++j)
+        if (headers[j].dwFlags & WHDR_PREPARED)
+          waveInUnprepareHeader(input, &headers[j], sizeof(WAVEHDR));
+      waveInClose(input);
+      return false;
+    }
+  }
+
+  if (waveInStart(input) != MMSYSERR_NOERROR) {
+    waveInReset(input);
+    for (int i = 0; i < kBufferCount; ++i)
+      waveInUnprepareHeader(input, &headers[i], sizeof(WAVEHDR));
+    waveInClose(input);
+    return false;
+  }
+
+  Log("STT_CAPTURE: using WinMM fallback input=" + session.name);
+  while (InterlockedCompareExchange(&g_recording, 0, 0) != 0 &&
+         GetTickCount() - g_startedAt < kMaximumRecordingMs) {
+    for (int i = 0; i < kBufferCount; ++i) {
+      if (!(headers[i].dwFlags & WHDR_DONE)) continue;
+      const short *samples = reinterpret_cast<const short *>(headers[i].lpData);
+      size_t count = headers[i].dwBytesRecorded / sizeof(short);
+      session.audio.insert(session.audio.end(), samples, samples + count);
+      headers[i].dwBytesRecorded = 0;
+      waveInAddBuffer(input, &headers[i], sizeof(WAVEHDR));
+    }
+    Sleep(5);
+  }
+
+  waveInStop(input);
+  waveInReset(input);
+  for (int i = 0; i < kBufferCount; ++i) {
+    if (headers[i].dwBytesRecorded > 0) {
+      const short *samples = reinterpret_cast<const short *>(headers[i].lpData);
+      size_t count = headers[i].dwBytesRecorded / sizeof(short);
+      session.audio.insert(session.audio.end(), samples, samples + count);
+    }
+    if (headers[i].dwFlags & WHDR_PREPARED)
+      waveInUnprepareHeader(input, &headers[i], sizeof(WAVEHDR));
+  }
+  waveInClose(input);
+  return true;
+}
+
+SignalStats AnalyzeSignal(const std::vector<short> &audio) {
+  SignalStats stats;
+  if (audio.empty()) return stats;
+  const int signalFloor = 64;
+  double sumSquares = 0.0;
+  size_t signalSamples = 0;
+  for (size_t i = 0; i < audio.size(); ++i) {
+    int amplitude = std::abs((int)audio[i]);
+    if (amplitude > stats.peak) stats.peak = amplitude;
+    sumSquares += (double)audio[i] * (double)audio[i];
+    if (amplitude >= signalFloor) ++signalSamples;
+  }
+  stats.rms = std::sqrt(sumSquares / (double)audio.size());
+  stats.signalPercent = 100.0 * (double)signalSamples / (double)audio.size();
+  stats.valid = audio.size() >= 8000 && stats.peak >= signalFloor && stats.rms >= 2.0;
+  return stats;
+}
+
+std::string SignalLog(const CaptureSession &session, const SignalStats &stats) {
+  std::ostringstream line;
+  line << "STT_CAPTURE: input=" << session.name
+       << " samples=" << session.audio.size()
+       << " peak=" << stats.peak
+       << " rms=" << std::fixed << std::setprecision(1) << stats.rms
+       << " signal=" << std::setprecision(2) << stats.signalPercent << "%"
+       << " valid=" << (stats.valid ? 1 : 0);
+  return line.str();
+}
+
+DWORD WINAPI CaptureThread(LPVOID parameter) {
+  CaptureTask *task = static_cast<CaptureTask *>(parameter);
+  if (!task) {
+    InterlockedExchange(&g_captureWorkerActive, 0);
+    return 0;
+  }
+
+  HRESULT initResult = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  bool shouldUninitialize = SUCCEEDED(initResult);
+  std::vector<CaptureSession *> sessions;
+  bool usedWasapi = false;
+  if (SUCCEEDED(initResult) || initResult == RPC_E_CHANGED_MODE)
+    usedWasapi = CaptureWithWasapi(sessions);
+
+  CaptureSession winmmSession;
+  if (!usedWasapi) CaptureWithWinMM(winmmSession);
+  InterlockedExchange(&g_recording, 0);
+
+  if (InterlockedCompareExchange(&g_cancelRequested, 0, 0) == 0) {
+    CaptureSession *winner = NULL;
+    double winnerScore = -1.0;
+    if (usedWasapi) {
+      for (size_t i = 0; i < sessions.size(); ++i) {
+        SignalStats stats = AnalyzeSignal(sessions[i]->audio);
+        Log(SignalLog(*sessions[i], stats));
+        double score = stats.rms + ((double)stats.peak * 0.02);
+        if (stats.valid && score > winnerScore) {
+          winner = sessions[i];
+          winnerScore = score;
+        }
+      }
+    } else {
+      SignalStats stats = AnalyzeSignal(winmmSession.audio);
+      Log(SignalLog(winmmSession, stats));
+      if (stats.valid) winner = &winmmSession;
+    }
+
+    DWORD duration = GetTickCount() - g_startedAt;
+    if (duration < 500) {
+      QueueResult(task->context, "",
+                  "Hold push-to-talk longer before releasing it.");
+    } else if (!winner) {
+      QueueResult(task->context, "",
+                  "No microphone signal was detected. Check your Windows input device.");
+    } else {
+      Log("STT_CAPTURE: selected input=" + winner->name +
+          " duration_ms=" + ToString((int)duration));
+      std::vector<unsigned char> wav = BuildWav(winner->audio);
+      std::string response = UploadWavToStobe(wav);
+      std::string text = JsonReadField(response, "text");
+      std::string error = JsonReadField(response, "error");
+      if (text.empty() && error.empty()) error = "Speech transcription failed.";
+      QueueResult(task->context, text, error);
+    }
+  }
+
+  CloseCaptureSessions(sessions);
+  if (shouldUninitialize) CoUninitialize();
+  delete task;
+  InterlockedExchange(&g_captureWorkerActive, 0);
+  return 0;
 }
 
 } // namespace
 
 bool Start(const Context &context) {
   EnsureInitialized();
-  if (InterlockedCompareExchange(&g_recording, 1, 0) != 0) return false;
-  WAVEFORMATEX format = {};
-  format.wFormatTag = WAVE_FORMAT_PCM; format.nChannels = 1;
-  format.nSamplesPerSec = kSampleRate; format.wBitsPerSample = 16;
-  format.nBlockAlign = 2; format.nAvgBytesPerSec = kSampleRate * 2;
-  if (waveInOpen(&g_waveIn, WAVE_MAPPER, &format,
-                 reinterpret_cast<DWORD_PTR>(WaveInCallback), 0,
-                 CALLBACK_FUNCTION) != MMSYSERR_NOERROR) {
+  if (InterlockedCompareExchange(&g_captureWorkerActive, 1, 0) != 0)
+    return false;
+  InterlockedExchange(&g_cancelRequested, 0);
+  InterlockedExchange(&g_recording, 1);
+  g_startedAt = GetTickCount();
+  CaptureTask *task = new CaptureTask();
+  task->context = context;
+  HANDLE thread = CreateThread(NULL, 0, CaptureThread, task, 0, NULL);
+  if (!thread) {
+    delete task;
     InterlockedExchange(&g_recording, 0);
-    Log("STT_CAPTURE: waveInOpen failed");
+    InterlockedExchange(&g_captureWorkerActive, 0);
     return false;
   }
-  EnterCriticalSection(&g_mutex);
-  g_pcm.clear(); g_context = context;
-  LeaveCriticalSection(&g_mutex);
-  for (int i = 0; i < kBufferCount; ++i) {
-    ZeroMemory(&g_headers[i], sizeof(WAVEHDR));
-    g_headers[i].lpData = g_buffers[i]; g_headers[i].dwBufferLength = kBufferBytes;
-    waveInPrepareHeader(g_waveIn, &g_headers[i], sizeof(WAVEHDR));
-    waveInAddBuffer(g_waveIn, &g_headers[i], sizeof(WAVEHDR));
-  }
-  g_startedAt = GetTickCount();
-  if (waveInStart(g_waveIn) != MMSYSERR_NOERROR) {
-    Cancel(); return false;
-  }
+  CloseHandle(thread);
   Log("STT_CAPTURE: recording started mode=" + context.mode +
       " speaker=" + context.speakerName + " target=" + context.targetName);
   return true;
 }
 
 void StopAndTranscribe() {
-  if (InterlockedExchange(&g_recording, 0) == 0 || !g_waveIn) return;
-  waveInStop(g_waveIn); waveInReset(g_waveIn);
-  for (int i = 0; i < kBufferCount; ++i)
-    waveInUnprepareHeader(g_waveIn, &g_headers[i], sizeof(WAVEHDR));
-  waveInClose(g_waveIn); g_waveIn = NULL;
-  std::vector<unsigned char> pcm; Context context;
-  EnterCriticalSection(&g_mutex); pcm.swap(g_pcm); context = g_context; LeaveCriticalSection(&g_mutex);
-  DWORD duration = GetTickCount() - g_startedAt;
-  Log("STT_CAPTURE: recording stopped duration_ms=" + ToString((int)duration) +
-      " pcm_bytes=" + ToString((int)pcm.size()));
-  if (duration < 500 || pcm.size() < 16000) {
-    QueueResult(context, "", "Hold push-to-talk longer before releasing it.");
-    return;
-  }
-  UploadTask *task = new UploadTask(); task->context = context; task->wav = BuildWav(pcm);
-  HANDLE thread = CreateThread(NULL, 0, UploadThread, task, 0, NULL);
-  if (thread) CloseHandle(thread); else { delete task; QueueResult(context, "", "Could not start speech transcription."); }
+  if (InterlockedExchange(&g_recording, 0) == 0) return;
+  Log("STT_CAPTURE: stop requested; selecting active microphone input");
 }
 
 void Cancel() {
-  if (InterlockedExchange(&g_recording, 0) == 0 || !g_waveIn) return;
-  waveInStop(g_waveIn); waveInReset(g_waveIn);
-  for (int i = 0; i < kBufferCount; ++i)
-    waveInUnprepareHeader(g_waveIn, &g_headers[i], sizeof(WAVEHDR));
-  waveInClose(g_waveIn); g_waveIn = NULL;
-  EnterCriticalSection(&g_mutex); g_pcm.clear(); LeaveCriticalSection(&g_mutex);
+  if (InterlockedCompareExchange(&g_captureWorkerActive, 0, 0) == 0) return;
+  InterlockedExchange(&g_cancelRequested, 1);
+  InterlockedExchange(&g_recording, 0);
   Log("STT_CAPTURE: recording cancelled");
 }
 
@@ -184,16 +480,25 @@ void Update() {
     StopAndTranscribe();
 }
 
-bool IsRecording() { return InterlockedCompareExchange(&g_recording, 0, 0) != 0; }
+bool IsRecording() {
+  return InterlockedCompareExchange(&g_recording, 0, 0) != 0;
+}
 
 bool ConsumeResult(int resultId, Context &contextOut, std::string &textOut,
                    std::string &errorOut) {
-  EnsureInitialized(); EnterCriticalSection(&g_mutex);
+  EnsureInitialized();
+  EnterCriticalSection(&g_mutex);
   std::map<int, Result>::iterator found = g_results.find(resultId);
-  if (found == g_results.end()) { LeaveCriticalSection(&g_mutex); return false; }
-  contextOut = found->second.context; textOut = found->second.text;
-  errorOut = found->second.error; g_results.erase(found);
-  LeaveCriticalSection(&g_mutex); return true;
+  if (found == g_results.end()) {
+    LeaveCriticalSection(&g_mutex);
+    return false;
+  }
+  contextOut = found->second.context;
+  textOut = found->second.text;
+  errorOut = found->second.error;
+  g_results.erase(found);
+  LeaveCriticalSection(&g_mutex);
+  return true;
 }
 
 } // namespace Voice
