@@ -2756,6 +2756,12 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   std::string okValue = TrimChatLine(JsonReadField(response, "ok"));
   bool ok = (okValue == "true" || okValue == "1");
   if (!ok) {
+    std::string error = TrimChatLine(JsonReadField(response, "error"));
+    if (error == "player_dialogue_audio_disabled") {
+      Log("CHAT_TIMING: PLAYER_TTS skipped by global Speak Player Dialogue "
+          "setting.");
+      return 0;
+    }
     Log("CHAT_TIMING: PLAYER_TTS response not ok after " +
         ToString((int)requestMs) + " ms");
     return 0;
