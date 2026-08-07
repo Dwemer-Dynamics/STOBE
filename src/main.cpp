@@ -8488,7 +8488,14 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {
         if (!g_ttsEnabled) {
+          ClearPlayerTtsPlaybackBarrier(GetChatInterruptGeneration());
           Log("TIMING_META: PLAYER_TTS ignored because TTS is disabled.");
+          continue;
+        }
+        LONG playerTtsGeneration = GetChatInterruptGeneration();
+        if (!IsPlayerTtsPlaybackBarrierPending(playerTtsGeneration)) {
+          Log("TIMING_META: PLAYER_TTS ignored because playback barrier is no "
+              "longer pending.");
           continue;
         }
         std::string payload = TrimCopy(msg.substr(12));
@@ -8551,16 +8558,34 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.message = "";
             act.ttsHash = hash;
             act.taskValue = durationMs;
-            g_uiActionQueue.push_back(act);
+            std::deque<QueuedAction>::iterator insertAt =
+                g_uiActionQueue.begin();
+            while (insertAt != g_uiActionQueue.end() &&
+                   insertAt->type == ACT_SAY && insertAt->taskValue < 0) {
+              ++insertAt;
+            }
+            g_uiActionQueue.insert(insertAt, act);
+            bool barrierReleased = ClearPlayerTtsPlaybackBarrier(
+                playerTtsGeneration);
             LeaveCriticalSection(&g_uiMutex);
             Log("TIMING_META: PLAYER_TTS queued ACT_PLAY_TTS hash=" +
-                hash.substr(0, 8) + " dur_ms=" + ToString(durationMs));
+                hash.substr(0, 8) + " dur_ms=" + ToString(durationMs) +
+                " priority=player_first barrier_released=" +
+                std::string(barrierReleased ? "1" : "0"));
             if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000) {
               Log("CHAT_SPEAKER: PLAYER_TTS speaker=" + playerSpeaker->getName() +
                   " serial=" +
                   ToString(playerSpeaker->getHandle().serial));
             }
+          } else {
+            ClearPlayerTtsPlaybackBarrier(playerTtsGeneration);
+            Log("TIMING_META: PLAYER_TTS barrier released because player "
+                "speaker is unavailable.");
           }
+        } else {
+          ClearPlayerTtsPlaybackBarrier(playerTtsGeneration);
+          Log("TIMING_META: PLAYER_TTS barrier released because payload or "
+              "player roster is invalid.");
         }
       } else if (isPlayerSay || isNPCAction || isNPCSay) {
         g_lastBoredEventTick = GetTickCount();

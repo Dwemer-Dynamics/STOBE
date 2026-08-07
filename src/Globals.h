@@ -202,6 +202,9 @@ GameWorld *GetWorldSafe();
 LONG BeginChatInterruptGeneration();
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
+void BeginPlayerTtsPlaybackBarrier(LONG generation);
+bool IsPlayerTtsPlaybackBarrierPending(LONG generation = 0);
+bool ClearPlayerTtsPlaybackBarrier(LONG generation);
 void SetNarratorDisplayName(const std::string &name);
 std::string GetNarratorDisplayName();
 

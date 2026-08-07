@@ -2727,6 +2727,7 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   }
 
   if (!g_ttsEnabled) {
+    ClearPlayerTtsPlaybackBarrier(task->generation);
     delete task;
     Log("CHAT_TIMING: PLAYER_TTS request dropped because TTS is disabled.");
     return 0;
@@ -2739,16 +2740,19 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   DWORD requestMs = GetTickCount() - requestStartTick;
   delete task;
   if (!IsChatInterruptGenerationCurrent(generation)) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response discarded (stale generation) after " +
         ToString((int)requestMs) + " ms");
     return 0;
   }
   if (response.empty()) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS empty response after " +
         ToString((int)requestMs) + " ms");
     return 0;
   }
   if (!g_ttsEnabled) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response discarded because TTS is now disabled.");
     return 0;
   }
@@ -2758,10 +2762,12 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   if (!ok) {
     std::string error = TrimChatLine(JsonReadField(response, "error"));
     if (error == "player_dialogue_audio_disabled") {
+      ClearPlayerTtsPlaybackBarrier(generation);
       Log("CHAT_TIMING: PLAYER_TTS skipped by global Speak Player Dialogue "
           "setting.");
       return 0;
     }
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response not ok after " +
         ToString((int)requestMs) + " ms");
     return 0;
@@ -2771,6 +2777,7 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   int durationMs =
       ParseTtsDurationToken("ttsd=" + TrimChatLine(JsonReadField(response, "duration_ms")));
   if (hash.empty()) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS missing/invalid hash after " +
         ToString((int)requestMs) + " ms");
     return 0;
@@ -2783,7 +2790,13 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
       " gen=" + ToString((int)generation));
 
   if (!IsChatInterruptGenerationCurrent(generation)) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS dropped before queue (stale generation)");
+    return 0;
+  }
+  if (!IsPlayerTtsPlaybackBarrierPending(generation)) {
+    Log("CHAT_TIMING: PLAYER_TTS dropped because playback barrier expired gen=" +
+        ToString((int)generation));
     return 0;
   }
 
@@ -4014,6 +4027,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText) {
     playerTtsTask->generation = chatGeneration;
     playerTtsTask->requestStartTick = GetTickCount();
     playerTtsTask->playerText = text;
+    BeginPlayerTtsPlaybackBarrier(chatGeneration);
     Log("CHAT_TIMING: PLAYER_TTS request dispatched, text_len=" +
         ToString((int)text.length()) + " gen=" + ToString((int)chatGeneration));
     HANDLE playerTtsThread =
@@ -4021,6 +4035,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText) {
     if (playerTtsThread) {
       CloseHandle(playerTtsThread);
     } else {
+      ClearPlayerTtsPlaybackBarrier(chatGeneration);
       delete playerTtsTask;
       Log("CHAT_THREAD: failed to start player TTS response thread.");
     }
