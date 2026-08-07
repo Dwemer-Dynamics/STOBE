@@ -5508,6 +5508,17 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS ||
           (nextAction.type == ACT_NOTIFY &&
            nextAction.narratorNotification);
+      bool pendingPlayerBubble =
+          nextAction.type == ACT_SAY && nextAction.taskValue < 0;
+      if (nextActionIsSpeech && !pendingPlayerBubble &&
+          IsPlayerTtsPlaybackBarrierPending()) {
+        static DWORD playerTtsBarrierLogTick = 0;
+        if (nowTick - playerTtsBarrierLogTick >= 1000) {
+          playerTtsBarrierLogTick = nowTick;
+          Log("ACTION_TIMING: speech queue waiting for PLAYER_TTS barrier");
+        }
+        break;
+      }
       if (nextActionIsSpeech && g_nextSpeechActionTick != 0 &&
           nowTick < g_nextSpeechActionTick) {
         break;
