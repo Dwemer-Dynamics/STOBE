@@ -1492,10 +1492,14 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
                             bool requireStrictTalkValidation,
                             std::string &failReason) {
   Log("CHAT_VALIDATE: start");
-  if (!world || !player || !target || (uintptr_t)player <= 0x1000 ||
-      (uintptr_t)target <= 0x1000) {
-    failReason = "Target not available.";
-    Log("CHAT_VALIDATE: fail target unavailable");
+  if (!world || !player || (uintptr_t)player <= 0x1000) {
+    failReason = "Selected speaker is not available.";
+    Log("CHAT_VALIDATE: fail speaker unavailable");
+    return false;
+  }
+  if (!target || (uintptr_t)target <= 0x1000) {
+    failReason = "No one is nearby to respond.";
+    Log("CHAT_VALIDATE: fail no nearby target");
     return false;
   }
 
