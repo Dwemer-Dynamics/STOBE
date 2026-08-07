@@ -27,7 +27,9 @@
 #include "KenshiTownCompat.h"
 #include "PlayerBaseState.h"
 #include "StobeIdentityRename.h"
+#include "StobeChatMode.h"
 #include "Utils.h"
+#include "VoiceCapture.h"
 #include "WorldStateRuntime.h"
 
 #include <kenshi/CharStats.h>
@@ -1511,8 +1513,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.0.0";
-static const char *kStobePluginReleaseDate = "2026-08-01";
+static const char *kStobePluginVersion = "1.1.0";
+static const char *kStobePluginReleaseDate = "2026-08-07";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -8345,8 +8347,33 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             PopulateAiDiaryEntries(data);
           } else if (command == "SET_AIDIARY_TEXT") {
             SetAiDiaryText(data);
+          } else if (command == "SET_AIDIARY_AUDIO_STATE") {
+            SetAiDiaryAudioState(data);
           } else if (command == "SET_STOBE_HISTORY") {
             SetRecentHistoryText(data);
+          } else if (command == "STT_TRANSCRIPT") {
+            Stobe::Voice::Context voiceContext;
+            std::string transcript;
+            std::string error;
+            if (Stobe::Voice::ConsumeResult(atoi(data.c_str()), voiceContext,
+                                            transcript, error)) {
+              if (!error.empty() || transcript.empty()) {
+                std::string message = error.empty() ? "No speech was detected." : error;
+                if (thisptr)
+                  thisptr->showPlayerAMessage_withLog(message, true);
+                Log("STT_RESULT: rejected reason=" + message);
+              } else {
+                Log("STT_RESULT: dispatching transcript mode=" + voiceContext.mode +
+                    " speaker=" + voiceContext.speakerName +
+                    " target=" + voiceContext.targetName +
+                    " text_len=" + ToString((int)transcript.length()));
+                SubmitVoiceChatText(transcript, voiceContext.speakerName,
+                                    voiceContext.speakerSerial,
+                                    voiceContext.targetName,
+                                    voiceContext.targetSerial,
+                                    voiceContext.mode);
+              }
+            }
           } else if (command == "SET_PROFILE_MODEL") {
             ApplyProfileModelSlotUpdate(data);
           } else if (command == "SET_CONFIG") {
@@ -8461,7 +8488,14 @@ void ProcessMessageQueue(GameWorld *thisptr) {
         LeaveCriticalSection(&g_uiMutex);
       } else if (isPlayerTts) {
         if (!g_ttsEnabled) {
+          ClearPlayerTtsPlaybackBarrier(GetChatInterruptGeneration());
           Log("TIMING_META: PLAYER_TTS ignored because TTS is disabled.");
+          continue;
+        }
+        LONG playerTtsGeneration = GetChatInterruptGeneration();
+        if (!IsPlayerTtsPlaybackBarrierPending(playerTtsGeneration)) {
+          Log("TIMING_META: PLAYER_TTS ignored because playback barrier is no "
+              "longer pending.");
           continue;
         }
         std::string payload = TrimCopy(msg.substr(12));
@@ -8524,16 +8558,34 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             act.message = "";
             act.ttsHash = hash;
             act.taskValue = durationMs;
-            g_uiActionQueue.push_back(act);
+            std::deque<QueuedAction>::iterator insertAt =
+                g_uiActionQueue.begin();
+            while (insertAt != g_uiActionQueue.end() &&
+                   insertAt->type == ACT_SAY && insertAt->taskValue < 0) {
+              ++insertAt;
+            }
+            g_uiActionQueue.insert(insertAt, act);
+            bool barrierReleased = ClearPlayerTtsPlaybackBarrier(
+                playerTtsGeneration);
             LeaveCriticalSection(&g_uiMutex);
             Log("TIMING_META: PLAYER_TTS queued ACT_PLAY_TTS hash=" +
-                hash.substr(0, 8) + " dur_ms=" + ToString(durationMs));
+                hash.substr(0, 8) + " dur_ms=" + ToString(durationMs) +
+                " priority=player_first barrier_released=" +
+                std::string(barrierReleased ? "1" : "0"));
             if (playerSpeaker && (uintptr_t)playerSpeaker > 0x1000) {
               Log("CHAT_SPEAKER: PLAYER_TTS speaker=" + playerSpeaker->getName() +
                   " serial=" +
                   ToString(playerSpeaker->getHandle().serial));
             }
+          } else {
+            ClearPlayerTtsPlaybackBarrier(playerTtsGeneration);
+            Log("TIMING_META: PLAYER_TTS barrier released because player "
+                "speaker is unavailable.");
           }
+        } else {
+          ClearPlayerTtsPlaybackBarrier(playerTtsGeneration);
+          Log("TIMING_META: PLAYER_TTS barrier released because payload or "
+              "player roster is invalid.");
         }
       } else if (isPlayerSay || isNPCAction || isNPCSay) {
         g_lastBoredEventTick = GetTickCount();
@@ -12193,7 +12245,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     g_startingWindow = nullptr;
     g_welcomeWindow = nullptr;
     g_aiNpcInfoWindow = nullptr;
-    g_aiDiaryWindow = nullptr;
+    CloseAiDiaryUI(false);
     g_recentHistoryWindow = nullptr;
     g_statusHudWindow = nullptr;
     return;
@@ -12360,6 +12412,87 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
+
+  static bool pushToTalkWasDown = false;
+  bool pushToTalkDown = (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
+  if (pushToTalkDown && !pushToTalkWasDown && !IsAnyStobeMenuUIOpen()) {
+    std::string voiceMode = Stobe::ChatMode::Normalize(g_chatMode);
+    bool narratorMode = (voiceMode == "narrator");
+    Character *speaker = nullptr;
+    Character *target = nullptr;
+    bool selectedIsPlayer = false;
+    if (sel && (uintptr_t)sel > 0x1000) {
+      try { selectedIsPlayer = sel->isPlayerCharacter(); } catch (...) {}
+    }
+    if (selectedIsPlayer) {
+      speaker = sel;
+      target = ResolveNearestNpcTargetForSelection(worldUi, speaker);
+    } else if (sel && (uintptr_t)sel > 0x1000) {
+      target = sel;
+      speaker = ResolveNearestPlayerSpeakerForTarget(worldUi, target);
+    } else if (worldUi && worldUi->player &&
+               worldUi->player->playerCharacters.size() > 0) {
+      speaker = worldUi->player->playerCharacters[0];
+      target = ResolveNearestNpcTargetForSelection(worldUi, speaker);
+    }
+
+    bool targetIsAnimal = target && IsAnimalCharacterSafe(target);
+    if (!narratorMode && targetIsAnimal && !g_enableAnimalTalks) {
+      target = nullptr;
+      if (worldUi)
+        worldUi->showPlayerAMessage_withLog(
+            "Animal Talks must be enabled to speak to this target.", true);
+    }
+    if (!speaker || (uintptr_t)speaker < 0x1000) {
+      if (worldUi)
+        worldUi->showPlayerAMessage_withLog(
+            "Push-to-talk needs a selected player character.", true);
+      Log("STT_CAPTURE: start blocked; no valid speaker");
+    } else if (!narratorMode &&
+               (!target || (uintptr_t)target < 0x1000)) {
+      if (worldUi)
+        worldUi->showPlayerAMessage_withLog(
+            "No one is nearby to respond.", true);
+      Log("STT_CAPTURE: start blocked; no nearby target mode=" + voiceMode);
+    } else {
+      Stobe::Voice::Context voiceContext;
+      try {
+        voiceContext.speakerName = speaker->getName();
+        voiceContext.speakerSerial = ToString(speaker->getHandle().serial);
+        if (narratorMode) {
+          voiceContext.targetName = GetNarratorDisplayName();
+          voiceContext.targetSerial.clear();
+        } else {
+          voiceContext.targetName = target->getName();
+          voiceContext.targetSerial = ToString(target->getHandle().serial);
+        }
+      } catch (...) {
+      }
+      voiceContext.mode = voiceMode;
+      if (narratorMode) {
+        g_talkTargetHand = hand();
+      } else {
+        g_talkTargetHand = target->getHandle();
+        SyncInventoryForCharacter(target, true, "stt_start");
+        if (targetIsAnimal) MarkAnimalActivated(target->getHandle().serial);
+      }
+      InterruptTtsPlayback();
+      if (Stobe::Voice::Start(voiceContext)) {
+        if (worldUi)
+          worldUi->showPlayerAMessage_withLog("Listening...", false);
+      } else if (worldUi) {
+        worldUi->showPlayerAMessage_withLog(
+            "Could not start the microphone.", true);
+      }
+    }
+  } else if (!pushToTalkDown && pushToTalkWasDown &&
+             Stobe::Voice::IsRecording()) {
+    Stobe::Voice::StopAndTranscribe();
+    if (worldUi)
+      worldUi->showPlayerAMessage_withLog("Transcribing...", false);
+  }
+  pushToTalkWasDown = pushToTalkDown;
+  Stobe::Voice::Update();
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
@@ -12622,8 +12755,10 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         Log("UI: closed STOBE menu before opening chat.");
       }
       if (sel && (uintptr_t)sel > 0x1000) {
-        Character *chatTarget = sel;
+        Character *chatTarget = nullptr;
+        Character *chatSpeaker = nullptr;
         if (sel->isPlayerCharacter()) {
+          chatSpeaker = sel;
           Character *resolvedTarget = nullptr;
           if (g_useNearestPlayerSpeaker) {
             resolvedTarget = ResolveNearestNpcTargetForSelection(world, sel);
@@ -12632,12 +12767,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
               Log("CHAT_OPEN: selected player speaker '" + sel->getName() +
                   "' targeted nearest NPC '" + chatTarget->getName() + "'");
             } else {
-              EnterCriticalSection(&g_msgMutex);
-              g_messageQueue.push_back("NOTIFY:No nearby NPC target available.");
-              LeaveCriticalSection(&g_msgMutex);
               Log("CHAT_OPEN: selected player speaker '" + sel->getName() +
-                  "' has no nearby NPC target; chat open blocked");
-              return;
+                  "' has no nearby NPC target; opening targetless chat");
             }
           } else {
             resolvedTarget = ResolveNearestSquadmateTargetForSelection(world, sel);
@@ -12647,24 +12778,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
                   "' retargeted to nearest squadmate '" + chatTarget->getName() +
                   "'");
             } else {
-              // No alternate squadmate to target from selected player actor.
-              EnterCriticalSection(&g_msgMutex);
-              g_messageQueue.push_back(
-                  "NOTIFY:No nearby squadmate target available.");
-              LeaveCriticalSection(&g_msgMutex);
               Log("CHAT_OPEN: selected squadmate '" + sel->getName() +
-                  "' has no alternate squadmate target; chat open blocked");
-              return;
+                  "' has no alternate squadmate target; opening targetless chat");
             }
           }
+        } else {
+          chatTarget = sel;
+          chatSpeaker = ResolveNearestPlayerSpeakerForTarget(world, chatTarget);
         }
 
-        if (!IsAliveConsciousCharacterForTargeting(chatTarget)) {
+        if (chatTarget && !IsAliveConsciousCharacterForTargeting(chatTarget)) {
           Log("CHAT_OPEN: allowing dead_or_unconscious target='" +
               chatTarget->getName() + "'");
         }
 
-        bool selectedIsAnimal = IsAnimalCharacterSafe(chatTarget);
+        bool selectedIsAnimal = chatTarget && IsAnimalCharacterSafe(chatTarget);
         if (selectedIsAnimal) {
           unsigned int animalSerial = chatTarget->getHandle().serial;
           if (!g_enableAnimalTalks) {
@@ -12672,25 +12800,33 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
             g_messageQueue.push_back(
                 "NOTIFY:Animal Talks is OFF in plugin settings.");
             LeaveCriticalSection(&g_msgMutex);
-            Log("ANIMAL_TALKS: blocked chat open; toggle disabled serial=" +
+            Log("ANIMAL_TALKS: ignored selected target; toggle disabled serial=" +
                 ToString(animalSerial));
-            return;
+            chatTarget = nullptr;
+            selectedIsAnimal = false;
+          } else {
+            MarkAnimalActivated(animalSerial);
+            Log("ANIMAL_TALKS: activated animal serial=" +
+                ToString(animalSerial) + " name=" + chatTarget->getName());
           }
-          MarkAnimalActivated(animalSerial);
-          Log("ANIMAL_TALKS: activated animal serial=" +
-              ToString(animalSerial) + " name=" + chatTarget->getName());
         }
 
-        g_talkTargetHand = chatTarget->getHandle();
-        QueueIdentityRenameCandidate(chatTarget, "chat_open_target");
-        SyncInventoryForCharacter(chatTarget, true, "chat_open");
+        if (chatTarget) {
+          g_talkTargetHand = chatTarget->getHandle();
+          QueueIdentityRenameCandidate(chatTarget, "chat_open_target");
+          SyncInventoryForCharacter(chatTarget, true, "chat_open");
+        } else {
+          g_talkTargetHand = hand();
+        }
 
         bool chatTargetIsTrader = false;
-        try {
-          chatTargetIsTrader = !chatTarget->isPlayerCharacter() &&
-                               chatTarget->isATrader();
-        } catch (...) {
-          chatTargetIsTrader = false;
+        if (chatTarget) {
+          try {
+            chatTargetIsTrader = !chatTarget->isPlayerCharacter() &&
+                                 chatTarget->isATrader();
+          } catch (...) {
+            chatTargetIsTrader = false;
+          }
         }
         if (chatTargetIsTrader) {
           bool capturedTraderInventory =
@@ -12705,7 +12841,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         }
 
         // Suppress vanilla dialogue state to prevent "double dialogue"
-        if (chatTarget->dialogue && (uintptr_t)chatTarget->dialogue > 0x1000) {
+        if (chatTarget && chatTarget->dialogue &&
+            (uintptr_t)chatTarget->dialogue > 0x1000) {
           try {
             chatTarget->dialogue->endDialogue(true);
             chatTarget->dialogue->setInDialog(false);
@@ -12713,17 +12850,25 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
           }
         }
 
-        std::string pName = (thisptr->playerCharacters.size() > 0)
-                                ? thisptr->playerCharacters[0]->getName()
-                                : "Drifter";
-        CreateChatUI(chatTarget->getName(), pName,
-                     ToString(chatTarget->getHandle().serial));
-        Log("UI: CreateChatUI done target=" + chatTarget->getName());
+        if ((!chatSpeaker || (uintptr_t)chatSpeaker < 0x1000) &&
+            thisptr->playerCharacters.size() > 0) {
+          chatSpeaker = thisptr->playerCharacters[0];
+        }
+        std::string pName = chatSpeaker ? chatSpeaker->getName() : "Drifter";
+        std::string targetName = chatTarget ? chatTarget->getName() : "";
+        std::string targetSerial =
+            chatTarget ? ToString(chatTarget->getHandle().serial) : "";
+        CreateChatUI(targetName, pName, targetSerial);
+        Log("UI: CreateChatUI done target=" +
+            (targetName.empty() ? std::string("<none>") : targetName));
       } else {
-        EnterCriticalSection(&g_msgMutex);
-        g_messageQueue.push_back("NOTIFY:Select an NPC before opening chat.");
-        LeaveCriticalSection(&g_msgMutex);
-        Log("CHAT_OPEN: no selected character; chat open blocked");
+        Character *chatSpeaker =
+            thisptr->playerCharacters.size() > 0 ? thisptr->playerCharacters[0]
+                                                 : nullptr;
+        std::string pName = chatSpeaker ? chatSpeaker->getName() : "Drifter";
+        g_talkTargetHand = hand();
+        CreateChatUI("", pName, "");
+        Log("CHAT_OPEN: no selected character; opened targetless chat");
       }
     }
   }

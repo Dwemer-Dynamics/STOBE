@@ -799,6 +799,11 @@ RequestPlan ResolveRequest(const std::wstring &endpoint,
     return request;
   }
 
+  if (endpoint == L"/diary_audio") {
+    request.path = L"/StobeServer/diary_audio.php";
+    return request;
+  }
+
   if (endpoint == L"/conf_opts") {
     request.path = L"/StobeServer/conf_opts.php";
     return request;
@@ -1262,6 +1267,63 @@ std::string UploadCsvImportToStobe(const std::string &csvData,
   WinHttpCloseHandle(hRequest);
   WinHttpCloseHandle(hConnect);
   WinHttpCloseHandle(hSession);
+  return response;
+}
+
+std::string UploadWavToStobe(const std::vector<unsigned char> &wavData) {
+  EnsureDiscovered();
+  if (wavData.size() <= 44 || wavData.size() > 4u * 1024u * 1024u) {
+    Log("STT_UPLOAD: invalid WAV size=" + ToString((int)wavData.size()));
+    return "";
+  }
+  const std::string boundary = "----StobeSttBoundary7MA4YWxkTrZu0gW";
+  const std::string header = "--" + boundary +
+      "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"stobe-voice.wav\""
+      "\r\nContent-Type: audio/wav\r\n\r\n";
+  const std::string footer = "\r\n--" + boundary + "--\r\n";
+  std::string body;
+  body.reserve(header.size() + wavData.size() + footer.size());
+  body.append(header);
+  body.append(reinterpret_cast<const char *>(wavData.data()), wavData.size());
+  body.append(footer);
+
+  HINTERNET session = WinHttpOpen(L"Stobe/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                  WINHTTP_NO_PROXY_NAME,
+                                  WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!session) return "";
+  WinHttpSetTimeouts(session, 15000, 15000, 60000, 60000);
+  HINTERNET connection = WinHttpConnect(session, g_stobeHost.c_str(), g_stobePort, 0);
+  if (!connection) {
+    WinHttpCloseHandle(session);
+    return "";
+  }
+  HINTERNET request = WinHttpOpenRequest(connection, L"POST", L"/StobeServer/stt.php",
+                                         NULL, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+  std::wstring contentType = ToWide("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
+  BOOL sent = request && WinHttpSendRequest(
+      request, contentType.c_str(), (DWORD)-1L, &body[0], (DWORD)body.size(),
+      (DWORD)body.size(), 0);
+  BOOL received = sent && WinHttpReceiveResponse(request, NULL);
+  DWORD statusCode = 0, statusSize = sizeof(statusCode);
+  if (received) {
+    WinHttpQueryHeaders(request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
+                        WINHTTP_NO_HEADER_INDEX);
+  }
+  std::string response = received ? ReadHttpResponse(request) : "";
+  if (statusCode >= 200 && statusCode < 300) {
+    g_dwemerDistroLastSuccessTick = GetTickCount();
+    InterlockedExchange(&g_dwemerDistroConnected, 1);
+    Log("STT_UPLOAD: completed bytes=" + ToString((int)wavData.size()));
+  } else {
+    Log("STT_UPLOAD: failed status=" + ToString((int)statusCode) +
+        " response=" + response.substr(0, 240));
+  }
+  if (request) WinHttpCloseHandle(request);
+  WinHttpCloseHandle(connection);
+  WinHttpCloseHandle(session);
   return response;
 }
 

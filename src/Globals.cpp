@@ -20,6 +20,12 @@ DWORD g_lastRechatDispatchTick = 0;
 std::map<unsigned int, std::string> g_originFactions;
 LONG g_chatInterruptGeneration = 1;
 
+namespace {
+const DWORD kPlayerTtsBarrierTimeoutMs = 65000;
+volatile LONG g_playerTtsBarrierGeneration = 0;
+volatile LONG g_playerTtsBarrierStartTick = 0;
+}
+
 float g_boredEventRange = 200.0f;
 float g_proximityRadius = 80.0f;
 float g_shoutRadius = 200.0f;
@@ -147,6 +153,8 @@ int g_chatHotkey = VK_OEM_2; // '/' by default
 std::string g_chatHotkeyStr = "/";
 int g_generalHotkey = VK_OEM_PLUS; // '=' by default
 std::string g_generalHotkeyStr = "=";
+int g_pushToTalkHotkey = 'V';
+std::string g_pushToTalkHotkeyStr = "V";
 std::string g_chatMode = "chat";
 bool g_autoChatEnabled = false;
 bool g_useNearestPlayerSpeaker = true;
@@ -320,6 +328,9 @@ LONG BeginChatInterruptGeneration() {
   LONG generation = InterlockedIncrement(&g_chatInterruptGeneration);
   std::set<std::string> cancelledUtterances;
 
+  InterlockedExchange(&g_playerTtsBarrierGeneration, 0);
+  InterlockedExchange(&g_playerTtsBarrierStartTick, 0);
+
   InterruptTtsPlayback();
 
   EnterCriticalSection(&g_msgMutex);
@@ -370,4 +381,52 @@ LONG BeginChatInterruptGeneration() {
   }
 
   return generation;
+}
+
+void BeginPlayerTtsPlaybackBarrier(LONG generation) {
+  if (generation <= 0) {
+    return;
+  }
+  DWORD startTick = GetTickCount();
+  if (startTick == 0) {
+    startTick = 1;
+  }
+  InterlockedExchange(&g_playerTtsBarrierStartTick,
+                      static_cast<LONG>(startTick));
+  InterlockedExchange(&g_playerTtsBarrierGeneration, generation);
+}
+
+bool ClearPlayerTtsPlaybackBarrier(LONG generation) {
+  if (generation <= 0) {
+    return false;
+  }
+  LONG cleared = InterlockedCompareExchange(
+      &g_playerTtsBarrierGeneration, 0, generation);
+  if (cleared != generation) {
+    return false;
+  }
+  InterlockedExchange(&g_playerTtsBarrierStartTick, 0);
+  return true;
+}
+
+bool IsPlayerTtsPlaybackBarrierPending(LONG generation) {
+  LONG pendingGeneration = InterlockedCompareExchange(
+      &g_playerTtsBarrierGeneration, 0, 0);
+  if (pendingGeneration <= 0 ||
+      (generation > 0 && pendingGeneration != generation)) {
+    return false;
+  }
+
+  DWORD startTick = static_cast<DWORD>(InterlockedCompareExchange(
+      &g_playerTtsBarrierStartTick, 0, 0));
+  if (!g_ttsEnabled || startTick == 0 ||
+      GetTickCount() - startTick >= kPlayerTtsBarrierTimeoutMs) {
+    if (ClearPlayerTtsPlaybackBarrier(pendingGeneration)) {
+      Log("CHAT_TIMING: PLAYER_TTS barrier released without playback gen=" +
+          ToString((int)pendingGeneration) +
+          (!g_ttsEnabled ? " reason=tts_disabled" : " reason=timeout"));
+    }
+    return false;
+  }
+  return true;
 }
