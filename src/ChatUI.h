@@ -3,6 +3,7 @@
 // Aggregate include for Stobe UI modules.
 #include "ChatUIGlobals.h"
 #include "ChatBox.h"
+#include "DirectorConsole.h"
 #include "StartingWindow.h"
 #include "AiNpcInfoWindow.h"
 #include "JournalWindow.h"

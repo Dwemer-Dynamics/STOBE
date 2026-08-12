@@ -16,6 +16,8 @@
 #include "Comm.h"
 #include "Context.h"
 #include "DialogueMenuTts.h"
+#include "DirectorConsole.h"
+#include "DirectorRuntime.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? Kenshi engine writes MUST occur on the main thread inside hooks.
 #include <core/Functions.h>
@@ -12241,6 +12243,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
     CloseChatUI();
+    ResetDirectorConsole("gui_unavailable");
     g_settingsWindow = nullptr;
     g_startingWindow = nullptr;
     g_welcomeWindow = nullptr;
@@ -12255,6 +12258,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
+    ResetDirectorConsole("world_unstable");
     if (worldWasStable) {
       worldWasStable = false;
       Log("HOOK: world transition detected; pausing UI hook logic.");
@@ -12398,6 +12402,25 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       } else {
         CreateStartingUI();
         Log("UI: CreateStartingUI done.");
+      }
+    }
+  }
+
+  // The configured director key opens a live script console. It stays paused
+  // until the player has reviewed the generated Lua and chooses Execute.
+  if (g_enableDirector &&
+      (GetAsyncKeyState(g_directorHotkey) & 0x8000)) {
+    static DWORD lastDirectorTick = 0;
+    DWORD now = GetTickCount();
+    if (now - lastDirectorTick > 500) {
+      lastDirectorTick = now;
+      if (g_directorWindow) {
+        CloseDirectorConsole();
+      } else {
+        if (IsAnyStobeMenuUIOpen()) {
+          CloseAllStobeMenuUI();
+        }
+        CreateDirectorConsole(worldUi, ResolveSelectedCharacterSehSafe(thisptr));
       }
     }
   }
@@ -12549,6 +12572,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    UpdateDirectorConsole(world, sel);
+    Stobe::Director::Update(world, sel);
     Stobe::WorldStateRuntime::Update(world, worldBecameStableTick);
     UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);

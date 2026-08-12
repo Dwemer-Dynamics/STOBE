@@ -19,6 +19,7 @@ void SaveStobeRuntimeConfig();
 void SetHotkeyFromString(const std::string &keyStr);
 void SetGeneralHotkeyFromString(const std::string &keyStr);
 void SetPushToTalkHotkeyFromString(const std::string &keyStr);
+void SetDirectorHotkeyFromString(const std::string &keyStr);
 float ResolveDialogueGameSpeedMultiplier(GameWorld *world);
 void SleepIfPaused(DWORD ms);
 void ResetRuntimeLogsForSession();

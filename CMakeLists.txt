@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 1.1.1 LANGUAGES CXX)
+project(Stobe VERSION 1.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +64,40 @@ if(NOT OGRE_MAIN_LIBRARY)
   message(FATAL_ERROR "OgreMain_x64.lib not found in candidate paths.")
 endif()
 
+set(LUA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lua-5.4.8/src")
+add_library(stobe_lua STATIC
+  ${LUA_SOURCE_DIR}/lapi.c
+  ${LUA_SOURCE_DIR}/lauxlib.c
+  ${LUA_SOURCE_DIR}/lbaselib.c
+  ${LUA_SOURCE_DIR}/lcode.c
+  ${LUA_SOURCE_DIR}/lctype.c
+  ${LUA_SOURCE_DIR}/ldebug.c
+  ${LUA_SOURCE_DIR}/ldo.c
+  ${LUA_SOURCE_DIR}/ldump.c
+  ${LUA_SOURCE_DIR}/lfunc.c
+  ${LUA_SOURCE_DIR}/lgc.c
+  ${LUA_SOURCE_DIR}/llex.c
+  ${LUA_SOURCE_DIR}/lmathlib.c
+  ${LUA_SOURCE_DIR}/lmem.c
+  ${LUA_SOURCE_DIR}/lobject.c
+  ${LUA_SOURCE_DIR}/lopcodes.c
+  ${LUA_SOURCE_DIR}/lparser.c
+  ${LUA_SOURCE_DIR}/lstate.c
+  ${LUA_SOURCE_DIR}/lstring.c
+  ${LUA_SOURCE_DIR}/lstrlib.c
+  ${LUA_SOURCE_DIR}/ltable.c
+  ${LUA_SOURCE_DIR}/ltablib.c
+  ${LUA_SOURCE_DIR}/ltm.c
+  ${LUA_SOURCE_DIR}/lundump.c
+  ${LUA_SOURCE_DIR}/lutf8lib.c
+  ${LUA_SOURCE_DIR}/lvm.c
+  ${LUA_SOURCE_DIR}/lzio.c
+)
+target_include_directories(stobe_lua PUBLIC "${LUA_SOURCE_DIR}")
+if(MSVC)
+  target_compile_definitions(stobe_lua PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_library(Stobe SHARED
   src/AudioPlayback.cpp
   src/AutonomyController.cpp
@@ -78,6 +112,8 @@ add_library(Stobe SHARED
   src/Comm.cpp
   src/Context.cpp
   src/DialogueMenuTts.cpp
+  src/DirectorConsole.cpp
+  src/DirectorRuntime.cpp
   src/Functions.cpp
   src/Globals.cpp
   src/KenshiAiCompat.cpp
@@ -113,6 +149,7 @@ if(EXISTS "${BOOST_INCLUDE_DIR}/stage/lib")
 endif()
 
 target_link_libraries(Stobe PRIVATE
+  stobe_lua
   "${KENSHI_LIB_LIBRARY}"
   "${MYGUI_ENGINE_LIBRARY}"
   "${OGRE_MAIN_LIBRARY}"
