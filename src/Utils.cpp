@@ -477,6 +477,19 @@ void SetGeneralHotkeyFromString(const std::string &keyStr) {
   }
 }
 
+void SetPushToTalkHotkeyFromString(const std::string &keyStr) {
+  std::string normalized = TrimCopy(keyStr);
+  if (normalized.size() == 1 && normalized[0] >= 'a' && normalized[0] <= 'z')
+    normalized[0] = static_cast<char>(normalized[0] - ('a' - 'A'));
+  if (normalized.size() == 1 && normalized[0] >= 'A' && normalized[0] <= 'Z') {
+    g_pushToTalkHotkey = normalized[0];
+    g_pushToTalkHotkeyStr = normalized;
+  } else {
+    g_pushToTalkHotkey = 'V';
+    g_pushToTalkHotkeyStr = "V";
+  }
+}
+
 void LoadStobeRuntimeConfig() {
   std::string baseIniPath = GetStobeIniPath(false);
   std::string customIniPath = GetStobeCustomIniPath(true);
@@ -498,6 +511,8 @@ void LoadStobeRuntimeConfig() {
       baseIniPath, customIniPath, "Settings", "GeneralHotkey", "="));
   SetHotkeyFromString(ReadLayeredIniString(baseIniPath, customIniPath,
                                            "Settings", "ChatHotkey", "/"));
+  SetPushToTalkHotkeyFromString(ReadLayeredIniString(
+      baseIniPath, customIniPath, "Settings", "PushToTalkHotkey", "V"));
   g_chatMode = Stobe::ChatMode::Normalize(ReadLayeredIniString(
       baseIniPath, customIniPath, "Settings", "ChatMode", "chat"));
   g_autoChatEnabled =
@@ -632,6 +647,8 @@ void SaveStobeRuntimeConfig() {
                              g_generalHotkeyStr.c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatHotkey", g_chatHotkeyStr.c_str(),
                              iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "PushToTalkHotkey",
+                             g_pushToTalkHotkeyStr.c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatMode", g_chatMode.c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "AutoChat",

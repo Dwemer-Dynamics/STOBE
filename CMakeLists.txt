@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 1.0.0 LANGUAGES CXX)
+project(Stobe VERSION 1.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,7 @@ add_library(Stobe SHARED
   src/main.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
+  src/VoiceCapture.cpp
   src/WelcomeWindow.cpp
   src/WorldStateRuntime.cpp
 )
@@ -117,6 +118,7 @@ target_link_libraries(Stobe PRIVATE
   "${OGRE_MAIN_LIBRARY}"
   winhttp.lib
   winmm.lib
+  ole32.lib
   ws2_32.lib
 )
 

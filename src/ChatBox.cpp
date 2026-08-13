@@ -58,6 +58,7 @@ std::string g_chatTargetNameStr = "";
 std::string g_chatLastRealTargetHandleStr = "";
 std::string g_chatLastRealTargetNameStr = "";
 std::string g_chatPlayerNameStr = "";
+std::string g_chatSpeakerHandleOverride = "";
 std::string g_renameTargetNameStr = "";
 std::string g_renameTargetHandleStr = "";
 std::string g_renameSpeakerNameStr = "";
@@ -1258,6 +1259,18 @@ Character *ResolveConfiguredPlayerSpeaker(GameWorld *world, Character *target) {
 
 Character *ResolveSelectedOrConfiguredPlayerSpeaker(GameWorld *world,
                                                     Character *target) {
+  if (!g_chatSpeakerHandleOverride.empty()) {
+    Character *requested = ResolveChatTargetCharacter(
+        world, g_chatPlayerNameStr, g_chatSpeakerHandleOverride);
+    if (requested && (uintptr_t)requested > 0x1000) {
+      try {
+        if (requested->isPlayerCharacter() &&
+            !IsCharacterUnavailableForConversation(requested))
+          return requested;
+      } catch (...) {
+      }
+    }
+  }
   Character *selected = ResolveSelectedChatSpeaker(world);
   if (selected && (uintptr_t)selected > 0x1000) {
     bool isPlayerCharacter = false;
@@ -1479,10 +1492,14 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
                             bool requireStrictTalkValidation,
                             std::string &failReason) {
   Log("CHAT_VALIDATE: start");
-  if (!world || !player || !target || (uintptr_t)player <= 0x1000 ||
-      (uintptr_t)target <= 0x1000) {
-    failReason = "Target not available.";
-    Log("CHAT_VALIDATE: fail target unavailable");
+  if (!world || !player || (uintptr_t)player <= 0x1000) {
+    failReason = "Selected speaker is not available.";
+    Log("CHAT_VALIDATE: fail speaker unavailable");
+    return false;
+  }
+  if (!target || (uintptr_t)target <= 0x1000) {
+    failReason = "No one is nearby to respond.";
+    Log("CHAT_VALIDATE: fail no nearby target");
     return false;
   }
 
@@ -2714,6 +2731,7 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   }
 
   if (!g_ttsEnabled) {
+    ClearPlayerTtsPlaybackBarrier(task->generation);
     delete task;
     Log("CHAT_TIMING: PLAYER_TTS request dropped because TTS is disabled.");
     return 0;
@@ -2726,16 +2744,19 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   DWORD requestMs = GetTickCount() - requestStartTick;
   delete task;
   if (!IsChatInterruptGenerationCurrent(generation)) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response discarded (stale generation) after " +
         ToString((int)requestMs) + " ms");
     return 0;
   }
   if (response.empty()) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS empty response after " +
         ToString((int)requestMs) + " ms");
     return 0;
   }
   if (!g_ttsEnabled) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response discarded because TTS is now disabled.");
     return 0;
   }
@@ -2743,6 +2764,14 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   std::string okValue = TrimChatLine(JsonReadField(response, "ok"));
   bool ok = (okValue == "true" || okValue == "1");
   if (!ok) {
+    std::string error = TrimChatLine(JsonReadField(response, "error"));
+    if (error == "player_dialogue_audio_disabled") {
+      ClearPlayerTtsPlaybackBarrier(generation);
+      Log("CHAT_TIMING: PLAYER_TTS skipped by global Speak Player Dialogue "
+          "setting.");
+      return 0;
+    }
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS response not ok after " +
         ToString((int)requestMs) + " ms");
     return 0;
@@ -2752,6 +2781,7 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
   int durationMs =
       ParseTtsDurationToken("ttsd=" + TrimChatLine(JsonReadField(response, "duration_ms")));
   if (hash.empty()) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS missing/invalid hash after " +
         ToString((int)requestMs) + " ms");
     return 0;
@@ -2764,7 +2794,13 @@ DWORD WINAPI PlayerTtsResponseThread(LPVOID lpParam) {
       " gen=" + ToString((int)generation));
 
   if (!IsChatInterruptGenerationCurrent(generation)) {
+    ClearPlayerTtsPlaybackBarrier(generation);
     Log("CHAT_TIMING: PLAYER_TTS dropped before queue (stale generation)");
+    return 0;
+  }
+  if (!IsPlayerTtsPlaybackBarrierPending(generation)) {
+    Log("CHAT_TIMING: PLAYER_TTS dropped because playback barrier expired gen=" +
+        ToString((int)generation));
     return 0;
   }
 
@@ -3338,14 +3374,10 @@ void OnChatInputChange(MyGUI::EditBox *sender) {
 
 void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
-void OnChatSendClick(MyGUI::Widget *sender) {
-  if (!g_chatInput)
+void SubmitChatTextForCurrentContext(const std::string &submittedText) {
+  std::string text = submittedText;
+  if (text.empty())
     return;
-  std::string text = g_chatInput->getCaption().asUTF8();
-  if (text.empty()) {
-    CloseChatUI();
-    return;
-  }
 
   std::string npcName = g_chatTargetNameStr;
   std::string handleStr = g_chatTargetHandleStr;
@@ -3373,7 +3405,8 @@ void OnChatSendClick(MyGUI::Widget *sender) {
       RefreshAvailableChatTargets(true);
       RefreshChatHeaderLabel();
 
-      g_chatInput->setCaption("");
+      if (g_chatInput)
+        g_chatInput->setCaption("");
       return;
     }
   }
@@ -3998,6 +4031,7 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     playerTtsTask->generation = chatGeneration;
     playerTtsTask->requestStartTick = GetTickCount();
     playerTtsTask->playerText = text;
+    BeginPlayerTtsPlaybackBarrier(chatGeneration);
     Log("CHAT_TIMING: PLAYER_TTS request dispatched, text_len=" +
         ToString((int)text.length()) + " gen=" + ToString((int)chatGeneration));
     HANDLE playerTtsThread =
@@ -4005,6 +4039,7 @@ void OnChatSendClick(MyGUI::Widget *sender) {
     if (playerTtsThread) {
       CloseHandle(playerTtsThread);
     } else {
+      ClearPlayerTtsPlaybackBarrier(chatGeneration);
       delete playerTtsTask;
       Log("CHAT_THREAD: failed to start player TTS response thread.");
     }
@@ -4072,6 +4107,33 @@ void OnChatSendClick(MyGUI::Widget *sender) {
   }
   Log("CHAT: dispatched inputtext event to StobeServer stream endpoint. people=" +
       peopleJson);
+}
+
+void SubmitVoiceChatText(const std::string &submittedText,
+                         const std::string &speakerName,
+                         const std::string &speakerSerial,
+                         const std::string &targetName,
+                         const std::string &targetSerial,
+                         const std::string &mode) {
+  g_chatPlayerNameStr = speakerName;
+  g_chatSpeakerHandleOverride = speakerSerial;
+  g_chatTargetNameStr = targetName;
+  g_chatTargetHandleStr = targetSerial;
+  g_chatMode = Stobe::ChatMode::Normalize(mode);
+  g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
+  SubmitChatTextForCurrentContext(submittedText);
+  g_chatSpeakerHandleOverride.clear();
+}
+
+void OnChatSendClick(MyGUI::Widget *sender) {
+  if (!g_chatInput)
+    return;
+  std::string text = g_chatInput->getCaption().asUTF8();
+  if (text.empty()) {
+    CloseChatUI();
+    return;
+  }
+  SubmitChatTextForCurrentContext(text);
 }
 
 void OnChatCancelClick(MyGUI::Widget *sender) { CloseChatUI(); }
