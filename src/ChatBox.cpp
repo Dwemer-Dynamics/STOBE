@@ -822,6 +822,17 @@ bool IsCharacterUnavailableForConversation(Character *character) {
   return false;
 }
 
+bool IsCharacterInActiveCombat(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    return character->isInCombatMode(true, true);
+  } catch (...) {
+    return false;
+  }
+}
+
 bool IsDigitsOnlyToken(const std::string &value) {
   if (value.empty()) {
     return false;
@@ -4551,6 +4562,10 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   if (!player || (uintptr_t)player <= 0x1000) {
     return false;
   }
+  if (!forceDirectorMode && IsCharacterInActiveCombat(player)) {
+    Log("BORED_EVENT: skipped (player is in active combat)");
+    return false;
+  }
 
   struct CandidateNpc {
     std::string name;
@@ -4632,6 +4647,9 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     } catch (...) {
       continue;
     }
+    if (!forceDirectorMode && IsCharacterInActiveCombat(other)) {
+      continue;
+    }
 
     // For bored events we only exclude the actual controlled player character.
     // Other player-faction squadmates are valid NPC speakers/listeners.
@@ -4670,6 +4688,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       (uintptr_t)preferredCharacter > 0x1000 &&
       (targetLockedSpeaker ||
        !IsCharacterUnavailableForConversation(preferredCharacter)) &&
+      (forceDirectorMode ||
+       !IsCharacterInActiveCombat(preferredCharacter)) &&
       ShouldIncludeAnimalForTalk(preferredCharacter)) {
     try {
       CandidateNpc c;

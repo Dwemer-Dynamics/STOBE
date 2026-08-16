@@ -1424,6 +1424,23 @@ struct NpcWorldEventState {
         lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
 };
 
+struct CombatLifecycleState {
+  bool active;
+  DWORD startedTick;
+  DWORD lastObservedTick;
+  std::string actorName;
+  std::string actorFaction;
+  unsigned int actorSerial;
+  std::string targetName;
+  std::string targetFaction;
+  unsigned int targetSerial;
+
+  CombatLifecycleState()
+      : active(false), startedTick(0), lastObservedTick(0), actorName(""),
+        actorFaction("None"), actorSerial(0), targetName("None"),
+        targetFaction("None"), targetSerial(0) {}
+};
+
 struct PendingMedicalItemUseState {
   std::map<std::string, int> pendingByKey;
   DWORD lastUpdateTick;
@@ -1496,6 +1513,8 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
+static CombatLifecycleState g_combatLifecycleState;
+static const DWORD kCombatEndGraceMs = 12 * 1000;
 static DWORD g_lastIdentityRenameSweepTick = 0;
 static const DWORD kIdentityRenameSweepIntervalMs = 2500;
 static const size_t kIdentityRenameSweepCandidateLimit = 24;
@@ -6539,6 +6558,55 @@ static void PruneNpcWorldEventState() {
   PrunePredationEventSessionState(nowTick);
 }
 
+// Emits one lifecycle pair for a nearby encounter instead of per-hit combat noise.
+static void UpdateCombatLifecycleEvent(
+    bool combatObserved, const std::string &actorName,
+    const std::string &actorFaction, unsigned int actorSerial,
+    const std::string &targetName, const std::string &targetFaction,
+    unsigned int targetSerial, DWORD nowTick) {
+  if (combatObserved) {
+    if (!g_combatLifecycleState.active) {
+      g_combatLifecycleState.active = true;
+      g_combatLifecycleState.startedTick = nowTick;
+      g_combatLifecycleState.actorName = actorName;
+      g_combatLifecycleState.actorFaction = actorFaction;
+      g_combatLifecycleState.actorSerial = actorSerial;
+      g_combatLifecycleState.targetName = targetName;
+      g_combatLifecycleState.targetFaction = targetFaction;
+      g_combatLifecycleState.targetSerial = targetSerial;
+      LogGameEvent("combat_start", actorName, actorFaction, targetName,
+                   targetFaction, "entered active combat", actorSerial,
+                   targetSerial);
+    } else if (!targetName.empty() && targetName != "None") {
+      g_combatLifecycleState.targetName = targetName;
+      g_combatLifecycleState.targetFaction = targetFaction;
+      g_combatLifecycleState.targetSerial = targetSerial;
+    }
+    g_combatLifecycleState.lastObservedTick = nowTick;
+    return;
+  }
+
+  if (!g_combatLifecycleState.active ||
+      nowTick - g_combatLifecycleState.lastObservedTick < kCombatEndGraceMs) {
+    return;
+  }
+
+  DWORD durationSeconds =
+      (nowTick - g_combatLifecycleState.startedTick + 500) / 1000;
+  if (durationSeconds < 1) {
+    durationSeconds = 1;
+  }
+  LogGameEvent("combat_end", g_combatLifecycleState.actorName,
+               g_combatLifecycleState.actorFaction,
+               g_combatLifecycleState.targetName,
+               g_combatLifecycleState.targetFaction,
+               "combat ended after " + ToString((int)durationSeconds) +
+                   " seconds",
+               g_combatLifecycleState.actorSerial,
+               g_combatLifecycleState.targetSerial);
+  g_combatLifecycleState = CombatLifecycleState();
+}
+
 static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
   std::string value = TrimCopy(rawValue);
   if (value.empty()) {
@@ -7315,6 +7383,14 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
   pendingTransferDeltas.reserve(candidates.size());
   pendingPickupEvents.reserve(candidates.size());
 
+  bool combatObserved = false;
+  std::string combatActorName = "Unknown";
+  std::string combatActorFaction = "None";
+  unsigned int combatActorSerial = 0;
+  std::string combatTargetName = "None";
+  std::string combatTargetFaction = "None";
+  unsigned int combatTargetSerial = 0;
+
   for (size_t i = 0; i < candidates.size(); ++i) {
     Character *npc = candidates[i];
     if (!npc || (uintptr_t)npc < 0x1000) {
@@ -7352,6 +7428,32 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
     hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
     hasHungerNow = ResolveNpcHungerMetrics(npc, hungerNow, fedNow, satietyNow);
+
+    bool inCombatNow = false;
+    Character *attackTargetNow = nullptr;
+    try {
+      inCombatNow = npc->isInCombatMode(true, true);
+      if (inCombatNow) {
+        hand attackTarget = npc->getAttackTarget();
+        if (attackTarget.isValid() && !attackTarget.isNull()) {
+          attackTargetNow = attackTarget.getCharacter();
+        }
+      }
+    } catch (...) {
+      inCombatNow = false;
+      attackTargetNow = nullptr;
+    }
+    if (!combatObserved && inCombatNow && !deadNow && !unconsciousNow) {
+      combatObserved = true;
+      combatActorName = ResolveCharacterNameSafe(npc);
+      combatActorFaction = SafeFaction(npc);
+      combatActorSerial = serial;
+      if (attackTargetNow && (uintptr_t)attackTargetNow > 0x1000) {
+        combatTargetName = ResolveCharacterNameSafe(attackTargetNow);
+        combatTargetFaction = SafeFaction(attackTargetNow);
+        combatTargetSerial = ResolveCharacterSerialForEvent(attackTargetNow);
+      }
+    }
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -7794,6 +7896,10 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
                     pickupEvent.currentSnapshot, matchedGain,
                     pickupEvent.hasMoneyAfter, pickupEvent.moneyAfter);
   }
+
+  UpdateCombatLifecycleEvent(
+      combatObserved, combatActorName, combatActorFaction, combatActorSerial,
+      combatTargetName, combatTargetFaction, combatTargetSerial, nowTick);
 
   static DWORD lastPruneTick = 0;
   if (nowTick - lastPruneTick >= 60000) {
@@ -12278,6 +12384,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_activatedAnimalSerials.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
+      g_combatLifecycleState = CombatLifecycleState();
       g_lastNpcWorldEventSweepTick = 0;
       g_lastInventorySweepTick = 0;
       g_lastInfoNpcTelemetryCheckTick = 0;
