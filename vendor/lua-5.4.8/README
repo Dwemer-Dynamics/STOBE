@@ -1,0 +1,9 @@
+
+This is Lua 5.4.8, released on 21 May 2025.
+
+Stobe vendors the runtime core and only the standard-library source files it
+links into the sandbox. The downloaded release archive was verified against
+SHA-256 4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae.
+
+For installation instructions, license details, and
+further information about Lua, see readme.html.

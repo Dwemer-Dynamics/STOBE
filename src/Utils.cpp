@@ -490,6 +490,34 @@ void SetPushToTalkHotkeyFromString(const std::string &keyStr) {
   }
 }
 
+void SetDirectorHotkeyFromString(const std::string &keyStr) {
+  std::string normalized = TrimCopy(keyStr);
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    if (normalized[i] >= 'a' && normalized[i] <= 'z') {
+      normalized[i] = static_cast<char>(normalized[i] - ('a' - 'A'));
+    }
+  }
+  g_directorHotkeyStr = normalized;
+  if (normalized == "F6")
+    g_directorHotkey = VK_F6;
+  else if (normalized == "F7")
+    g_directorHotkey = VK_F7;
+  else if (normalized == "F8")
+    g_directorHotkey = VK_F8;
+  else if (normalized == "F9")
+    g_directorHotkey = VK_F9;
+  else if (normalized == "F10")
+    g_directorHotkey = VK_F10;
+  else if (normalized == "F11")
+    g_directorHotkey = VK_F11;
+  else if (normalized == "F12")
+    g_directorHotkey = VK_F12;
+  else {
+    g_directorHotkey = VK_HOME;
+    g_directorHotkeyStr = "HOME";
+  }
+}
+
 void LoadStobeRuntimeConfig() {
   std::string baseIniPath = GetStobeIniPath(false);
   std::string customIniPath = GetStobeCustomIniPath(true);
@@ -513,6 +541,10 @@ void LoadStobeRuntimeConfig() {
                                            "Settings", "ChatHotkey", "/"));
   SetPushToTalkHotkeyFromString(ReadLayeredIniString(
       baseIniPath, customIniPath, "Settings", "PushToTalkHotkey", "V"));
+  g_enableDirector = ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                                       "EnableDirector", 1) != 0;
+  SetDirectorHotkeyFromString(ReadLayeredIniString(
+      baseIniPath, customIniPath, "Settings", "DirectorHotkey", "HOME"));
   g_chatMode = Stobe::ChatMode::Normalize(ReadLayeredIniString(
       baseIniPath, customIniPath, "Settings", "ChatMode", "chat"));
   g_autoChatEnabled =
@@ -649,6 +681,10 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "PushToTalkHotkey",
                              g_pushToTalkHotkeyStr.c_str(), iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableDirector",
+                             g_enableDirector ? "1" : "0", iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "DirectorHotkey",
+                             g_directorHotkeyStr.c_str(), iniPath.c_str());
   WritePrivateProfileStringA("Settings", "ChatMode", g_chatMode.c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "AutoChat",

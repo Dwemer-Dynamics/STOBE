@@ -155,6 +155,9 @@ int g_generalHotkey = VK_OEM_PLUS; // '=' by default
 std::string g_generalHotkeyStr = "=";
 int g_pushToTalkHotkey = 'V';
 std::string g_pushToTalkHotkeyStr = "V";
+bool g_enableDirector = true;
+int g_directorHotkey = VK_HOME;
+std::string g_directorHotkeyStr = "HOME";
 std::string g_chatMode = "chat";
 bool g_autoChatEnabled = false;
 bool g_useNearestPlayerSpeaker = true;

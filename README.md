@@ -10,6 +10,23 @@ This is the Kenshi DLL mod for Stobe AI Framework.
 4. Stobe receives streamed dialogue/action lines and applies them in-game.
 5. Optional TTS audio is fetched and played while speech bubbles stay in sync.
 
+## Live Director
+
+Press `Home` during a loaded game to open the Live Director. Describe an action,
+generate a Lua script through the default StobeServer LLM connector, review the
+source, and choose **Execute Reviewed Script**. The game remains paused while
+the console is open, and no generated script runs without that confirmation.
+
+The embedded Lua 5.4 runtime exposes only a bounded `kenshi` API for live world
+inspection, notifications, saves, game speed, movement, and player-squad
+teleports. File, process, network, package, debug, native-module, raw-pointer,
+and arbitrary-memory access are unavailable. Scripts have 24 KiB source, 8 MiB
+memory, and 250,000-instruction limits. Mutating scripts request a recovery save
+named `STOBE Director Recovery` before execution.
+
+Set `EnableDirector=0` in `StobeCustom.ini` to disable it, or set
+`DirectorHotkey` to `HOME` or `F6`-`F12`.
+
 ## Configuration (Update-Safe)
 
 Stobe uses layered INI config under `Kenshi\\mods\\Stobe\\`:
@@ -31,6 +48,7 @@ This preserves user settings while still allowing newly added defaults to flow i
 - [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi)
 - [KenshiLib](https://github.com/KenshiReclaimer/KenshiLib)
 - [nlohmann/json](https://github.com/nlohmann/json)
+- [Lua 5.4](https://www.lua.org/)
 
 ## Build
 
