@@ -1407,6 +1407,7 @@ struct NpcWorldEventState {
   int lockpickingSkill;
   std::string lastSpeechLine;
   InventoryEventSnapshot inventory;
+  std::map<uintptr_t, float> fleshHealthByPart;
   DWORD lastSeenTick;
 
   NpcWorldEventState()
@@ -1532,6 +1533,7 @@ static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
 static CombatLifecycleState g_combatLifecycleState;
 static const DWORD kCombatEndGraceMs = 12 * 1000;
 static const DWORD kRecentCombatSignalMs = 8 * 1000;
+static const float kMajorDamageThreshold = 15.0f;
 static const size_t kCombatParticipantLimit = 64;
 static std::map<unsigned int, DWORD> g_recentCombatSignalTickBySerial;
 static DWORD g_lastIdentityRenameSweepTick = 0;
@@ -5259,6 +5261,44 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
+// Capture body-part health without installing the dormant per-damage hook.
+static bool CollectFleshHealthByPart(
+    Character *npc, std::map<uintptr_t, float> &healthByPartOut) {
+  healthByPartOut.clear();
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  MedicalSystem *med = nullptr;
+  try {
+    med = npc->getMedical();
+  } catch (...) {
+    med = nullptr;
+  }
+  if (!med || (uintptr_t)med < 0x1000) {
+    return false;
+  }
+
+  try {
+    for (uint32_t i = 0; i < med->anatomy.size(); ++i) {
+      MedicalSystem::HealthPartStatus *part = med->anatomy[i];
+      if (part && (uintptr_t)part >= 0x1000) {
+        healthByPartOut[(uintptr_t)part] = part->flesh;
+      }
+    }
+  } catch (...) {
+    healthByPartOut.clear();
+    return false;
+  }
+  return !healthByPartOut.empty();
+}
+
+static void EmitMajorDamageEvent(Character *victim) {
+  LogGameEvent("major_damage", ResolveCharacterNameSafe(victim),
+               SafeFaction(victim), "None", "None", "took a major hit",
+               ResolveCharacterSerialForEvent(victim), 0);
+}
+
 static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
                                     float &fedOut, float &satietyOut) {
   hungerOut = 0.0f;
@@ -6824,7 +6864,7 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   int deadCount = 0;
   int unconsciousCount = 0;
   int fledCount = 0;
-  int playerStanding = 0;
+  int friendlyStanding = 0;
   int opponentStanding = 0;
   bool lostTracking = !g_combatLifecycleState.sawOpponent;
   for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
@@ -6848,7 +6888,7 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
       lostTracking = true;
     } else if (standing) {
       if (participant.playerSide) {
-        ++playerStanding;
+        ++friendlyStanding;
       } else {
         ++opponentStanding;
       }
@@ -6860,9 +6900,9 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
     outcome = "lost_tracking";
   } else if (fledCount > 0) {
     outcome = "escape";
-  } else if (playerStanding > 0 && opponentStanding == 0) {
+  } else if (friendlyStanding > 0 && opponentStanding == 0) {
     outcome = "victory";
-  } else if (playerStanding == 0 && opponentStanding > 0) {
+  } else if (friendlyStanding == 0 && opponentStanding > 0) {
     outcome = "defeat";
   }
 
@@ -6875,7 +6915,7 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
       "combat ended after " + ToString((int)durationSeconds) +
       " seconds (outcome: " + outcome + "; participants: " +
       ToString((int)g_combatLifecycleState.participants.size()) +
-      "; player side standing: " + ToString(playerStanding) +
+      "; friendly side standing: " + ToString(friendlyStanding) +
       "; opponents standing: " + ToString(opponentStanding) +
       "; knocked out: " + ToString(unconsciousCount) +
       "; dead: " + ToString(deadCount) + "; fled: " +
@@ -7701,6 +7741,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     float hungerNow = 0.0f;
     float fedNow = 0.0f;
     float satietyNow = 0.0f;
+    std::map<uintptr_t, float> fleshHealthByPartNow;
     int lockpickingNow = 0;
     try {
       deadNow = npc->isDead();
@@ -7712,6 +7753,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
     hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
     hasHungerNow = ResolveNpcHungerMetrics(npc, hungerNow, fedNow, satietyNow);
+    CollectFleshHealthByPart(npc, fleshHealthByPartNow);
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -7842,6 +7884,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
       state.lockpickingSkill = lockpickingNow;
       state.lastSpeechLine = normalizedSpeechLine;
       state.inventory = inventorySnapshot;
+      state.fleshHealthByPart = fleshHealthByPartNow;
       state.lastSeenTick = nowTick;
       if (!isPlayerActor && IsAnyPredationTask(currentTaskNow)) {
         EmitPredationEventFromTask(npc, currentTaskSubject, nowTick,
@@ -7866,6 +7909,22 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
 
     NpcWorldEventState previousState = state;
+    bool majorDamageNow = false;
+    for (std::map<uintptr_t, float>::const_iterator it =
+             fleshHealthByPartNow.begin();
+         it != fleshHealthByPartNow.end(); ++it) {
+      std::map<uintptr_t, float>::const_iterator previousIt =
+          previousState.fleshHealthByPart.find(it->first);
+      if (previousIt != previousState.fleshHealthByPart.end() &&
+          previousIt->second - it->second > kMajorDamageThreshold) {
+        majorDamageNow = true;
+        break;
+      }
+    }
+    if (majorDamageNow && ObserveCombatCharacter(npc, nowTick).evidence) {
+      MarkRecentCombatSignal(npc, nowTick);
+      EmitMajorDamageEvent(npc);
+    }
     std::map<std::string, int> gainByKey;
     std::map<std::string, int> lossByKey;
     bool suppressPickupEvent = false;
@@ -8136,6 +8195,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     state.lockpickingSkill = lockpickingNow;
     state.lastSpeechLine = normalizedSpeechLine;
     state.inventory = inventorySnapshot;
+    state.fleshHealthByPart = fleshHealthByPartNow;
     state.lastSeenTick = nowTick;
   }
 
@@ -11598,10 +11658,7 @@ void applyDamage_hook(MedicalSystem::HealthPartStatus *part,
     MarkRecentCombatSignal(part->me, GetTickCount());
   }
   if (part && part->me && damage.total() > 15.0f) {
-    LogGameEvent("combat", "Unknown", "None", part->me->getName(),
-                 SafeFaction(part->me),
-                 "Took substantial damage: " + ToString((int)damage.total()), 0,
-                 ResolveCharacterSerialForEvent(part->me));
+    EmitMajorDamageEvent(part->me);
   }
   if (applyDamage_orig)
     applyDamage_orig(part, damage);
