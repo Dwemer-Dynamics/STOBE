@@ -1407,6 +1407,7 @@ struct NpcWorldEventState {
   int lockpickingSkill;
   std::string lastSpeechLine;
   InventoryEventSnapshot inventory;
+  std::map<uintptr_t, float> fleshHealthByPart;
   DWORD lastSeenTick;
 
   NpcWorldEventState()
@@ -1422,6 +1423,39 @@ struct NpcWorldEventState {
         currentTaskSubjectName(""), constructionAction(0),
         constructionSubjectSerial(0), constructionSubjectName(""),
         lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
+};
+
+struct CombatParticipantState {
+  std::string name;
+  std::string faction;
+  bool playerSide;
+  bool dead;
+  bool unconscious;
+  bool fled;
+  DWORD lastSeenTick;
+
+  CombatParticipantState()
+      : name("Unknown"), faction("None"), playerSide(false), dead(false),
+        unconscious(false), fled(false), lastSeenTick(0) {}
+};
+
+struct CombatLifecycleState {
+  bool active;
+  DWORD startedTick;
+  DWORD lastObservedTick;
+  std::string actorName;
+  std::string actorFaction;
+  unsigned int actorSerial;
+  std::string targetName;
+  std::string targetFaction;
+  unsigned int targetSerial;
+  bool sawOpponent;
+  std::map<unsigned int, CombatParticipantState> participants;
+
+  CombatLifecycleState()
+      : active(false), startedTick(0), lastObservedTick(0), actorName(""),
+        actorFaction("None"), actorSerial(0), targetName("None"),
+        targetFaction("None"), targetSerial(0), sawOpponent(false) {}
 };
 
 struct PendingMedicalItemUseState {
@@ -1496,6 +1530,12 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
+static CombatLifecycleState g_combatLifecycleState;
+static const DWORD kCombatEndGraceMs = 12 * 1000;
+static const DWORD kRecentCombatSignalMs = 8 * 1000;
+static const float kMajorDamageThreshold = 15.0f;
+static const size_t kCombatParticipantLimit = 64;
+static std::map<unsigned int, DWORD> g_recentCombatSignalTickBySerial;
 static DWORD g_lastIdentityRenameSweepTick = 0;
 static const DWORD kIdentityRenameSweepIntervalMs = 2500;
 static const size_t kIdentityRenameSweepCandidateLimit = 24;
@@ -5221,6 +5261,44 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
+// Capture body-part health without installing the dormant per-damage hook.
+static bool CollectFleshHealthByPart(
+    Character *npc, std::map<uintptr_t, float> &healthByPartOut) {
+  healthByPartOut.clear();
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  MedicalSystem *med = nullptr;
+  try {
+    med = npc->getMedical();
+  } catch (...) {
+    med = nullptr;
+  }
+  if (!med || (uintptr_t)med < 0x1000) {
+    return false;
+  }
+
+  try {
+    for (uint32_t i = 0; i < med->anatomy.size(); ++i) {
+      MedicalSystem::HealthPartStatus *part = med->anatomy[i];
+      if (part && (uintptr_t)part >= 0x1000) {
+        healthByPartOut[(uintptr_t)part] = part->flesh;
+      }
+    }
+  } catch (...) {
+    healthByPartOut.clear();
+    return false;
+  }
+  return !healthByPartOut.empty();
+}
+
+static void EmitMajorDamageEvent(Character *victim) {
+  LogGameEvent("major_damage", ResolveCharacterNameSafe(victim),
+               SafeFaction(victim), "None", "None", "took a major hit",
+               ResolveCharacterSerialForEvent(victim), 0);
+}
+
 static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
                                     float &fedOut, float &satietyOut) {
   hungerOut = 0.0f;
@@ -6539,6 +6617,328 @@ static void PruneNpcWorldEventState() {
   PrunePredationEventSessionState(nowTick);
 }
 
+struct CombatCharacterObservation {
+  bool dead;
+  bool unconscious;
+  bool fleeing;
+  bool evidence;
+  Character *attackTarget;
+  std::vector<Character *> attackers;
+
+  CombatCharacterObservation()
+      : dead(false), unconscious(false), fleeing(false), evidence(false),
+        attackTarget(nullptr) {}
+};
+
+static void MarkRecentCombatSignal(Character *npc, DWORD nowTick) {
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  if (serial != 0) {
+    g_recentCombatSignalTickBySerial[serial] = nowTick;
+  }
+}
+
+static bool HasRecentCombatSignal(unsigned int serial, DWORD nowTick) {
+  std::map<unsigned int, DWORD>::const_iterator it =
+      g_recentCombatSignalTickBySerial.find(serial);
+  return it != g_recentCombatSignalTickBySerial.end() &&
+         nowTick - it->second <= kRecentCombatSignalMs;
+}
+
+static void QueueCombatCharacter(Character *npc,
+                                 std::vector<Character *> &queue,
+                                 std::set<unsigned int> &queuedSerials) {
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  if (!npc || (uintptr_t)npc < 0x1000 || serial == 0 ||
+      queuedSerials.count(serial) != 0 ||
+      queue.size() >= kCombatParticipantLimit) {
+    return;
+  }
+  queuedSerials.insert(serial);
+  queue.push_back(npc);
+}
+
+// Combines Kenshi's current combat flags with recent attack/damage hooks so a
+// brief engine-state gap cannot split one encounter into multiple lifecycle events.
+static CombatCharacterObservation ObserveCombatCharacter(Character *npc,
+                                                           DWORD nowTick) {
+  CombatCharacterObservation observation;
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return observation;
+  }
+
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  try {
+    observation.dead = npc->isDead();
+    observation.unconscious = npc->isUnconcious();
+    observation.fleeing = npc->isFleeing();
+  } catch (...) {
+  }
+
+  bool inCombat = false;
+  bool rangedCombat = false;
+  bool underMeleeAttack = false;
+  try {
+    inCombat = npc->isInCombatMode(true, true);
+  } catch (...) {
+  }
+  try {
+    rangedCombat = npc->isInRangedCombatMode();
+  } catch (...) {
+  }
+  try {
+    underMeleeAttack = npc->isLiterallyUnderMeleeAttackRightNowForSure();
+  } catch (...) {
+  }
+
+  try {
+    observation.attackTarget =
+        ResolveCharacterFromHandSafe(npc->getAttackTarget());
+  } catch (...) {
+    observation.attackTarget = nullptr;
+  }
+
+  lektor<hand> attackerHandles;
+  try {
+    npc->getAllAttackers(attackerHandles);
+  } catch (...) {
+  }
+  for (uint32_t i = 0; i < attackerHandles.size(); ++i) {
+    Character *attacker = ResolveCharacterFromHandSafe(attackerHandles.stuff[i]);
+    if (attacker && attacker != npc) {
+      observation.attackers.push_back(attacker);
+    }
+  }
+
+  observation.evidence =
+      !observation.dead && !observation.unconscious &&
+      (inCombat || rangedCombat || underMeleeAttack ||
+       observation.attackTarget != nullptr || !observation.attackers.empty() ||
+       HasRecentCombatSignal(serial, nowTick));
+  return observation;
+}
+
+// Tracks a player-squad encounter by its confirmed attack graph, rather than by
+// whoever happens to remain inside the original nearby-NPC scan radius.
+static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
+  if (!world || !world->player) {
+    return;
+  }
+
+  std::set<unsigned int> playerSquadSerials;
+  std::map<unsigned int, Character *> loadedBySerial;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
+      playerSquadSerials.insert(serial);
+      loadedBySerial[serial] = member;
+    }
+  }
+  try {
+    const ogre_unordered_set<Character *>::type &loadedCharacters =
+        world->getCharacterUpdateList();
+    for (ogre_unordered_set<Character *>::type::const_iterator it =
+             loadedCharacters.begin();
+         it != loadedCharacters.end(); ++it) {
+      Character *candidate = *it;
+      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
+      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
+        loadedBySerial[serial] = candidate;
+      }
+    }
+  } catch (...) {
+  }
+
+  Character *seedActor = nullptr;
+  Character *seedTarget = nullptr;
+  if (!g_combatLifecycleState.active) {
+    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+      Character *member = world->player->playerCharacters[i];
+      CombatCharacterObservation observation =
+          ObserveCombatCharacter(member, nowTick);
+      if (!observation.evidence) {
+        continue;
+      }
+      seedActor = member;
+      seedTarget = observation.attackTarget;
+      if (!seedTarget && !observation.attackers.empty()) {
+        seedTarget = observation.attackers[0];
+      }
+      break;
+    }
+    if (!seedActor) {
+      return;
+    }
+
+    g_combatLifecycleState.active = true;
+    g_combatLifecycleState.startedTick = nowTick;
+    g_combatLifecycleState.lastObservedTick = nowTick;
+    g_combatLifecycleState.actorName = ResolveCharacterNameSafe(seedActor);
+    g_combatLifecycleState.actorFaction = SafeFaction(seedActor);
+    g_combatLifecycleState.actorSerial =
+        ResolveCharacterSerialForEvent(seedActor);
+    if (seedTarget && (uintptr_t)seedTarget >= 0x1000) {
+      g_combatLifecycleState.targetName = ResolveCharacterNameSafe(seedTarget);
+      g_combatLifecycleState.targetFaction = SafeFaction(seedTarget);
+      g_combatLifecycleState.targetSerial =
+          ResolveCharacterSerialForEvent(seedTarget);
+    }
+    LogGameEvent("combat_start", g_combatLifecycleState.actorName,
+                 g_combatLifecycleState.actorFaction,
+                 g_combatLifecycleState.targetName,
+                 g_combatLifecycleState.targetFaction,
+                 "entered active combat", g_combatLifecycleState.actorSerial,
+                 g_combatLifecycleState.targetSerial);
+  }
+
+  std::vector<Character *> queue;
+  std::set<unsigned int> queuedSerials;
+  queue.reserve(kCombatParticipantLimit);
+  if (seedActor) {
+    QueueCombatCharacter(seedActor, queue, queuedSerials);
+  } else {
+    for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+             g_combatLifecycleState.participants.begin();
+         it != g_combatLifecycleState.participants.end(); ++it) {
+      std::map<unsigned int, Character *>::const_iterator loadedIt =
+          loadedBySerial.find(it->first);
+      if (loadedIt != loadedBySerial.end()) {
+        QueueCombatCharacter(loadedIt->second, queue, queuedSerials);
+      }
+    }
+    // A squad member can join or resume the same player-centric encounter.
+    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+      Character *member = world->player->playerCharacters[i];
+      if (ObserveCombatCharacter(member, nowTick).evidence) {
+        QueueCombatCharacter(member, queue, queuedSerials);
+      }
+    }
+  }
+
+  bool combatObserved = false;
+  for (size_t queueIndex = 0; queueIndex < queue.size(); ++queueIndex) {
+    Character *npc = queue[queueIndex];
+    unsigned int serial = ResolveCharacterSerialForEvent(npc);
+    if (serial == 0) {
+      continue;
+    }
+    CombatCharacterObservation observation = ObserveCombatCharacter(npc, nowTick);
+    CombatParticipantState &participant =
+        g_combatLifecycleState.participants[serial];
+    participant.name = ResolveCharacterNameSafe(npc);
+    participant.faction = SafeFaction(npc);
+    participant.playerSide = participant.playerSide ||
+                             playerSquadSerials.count(serial) != 0;
+    participant.dead = observation.dead;
+    participant.unconscious = observation.unconscious;
+    participant.fled = observation.fleeing;
+    participant.lastSeenTick = nowTick;
+
+    if (!participant.playerSide) {
+      g_combatLifecycleState.sawOpponent = true;
+      if (g_combatLifecycleState.targetSerial == 0) {
+        g_combatLifecycleState.targetName = participant.name;
+        g_combatLifecycleState.targetFaction = participant.faction;
+        g_combatLifecycleState.targetSerial = serial;
+      }
+    }
+
+    if (!observation.evidence) {
+      continue;
+    }
+    combatObserved = true;
+    QueueCombatCharacter(observation.attackTarget, queue, queuedSerials);
+    for (size_t i = 0; i < observation.attackers.size(); ++i) {
+      QueueCombatCharacter(observation.attackers[i], queue, queuedSerials);
+    }
+  }
+
+  if (combatObserved) {
+    g_combatLifecycleState.lastObservedTick = nowTick;
+    return;
+  }
+  if (nowTick - g_combatLifecycleState.lastObservedTick < kCombatEndGraceMs) {
+    return;
+  }
+
+  int deadCount = 0;
+  int unconsciousCount = 0;
+  int fledCount = 0;
+  int friendlyStanding = 0;
+  int opponentStanding = 0;
+  bool lostTracking = !g_combatLifecycleState.sawOpponent;
+  for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+           g_combatLifecycleState.participants.begin();
+       it != g_combatLifecycleState.participants.end(); ++it) {
+    const CombatParticipantState &participant = it->second;
+    if (participant.dead) {
+      ++deadCount;
+    } else if (participant.unconscious) {
+      ++unconsciousCount;
+    }
+    if (participant.fled && !participant.dead && !participant.unconscious) {
+      ++fledCount;
+    }
+
+    bool standing = !participant.dead && !participant.unconscious &&
+                    !participant.fled;
+    bool missing = participant.lastSeenTick == 0 ||
+                   nowTick - participant.lastSeenTick >= kCombatEndGraceMs;
+    if (standing && missing) {
+      lostTracking = true;
+    } else if (standing) {
+      if (participant.playerSide) {
+        ++friendlyStanding;
+      } else {
+        ++opponentStanding;
+      }
+    }
+  }
+
+  std::string outcome = "disengaged";
+  if (lostTracking) {
+    outcome = "lost_tracking";
+  } else if (fledCount > 0) {
+    outcome = "escape";
+  } else if (friendlyStanding > 0 && opponentStanding == 0) {
+    outcome = "victory";
+  } else if (friendlyStanding == 0 && opponentStanding > 0) {
+    outcome = "defeat";
+  }
+
+  DWORD durationSeconds =
+      (nowTick - g_combatLifecycleState.startedTick + 500) / 1000;
+  if (durationSeconds < 1) {
+    durationSeconds = 1;
+  }
+  std::string message =
+      "combat ended after " + ToString((int)durationSeconds) +
+      " seconds (outcome: " + outcome + "; participants: " +
+      ToString((int)g_combatLifecycleState.participants.size()) +
+      "; friendly side standing: " + ToString(friendlyStanding) +
+      "; opponents standing: " + ToString(opponentStanding) +
+      "; knocked out: " + ToString(unconsciousCount) +
+      "; dead: " + ToString(deadCount) + "; fled: " +
+      ToString(fledCount) + ")";
+  LogGameEvent("combat_end", g_combatLifecycleState.actorName,
+               g_combatLifecycleState.actorFaction,
+               g_combatLifecycleState.targetName,
+               g_combatLifecycleState.targetFaction, message,
+               g_combatLifecycleState.actorSerial,
+               g_combatLifecycleState.targetSerial);
+  g_combatLifecycleState = CombatLifecycleState();
+
+  for (std::map<unsigned int, DWORD>::iterator it =
+           g_recentCombatSignalTickBySerial.begin();
+       it != g_recentCombatSignalTickBySerial.end();) {
+    if (nowTick - it->second > kCombatEndGraceMs) {
+      it = g_recentCombatSignalTickBySerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
   std::string value = TrimCopy(rawValue);
   if (value.empty()) {
@@ -7341,6 +7741,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     float hungerNow = 0.0f;
     float fedNow = 0.0f;
     float satietyNow = 0.0f;
+    std::map<uintptr_t, float> fleshHealthByPartNow;
     int lockpickingNow = 0;
     try {
       deadNow = npc->isDead();
@@ -7352,6 +7753,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
     hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
     hasHungerNow = ResolveNpcHungerMetrics(npc, hungerNow, fedNow, satietyNow);
+    CollectFleshHealthByPart(npc, fleshHealthByPartNow);
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -7482,6 +7884,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
       state.lockpickingSkill = lockpickingNow;
       state.lastSpeechLine = normalizedSpeechLine;
       state.inventory = inventorySnapshot;
+      state.fleshHealthByPart = fleshHealthByPartNow;
       state.lastSeenTick = nowTick;
       if (!isPlayerActor && IsAnyPredationTask(currentTaskNow)) {
         EmitPredationEventFromTask(npc, currentTaskSubject, nowTick,
@@ -7506,6 +7909,22 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
 
     NpcWorldEventState previousState = state;
+    bool majorDamageNow = false;
+    for (std::map<uintptr_t, float>::const_iterator it =
+             fleshHealthByPartNow.begin();
+         it != fleshHealthByPartNow.end(); ++it) {
+      std::map<uintptr_t, float>::const_iterator previousIt =
+          previousState.fleshHealthByPart.find(it->first);
+      if (previousIt != previousState.fleshHealthByPart.end() &&
+          previousIt->second - it->second > kMajorDamageThreshold) {
+        majorDamageNow = true;
+        break;
+      }
+    }
+    if (majorDamageNow && ObserveCombatCharacter(npc, nowTick).evidence) {
+      MarkRecentCombatSignal(npc, nowTick);
+      EmitMajorDamageEvent(npc);
+    }
     std::map<std::string, int> gainByKey;
     std::map<std::string, int> lossByKey;
     bool suppressPickupEvent = false;
@@ -7776,6 +8195,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     state.lockpickingSkill = lockpickingNow;
     state.lastSpeechLine = normalizedSpeechLine;
     state.inventory = inventorySnapshot;
+    state.fleshHealthByPart = fleshHealthByPartNow;
     state.lastSeenTick = nowTick;
   }
 
@@ -7794,6 +8214,8 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
                     pickupEvent.currentSnapshot, matchedGain,
                     pickupEvent.hasMoneyAfter, pickupEvent.moneyAfter);
   }
+
+  UpdateCombatLifecycleEvent(world, nowTick);
 
   static DWORD lastPruneTick = 0;
   if (nowTick - lastPruneTick >= 60000) {
@@ -11218,6 +11640,9 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 void attackingYou_hook(Character *npc, Character *attacker, bool so,
                        bool doAwarenessCheck) {
   if (attacker && npc) {
+    DWORD nowTick = GetTickCount();
+    MarkRecentCombatSignal(attacker, nowTick);
+    MarkRecentCombatSignal(npc, nowTick);
     LogGameEvent("combat", attacker->getName(), SafeFaction(attacker),
                  npc->getName(), SafeFaction(npc), "Initiated attack",
                  ResolveCharacterSerialForEvent(attacker),
@@ -11229,11 +11654,11 @@ void attackingYou_hook(Character *npc, Character *attacker, bool so,
 
 void applyDamage_hook(MedicalSystem::HealthPartStatus *part,
                       const Damages &damage) {
+  if (part && part->me && damage.total() > 0.0f) {
+    MarkRecentCombatSignal(part->me, GetTickCount());
+  }
   if (part && part->me && damage.total() > 15.0f) {
-    LogGameEvent("combat", "Unknown", "None", part->me->getName(),
-                 SafeFaction(part->me),
-                 "Took substantial damage: " + ToString((int)damage.total()), 0,
-                 ResolveCharacterSerialForEvent(part->me));
+    EmitMajorDamageEvent(part->me);
   }
   if (applyDamage_orig)
     applyDamage_orig(part, damage);
@@ -12278,6 +12703,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_activatedAnimalSerials.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
+      g_combatLifecycleState = CombatLifecycleState();
+      g_recentCombatSignalTickBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
       g_lastInventorySweepTick = 0;
       g_lastInfoNpcTelemetryCheckTick = 0;
