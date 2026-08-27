@@ -48,6 +48,9 @@ MyGUI::ComboBox *g_chatTargetCombo = nullptr;
 MyGUI::ComboBox *g_chatActionCombo = nullptr;
 MyGUI::ComboBox *g_chatProfileModelCombo = nullptr;
 MyGUI::EditBox *g_chatActionArgInput = nullptr;
+MyGUI::ComboBox *g_chatMoodCombo = nullptr;
+MyGUI::EditBox *g_chatCustomMoodInput = nullptr;
+MyGUI::TextBox *g_chatMoodLabel = nullptr;
 MyGUI::Button *g_chatAutoChatToggle = nullptr;
 MyGUI::TextBox *g_chatLabel = nullptr;
 MyGUI::Window *g_renameWindow = nullptr;
@@ -63,6 +66,10 @@ std::string g_renameTargetNameStr = "";
 std::string g_renameTargetHandleStr = "";
 std::string g_renameSpeakerNameStr = "";
 size_t g_lastChatModeIndex = 1;
+// The player mood selection survives chat close/reopen for the process
+// lifetime, mirroring how g_chatMode keeps the last chat mode.
+size_t g_playerMoodIndex = 0;
+std::string g_playerCustomMoodRawStr = "";
 bool g_chatJustOpened = false;
 bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
@@ -78,6 +85,12 @@ const float kCheatRangeUnits = 100.0f;
 const char *kNarratorName = "The Narrator";
 const char *kProfileModelLabels[] = {
     "Standard", "Fast", "Powerful", "Experimental"};
+// Delivery cue for the player's own spoken line. "none" sends no cue and
+// "custom" is always the last entry so it can be detected by index.
+const char *kPlayerMoodOptions[] = {
+    "none",       "happy",   "sad",      "angry",  "annoyed", "scared",
+    "surprised",  "confused", "suspicious", "playful", "flirty", "custom"};
+const int kPlayerCustomMoodMaxChars = 80;
 
 class ActiveChatStreamScope {
 public:
@@ -118,6 +131,9 @@ void OnRenameConfirmClick(MyGUI::Widget *sender);
 void OnRenameCancelClick(MyGUI::Widget *sender);
 void OnRenameWindowButtonPressed(MyGUI::Window *sender,
                                  const std::string &name);
+void OnChatMoodChange(MyGUI::ComboBox *sender, size_t index);
+void OnChatCustomMoodChange(MyGUI::EditBox *sender);
+void RefreshChatMoodControls();
 
 int NormalizeProfileModelSlot(int slot) {
   return slot >= 1 && slot <= 4 ? slot : 1;
@@ -308,6 +324,119 @@ float ScreenPixelsToRealHeight(int pixels) {
   }
 
   return (float)pixels / (float)viewSize.height;
+}
+
+size_t PlayerMoodOptionCount() {
+  return sizeof(kPlayerMoodOptions) / sizeof(kPlayerMoodOptions[0]);
+}
+
+size_t PlayerMoodCustomIndex() { return PlayerMoodOptionCount() - 1; }
+
+size_t SanitizePlayerMoodIndex(size_t index) {
+  return index < PlayerMoodOptionCount() ? index : 0;
+}
+
+// Spoken player lines only. Narrator, cheat, injection and autochat requests
+// carry no player delivery cue.
+bool ChatModeAllowsPlayerMood(const std::string &requestMode) {
+  return requestMode == "talk" || requestMode == "whisper" ||
+         requestMode == "shout";
+}
+
+// Clamp on character boundaries so a multi-byte sequence is never split.
+std::string ClampUtf8Characters(const std::string &value,
+                                size_t maxCharacters) {
+  size_t characters = 0;
+  size_t index = 0;
+  while (index < value.size()) {
+    if (characters >= maxCharacters) {
+      return value.substr(0, index);
+    }
+    const unsigned char lead = (unsigned char)value[index];
+    size_t width = 1;
+    if ((lead & 0xF8) == 0xF0) {
+      width = 4;
+    } else if ((lead & 0xF0) == 0xE0) {
+      width = 3;
+    } else if ((lead & 0xE0) == 0xC0) {
+      width = 2;
+    }
+    if (index + width > value.size()) {
+      width = value.size() - index;
+    }
+    index += width;
+    ++characters;
+  }
+  return value;
+}
+
+// Trim, collapse internal whitespace and cap the player's custom mood cue.
+std::string NormalizePlayerMoodCue(const std::string &raw) {
+  std::string collapsed;
+  collapsed.reserve(raw.size());
+  bool pendingSpace = false;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const unsigned char ch = (unsigned char)raw[i];
+    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+      if (!collapsed.empty()) {
+        pendingSpace = true;
+      }
+      continue;
+    }
+    if (pendingSpace) {
+      collapsed.push_back(' ');
+      pendingSpace = false;
+    }
+    collapsed.push_back(raw[i]);
+  }
+  return ClampUtf8Characters(collapsed, (size_t)kPlayerCustomMoodMaxChars);
+}
+
+// Read the live widgets so the voice path and a closed chat box both fall back
+// to the last in-process selection.
+void CapturePlayerMoodSelection() {
+  if (g_chatMoodCombo) {
+    const size_t rawIndex = g_chatMoodCombo->getIndexSelected();
+    if (rawIndex != MyGUI::ITEM_NONE) {
+      g_playerMoodIndex = SanitizePlayerMoodIndex(rawIndex);
+    }
+  }
+  if (g_chatCustomMoodInput) {
+    g_playerCustomMoodRawStr = g_chatCustomMoodInput->getCaption().asUTF8();
+  }
+}
+
+/**
+ * Resolve the outbound mood cue for one request.
+ *
+ * Both outputs are cleared first so a previous line's cue can never leak into
+ * the next one. Returns false only when "custom" is selected with nothing
+ * usable typed, which the caller reports and treats as a blocked send.
+ */
+bool ResolvePlayerMoodCue(const std::string &requestMode,
+                          std::string &playerMoodOut,
+                          std::string &customMoodOut) {
+  playerMoodOut.clear();
+  customMoodOut.clear();
+  if (!ChatModeAllowsPlayerMood(requestMode)) {
+    return true;
+  }
+
+  const size_t moodIndex = SanitizePlayerMoodIndex(g_playerMoodIndex);
+  if (moodIndex == 0) {
+    return true;
+  }
+  if (moodIndex == PlayerMoodCustomIndex()) {
+    const std::string cue = NormalizePlayerMoodCue(g_playerCustomMoodRawStr);
+    if (cue.empty()) {
+      return false;
+    }
+    playerMoodOut = "custom";
+    customMoodOut = cue;
+    return true;
+  }
+  playerMoodOut = kPlayerMoodOptions[moodIndex];
+  return true;
 }
 
 float ParentPixelsToRealHeight(MyGUI::Widget *parent, int pixels) {
@@ -1930,6 +2059,9 @@ void CloseChatUI() {
     g_chatActionArgInput = nullptr;
     g_chatAutoChatToggle = nullptr;
     g_chatLabel = nullptr;
+    g_chatMoodCombo = nullptr;
+    g_chatCustomMoodInput = nullptr;
+    g_chatMoodLabel = nullptr;
   }
   g_chatTargetOptions.clear();
   g_chatTargetRefreshInProgress = false;
@@ -3374,7 +3506,8 @@ void OnChatInputChange(MyGUI::EditBox *sender) {
 
 void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
-void SubmitChatTextForCurrentContext(const std::string &submittedText) {
+void SubmitChatTextForCurrentContext(const std::string &submittedText,
+                                     bool fromVoice) {
   std::string text = submittedText;
   if (text.empty())
     return;
@@ -3437,6 +3570,21 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText) {
   }
   std::string mode =
       Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
+
+  // Delivery cue for the player's own line. It travels in its own fields and
+  // never changes the literal speech text or the player TTS request.
+  CapturePlayerMoodSelection();
+  const bool moodApplies = ChatModeAllowsPlayerMood(mode);
+  std::string playerMoodCue = "";
+  std::string customMoodCue = "";
+  if (!ResolvePlayerMoodCue(mode, playerMoodCue, customMoodCue) && !fromVoice) {
+    if (world) {
+      world->showPlayerAMessage_withLog(
+          "Chat blocked: Enter a custom mood or choose a different mood.", true);
+    }
+    Log("CHAT_GATE: blocked empty custom player mood mode=" + mode);
+    return;
+  }
 
   size_t selectedManualActionIndex = 0;
   if (g_chatActionCombo) {
@@ -4070,6 +4218,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText) {
           L"&manual_action_target_sid=" + ToWide(UrlEncode(resolvedTargetHandle));
     }
   }
+  if (moodApplies) {
+    // Always explicit, so a cleared mood also clears the server-side cue.
+    endpoint += L"&player_mood=" + ToWide(UrlEncode(playerMoodCue));
+    endpoint += L"&custom_mood=" + ToWide(UrlEncode(customMoodCue));
+  }
   Log("CHAT_SEND_STAGE: building_people_json");
   std::string peopleJson =
       BuildPeopleJson(world, playerName, targetName, resolvedTargetHandle,
@@ -4121,7 +4274,7 @@ void SubmitVoiceChatText(const std::string &submittedText,
   g_chatTargetHandleStr = targetSerial;
   g_chatMode = Stobe::ChatMode::Normalize(mode);
   g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
-  SubmitChatTextForCurrentContext(submittedText);
+  SubmitChatTextForCurrentContext(submittedText, true);
   g_chatSpeakerHandleOverride.clear();
 }
 
@@ -5028,7 +5181,15 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   // Identity renames are queued and handled asynchronously by
   // RenameWorker, so CreateChatUI never blocks on HTTP.
   const float chatWindowW = 0.46f;
-  const float chatWindowH = 0.24f + ScreenPixelsToRealHeight(20);
+  // One extra control row carries the player mood controls. The window grows by
+  // exactly that row and every existing vertical metric is scaled by the same
+  // ratio, so the current widgets keep their previous absolute geometry at any
+  // UI scale.
+  const float chatRowH = 0.16f;
+  const float chatRowGap = 0.025f;
+  const float chatWindowBaseH = 0.24f + ScreenPixelsToRealHeight(20);
+  const float chatWindowH = chatWindowBaseH * (1.0f + chatRowH + chatRowGap);
+  const float chatVScale = chatWindowBaseH / chatWindowH;
   const float chatWindowX = (1.0f - chatWindowW) * 0.5f;
   const float chatWindowY = (1.0f - chatWindowH) * 0.5f;
   g_chatWindow = gui->createWidgetReal<MyGUI::Window>(
@@ -5040,19 +5201,21 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
       MyGUI::newDelegate(OnChatWindowButtonPressed);
   MyGUI::Widget *client = g_chatWindow->getClientWidget();
   g_chatLabel = client->createWidgetReal<MyGUI::TextBox>(
-      "Kenshi_TextboxStandardText", 0.05f, 0.04f, 0.44f, 0.13f,
-      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatLabel");
+      "Kenshi_TextboxStandardText", 0.05f, 0.04f * chatVScale, 0.44f,
+      0.13f * chatVScale, MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_ChatLabel");
   g_chatLabel->setCaption(WideFromUtf8("Speaker: " + g_chatPlayerNameStr).c_str());
-  const float targetComboHeight = 0.13f + ParentPixelsToRealHeight(client, 20);
+  const float targetComboHeight =
+      0.13f * chatVScale + ParentPixelsToRealHeight(client, 20);
   g_chatTargetCombo = client->createWidgetReal<MyGUI::ComboBox>(
-      "Kenshi_ComboBox", 0.53f, 0.04f, 0.42f, targetComboHeight,
+      "Kenshi_ComboBox", 0.53f, 0.04f * chatVScale, 0.42f, targetComboHeight,
       MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatTargetCombo");
   g_chatTargetCombo->setComboModeDrop(true);
   g_chatTargetCombo->eventComboAccept += MyGUI::newDelegate(OnChatTargetChange);
   g_chatTargetCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatTargetChange);
   g_chatInput = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", 0.05f, 0.22f, 0.9f, 0.18f,
+      "Kenshi_EditBox", 0.05f, 0.22f * chatVScale, 0.9f, 0.18f * chatVScale,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_ChatInput");
 
   // Single-line style input.
@@ -5066,10 +5229,10 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatInput->eventEditSelectAccept += MyGUI::newDelegate(OnChatInputAccept);
   MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatInput);
 
-  const float inputY = 0.22f;
-  const float inputH = 0.18f;
-  const float rowGap = 0.025f;
-  const float rowH = 0.16f;
+  const float inputY = 0.22f * chatVScale;
+  const float inputH = 0.18f * chatVScale;
+  const float rowGap = chatRowGap * chatVScale;
+  const float rowH = chatRowH * chatVScale;
   const float primaryRowY = inputY + inputH + rowGap;
   const float secondaryRowY = primaryRowY + rowH + rowGap;
   const float controlRowY = secondaryRowY + rowH + rowGap;
@@ -5097,6 +5260,13 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float actionX = controlRowLeftX + modeWidth + controlRowGap;
   const float actionArgX = actionX + actionWidth + controlRowGap;
   const float sendX = actionArgX + actionArgWidth + controlRowGap;
+  const float moodRowY = controlRowY + rowH + rowGap;
+  const float moodLabelX = controlRowLeftX;
+  const float moodLabelW = 0.10f;
+  const float moodComboX = moodLabelX + moodLabelW + 0.01f;
+  const float moodComboW = 0.26f;
+  const float moodCustomX = moodComboX + moodComboW + controlRowGap;
+  const float moodCustomW = 0.95f - moodCustomX;
 
   g_chatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
       "Kenshi_ComboBox", controlRowLeftX, controlRowY, modeWidth, rowH,
@@ -5136,6 +5306,38 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatActionArgInput->setFontHeight(16);
   g_chatActionArgInput->setCaption("");
   OnChatActionChange(g_chatActionCombo, g_chatActionCombo->getIndexSelected());
+
+  g_chatMoodLabel = client->createWidgetReal<MyGUI::TextBox>(
+      "Kenshi_TextboxStandardText", moodLabelX, moodRowY, moodLabelW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatMoodLabel");
+  g_chatMoodLabel->setCaption(WideFromUtf8("Mood").c_str());
+
+  g_chatMoodCombo = client->createWidgetReal<MyGUI::ComboBox>(
+      "Kenshi_ComboBox", moodComboX, moodRowY, moodComboW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatMoodCombo");
+  g_chatMoodCombo->setComboModeDrop(true);
+  for (size_t moodOption = 0; moodOption < PlayerMoodOptionCount();
+       ++moodOption) {
+    g_chatMoodCombo->addItem(
+        WideFromUtf8(kPlayerMoodOptions[moodOption]).c_str());
+  }
+  g_chatMoodCombo->eventComboAccept += MyGUI::newDelegate(OnChatMoodChange);
+  g_chatMoodCombo->eventComboChangePosition +=
+      MyGUI::newDelegate(OnChatMoodChange);
+
+  g_chatCustomMoodInput = client->createWidgetReal<MyGUI::EditBox>(
+      "Kenshi_EditBox", moodCustomX, moodRowY, moodCustomW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatCustomMoodInput");
+  g_chatCustomMoodInput->setEditMultiLine(false);
+  g_chatCustomMoodInput->setEditWordWrap(false);
+  g_chatCustomMoodInput->setVisibleVScroll(false);
+  g_chatCustomMoodInput->setTextAlign(MyGUI::Align::Default);
+  g_chatCustomMoodInput->setFontHeight(16);
+  g_chatCustomMoodInput->setMaxTextLength((size_t)kPlayerCustomMoodMaxChars);
+  g_chatCustomMoodInput->eventEditTextChange +=
+      MyGUI::newDelegate(OnChatCustomMoodChange);
+
+  RefreshChatMoodControls();
 
   g_chatAutoChatToggle = client->createWidgetReal<MyGUI::Button>(
       "Kenshi_Button1", primaryAutoX, primaryRowY, primaryBtnW, rowH,
@@ -5279,6 +5481,52 @@ void OnChatActionChange(MyGUI::ComboBox *sender, size_t index) {
   }
 }
 
+void OnChatMoodChange(MyGUI::ComboBox *sender, size_t index) {
+  if (!sender || index == MyGUI::ITEM_NONE) {
+    return;
+  }
+  g_playerMoodIndex = SanitizePlayerMoodIndex(index);
+  RefreshChatMoodControls();
+  if (g_playerMoodIndex == PlayerMoodCustomIndex() && g_chatCustomMoodInput) {
+    MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatCustomMoodInput);
+  }
+}
+
+void OnChatCustomMoodChange(MyGUI::EditBox *sender) {
+  if (!sender) {
+    return;
+  }
+  // Keep the raw text while typing; it is normalized when the line is sent.
+  g_playerCustomMoodRawStr = sender->getCaption().asUTF8();
+}
+
+void RefreshChatMoodControls() {
+  g_playerMoodIndex = SanitizePlayerMoodIndex(g_playerMoodIndex);
+  const bool enabled = ChatModeAllowsPlayerMood(
+      Stobe::ChatMode::ResolveRequestMode(g_chatMode, g_autoChatEnabled));
+  if (g_chatMoodCombo) {
+    g_chatMoodCombo->setEnabled(enabled);
+  }
+  if (g_chatMoodCombo &&
+      g_chatMoodCombo->getIndexSelected() != g_playerMoodIndex) {
+    g_chatMoodCombo->setIndexSelected(g_playerMoodIndex);
+  }
+
+  const bool customSelected = (g_playerMoodIndex == PlayerMoodCustomIndex());
+  if (g_chatCustomMoodInput) {
+    if (g_chatCustomMoodInput->getCaption().asUTF8() !=
+        g_playerCustomMoodRawStr) {
+      g_chatCustomMoodInput->setCaption(
+          WideFromUtf8(g_playerCustomMoodRawStr).c_str());
+    }
+    g_chatCustomMoodInput->setEnabled(enabled && customSelected);
+  }
+  if (g_chatMoodLabel) {
+    g_chatMoodLabel->setCaption(
+        WideFromUtf8(customSelected ? "Mood *" : "Mood").c_str());
+  }
+}
+
 void OnAutoChatToggleClick(MyGUI::Widget *sender) {
   if (Stobe::ChatMode::IsInjectionMode(g_chatMode)) {
     return;
@@ -5289,6 +5537,7 @@ void OnAutoChatToggleClick(MyGUI::Widget *sender) {
 }
 
 void RefreshChatModeControls() {
+  RefreshChatMoodControls();
   g_chatMode = Stobe::ChatMode::Normalize(g_chatMode);
   g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
   if (g_chatModeCombo) {
@@ -5368,16 +5617,25 @@ void SendChatToStobeServer(GameWorld *world, Character *sel,
   else if (sel && sel->getName() == npcName)
     detailedContext = BuildNpcContextEnvelope(sel);
 
+  std::string moodJson = "";
+  if (ChatModeAllowsPlayerMood(mode)) {
+    std::string playerMoodCue = "";
+    std::string customMoodCue = "";
+    // An unusable custom cue resolves to empty here, which clears the field.
+    ResolvePlayerMoodCue(mode, playerMoodCue, customMoodCue);
+    moodJson = ", \"player_mood\": \"" + EscapeJSON(playerMoodCue) +
+               "\", \"custom_mood\": \"" + EscapeJSON(customMoodCue) + "\"";
+  }
+
   std::string json =
       "{\"npc\": \"" + EscapeJSON(npcName) + "\", \"npcs\": [" + npcsJson +
       "], \"nearby\": [" + nearbyFullJson + "], \"message\": \"" +
       EscapeJSON(text) + "\", \"player\": \"" + EscapeJSON(playerName) +
       "\", \"mode\": \"" + mode + "\", \"tts_enabled\": " +
-      std::string(g_ttsEnabled ? "true" : "false") +
+      std::string(g_ttsEnabled ? "true" : "false") + moodJson +
       ", \"context\": " + detailedContext + "}";
   AsyncPostToStobe(L"/chat", json);
 }
 
 } // namespace UI
 } // namespace Stobe
-

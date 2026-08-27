@@ -34,7 +34,8 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam);
 void OnChatInputChange(MyGUI::EditBox *sender);
 void OnChatInputAccept(MyGUI::EditBox *sender);
 void OnChatSendClick(MyGUI::Widget *sender);
-void SubmitChatTextForCurrentContext(const std::string &submittedText);
+void SubmitChatTextForCurrentContext(const std::string &submittedText,
+                                     bool fromVoice = false);
 void SubmitVoiceChatText(const std::string &submittedText,
                          const std::string &speakerName,
                          const std::string &speakerSerial,
