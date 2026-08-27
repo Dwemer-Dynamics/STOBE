@@ -1306,7 +1306,21 @@ static std::string BuildEventStreamData(const std::string &type,
   }
 
   std::string line = "";
-  if (normalizedType == "knockout" &&
+  if (normalizedType == "combat_start" && !listener.empty() &&
+      listener != speaker) {
+    line = speaker + ": " + body + " with " + listener;
+  } else if (normalizedType == "combat_end" && !listener.empty() &&
+             listener != speaker) {
+    const std::string combatEndedPrefix = "combat ended";
+    std::string trimmedBody = TrimCopy(body);
+    std::string normalizedBody = ToLowerAsciiCopy(trimmedBody);
+    if (normalizedBody.rfind(combatEndedPrefix, 0) == 0) {
+      line = speaker + ": combat with " + listener +
+             trimmedBody.substr(std::string("combat").length());
+    } else {
+      line = speaker + ": " + body + " with " + listener;
+    }
+  } else if (normalizedType == "knockout" &&
       ToLowerAsciiCopy(TrimCopy(body)).rfind("was ", 0) == 0) {
     line = speaker + " " + body;
   } else {
@@ -1315,6 +1329,7 @@ static std::string BuildEventStreamData(const std::string &type,
   if (!listener.empty() && listener != speaker &&
       normalizedType != "action" && normalizedType != "infoaction" &&
       normalizedType != "trade" && normalizedType != "healing" &&
+      normalizedType != "combat_start" && normalizedType != "combat_end" &&
       normalizedType != "limb_loss" && normalizedType != "horn_cut") {
     line += " (talking to: " + listener + ")";
   }
