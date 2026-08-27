@@ -5233,7 +5233,8 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float inputH = 0.18f * chatVScale;
   const float rowGap = chatRowGap * chatVScale;
   const float rowH = chatRowH * chatVScale;
-  const float primaryRowY = inputY + inputH + rowGap;
+  const float moodRowY = inputY + inputH + rowGap;
+  const float primaryRowY = moodRowY + rowH + rowGap;
   const float secondaryRowY = primaryRowY + rowH + rowGap;
   const float controlRowY = secondaryRowY + rowH + rowGap;
   const float primaryRowLeftX = 0.05f;
@@ -5260,7 +5261,6 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float actionX = controlRowLeftX + modeWidth + controlRowGap;
   const float actionArgX = actionX + actionWidth + controlRowGap;
   const float sendX = actionArgX + actionArgWidth + controlRowGap;
-  const float moodRowY = controlRowY + rowH + rowGap;
   const float moodLabelX = controlRowLeftX;
   const float moodLabelW = 0.10f;
   const float moodComboX = moodLabelX + moodLabelW + 0.01f;
