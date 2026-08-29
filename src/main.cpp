@@ -12841,8 +12841,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   UpdateStatusHud(worldUi);
 
   static bool pushToTalkWasDown = false;
-  bool pushToTalkDown = (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
-  if (pushToTalkDown && !pushToTalkWasDown && !IsAnyStobeMenuUIOpen()) {
+  bool pushToTalkEnabled = g_pushToTalkHotkey != 0;
+  bool pushToTalkDown =
+      pushToTalkEnabled &&
+      (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
+  if (!pushToTalkEnabled) {
+    if (Stobe::Voice::IsRecording())
+      Stobe::Voice::Cancel();
+  } else if (pushToTalkDown && !pushToTalkWasDown &&
+             !IsAnyStobeMenuUIOpen()) {
     std::string voiceMode = Stobe::ChatMode::Normalize(g_chatMode);
     bool narratorMode = (voiceMode == "narrator");
     Character *speaker = nullptr;
@@ -12919,7 +12926,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       worldUi->showPlayerAMessage_withLog("Transcribing...", false);
   }
   pushToTalkWasDown = pushToTalkDown;
-  Stobe::Voice::Update();
+  if (pushToTalkEnabled)
+    Stobe::Voice::Update();
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);

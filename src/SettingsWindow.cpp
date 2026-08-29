@@ -168,16 +168,25 @@ void PopulateGeneralHotkeyCombo() {
   g_generalHotkeyCombo->setIndexSelected(selected);
 }
 
+const char *const kPushToTalkDisabledLabel = "-";
+
 void PopulatePushToTalkHotkeyCombo() {
   if (!g_pushToTalkHotkeyCombo)
     return;
   g_pushToTalkHotkeyCombo->removeAllItems();
   const char *keys[] = {"V", "B", "N", "M", "C", "X", "Z"};
-  size_t selected = 0;
+  const size_t disabledIndex = 0;
+  g_pushToTalkHotkeyCombo->addItem(
+      WideFromUtf8(kPushToTalkDisabledLabel).c_str());
+  // Unknown keys keep falling back to "V", which now sits one row lower.
+  size_t selected = disabledIndex + 1;
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
     g_pushToTalkHotkeyCombo->addItem(WideFromUtf8(keys[i]).c_str());
-    if (g_pushToTalkHotkeyStr == keys[i]) selected = i;
+    if (g_pushToTalkHotkeyStr == keys[i]) selected = disabledIndex + 1 + i;
   }
+  if (g_pushToTalkHotkey == 0 ||
+      g_pushToTalkHotkeyStr == kPushToTalkDisabledLabel)
+    selected = disabledIndex;
   g_pushToTalkHotkeyCombo->setIndexSelected(selected);
 }
 
