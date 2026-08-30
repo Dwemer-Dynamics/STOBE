@@ -2715,6 +2715,7 @@ bool StopCharacterFactionCombat(Character *character, bool playerCharacter,
 struct StopFactionAttackResult {
   bool applied;
   bool diplomacyApplied;
+  bool coexistenceApplied;
   int speakerFactionMembersStopped;
   int targetFactionMembersStopped;
   int playerOrdersCleared;
@@ -2724,13 +2725,13 @@ struct StopFactionAttackResult {
   std::string reason;
 
   StopFactionAttackResult()
-      : applied(false), diplomacyApplied(false),
+      : applied(false), diplomacyApplied(false), coexistenceApplied(false),
         speakerFactionMembersStopped(0), targetFactionMembersStopped(0),
         playerOrdersCleared(0), temporaryEnemyPairsCleared(0) {}
 };
 
-// Ends combat and temporary hostility between the speaker faction and the
-// target faction without clearing crimes, bounties, jobs, or stances.
+// Ends combat and establishes coexistence between the speaker faction and the
+// target faction without changing reputation, crimes, bounties, jobs, or stances.
 StopFactionAttackResult StopFactionAttack(GameWorld *world,
                                           Character *speaker,
                                           Character *target) {
@@ -2856,10 +2857,20 @@ StopFactionAttackResult StopFactionAttack(GameWorld *world,
 
   bool speakerPeaceApplied = false;
   bool targetPeaceApplied = false;
+  bool speakerCoexistenceApplied = false;
+  bool targetCoexistenceApplied = false;
   try {
     if (speakerFaction->relations) {
       speakerFaction->relations->setNoLongerEnemies(targetFaction);
       speakerPeaceApplied = true;
+      FactionRelations::RelationData *relationData =
+          speakerFaction->relations->getRelationData(targetFaction);
+      if (relationData) {
+        relationData->peaceTreaty = true;
+        relationData->war = false;
+        relationData->coexists = true;
+        speakerCoexistenceApplied = true;
+      }
     }
   } catch (...) {
   }
@@ -2867,10 +2878,20 @@ StopFactionAttackResult StopFactionAttack(GameWorld *world,
     if (targetFaction->relations) {
       targetFaction->relations->setNoLongerEnemies(speakerFaction);
       targetPeaceApplied = true;
+      FactionRelations::RelationData *relationData =
+          targetFaction->relations->getRelationData(speakerFaction);
+      if (relationData) {
+        relationData->peaceTreaty = true;
+        relationData->war = false;
+        relationData->coexists = true;
+        targetCoexistenceApplied = true;
+      }
     }
   } catch (...) {
   }
   result.diplomacyApplied = speakerPeaceApplied && targetPeaceApplied;
+  result.coexistenceApplied =
+      speakerCoexistenceApplied && targetCoexistenceApplied;
 
   for (size_t i = 0; i < speakerFactionCombatants.size(); ++i) {
     Character *member = speakerFactionCombatants[i];
@@ -6173,6 +6194,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
               "' applied=" + (stopResult.applied ? "1" : "0") +
               " diplomacy=" +
               (stopResult.diplomacyApplied ? "1" : "0") +
+              " coexistence=" +
+              (stopResult.coexistenceApplied ? "1" : "0") +
               " speaker_faction_members_stopped=" +
               ToString(stopResult.speakerFactionMembersStopped) +
               " target_faction_members_stopped=" +
