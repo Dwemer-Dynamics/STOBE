@@ -2639,6 +2639,48 @@ Faction *ResolveStopAttackFaction(Character *character) {
   }
 }
 
+const DWORD kFactionCeasefireGuardDurationMs = 10000;
+const DWORD kFactionCeasefireGuardIntervalMs = 100;
+const size_t kMaxActiveFactionCeasefireGuards = 8;
+
+struct ActiveFactionCeasefireGuard {
+  GameWorld *world;
+  Faction *firstFaction;
+  Faction *secondFaction;
+  std::string firstFactionName;
+  std::string secondFactionName;
+  DWORD startedTick;
+  DWORD lastEnforcementTick;
+  DWORD lastSuppressionLogTick;
+
+  ActiveFactionCeasefireGuard()
+      : world(nullptr), firstFaction(nullptr), secondFaction(nullptr),
+        startedTick(0), lastEnforcementTick(0), lastSuppressionLogTick(0) {}
+};
+
+std::vector<ActiveFactionCeasefireGuard> g_activeFactionCeasefireGuards;
+
+// Applies the non-hostile faction flags without changing the relation score.
+bool ApplyFactionCoexistence(Faction *sourceFaction, Faction *targetFaction) {
+  if (!sourceFaction || !targetFaction || !sourceFaction->relations) {
+    return false;
+  }
+  try {
+    sourceFaction->relations->setNoLongerEnemies(targetFaction);
+    FactionRelations::RelationData *relationData =
+        sourceFaction->relations->getRelationData(targetFaction);
+    if (!relationData) {
+      return false;
+    }
+    relationData->peaceTreaty = true;
+    relationData->war = false;
+    relationData->coexists = true;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool CharacterHasCombatLinkToFaction(Character *character,
                                      Faction *opposingFaction) {
   if (!character || (uintptr_t)character <= 0x1000 || !opposingFaction) {
@@ -2674,7 +2716,7 @@ bool CharacterHasCombatLinkToFaction(Character *character,
 }
 
 bool StopCharacterFactionCombat(Character *character, bool playerCharacter,
-                                int &playerOrdersCleared) {
+                                 int &playerOrdersCleared) {
   if (!character || (uintptr_t)character <= 0x1000) {
     return false;
   }
@@ -2710,6 +2752,200 @@ bool StopCharacterFactionCombat(Character *character, bool playerCharacter,
   } catch (...) {
   }
   return changed;
+}
+
+// Keeps late attacks from restarting combat while a negotiated ceasefire
+// settles.
+void UpdateFactionCeasefireGuards(GameWorld *world) {
+  if (!world || g_activeFactionCeasefireGuards.empty()) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  for (std::vector<ActiveFactionCeasefireGuard>::iterator guardIt =
+           g_activeFactionCeasefireGuards.begin();
+       guardIt != g_activeFactionCeasefireGuards.end();) {
+    ActiveFactionCeasefireGuard &guard = *guardIt;
+    if (guard.world != world ||
+        nowTick - guard.startedTick >= kFactionCeasefireGuardDurationMs) {
+      Log("CEASEFIRE_GUARD: expired faction_a='" + guard.firstFactionName +
+          "' faction_b='" + guard.secondFactionName + "'");
+      guardIt = g_activeFactionCeasefireGuards.erase(guardIt);
+      continue;
+    }
+    if (guard.lastEnforcementTick != 0 &&
+        nowTick - guard.lastEnforcementTick <
+            kFactionCeasefireGuardIntervalMs) {
+      ++guardIt;
+      continue;
+    }
+    guard.lastEnforcementTick = nowTick;
+
+    std::vector<Character *> firstMembers;
+    std::vector<Character *> secondMembers;
+    auto addFactionMember = [&guard, &firstMembers, &secondMembers](
+                                Character *candidate) {
+      if (!candidate || (uintptr_t)candidate <= 0x1000) {
+        return;
+      }
+      Faction *candidateFaction = ResolveStopAttackFaction(candidate);
+      std::vector<Character *> *members = nullptr;
+      if (candidateFaction == guard.firstFaction) {
+        members = &firstMembers;
+      } else if (candidateFaction == guard.secondFaction) {
+        members = &secondMembers;
+      }
+      if (members && std::find(members->begin(), members->end(), candidate) ==
+                         members->end()) {
+        members->push_back(candidate);
+      }
+    };
+
+    try {
+      const ogre_unordered_set<Character *>::type &loadedCharacters =
+          world->getCharacterUpdateList();
+      for (ogre_unordered_set<Character *>::type::const_iterator it =
+               loadedCharacters.begin();
+           it != loadedCharacters.end(); ++it) {
+        addFactionMember(*it);
+      }
+    } catch (...) {
+    }
+    if (world->player) {
+      for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+        addFactionMember(world->player->playerCharacters[i]);
+      }
+    }
+
+    std::vector<Character *> firstCombatants;
+    std::vector<Character *> secondCombatants;
+    for (size_t i = 0; i < firstMembers.size(); ++i) {
+      if (CharacterHasCombatLinkToFaction(firstMembers[i],
+                                          guard.secondFaction)) {
+        firstCombatants.push_back(firstMembers[i]);
+      }
+    }
+    for (size_t i = 0; i < secondMembers.size(); ++i) {
+      if (CharacterHasCombatLinkToFaction(secondMembers[i],
+                                          guard.firstFaction)) {
+        secondCombatants.push_back(secondMembers[i]);
+      }
+    }
+
+    if (!firstCombatants.empty() || !secondCombatants.empty()) {
+      int temporaryEnemyPairsCleared = 0;
+      for (size_t firstIndex = 0; firstIndex < firstMembers.size();
+           ++firstIndex) {
+        for (size_t secondIndex = 0; secondIndex < secondMembers.size();
+             ++secondIndex) {
+          try {
+            firstMembers[firstIndex]->clearTempEnemyStatus(
+                secondMembers[secondIndex]);
+            secondMembers[secondIndex]->clearTempEnemyStatus(
+                firstMembers[firstIndex]);
+            ++temporaryEnemyPairsCleared;
+          } catch (...) {
+          }
+        }
+      }
+
+      ApplyFactionCoexistence(guard.firstFaction, guard.secondFaction);
+      ApplyFactionCoexistence(guard.secondFaction, guard.firstFaction);
+
+      int playerOrdersCleared = 0;
+      int membersStopped = 0;
+      int loggedMemberNames = 0;
+      std::string stoppedNames;
+      for (size_t i = 0; i < firstCombatants.size(); ++i) {
+        if (StopCharacterFactionCombat(firstCombatants[i],
+                                       IsInPlayerFactionSafe(firstCombatants[i]),
+                                       playerOrdersCleared)) {
+          ++membersStopped;
+          if (loggedMemberNames < 8) {
+            if (!stoppedNames.empty()) {
+              stoppedNames += ", ";
+            }
+            stoppedNames += SafeCharacterName(firstCombatants[i]);
+            ++loggedMemberNames;
+          }
+        }
+      }
+      for (size_t i = 0; i < secondCombatants.size(); ++i) {
+        if (StopCharacterFactionCombat(secondCombatants[i],
+                                       IsInPlayerFactionSafe(secondCombatants[i]),
+                                       playerOrdersCleared)) {
+          ++membersStopped;
+          if (loggedMemberNames < 8) {
+            if (!stoppedNames.empty()) {
+              stoppedNames += ", ";
+            }
+            stoppedNames += SafeCharacterName(secondCombatants[i]);
+            ++loggedMemberNames;
+          }
+        }
+      }
+      if (membersStopped > loggedMemberNames) {
+        stoppedNames += ", ...";
+      }
+
+      if (guard.lastSuppressionLogTick == 0 ||
+          nowTick - guard.lastSuppressionLogTick >= 500) {
+        guard.lastSuppressionLogTick = nowTick;
+        Log("CEASEFIRE_GUARD: suppressed faction_a='" +
+            guard.firstFactionName + "' faction_b='" +
+            guard.secondFactionName + "' members_stopped=" +
+            ToString(membersStopped) + " player_orders_cleared=" +
+            ToString(playerOrdersCleared) + " temporary_enemy_pairs_cleared=" +
+            ToString(temporaryEnemyPairsCleared) + " members='" +
+            stoppedNames + "'");
+      }
+    }
+    ++guardIt;
+  }
+}
+
+void RegisterFactionCeasefireGuard(GameWorld *world, Faction *firstFaction,
+                                   Faction *secondFaction,
+                                   const std::string &firstFactionName,
+                                   const std::string &secondFactionName) {
+  if (!world || !firstFaction || !secondFaction) {
+    return;
+  }
+  const DWORD nowTick = GetTickCount();
+  for (size_t i = 0; i < g_activeFactionCeasefireGuards.size(); ++i) {
+    ActiveFactionCeasefireGuard &guard = g_activeFactionCeasefireGuards[i];
+    const bool samePair =
+        (guard.firstFaction == firstFaction &&
+         guard.secondFaction == secondFaction) ||
+        (guard.firstFaction == secondFaction &&
+         guard.secondFaction == firstFaction);
+    if (guard.world == world && samePair) {
+      guard.startedTick = nowTick;
+      guard.lastEnforcementTick = 0;
+      guard.lastSuppressionLogTick = 0;
+      Log("CEASEFIRE_GUARD: renewed duration_ms=" +
+          ToString((int)kFactionCeasefireGuardDurationMs) + " faction_a='" +
+          firstFactionName + "' faction_b='" + secondFactionName + "'");
+      return;
+    }
+  }
+
+  if (g_activeFactionCeasefireGuards.size() >=
+      kMaxActiveFactionCeasefireGuards) {
+    g_activeFactionCeasefireGuards.erase(
+        g_activeFactionCeasefireGuards.begin());
+  }
+  ActiveFactionCeasefireGuard guard;
+  guard.world = world;
+  guard.firstFaction = firstFaction;
+  guard.secondFaction = secondFaction;
+  guard.firstFactionName = firstFactionName;
+  guard.secondFactionName = secondFactionName;
+  guard.startedTick = nowTick;
+  g_activeFactionCeasefireGuards.push_back(guard);
+  Log("CEASEFIRE_GUARD: started duration_ms=" +
+      ToString((int)kFactionCeasefireGuardDurationMs) + " faction_a='" +
+      firstFactionName + "' faction_b='" + secondFactionName + "'");
 }
 
 struct StopFactionAttackResult {
@@ -2855,43 +3091,13 @@ StopFactionAttackResult StopFactionAttack(GameWorld *world,
     }
   }
 
-  bool speakerPeaceApplied = false;
-  bool targetPeaceApplied = false;
-  bool speakerCoexistenceApplied = false;
-  bool targetCoexistenceApplied = false;
-  try {
-    if (speakerFaction->relations) {
-      speakerFaction->relations->setNoLongerEnemies(targetFaction);
-      speakerPeaceApplied = true;
-      FactionRelations::RelationData *relationData =
-          speakerFaction->relations->getRelationData(targetFaction);
-      if (relationData) {
-        relationData->peaceTreaty = true;
-        relationData->war = false;
-        relationData->coexists = true;
-        speakerCoexistenceApplied = true;
-      }
-    }
-  } catch (...) {
-  }
-  try {
-    if (targetFaction->relations) {
-      targetFaction->relations->setNoLongerEnemies(speakerFaction);
-      targetPeaceApplied = true;
-      FactionRelations::RelationData *relationData =
-          targetFaction->relations->getRelationData(speakerFaction);
-      if (relationData) {
-        relationData->peaceTreaty = true;
-        relationData->war = false;
-        relationData->coexists = true;
-        targetCoexistenceApplied = true;
-      }
-    }
-  } catch (...) {
-  }
-  result.diplomacyApplied = speakerPeaceApplied && targetPeaceApplied;
-  result.coexistenceApplied =
+  const bool speakerCoexistenceApplied =
+      ApplyFactionCoexistence(speakerFaction, targetFaction);
+  const bool targetCoexistenceApplied =
+      ApplyFactionCoexistence(targetFaction, speakerFaction);
+  result.diplomacyApplied =
       speakerCoexistenceApplied && targetCoexistenceApplied;
+  result.coexistenceApplied = result.diplomacyApplied;
 
   for (size_t i = 0; i < speakerFactionCombatants.size(); ++i) {
     Character *member = speakerFactionCombatants[i];
@@ -2909,9 +3115,14 @@ StopFactionAttackResult StopFactionAttack(GameWorld *world,
   }
 
   result.applied = result.diplomacyApplied ||
-                   result.temporaryEnemyPairsCleared > 0 ||
-                   result.speakerFactionMembersStopped > 0 ||
-                   result.targetFactionMembersStopped > 0;
+                    result.temporaryEnemyPairsCleared > 0 ||
+                    result.speakerFactionMembersStopped > 0 ||
+                    result.targetFactionMembersStopped > 0;
+  if (result.coexistenceApplied) {
+    RegisterFactionCeasefireGuard(
+        world, speakerFaction, targetFaction, result.speakerFactionName,
+        result.targetFactionName);
+  }
   result.reason = result.applied ? "ceasefire_applied" : "no_effect";
   return result;
 }
@@ -5678,6 +5889,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static DWORD speechDelayLastTick = 0;
 
   UpdateNarratorTimedPopupLifecycle();
+
+  UpdateFactionCeasefireGuards(thisptr);
 
   UpdateNpcDrunkStates(thisptr);
   UpdateNpcSustainedKnockoutStates(thisptr);
