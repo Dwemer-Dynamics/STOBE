@@ -9295,6 +9295,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                      actionCommand == "ROLEPLAY-ACTION" ||
                      actionCommand == "NOTIFY") {
             actionCommand = "ROLEPLAY_ACTION";
+          } else if (actionCommand == "STOPATTACK") {
+            actionCommand = "STOP_ATTACK";
           }
           if (ShouldDropDuplicateNpcAction(
                   targetHand.isValid() ? targetHand.serial : 0, actionCommand,
@@ -10271,6 +10273,30 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LeaveCriticalSection(&g_uiMutex);
             Log("HOOK_MSG_PROC: ATTACK target resolved arg='" + actionArgument +
                 "' target_serial=" + ToString((int)act.target.serial));
+          } else if (actionCommand == "STOP_ATTACK") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            hand resolvedTarget =
+                resolveActionTargetHand(actionArgument, targetHand);
+            if (!resolvedTarget.isValid() || resolvedTarget.isNull() ||
+                resolvedTarget.serial == targetHand.serial) {
+              Log("HOOK_MSG_PROC: STOP_ATTACK ignored; explicit opposing "
+                  "target could not be resolved arg='" +
+                  actionArgument + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_STOP_ATTACK;
+            act.actor = targetHand;
+            act.target = resolvedTarget;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: STOP_ATTACK queued actor_serial=" +
+                ToString((int)targetHand.serial) + " target_serial=" +
+                ToString((int)resolvedTarget.serial) + " arg='" +
+                actionArgument + "'");
           } else if (actionCommand == "SUICIDE") {
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;

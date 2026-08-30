@@ -2995,7 +2995,8 @@ DWORD WINAPI ManualDiaryResponseThread(LPVOID lpParam) {
 
 void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
   static const char *commandNames[] = {
-      "ATTACK",           "FOLLOW",        "STOP_FOLLOW",
+      "ATTACK",           "STOP_ATTACK",   "STOPATTACK",
+      "FOLLOW",           "STOP_FOLLOW",
       "JOIN_PARTY",       "LEAVE",
       "IDLE",             "STOP_CARRYING", "RELEASE_PLAYER",
       "RELEASE_PRISONER",
