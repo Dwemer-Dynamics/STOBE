@@ -1553,8 +1553,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.2.1";
-static const char *kStobePluginReleaseDate = "2026-08-28";
+static const char *kStobePluginVersion = "1.2.2";
+static const char *kStobePluginReleaseDate = "2026-08-30";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -9295,6 +9295,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                      actionCommand == "ROLEPLAY-ACTION" ||
                      actionCommand == "NOTIFY") {
             actionCommand = "ROLEPLAY_ACTION";
+          } else if (actionCommand == "STOPATTACK") {
+            actionCommand = "STOP_ATTACK";
           }
           if (ShouldDropDuplicateNpcAction(
                   targetHand.isValid() ? targetHand.serial : 0, actionCommand,
@@ -10271,6 +10273,30 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LeaveCriticalSection(&g_uiMutex);
             Log("HOOK_MSG_PROC: ATTACK target resolved arg='" + actionArgument +
                 "' target_serial=" + ToString((int)act.target.serial));
+          } else if (actionCommand == "STOP_ATTACK") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            hand resolvedTarget =
+                resolveActionTargetHand(actionArgument, targetHand);
+            if (!resolvedTarget.isValid() || resolvedTarget.isNull() ||
+                resolvedTarget.serial == targetHand.serial) {
+              Log("HOOK_MSG_PROC: STOP_ATTACK ignored; explicit opposing "
+                  "target could not be resolved arg='" +
+                  actionArgument + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_STOP_ATTACK;
+            act.actor = targetHand;
+            act.target = resolvedTarget;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: STOP_ATTACK queued actor_serial=" +
+                ToString((int)targetHand.serial) + " target_serial=" +
+                ToString((int)resolvedTarget.serial) + " arg='" +
+                actionArgument + "'");
           } else if (actionCommand == "SUICIDE") {
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
@@ -12841,8 +12867,15 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   UpdateStatusHud(worldUi);
 
   static bool pushToTalkWasDown = false;
-  bool pushToTalkDown = (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
-  if (pushToTalkDown && !pushToTalkWasDown && !IsAnyStobeMenuUIOpen()) {
+  bool pushToTalkEnabled = g_pushToTalkHotkey != 0;
+  bool pushToTalkDown =
+      pushToTalkEnabled &&
+      (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
+  if (!pushToTalkEnabled) {
+    if (Stobe::Voice::IsRecording())
+      Stobe::Voice::Cancel();
+  } else if (pushToTalkDown && !pushToTalkWasDown &&
+             !IsAnyStobeMenuUIOpen()) {
     std::string voiceMode = Stobe::ChatMode::Normalize(g_chatMode);
     bool narratorMode = (voiceMode == "narrator");
     Character *speaker = nullptr;
@@ -12919,7 +12952,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       worldUi->showPlayerAMessage_withLog("Transcribing...", false);
   }
   pushToTalkWasDown = pushToTalkDown;
-  Stobe::Voice::Update();
+  if (pushToTalkEnabled)
+    Stobe::Voice::Update();
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);

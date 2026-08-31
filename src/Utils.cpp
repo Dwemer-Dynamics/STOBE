@@ -481,7 +481,11 @@ void SetPushToTalkHotkeyFromString(const std::string &keyStr) {
   std::string normalized = TrimCopy(keyStr);
   if (normalized.size() == 1 && normalized[0] >= 'a' && normalized[0] <= 'z')
     normalized[0] = static_cast<char>(normalized[0] - ('a' - 'A'));
-  if (normalized.size() == 1 && normalized[0] >= 'A' && normalized[0] <= 'Z') {
+  if (normalized == "-") {
+    g_pushToTalkHotkey = 0;
+    g_pushToTalkHotkeyStr = "-";
+  } else if (normalized.size() == 1 && normalized[0] >= 'A' &&
+             normalized[0] <= 'Z') {
     g_pushToTalkHotkey = normalized[0];
     g_pushToTalkHotkeyStr = normalized;
   } else {
