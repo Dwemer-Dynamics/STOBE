@@ -2818,29 +2818,14 @@ bool EnsureCeasefirePairTemporaryAlliance(Character *first,
   return firstAllied && secondAllied;
 }
 
-// Kenshi exposes only a per-character bulk clear for short-term tags, so limit
-// expiry cleanup to participants with an ally tag in this ceasefire group.
+// Kenshi exposes only a per-character bulk clear for short-term tags. Always
+// invoke it for each ceasefire participant because shared or asymmetric memory
+// can affect combat even when a pair-specific tag lookup returns false.
 bool ClearCeasefireParticipantTemporaryAllies(
-    Character *participant, const std::vector<Character *> &opponents) {
+    Character *participant, const std::vector<Character *> &opponents,
+    int &remainingPairTags) {
+  remainingPairTags = 0;
   if (!participant || (uintptr_t)participant <= 0x1000) {
-    return false;
-  }
-
-  bool hadCeasefireAlly = false;
-  for (size_t i = 0; i < opponents.size(); ++i) {
-    Character *opponent = opponents[i];
-    if (!opponent || (uintptr_t)opponent <= 0x1000) {
-      continue;
-    }
-    try {
-      if (participant->getCharacterMemoryTag(opponent, ST_TEMPORARY_ALLY)) {
-        hadCeasefireAlly = true;
-        break;
-      }
-    } catch (...) {
-    }
-  }
-  if (!hadCeasefireAlly) {
     return false;
   }
 
@@ -2856,10 +2841,10 @@ bool ClearCeasefireParticipantTemporaryAllies(
     }
     try {
       if (participant->getCharacterMemoryTag(opponent, ST_TEMPORARY_ALLY)) {
-        return false;
+        ++remainingPairTags;
       }
     } catch (...) {
-      return false;
+      ++remainingPairTags;
     }
   }
   return true;
@@ -3175,17 +3160,24 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
 
     if (finishing) {
       int temporaryAllyParticipantsCleared = 0;
+      int temporaryAllyPairTagsRemaining = 0;
       for (size_t i = 0; i < firstParticipants.size(); ++i) {
+        int remainingPairTags = 0;
         if (ClearCeasefireParticipantTemporaryAllies(
-                firstParticipants[i], secondParticipants)) {
+                firstParticipants[i], secondParticipants,
+                remainingPairTags)) {
           ++temporaryAllyParticipantsCleared;
         }
+        temporaryAllyPairTagsRemaining += remainingPairTags;
       }
       for (size_t i = 0; i < secondParticipants.size(); ++i) {
+        int remainingPairTags = 0;
         if (ClearCeasefireParticipantTemporaryAllies(
-                secondParticipants[i], firstParticipants)) {
+                secondParticipants[i], firstParticipants,
+                remainingPairTags)) {
           ++temporaryAllyParticipantsCleared;
         }
+        temporaryAllyPairTagsRemaining += remainingPairTags;
       }
       Log("CEASEFIRE_GUARD: completed faction_a='" +
           guard.firstFactionName + "' faction_b='" + guard.secondFactionName +
@@ -3200,7 +3192,9 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
           " temporary_ally_pairs_applied=" +
           ToString(temporaryAllyPairsApplied) +
           " temporary_ally_participants_cleared=" +
-          ToString(temporaryAllyParticipantsCleared));
+          ToString(temporaryAllyParticipantsCleared) +
+          " temporary_ally_pair_tags_remaining=" +
+          ToString(temporaryAllyPairTagsRemaining));
       guardIt = g_activeFactionCeasefireGuards.erase(guardIt);
       continue;
     }
