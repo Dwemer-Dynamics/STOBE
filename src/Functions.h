@@ -5,6 +5,7 @@
 
 class Character;
 class GameWorld;
+class RootObjectBase;
 
 Character *ResolveLiveCharacter(GameWorld *world, const hand &characterHandle);
 bool CharacterHasHacksaw(Character *npc);
@@ -29,11 +30,19 @@ bool GetCharacterDrugPromptState(Character *npc, bool &isHighOut,
 void UpdateNpcDrunkStates(GameWorld *world);
 void UpdateNpcDrugStates(GameWorld *world);
 
-// Guards negotiated faction ceasefires without writing persistent Kenshi
-// character-memory tags.
+// Overlays negotiated faction truces without changing persistent relations.
+bool ShouldTreatFactionCeasefireTargetAsNeutral(Character *observer,
+                                                RootObjectBase *target);
 bool ShouldSuppressFactionCeasefireAttack(Character *first,
                                           Character *second);
-bool ShouldSuppressFactionCeasefireDamage(Character *victim);
+bool BreakFactionCeasefireForExplicitAttack(Character *attacker,
+                                            Character *target,
+                                            const std::string &source);
+bool BreakFactionCeasefireForPlayerOrder(Character *attacker,
+                                         Character *target,
+                                         const std::string &source);
+void RejectFactionCeasefireAttack(Character *attacker, Character *target,
+                                  const std::string &gate);
 
 // Action execution entry points for work queued from chat/rechat responses.
 void PerformLeaveSquad(Character *npc, GameWorld *world,
