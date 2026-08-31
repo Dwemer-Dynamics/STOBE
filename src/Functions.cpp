@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <core/Functions.h>
+#include <kenshi/Animation/AnimationClass.h>
 #include <kenshi/Appearance.h>
 #include <kenshi/AppearanceManager.h>
 #include <kenshi/AI/AITaskSystem.h>
@@ -2639,8 +2640,8 @@ Faction *ResolveStopAttackFaction(Character *character) {
   }
 }
 
-const DWORD kFactionCeasefireMinimumDurationMs = 3000;
-const DWORD kFactionCeasefireQuietDurationMs = 3000;
+const DWORD kFactionCeasefireMinimumDurationMs = 5000;
+const DWORD kFactionCeasefireQuietDurationMs = 5000;
 const DWORD kFactionCeasefireMaximumDurationMs = 30000;
 const DWORD kFactionCeasefireGuardIntervalMs = 100;
 const size_t kMaxActiveFactionCeasefireGuards = 8;
@@ -2903,6 +2904,20 @@ bool StopCharacterFactionCombat(Character *character, bool playerCharacter,
   }
   try {
     character->endCombatMode();
+    changed = true;
+  } catch (...) {
+  }
+  try {
+    AnimationClass *animation = character->getAnimationClass();
+    if (animation && (uintptr_t)animation > 0x1000) {
+      animation->endCombatAnimation();
+      changed = true;
+    }
+  } catch (...) {
+  }
+  try {
+    character->addGoal(IDLE, NULL);
+    character->reThinkCurrentAIAction();
     changed = true;
   } catch (...) {
   }
