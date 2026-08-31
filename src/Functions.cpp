@@ -2640,9 +2640,7 @@ Faction *ResolveStopAttackFaction(Character *character) {
   }
 }
 
-const DWORD kFactionCeasefireMinimumDurationMs = 5000;
-const DWORD kFactionCeasefireQuietDurationMs = 5000;
-const DWORD kFactionCeasefireMaximumDurationMs = 30000;
+const DWORD kFactionCeasefireProtectionDurationMs = 10000;
 const DWORD kFactionCeasefireGuardIntervalMs = 100;
 const size_t kMaxActiveFactionCeasefireGuards = 8;
 
@@ -2818,6 +2816,53 @@ bool EnsureCeasefirePairTemporaryAlliance(Character *first,
   } catch (...) {
   }
   return firstAllied && secondAllied;
+}
+
+// Kenshi exposes only a per-character bulk clear for short-term tags, so limit
+// expiry cleanup to participants with an ally tag in this ceasefire group.
+bool ClearCeasefireParticipantTemporaryAllies(
+    Character *participant, const std::vector<Character *> &opponents) {
+  if (!participant || (uintptr_t)participant <= 0x1000) {
+    return false;
+  }
+
+  bool hadCeasefireAlly = false;
+  for (size_t i = 0; i < opponents.size(); ++i) {
+    Character *opponent = opponents[i];
+    if (!opponent || (uintptr_t)opponent <= 0x1000) {
+      continue;
+    }
+    try {
+      if (participant->getCharacterMemoryTag(opponent, ST_TEMPORARY_ALLY)) {
+        hadCeasefireAlly = true;
+        break;
+      }
+    } catch (...) {
+    }
+  }
+  if (!hadCeasefireAlly) {
+    return false;
+  }
+
+  try {
+    participant->clearAllTempEnemyStatuses(ST_TEMPORARY_ALLY);
+  } catch (...) {
+    return false;
+  }
+  for (size_t i = 0; i < opponents.size(); ++i) {
+    Character *opponent = opponents[i];
+    if (!opponent || (uintptr_t)opponent <= 0x1000) {
+      continue;
+    }
+    try {
+      if (participant->getCharacterMemoryTag(opponent, ST_TEMPORARY_ALLY)) {
+        return false;
+      }
+    } catch (...) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Applies the non-hostile faction flags without changing the relation score.
@@ -3042,11 +3087,8 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
 
     const DWORD elapsedMs = nowTick - guard.startedTick;
     const DWORD quietMs = nowTick - guard.lastConflictTick;
-    const bool settled =
-        elapsedMs >= kFactionCeasefireMinimumDurationMs &&
-        quietMs >= kFactionCeasefireQuietDurationMs;
-    const bool timedOut = elapsedMs >= kFactionCeasefireMaximumDurationMs;
-    const bool finishing = settled || timedOut;
+    const bool finishing =
+        elapsedMs >= kFactionCeasefireProtectionDurationMs;
 
     int activeCrimesCleared = 0;
     for (size_t i = 0; i < firstParticipants.size(); ++i) {
@@ -3085,9 +3127,9 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
                                           secondParticipants[secondIndex])) {
           ++combatPairsUnlinked;
         }
-        if (EnsureCeasefirePairTemporaryAlliance(
-                firstParticipants[firstIndex],
-                secondParticipants[secondIndex])) {
+        if (!finishing && EnsureCeasefirePairTemporaryAlliance(
+                              firstParticipants[firstIndex],
+                              secondParticipants[secondIndex])) {
           ++temporaryAllyPairsApplied;
         }
       }
@@ -3132,9 +3174,22 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
     }
 
     if (finishing) {
+      int temporaryAllyParticipantsCleared = 0;
+      for (size_t i = 0; i < firstParticipants.size(); ++i) {
+        if (ClearCeasefireParticipantTemporaryAllies(
+                firstParticipants[i], secondParticipants)) {
+          ++temporaryAllyParticipantsCleared;
+        }
+      }
+      for (size_t i = 0; i < secondParticipants.size(); ++i) {
+        if (ClearCeasefireParticipantTemporaryAllies(
+                secondParticipants[i], firstParticipants)) {
+          ++temporaryAllyParticipantsCleared;
+        }
+      }
       Log("CEASEFIRE_GUARD: completed faction_a='" +
           guard.firstFactionName + "' faction_b='" + guard.secondFactionName +
-          "' reason=" + (settled ? "settled" : "timeout") +
+          "' reason=protection_expired" +
           " elapsed_ms=" + ToString((int)elapsedMs) +
           " quiet_ms=" + ToString((int)quietMs) +
           " participants=" + ToString((int)guard.participants.size()) +
@@ -3143,7 +3198,9 @@ void UpdateFactionCeasefireGuards(GameWorld *world) {
           " active_crimes_cleared=" + ToString(activeCrimesCleared) +
           " combat_pairs_unlinked=" + ToString(combatPairsUnlinked) +
           " temporary_ally_pairs_applied=" +
-          ToString(temporaryAllyPairsApplied));
+          ToString(temporaryAllyPairsApplied) +
+          " temporary_ally_participants_cleared=" +
+          ToString(temporaryAllyParticipantsCleared));
       guardIt = g_activeFactionCeasefireGuards.erase(guardIt);
       continue;
     }
@@ -3208,10 +3265,9 @@ void RegisterFactionCeasefireGuard(GameWorld *world, Faction *firstFaction,
           ++participantsAdded;
         }
       }
-      Log("CEASEFIRE_GUARD: renewed max_duration_ms=" +
-          ToString((int)kFactionCeasefireMaximumDurationMs) +
-          " quiet_duration_ms=" +
-          ToString((int)kFactionCeasefireQuietDurationMs) + " faction_a='" +
+      Log("CEASEFIRE_GUARD: renewed protection_duration_ms=" +
+          ToString((int)kFactionCeasefireProtectionDurationMs) +
+          " faction_a='" +
           firstFactionName + "' faction_b='" + secondFactionName +
           "' participants=" + ToString((int)guard.participants.size()) +
           " participants_added=" + ToString(participantsAdded));
@@ -3239,10 +3295,8 @@ void RegisterFactionCeasefireGuard(GameWorld *world, Faction *firstFaction,
     AddCeasefireParticipant(guard, secondCombatants[i], secondFaction);
   }
   g_activeFactionCeasefireGuards.push_back(guard);
-  Log("CEASEFIRE_GUARD: started max_duration_ms=" +
-      ToString((int)kFactionCeasefireMaximumDurationMs) +
-      " quiet_duration_ms=" +
-      ToString((int)kFactionCeasefireQuietDurationMs) + " faction_a='" +
+  Log("CEASEFIRE_GUARD: started protection_duration_ms=" +
+      ToString((int)kFactionCeasefireProtectionDurationMs) + " faction_a='" +
       firstFactionName + "' faction_b='" + secondFactionName +
       "' participants=" + ToString((int)guard.participants.size()));
 }
@@ -3395,11 +3449,11 @@ StopFactionAttackResult StopFactionAttack(GameWorld *world,
   }
 
   for (size_t speakerIndex = 0;
-       speakerIndex < speakerFactionMembers.size(); ++speakerIndex) {
-    Character *speakerMember = speakerFactionMembers[speakerIndex];
+       speakerIndex < speakerFactionCombatants.size(); ++speakerIndex) {
+    Character *speakerMember = speakerFactionCombatants[speakerIndex];
     for (size_t targetIndex = 0;
-         targetIndex < targetFactionMembers.size(); ++targetIndex) {
-      Character *targetMember = targetFactionMembers[targetIndex];
+         targetIndex < targetFactionCombatants.size(); ++targetIndex) {
+      Character *targetMember = targetFactionCombatants[targetIndex];
       if (ClearCeasefirePairCombatState(speakerMember, targetMember)) {
         ++result.temporaryEnemyPairsCleared;
         ++result.combatPairsUnlinked;
