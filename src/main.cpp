@@ -5294,9 +5294,31 @@ static bool CollectFleshHealthByPart(
 }
 
 static void EmitMajorDamageEvent(Character *victim) {
-  LogGameEvent("major_damage", ResolveCharacterNameSafe(victim),
-               SafeFaction(victim), "None", "None", "took a major hit",
-               ResolveCharacterSerialForEvent(victim), 0);
+  CombatAttribution attribution = ResolveCombatAttribution(victim);
+  std::string victimName = ResolveCharacterNameSafe(victim);
+  std::string attackerName = TrimCopy(attribution.actorName);
+  std::string weaponName = TrimCopy(attribution.weaponName);
+  std::string attackerLower = ToLowerAsciiCopy(attackerName);
+  std::string weaponLower = ToLowerAsciiCopy(weaponName);
+  bool knownAttacker = !attackerName.empty() && attackerLower != "unknown" &&
+                       attackerLower != ToLowerAsciiCopy(victimName);
+  bool knownWeapon = !weaponName.empty() && weaponLower != "unknown" &&
+                     weaponLower != "unknown weapon" && weaponLower != "none";
+
+  std::string message = "took a major hit";
+  if (knownAttacker) {
+    message += " from " + attackerName;
+    if (knownWeapon) {
+      message += weaponLower == "unarmed" ? " using unarmed attacks"
+                                           : " using " + weaponName;
+    }
+  }
+
+  LogGameEvent("major_damage", victimName, SafeFaction(victim),
+               knownAttacker ? attackerName : "None",
+               knownAttacker ? attribution.actorFaction : "None", message,
+               ResolveCharacterSerialForEvent(victim),
+               knownAttacker ? attribution.actorSerial : 0);
 }
 
 static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
