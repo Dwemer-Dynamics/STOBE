@@ -5,6 +5,13 @@
 
 typedef bool (*StobeStreamLineCallback)(const std::string &line, void *userData);
 
+enum SpeechDeliveryState {
+  SPEECH_DELIVERY_UNKNOWN = 0,
+  SPEECH_DELIVERY_PENDING,
+  SPEECH_DELIVERY_SPOKEN,
+  SPEECH_DELIVERY_CANCELLED
+};
+
 void AsyncPostToStobe(const std::wstring &endpoint, const std::string &jsonData);
 void AsyncPostToStobeSerial(const std::wstring &endpoint,
                             const std::string &jsonData);
@@ -28,6 +35,9 @@ void PostSpeechDeliveryState(const std::string &utteranceId,
                              const std::string &deliveryState);
 void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
                               const std::string &deliveryState);
+void TrackSpeechDeliveryState(const std::string &utteranceId);
+SpeechDeliveryState GetSpeechDeliveryState(const std::string &utteranceId);
+void ForgetSpeechDeliveryStates(const std::vector<std::string> &utteranceIds);
 bool IsDwemerDistroConnected();
 DWORD GetDwemerDistroLastSuccessAgeMs();
 std::string GetStobeServerHomeUrl();
