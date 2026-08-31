@@ -2235,6 +2235,7 @@ struct StreamChatParseState {
   std::string lastSpeaker;
   std::string lastSpeakerHandle;
   std::string lastSubtitle;
+  std::vector<std::string> speechUtteranceIds;
   std::set<std::string> seenActions;
 };
 
@@ -3328,6 +3329,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
       queueLine += " [TTSDUR:" + ToString(ttsDurationMs) + "]";
     }
     if (!utteranceId.empty()) {
+      TrackSpeechDeliveryState(utteranceId);
       queueLine += " [UTTERANCEID:" + utteranceId + "]";
     }
     if (!narratorSpeaker && state->task->allowUnavailableTargetSpeech &&
@@ -3345,6 +3347,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         PostSpeechDeliveryState(utteranceId, "cancelled");
       }
       return false;
+    }
+    if (!utteranceId.empty()) {
+      state->speechUtteranceIds.push_back(utteranceId);
     }
     std::string speakerHandle = "";
     if (!narratorSpeaker) {
@@ -3389,18 +3394,21 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   parseState.lastSpeaker = "";
   parseState.lastSpeakerHandle = "";
   parseState.lastSubtitle = "";
+  parseState.speechUtteranceIds.clear();
   parseState.seenActions.clear();
 
   bool requestOk =
       PostToStobeWithResponseStream(task->endpoint, "", OnStreamChatHttpLine,
                                     &parseState);
   if (!IsChatInterruptGenerationCurrent(generation)) {
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
     delete task;
     return 0;
   }
 
   if (!requestOk && parseState.lineCount == 0 && parseState.actionCount == 0) {
     Log("CHAT_THREAD: Stream request failed or returned no data.");
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
     delete task;
     return 0;
   }
@@ -3408,10 +3416,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     if (task->requestMode == "inject") {
       Log("CHAT_THREAD: Event injection stored successfully.");
       QueueUiNotifyAction("Event injected.");
+      ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
       delete task;
       return 0;
     }
     Log("CHAT_THREAD: Empty stream response from server.");
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
     delete task;
     return 0;
   }
@@ -3420,6 +3430,44 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
       " streamed chat lines and " + ToString(parseState.actionCount) +
       " action lines.");
   if (parseState.lineCount > 0 && IsChatInterruptGenerationCurrent(generation)) {
+    bool speechDelivered = !parseState.speechUtteranceIds.empty();
+    DWORD deliveryWaitStart = GetTickCount();
+    while (speechDelivered && IsChatInterruptGenerationCurrent(generation)) {
+      bool allSpoken = true;
+      for (size_t i = 0; i < parseState.speechUtteranceIds.size(); ++i) {
+        SpeechDeliveryState deliveryState =
+            GetSpeechDeliveryState(parseState.speechUtteranceIds[i]);
+        if (deliveryState == SPEECH_DELIVERY_CANCELLED ||
+            deliveryState == SPEECH_DELIVERY_UNKNOWN) {
+          speechDelivered = false;
+          break;
+        }
+        if (deliveryState != SPEECH_DELIVERY_SPOKEN) {
+          allSpoken = false;
+        }
+      }
+      if (!speechDelivered || allSpoken) {
+        break;
+      }
+      if ((GetTickCount() - deliveryWaitStart) > 600000) {
+        speechDelivered = false;
+        Log("RECHAT_TIMING: delivery confirmation wait timed out");
+        break;
+      }
+      SleepIfPaused(50);
+    }
+
+    if (!speechDelivered || !IsChatInterruptGenerationCurrent(generation)) {
+      Log("RECHAT_TIMING: follow-up suppressed; prior speech was not delivered" +
+          std::string(parseState.speechUtteranceIds.empty()
+                          ? " reason=missing_utterance_id"
+                          : " reason=cancelled_or_interrupted") +
+          " gen=" + ToString((int)generation));
+      ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
+      delete task;
+      return 0;
+    }
+
     DWORD followupDelayMs = static_cast<DWORD>(
         Stobe::Timing::ResolveRechatDispatchDelayMs(parseState.interLineDelayMs));
     bool waitForPlayback =
@@ -3451,6 +3499,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
     DispatchRechatFollowup(*task, parseState.lastSpeaker,
                            parseState.lastSpeakerHandle, parseState.lastSubtitle);
   }
+  ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
   delete task;
   return 0;
 }
