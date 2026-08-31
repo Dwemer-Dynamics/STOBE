@@ -29,6 +29,12 @@ bool GetCharacterDrugPromptState(Character *npc, bool &isHighOut,
 void UpdateNpcDrunkStates(GameWorld *world);
 void UpdateNpcDrugStates(GameWorld *world);
 
+// Guards negotiated faction ceasefires without writing persistent Kenshi
+// character-memory tags.
+bool ShouldSuppressFactionCeasefireAttack(Character *first,
+                                          Character *second);
+bool ShouldSuppressFactionCeasefireDamage(Character *victim);
+
 // Action execution entry points for work queued from chat/rechat responses.
 void PerformLeaveSquad(Character *npc, GameWorld *world,
                        const std::string &originFaction);

@@ -5261,7 +5261,8 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
-// Capture body-part health without installing the dormant per-damage hook.
+// Capture body-part health for qualitative events without relying on damage
+// hook callbacks.
 static bool CollectFleshHealthByPart(
     Character *npc, std::map<uintptr_t, float> &healthByPartOut) {
   healthByPartOut.clear();
@@ -11687,7 +11688,11 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
 void attackingYou_hook(Character *npc, Character *attacker, bool so,
                        bool doAwarenessCheck) {
-  if (attacker && npc) {
+  if (so && attacker && npc &&
+      ShouldSuppressFactionCeasefireAttack(npc, attacker)) {
+    return;
+  }
+  if (so && attacker && npc) {
     DWORD nowTick = GetTickCount();
     MarkRecentCombatSignal(attacker, nowTick);
     MarkRecentCombatSignal(npc, nowTick);
@@ -11702,11 +11707,9 @@ void attackingYou_hook(Character *npc, Character *attacker, bool so,
 
 void applyDamage_hook(MedicalSystem::HealthPartStatus *part,
                       const Damages &damage) {
-  if (part && part->me && damage.total() > 0.0f) {
-    MarkRecentCombatSignal(part->me, GetTickCount());
-  }
-  if (part && part->me && damage.total() > 15.0f) {
-    EmitMajorDamageEvent(part->me);
+  if (part && part->me && damage.total() > 0.0f &&
+      ShouldSuppressFactionCeasefireDamage(part->me)) {
+    return;
   }
   if (applyDamage_orig)
     applyDamage_orig(part, damage);
@@ -13598,6 +13601,45 @@ __declspec(dllexport) void startPlugin() {
   Log("HOOK_DIAG: AddHook status=" + ToString((int)status) +
       " orig=" + ToString((unsigned int)(uintptr_t)playerUpdate_orig));
   Log("HOOK: PlayerInterface::update installed (UI-only mode).");
+
+  void *thunkAttackingYou = (void *)GetProcAddress(
+      hLib, "?attackingYou@Character@@QEAAXPEAV1@_N1@Z");
+  if (!thunkAttackingYou) {
+    Log("HOOK_WARN: Character::attackingYou symbol not found.");
+  } else {
+    __int64 realAttackingYou = KenshiLib::GetRealAddress(thunkAttackingYou);
+    if (!realAttackingYou) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::attackingYou.");
+    } else {
+      KenshiLib::HookStatus attackingYouStatus = KenshiLib::AddHook(
+          (void *)realAttackingYou, (void *)attackingYou_hook,
+          (void **)&attackingYou_orig);
+      Log("HOOK_DIAG: Character::attackingYou AddHook status=" +
+          ToString((int)attackingYouStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)attackingYou_orig));
+    }
+  }
+
+  void *thunkHealthPartApplyDamage = (void *)GetProcAddress(
+      hLib,
+      "?applyDamage@HealthPartStatus@MedicalSystem@@QEAAXAEBVDamages@@@Z");
+  if (!thunkHealthPartApplyDamage) {
+    Log("HOOK_WARN: HealthPartStatus::applyDamage symbol not found.");
+  } else {
+    __int64 realHealthPartApplyDamage =
+        KenshiLib::GetRealAddress(thunkHealthPartApplyDamage);
+    if (!realHealthPartApplyDamage) {
+      Log("HOOK_WARN: GetRealAddress failed for "
+          "HealthPartStatus::applyDamage.");
+    } else {
+      KenshiLib::HookStatus applyDamageStatus = KenshiLib::AddHook(
+          (void *)realHealthPartApplyDamage, (void *)applyDamage_hook,
+          (void **)&applyDamage_orig);
+      Log("HOOK_DIAG: HealthPartStatus::applyDamage AddHook status=" +
+          ToString((int)applyDamageStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)applyDamage_orig));
+    }
+  }
 
   void *thunkInventoryBuyItem = (void *)GetProcAddress(
       hLib, "?buyItem@Inventory@@QEAAPEAVItem@@PEAV2@PEAVRootObject@@@Z");
