@@ -3,6 +3,7 @@
 
 class GameWorld;
 class Character;
+class PlayerInterface;
 
 namespace Stobe {
 namespace UI {
@@ -67,6 +68,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);
 void OnChatWindowButtonPressed(MyGUI::Window *sender, const std::string &name);
+void UpdateNpcContextRenameAction(PlayerInterface *playerInterface);
+void ResetNpcContextRenameAction(bool destroyWidget = true);
 
 } // namespace UI
 } // namespace Stobe
