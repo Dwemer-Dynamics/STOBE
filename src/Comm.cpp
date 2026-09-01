@@ -44,11 +44,54 @@ DWORD g_asyncPostDedupLastPruneTick = 0;
 const size_t kSerialHttpQueueCap = 1024;
 const DWORD kSerialHttpDropLogCooldownMs = 5000;
 const DWORD kAsyncPostDedupRetentionMs = 60000;
+const DWORD kSpeechDeliveryRetentionMs = 600000;
 struct AsyncPostDedupState {
   DWORD lastSentTick;
 };
 
+struct TrackedSpeechDeliveryState {
+  SpeechDeliveryState state;
+  DWORD updatedTick;
+};
+
 std::map<std::string, AsyncPostDedupState> g_asyncPostDedupByFingerprint;
+std::map<std::string, TrackedSpeechDeliveryState> g_speechDeliveryByUtterance;
+
+void PruneSpeechDeliveryStatesLocked(DWORD nowTick) {
+  for (std::map<std::string, TrackedSpeechDeliveryState>::iterator it =
+           g_speechDeliveryByUtterance.begin();
+       it != g_speechDeliveryByUtterance.end();) {
+    if (it->second.updatedTick == 0 ||
+        (nowTick - it->second.updatedTick) >= kSpeechDeliveryRetentionMs) {
+      it = g_speechDeliveryByUtterance.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void UpdateTrackedSpeechDeliveryStates(
+    const std::set<std::string> &utteranceIds,
+    SpeechDeliveryState deliveryState) {
+  if (utteranceIds.empty()) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  EnterCriticalSection(&g_stateMutex);
+  PruneSpeechDeliveryStatesLocked(nowTick);
+  for (std::set<std::string>::const_iterator it = utteranceIds.begin();
+       it != utteranceIds.end(); ++it) {
+    std::map<std::string, TrackedSpeechDeliveryState>::iterator tracked =
+        g_speechDeliveryByUtterance.find(*it);
+    if (tracked == g_speechDeliveryByUtterance.end()) {
+      continue;
+    }
+    tracked->second.state = deliveryState;
+    tracked->second.updatedTick = nowTick;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+}
 
 std::string DecodeBase64(const std::string &input) {
   static const std::string alphabet =
@@ -1079,6 +1122,10 @@ void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
     return;
   }
 
+  UpdateTrackedSpeechDeliveryStates(
+      uniqueIds, normalizedState == "spoken" ? SPEECH_DELIVERY_SPOKEN
+                                               : SPEECH_DELIVERY_CANCELLED);
+
   std::string payload = "{\"updates\":[";
   bool first = true;
   for (std::set<std::string>::const_iterator it = uniqueIds.begin();
@@ -1093,6 +1140,55 @@ void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
   payload += "]}";
 
   AsyncPostToStobe(L"/speech_delivery", payload);
+}
+
+void TrackSpeechDeliveryState(const std::string &utteranceId) {
+  const std::string candidate = Trim(utteranceId);
+  if (candidate.empty()) {
+    return;
+  }
+
+  const DWORD nowTick = GetTickCount();
+  EnterCriticalSection(&g_stateMutex);
+  PruneSpeechDeliveryStatesLocked(nowTick);
+  TrackedSpeechDeliveryState &tracked =
+      g_speechDeliveryByUtterance[candidate];
+  tracked.state = SPEECH_DELIVERY_PENDING;
+  tracked.updatedTick = nowTick;
+  LeaveCriticalSection(&g_stateMutex);
+}
+
+SpeechDeliveryState GetSpeechDeliveryState(const std::string &utteranceId) {
+  const std::string candidate = Trim(utteranceId);
+  if (candidate.empty()) {
+    return SPEECH_DELIVERY_UNKNOWN;
+  }
+
+  SpeechDeliveryState result = SPEECH_DELIVERY_UNKNOWN;
+  EnterCriticalSection(&g_stateMutex);
+  std::map<std::string, TrackedSpeechDeliveryState>::const_iterator it =
+      g_speechDeliveryByUtterance.find(candidate);
+  if (it != g_speechDeliveryByUtterance.end()) {
+    result = it->second.state;
+  }
+  LeaveCriticalSection(&g_stateMutex);
+  return result;
+}
+
+void ForgetSpeechDeliveryStates(
+    const std::vector<std::string> &utteranceIds) {
+  if (utteranceIds.empty()) {
+    return;
+  }
+
+  EnterCriticalSection(&g_stateMutex);
+  for (size_t i = 0; i < utteranceIds.size(); ++i) {
+    const std::string candidate = Trim(utteranceIds[i]);
+    if (!candidate.empty()) {
+      g_speechDeliveryByUtterance.erase(candidate);
+    }
+  }
+  LeaveCriticalSection(&g_stateMutex);
 }
 
 std::string UploadCsvImportToStobe(const std::string &csvData,

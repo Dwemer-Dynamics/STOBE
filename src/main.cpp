@@ -76,8 +76,14 @@ inline std::string SafeFaction(RootObjectBase *obj) {
 
 void (*playerUpdate_orig)(PlayerInterface *) = nullptr;
 void (*attackingYou_orig)(Character *, Character *, bool, bool) = nullptr;
-void (*applyDamage_orig)(MedicalSystem::HealthPartStatus *,
-                         const Damages &) = nullptr;
+bool (*aiIsEnemyRoot_orig)(AI *, RootObjectBase *) = nullptr;
+bool (*aiIsEnemyHand_orig)(AI *, const hand &, const Ogre::Vector3 &) = nullptr;
+Character *(*aiGetCharacter)(AI *) = nullptr;
+void (*newPlayerTaskSelectedCharacters_orig)(PlayerInterface *, TaskType,
+                                              const hand &, Building *,
+                                              const Ogre::Vector3 &, bool) =
+    nullptr;
+void (*attackTarget_orig)(Character *, Character *) = nullptr;
 bool (*applyFirstAid_orig)(MedicalSystem *, float, Item *, float,
                            Character *) = nullptr;
 bool (*characterGettingEaten_orig)(Character *, float, Character *) = nullptr;
@@ -1553,8 +1559,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.2.2";
-static const char *kStobePluginReleaseDate = "2026-08-30";
+static const char *kStobePluginVersion = "1.2.3";
+static const char *kStobePluginReleaseDate = "2026-08-31";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -5261,7 +5267,8 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
-// Capture body-part health without installing the dormant per-damage hook.
+// Capture body-part health for qualitative events without relying on damage
+// hook callbacks.
 static bool CollectFleshHealthByPart(
     Character *npc, std::map<uintptr_t, float> &healthByPartOut) {
   healthByPartOut.clear();
@@ -5294,9 +5301,31 @@ static bool CollectFleshHealthByPart(
 }
 
 static void EmitMajorDamageEvent(Character *victim) {
-  LogGameEvent("major_damage", ResolveCharacterNameSafe(victim),
-               SafeFaction(victim), "None", "None", "took a major hit",
-               ResolveCharacterSerialForEvent(victim), 0);
+  CombatAttribution attribution = ResolveCombatAttribution(victim);
+  std::string victimName = ResolveCharacterNameSafe(victim);
+  std::string attackerName = TrimCopy(attribution.actorName);
+  std::string weaponName = TrimCopy(attribution.weaponName);
+  std::string attackerLower = ToLowerAsciiCopy(attackerName);
+  std::string weaponLower = ToLowerAsciiCopy(weaponName);
+  bool knownAttacker = !attackerName.empty() && attackerLower != "unknown" &&
+                       attackerLower != ToLowerAsciiCopy(victimName);
+  bool knownWeapon = !weaponName.empty() && weaponLower != "unknown" &&
+                     weaponLower != "unknown weapon" && weaponLower != "none";
+
+  std::string message = "took a major hit";
+  if (knownAttacker) {
+    message += " from " + attackerName;
+    if (knownWeapon) {
+      message += weaponLower == "unarmed" ? " using unarmed attacks"
+                                           : " using " + weaponName;
+    }
+  }
+
+  LogGameEvent("major_damage", victimName, SafeFaction(victim),
+               knownAttacker ? attackerName : "None",
+               knownAttacker ? attribution.actorFaction : "None", message,
+               ResolveCharacterSerialForEvent(victim),
+               knownAttacker ? attribution.actorSerial : 0);
 }
 
 static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
@@ -11665,7 +11694,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
 void attackingYou_hook(Character *npc, Character *attacker, bool so,
                        bool doAwarenessCheck) {
-  if (attacker && npc) {
+  if (so && attacker && npc) {
+    BreakFactionCeasefireForPlayerOrder(attacker, npc,
+                                        "player_order_attacking_you");
+    if (ShouldSuppressFactionCeasefireAttack(npc, attacker)) {
+      RejectFactionCeasefireAttack(attacker, npc, "attacking_you");
+      return;
+    }
+  }
+  if (so && attacker && npc) {
     DWORD nowTick = GetTickCount();
     MarkRecentCombatSignal(attacker, nowTick);
     MarkRecentCombatSignal(npc, nowTick);
@@ -11678,16 +11715,111 @@ void attackingYou_hook(Character *npc, Character *attacker, bool so,
     attackingYou_orig(npc, attacker, so, doAwarenessCheck);
 }
 
-void applyDamage_hook(MedicalSystem::HealthPartStatus *part,
-                      const Damages &damage) {
-  if (part && part->me && damage.total() > 0.0f) {
-    MarkRecentCombatSignal(part->me, GetTickCount());
+bool aiIsEnemyRoot_hook(AI *ai, RootObjectBase *target) {
+  Character *observer = nullptr;
+  Character *targetCharacter = nullptr;
+  try {
+    observer = ai && aiGetCharacter ? aiGetCharacter(ai) : nullptr;
+    if (target && (target->getDataType() == HUMAN_CHARACTER ||
+                   target->getDataType() == ANIMAL_CHARACTER)) {
+      targetCharacter = static_cast<Character *>(target);
+    }
+  } catch (...) {
+    observer = nullptr;
+    targetCharacter = nullptr;
   }
-  if (part && part->me && damage.total() > 15.0f) {
-    EmitMajorDamageEvent(part->me);
+  if (observer && targetCharacter) {
+    BreakFactionCeasefireForPlayerOrder(observer, targetCharacter,
+                                        "player_order_enemy_root");
   }
-  if (applyDamage_orig)
-    applyDamage_orig(part, damage);
+  if (observer && ShouldTreatFactionCeasefireTargetAsNeutral(observer, target)) {
+    return false;
+  }
+  return aiIsEnemyRoot_orig ? aiIsEnemyRoot_orig(ai, target) : false;
+}
+
+bool aiIsEnemyHand_hook(AI *ai, const hand &subject,
+                        const Ogre::Vector3 &position) {
+  Character *observer = nullptr;
+  Character *targetCharacter = nullptr;
+  RootObjectBase *target = nullptr;
+  try {
+    observer = ai && aiGetCharacter ? aiGetCharacter(ai) : nullptr;
+    if (subject.isValid() && !subject.isNull()) {
+      target = subject.getRootObjectBase();
+      targetCharacter = subject.getCharacter();
+    }
+  } catch (...) {
+    observer = nullptr;
+    targetCharacter = nullptr;
+    target = nullptr;
+  }
+  if (observer && targetCharacter) {
+    BreakFactionCeasefireForPlayerOrder(observer, targetCharacter,
+                                        "player_order_enemy_hand");
+  }
+  if (observer && ShouldTreatFactionCeasefireTargetAsNeutral(observer, target)) {
+    return false;
+  }
+  return aiIsEnemyHand_orig ? aiIsEnemyHand_orig(ai, subject, position) : false;
+}
+
+void newPlayerTaskSelectedCharacters_hook(PlayerInterface *playerInterface,
+                                          TaskType task, const hand &subject,
+                                          Building *destinationIndoors,
+                                          const Ogre::Vector3 &position,
+                                          bool addDontClear) {
+  if (playerInterface &&
+      (task == UNPROVOKED_FOCUSED_MELEE_ATTACK ||
+       task == FOCUSED_MELEE_ATTACK ||
+       task == RANGED_ATTACK_FOCUSED_UNPROVOKED ||
+       task == RANGED_ATTACK_FOCUSED)) {
+    try {
+      Character *target = subject.isValid() && !subject.isNull()
+                              ? subject.getCharacter()
+                              : nullptr;
+      if (target) {
+        bool truceBroken = false;
+        for (ogre_unordered_set<hand>::type::const_iterator it =
+                 playerInterface->selectedCharacters.begin();
+             it != playerInterface->selectedCharacters.end(); ++it) {
+          Character *attacker = it->getCharacter();
+          if (attacker && BreakFactionCeasefireForExplicitAttack(
+                              attacker, target, "player_attack_order")) {
+            truceBroken = true;
+            break;
+          }
+        }
+        if (!truceBroken && playerInterface->selectedCharacter.isValid() &&
+            !playerInterface->selectedCharacter.isNull()) {
+          Character *attacker =
+              playerInterface->selectedCharacter.getCharacter();
+          BreakFactionCeasefireForExplicitAttack(attacker, target,
+                                                 "player_attack_order");
+        }
+      }
+    } catch (...) {
+    }
+  }
+  if (newPlayerTaskSelectedCharacters_orig) {
+    newPlayerTaskSelectedCharacters_orig(playerInterface, task, subject,
+                                         destinationIndoors, position,
+                                         addDontClear);
+  }
+}
+
+void attackTarget_hook(Character *attacker, Character *target) {
+  if (attacker && target) {
+    BreakFactionCeasefireForPlayerOrder(attacker, target,
+                                        "player_order_attack_target");
+    if (ShouldSuppressFactionCeasefireAttack(attacker, target)) {
+      RejectFactionCeasefireAttack(attacker, target, "attack_target");
+      return;
+    }
+  }
+  if (attackTarget_orig) {
+    attackTarget_orig(attacker, target);
+  }
 }
 
 bool applyFirstAid_hook(MedicalSystem *med, float skill, Item *equipment,
@@ -13576,6 +13708,119 @@ __declspec(dllexport) void startPlugin() {
   Log("HOOK_DIAG: AddHook status=" + ToString((int)status) +
       " orig=" + ToString((unsigned int)(uintptr_t)playerUpdate_orig));
   Log("HOOK: PlayerInterface::update installed (UI-only mode).");
+
+  void *thunkAttackingYou = (void *)GetProcAddress(
+      hLib, "?attackingYou@Character@@QEAAXPEAV1@_N1@Z");
+  if (!thunkAttackingYou) {
+    Log("HOOK_WARN: Character::attackingYou symbol not found.");
+  } else {
+    __int64 realAttackingYou = KenshiLib::GetRealAddress(thunkAttackingYou);
+    if (!realAttackingYou) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::attackingYou.");
+    } else {
+      KenshiLib::HookStatus attackingYouStatus = KenshiLib::AddHook(
+          (void *)realAttackingYou, (void *)attackingYou_hook,
+          (void **)&attackingYou_orig);
+      Log("HOOK_DIAG: Character::attackingYou AddHook status=" +
+          ToString((int)attackingYouStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)attackingYou_orig));
+    }
+  }
+
+  void *thunkAiGetCharacter =
+      (void *)GetProcAddress(hLib, "?getCharacter@AI@@QEAAPEAVCharacter@@XZ");
+  if (!thunkAiGetCharacter) {
+    Log("HOOK_WARN: AI::getCharacter symbol not found.");
+  } else {
+    __int64 realAiGetCharacter =
+        KenshiLib::GetRealAddress(thunkAiGetCharacter);
+    if (!realAiGetCharacter) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::getCharacter.");
+    } else {
+      aiGetCharacter = reinterpret_cast<Character *(*)(AI *)>(
+          realAiGetCharacter);
+      Log("HOOK_DIAG: AI::getCharacter resolved address=" +
+          ToString((unsigned int)(uintptr_t)aiGetCharacter));
+    }
+  }
+
+  void *thunkAiIsEnemyRoot =
+      (void *)GetProcAddress(hLib,
+                             "?isEnemy@AI@@QEAA_NPEAVRootObjectBase@@@Z");
+  if (!thunkAiIsEnemyRoot) {
+    Log("HOOK_WARN: AI::isEnemy(RootObjectBase*) symbol not found.");
+  } else {
+    __int64 realAiIsEnemyRoot = KenshiLib::GetRealAddress(thunkAiIsEnemyRoot);
+    if (!realAiIsEnemyRoot) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::isEnemy(RootObjectBase*).");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAiIsEnemyRoot, (void *)aiIsEnemyRoot_hook,
+          (void **)&aiIsEnemyRoot_orig);
+      Log("HOOK_DIAG: AI::isEnemy(RootObjectBase*) AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)aiIsEnemyRoot_orig));
+    }
+  }
+
+  void *thunkAiIsEnemyHand = (void *)GetProcAddress(
+      hLib, "?isEnemy@AI@@QEAA_NAEBVhand@@AEBVVector3@Ogre@@@Z");
+  if (!thunkAiIsEnemyHand) {
+    Log("HOOK_WARN: AI::isEnemy(hand) symbol not found.");
+  } else {
+    __int64 realAiIsEnemyHand = KenshiLib::GetRealAddress(thunkAiIsEnemyHand);
+    if (!realAiIsEnemyHand) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::isEnemy(hand).");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAiIsEnemyHand, (void *)aiIsEnemyHand_hook,
+          (void **)&aiIsEnemyHand_orig);
+      Log("HOOK_DIAG: AI::isEnemy(hand) AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)aiIsEnemyHand_orig));
+    }
+  }
+
+  void *thunkAttackTarget = (void *)GetProcAddress(
+      hLib, "?attackTarget@Character@@QEAAXPEAV1@@Z");
+  if (!thunkAttackTarget) {
+    Log("HOOK_WARN: Character::attackTarget symbol not found.");
+  } else {
+    __int64 realAttackTarget = KenshiLib::GetRealAddress(thunkAttackTarget);
+    if (!realAttackTarget) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::attackTarget.");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAttackTarget, (void *)attackTarget_hook,
+          (void **)&attackTarget_orig);
+      Log("HOOK_DIAG: Character::attackTarget AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)attackTarget_orig));
+    }
+  }
+
+  void *thunkNewPlayerTaskSelectedCharacters = (void *)GetProcAddress(
+      hLib,
+      "?newPlayerTaskSelectedCharacters@PlayerInterface@@QEAAXW4TaskType@@AEBVhand@@PEAVBuilding@@AEBVVector3@Ogre@@_N@Z");
+  if (!thunkNewPlayerTaskSelectedCharacters) {
+    Log("HOOK_WARN: PlayerInterface::newPlayerTaskSelectedCharacters symbol not found.");
+  } else {
+    __int64 realNewPlayerTaskSelectedCharacters =
+        KenshiLib::GetRealAddress(thunkNewPlayerTaskSelectedCharacters);
+    if (!realNewPlayerTaskSelectedCharacters) {
+      Log("HOOK_WARN: GetRealAddress failed for "
+          "PlayerInterface::newPlayerTaskSelectedCharacters.");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realNewPlayerTaskSelectedCharacters,
+          (void *)newPlayerTaskSelectedCharacters_hook,
+          (void **)&newPlayerTaskSelectedCharacters_orig);
+      Log("HOOK_DIAG: PlayerInterface::newPlayerTaskSelectedCharacters "
+          "AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)newPlayerTaskSelectedCharacters_orig));
+    }
+  }
 
   void *thunkInventoryBuyItem = (void *)GetProcAddress(
       hLib, "?buyItem@Inventory@@QEAAPEAVItem@@PEAV2@PEAVRootObject@@@Z");
