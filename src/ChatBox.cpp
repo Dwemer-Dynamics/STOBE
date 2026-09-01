@@ -346,23 +346,41 @@ MyGUI::Widget *TryGetNativeContextMenuWidget(ContextMenuGUI *menuGui) {
   return widget;
 }
 
-// Reads volatile native menu pointers without mixing SEH with UI objects that
+// Reads volatile native menu state without mixing SEH with UI objects that
 // require C++ stack unwinding under Stobe's required v100 compiler.
 bool TryReadNativeContextMenu(PlayerInterface *playerInterface,
-                              bool &menuVisible, RootObject *&rawTarget,
+                              RootObject *&rawTarget,
                               ContextMenuGUI *&primaryMenu,
                               ContextMenuGUI *&secondaryMenu) {
   __try {
-    menuVisible = playerInterface->contextMenu.isVisible();
     rawTarget = playerInterface->mouseRightTarget;
     primaryMenu = playerInterface->contextMenu.menuGUI;
     secondaryMenu = playerInterface->contextMenu.menuGUI2;
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    menuVisible = false;
     rawTarget = nullptr;
     primaryMenu = nullptr;
     secondaryMenu = nullptr;
+    return false;
+  }
+}
+
+// Reads ContextMenuGUI::contextMenuTarget from its documented locked-SDK
+// offset. The held right-click menu keeps this handle after mouseRightTarget
+// has already been cleared by PlayerInterface::update.
+bool TryReadNativeContextMenuTarget(ContextMenuGUI *menuGui,
+                                    hand &targetHand) {
+  if (!menuGui || reinterpret_cast<uintptr_t>(menuGui) < 0x1000) {
+    return false;
+  }
+
+  __try {
+    const hand *nativeTarget = reinterpret_cast<const hand *>(
+        reinterpret_cast<const char *>(menuGui) + 0xA8);
+    targetHand = *nativeTarget;
+    return targetHand.serial != 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    targetHand = hand();
     return false;
   }
 }
@@ -389,15 +407,19 @@ void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
     return;
   }
 
-  bool menuVisible = false;
   RootObject *rawTarget = nullptr;
   ContextMenuGUI *primaryMenu = nullptr;
   ContextMenuGUI *secondaryMenu = nullptr;
-  TryReadNativeContextMenu(playerInterface, menuVisible, rawTarget, primaryMenu,
+  TryReadNativeContextMenu(playerInterface, rawTarget, primaryMenu,
                            secondaryMenu);
 
-  if (!menuVisible || !rawTarget ||
-      reinterpret_cast<uintptr_t>(rawTarget) < 0x1000) {
+  MyGUI::Widget *menuWidget = TryGetNativeContextMenuWidget(primaryMenu);
+  ContextMenuGUI *activeMenu = menuWidget ? primaryMenu : nullptr;
+  if (!menuWidget) {
+    menuWidget = TryGetNativeContextMenuWidget(secondaryMenu);
+    activeMenu = menuWidget ? secondaryMenu : nullptr;
+  }
+  if (!menuWidget || !activeMenu) {
     ResetNpcContextRenameAction(true);
     return;
   }
@@ -407,7 +429,10 @@ void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
   std::string targetName;
   bool targetIsPlayer = true;
   try {
-    targetHand = rawTarget->getHandle();
+    if (!TryReadNativeContextMenuTarget(activeMenu, targetHand) && rawTarget &&
+        reinterpret_cast<uintptr_t>(rawTarget) >= 0x1000) {
+      targetHand = rawTarget->getHandle();
+    }
     target = targetHand.getCharacter();
     if (target && reinterpret_cast<uintptr_t>(target) >= 0x1000) {
       targetIsPlayer = target->isPlayerCharacter();
@@ -429,11 +454,6 @@ void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
   if (g_npcContextRenameButton &&
       g_npcContextRenameTargetHand.serial != targetHand.serial) {
     ResetNpcContextRenameAction(true);
-  }
-
-  MyGUI::Widget *menuWidget = TryGetNativeContextMenuWidget(primaryMenu);
-  if (!menuWidget) {
-    menuWidget = TryGetNativeContextMenuWidget(secondaryMenu);
   }
 
   const int buttonHeight = 30;
@@ -466,10 +486,9 @@ void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
   if (!g_npcContextRenameButton) {
     g_npcContextRenameButton = gui->createWidget<MyGUI::Button>(
         "Kenshi_Button1", buttonLeft, buttonTop, buttonWidth, buttonHeight,
-        MyGUI::Align::Top | MyGUI::Align::Left, "Overlapped",
+        MyGUI::Align::Top | MyGUI::Align::Left, "Popup",
         "Stobe_NpcContextRenameBtn");
-    g_npcContextRenameButton->setCaption(
-        WideFromUtf8("Rename with Stobe...").c_str());
+    g_npcContextRenameButton->setCaption(WideFromUtf8("Rename").c_str());
     g_npcContextRenameButton->eventMouseButtonClick +=
         MyGUI::newDelegate(OnNpcContextRenameClick);
   } else {
