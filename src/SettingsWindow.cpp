@@ -47,6 +47,7 @@ MyGUI::Button *g_speedDialogueToggle = nullptr;
 MyGUI::Button *g_regularDialogueToggle = nullptr;
 MyGUI::Button *g_itemImageSyncToggle = nullptr;
 MyGUI::Button *g_statusHudToggle = nullptr;
+MyGUI::Button *g_npcRenameToggle = nullptr;
 
 bool g_pendingAutoChat = false;
 bool g_pendingBoredEvents = true;
@@ -58,6 +59,7 @@ bool g_pendingSpeedDialogue = true;
 bool g_pendingRegularDialogueCapture = true;
 bool g_pendingItemImageSync = true;
 bool g_pendingStatusHud = false;
+bool g_pendingNpcRename = false;
 
 int ClampInt(int value, int minValue, int maxValue) {
   if (value < minValue)
@@ -249,6 +251,7 @@ void LoadPendingFromRuntime() {
   g_pendingRegularDialogueCapture = g_enableRegularDialogueCapture;
   g_pendingItemImageSync = g_enableItemImageSync;
   g_pendingStatusHud = g_enableStatusHud;
+  g_pendingNpcRename = g_enableNpcRename;
 }
 
 void RefreshPluginSettingsUI() {
@@ -295,6 +298,7 @@ void RefreshPluginSettingsUI() {
   SetToggleCaption(g_itemImageSyncToggle, "Image Sync",
                    g_pendingItemImageSync);
   SetToggleCaption(g_statusHudToggle, "Status HUD", g_pendingStatusHud);
+  SetToggleCaption(g_npcRenameToggle, "NPC Rename", g_pendingNpcRename);
 }
 
 void OnSettingsSaveClick(MyGUI::Widget *sender) {
@@ -337,6 +341,7 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   g_enableRegularDialogueCapture = g_pendingRegularDialogueCapture;
   g_enableItemImageSync = g_pendingItemImageSync;
   g_enableStatusHud = g_pendingStatusHud;
+  g_enableNpcRename = g_pendingNpcRename;
 
   int talkRadius = ParseIntOrDefault(
       g_talkRadiusEdit ? g_talkRadiusEdit->getCaption() : "", (int)g_proximityRadius);
@@ -439,6 +444,11 @@ void OnPluginStatusHudToggleClick(MyGUI::Widget *sender) {
   SetToggleCaption(g_statusHudToggle, "Status HUD", g_pendingStatusHud);
 }
 
+void OnPluginNpcRenameToggleClick(MyGUI::Widget *sender) {
+  g_pendingNpcRename = !g_pendingNpcRename;
+  SetToggleCaption(g_npcRenameToggle, "NPC Rename", g_pendingNpcRename);
+}
+
 void OnSettingsOpenConfigClick(MyGUI::Widget *sender) {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -509,6 +519,7 @@ void CloseSettingsUI() {
   g_regularDialogueToggle = nullptr;
   g_itemImageSyncToggle = nullptr;
   g_statusHudToggle = nullptr;
+  g_npcRenameToggle = nullptr;
 }
 
 void OnSettingsWindowButtonPressed(MyGUI::Window *sender,
@@ -549,7 +560,7 @@ void CreateSettingsUI() {
   const float sectionGap = 0.006f;
   const float toggleH = 0.052f;
   const float actionBtnH = 0.07f;
-  const float toggleRowGap = 0.06f;
+  const float toggleRowGap = 0.054f;
   const float sectionHeaderH = 0.038f;
   float y = 0.02f;
 
@@ -731,6 +742,14 @@ void CreateSettingsUI() {
       "Stobe_Plugin_DialogueMenuTtsToggle");
   g_dialogueMenuTtsToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginDialogueMenuTtsToggleClick);
+  y += toggleRowGap;
+
+  g_npcRenameToggle = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, y, 0.28f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left,
+      "Stobe_Plugin_NpcRenameToggle");
+  g_npcRenameToggle->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnPluginNpcRenameToggleClick);
   y += toggleRowGap;
 
   CreateLabel(client, labelX, y, labelW, rowH, "Speaker Mode",

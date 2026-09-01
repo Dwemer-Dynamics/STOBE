@@ -30,6 +30,7 @@
 #include <mygui/MyGUI_RenderManager.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
+#include <mygui/common/baselayout/BaseLayout.h>
 
 #include <algorithm>
 #include <cctype>
@@ -56,6 +57,9 @@ MyGUI::TextBox *g_chatLabel = nullptr;
 MyGUI::Window *g_renameWindow = nullptr;
 MyGUI::EditBox *g_renameInput = nullptr;
 MyGUI::TextBox *g_renameLabel = nullptr;
+MyGUI::Button *g_npcContextRenameButton = nullptr;
+hand g_npcContextRenameTargetHand;
+std::string g_npcContextRenameTargetName = "";
 std::string g_chatTargetHandleStr = "";
 std::string g_chatTargetNameStr = "";
 std::string g_chatLastRealTargetHandleStr = "";
@@ -131,6 +135,7 @@ void OnRenameConfirmClick(MyGUI::Widget *sender);
 void OnRenameCancelClick(MyGUI::Widget *sender);
 void OnRenameWindowButtonPressed(MyGUI::Window *sender,
                                  const std::string &name);
+void OnNpcContextRenameClick(MyGUI::Widget *sender);
 void OnChatMoodChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatCustomMoodChange(MyGUI::EditBox *sender);
 void RefreshChatMoodControls();
@@ -310,6 +315,190 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+}
+
+void ResetNpcContextRenameAction(bool destroyWidget) {
+  if (g_npcContextRenameButton && destroyWidget) {
+    TryDestroyWidgetSafe(g_npcContextRenameButton);
+  }
+  g_npcContextRenameButton = nullptr;
+  g_npcContextRenameTargetHand = hand();
+  g_npcContextRenameTargetName.clear();
+}
+
+// Locates the native context-menu root through the locked SDK's first
+// BaseLayout base without modifying Kenshi's menu or task list.
+MyGUI::Widget *TryGetNativeContextMenuWidget(ContextMenuGUI *menuGui) {
+  if (!menuGui || reinterpret_cast<uintptr_t>(menuGui) < 0x1000) {
+    return nullptr;
+  }
+
+  MyGUI::Widget *widget = nullptr;
+  __try {
+    wraps::BaseLayout *layout = reinterpret_cast<wraps::BaseLayout *>(menuGui);
+    widget = layout->mMainWidget;
+    if (!widget || !widget->getVisible()) {
+      widget = nullptr;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    widget = nullptr;
+  }
+  return widget;
+}
+
+// Reads volatile native menu state without mixing SEH with UI objects that
+// require C++ stack unwinding under Stobe's required v100 compiler.
+bool TryReadNativeContextMenu(PlayerInterface *playerInterface,
+                              RootObject *&rawTarget,
+                              ContextMenuGUI *&primaryMenu,
+                              ContextMenuGUI *&secondaryMenu) {
+  __try {
+    rawTarget = playerInterface->mouseRightTarget;
+    primaryMenu = playerInterface->contextMenu.menuGUI;
+    secondaryMenu = playerInterface->contextMenu.menuGUI2;
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    rawTarget = nullptr;
+    primaryMenu = nullptr;
+    secondaryMenu = nullptr;
+    return false;
+  }
+}
+
+// Reads ContextMenuGUI::contextMenuTarget from its documented locked-SDK
+// offset. The held right-click menu keeps this handle after mouseRightTarget
+// has already been cleared by PlayerInterface::update.
+bool TryReadNativeContextMenuTarget(ContextMenuGUI *menuGui,
+                                    hand &targetHand) {
+  if (!menuGui || reinterpret_cast<uintptr_t>(menuGui) < 0x1000) {
+    return false;
+  }
+
+  __try {
+    const hand *nativeTarget = reinterpret_cast<const hand *>(
+        reinterpret_cast<const char *>(menuGui) + 0xA8);
+    targetHand = *nativeTarget;
+    return targetHand.serial != 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    targetHand = hand();
+    return false;
+  }
+}
+
+void HideNativeContextMenuSafe(GameWorld *world) {
+  __try {
+    world->hideContextMenu();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+// Keeps a Stobe-owned rename action aligned with Kenshi's visible context
+// menu while preserving every native right-click order.
+void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) {
+    ResetNpcContextRenameAction(false);
+    return;
+  }
+
+  if (!g_enableNpcRename || !playerInterface ||
+      reinterpret_cast<uintptr_t>(playerInterface) < 0x1000 || g_chatWindow ||
+      g_renameWindow) {
+    ResetNpcContextRenameAction(true);
+    return;
+  }
+
+  RootObject *rawTarget = nullptr;
+  ContextMenuGUI *primaryMenu = nullptr;
+  ContextMenuGUI *secondaryMenu = nullptr;
+  TryReadNativeContextMenu(playerInterface, rawTarget, primaryMenu,
+                           secondaryMenu);
+
+  MyGUI::Widget *menuWidget = TryGetNativeContextMenuWidget(primaryMenu);
+  ContextMenuGUI *activeMenu = menuWidget ? primaryMenu : nullptr;
+  if (!menuWidget) {
+    menuWidget = TryGetNativeContextMenuWidget(secondaryMenu);
+    activeMenu = menuWidget ? secondaryMenu : nullptr;
+  }
+  if (!menuWidget || !activeMenu) {
+    ResetNpcContextRenameAction(true);
+    return;
+  }
+
+  Character *target = nullptr;
+  hand targetHand;
+  std::string targetName;
+  bool targetIsPlayer = true;
+  try {
+    if (!TryReadNativeContextMenuTarget(activeMenu, targetHand) && rawTarget &&
+        reinterpret_cast<uintptr_t>(rawTarget) >= 0x1000) {
+      targetHand = rawTarget->getHandle();
+    }
+    target = targetHand.getCharacter();
+    if (target && reinterpret_cast<uintptr_t>(target) >= 0x1000) {
+      targetIsPlayer = target->isPlayerCharacter();
+      targetName = TrimChatLine(target->getName());
+    }
+  } catch (...) {
+    target = nullptr;
+    targetHand = hand();
+    targetName.clear();
+    targetIsPlayer = true;
+  }
+
+  if (!target || !targetHand.isValid() || targetHand.serial == 0 ||
+      targetIsPlayer || targetName.empty()) {
+    ResetNpcContextRenameAction(true);
+    return;
+  }
+
+  if (g_npcContextRenameButton &&
+      g_npcContextRenameTargetHand.serial != targetHand.serial) {
+    ResetNpcContextRenameAction(true);
+  }
+
+  const int buttonHeight = 30;
+  const int menuGap = 2;
+  const MyGUI::IntSize &viewSize =
+      MyGUI::RenderManager::getInstance().getViewSize();
+  int buttonWidth = 190;
+  int buttonLeft = 0;
+  int buttonTop = 0;
+
+  if (menuWidget) {
+    const MyGUI::IntCoord menuCoord = menuWidget->getAbsoluteCoord();
+    buttonWidth = std::max(buttonWidth, menuCoord.width);
+    buttonLeft = menuCoord.left;
+    buttonTop = menuCoord.top + menuCoord.height + menuGap;
+    if (buttonTop + buttonHeight > viewSize.height) {
+      buttonTop = menuCoord.top - buttonHeight - menuGap;
+    }
+  } else {
+    const MyGUI::IntPoint &mousePosition =
+        MyGUI::InputManager::getInstance().getMousePosition();
+    buttonLeft = mousePosition.left + 12;
+    buttonTop = mousePosition.top + 36;
+  }
+
+  buttonWidth = std::min(buttonWidth, std::max(1, viewSize.width));
+  buttonLeft = std::max(0, std::min(buttonLeft, viewSize.width - buttonWidth));
+  buttonTop = std::max(0, std::min(buttonTop, viewSize.height - buttonHeight));
+
+  if (!g_npcContextRenameButton) {
+    g_npcContextRenameButton = gui->createWidget<MyGUI::Button>(
+        "Kenshi_Button1", buttonLeft, buttonTop, buttonWidth, buttonHeight,
+        MyGUI::Align::Top | MyGUI::Align::Left, "Popup",
+        "Stobe_NpcContextRenameBtn");
+    g_npcContextRenameButton->setCaption(WideFromUtf8("Rename").c_str());
+    g_npcContextRenameButton->eventMouseButtonClick +=
+        MyGUI::newDelegate(OnNpcContextRenameClick);
+  } else {
+    g_npcContextRenameButton->setCoord(buttonLeft, buttonTop, buttonWidth,
+                                       buttonHeight);
+  }
+
+  g_npcContextRenameTargetHand = targetHand;
+  g_npcContextRenameTargetName = targetName;
 }
 
 float ScreenPixelsToRealHeight(int pixels) {
@@ -4433,6 +4622,45 @@ void OnRenameClick(MyGUI::Widget *sender) {
   }
   g_chatPlayerNameStr = speakerName;
   CreateRenameUI(speakerName, speakerName, speakerHandle);
+}
+
+// Opens the existing rename dialog for the exact NPC that owned the native
+// right-click menu when this companion action was created.
+void OnNpcContextRenameClick(MyGUI::Widget *sender) {
+  const hand targetHand = g_npcContextRenameTargetHand;
+  const std::string targetName = g_npcContextRenameTargetName;
+  ResetNpcContextRenameAction(true);
+
+  GameWorld *world = GetWorldSafe();
+  if (world) {
+    HideNativeContextMenuSafe(world);
+  }
+
+  Character *target = ResolveChatTargetCharacter(
+      world, targetName, ToString(targetHand.serial));
+  bool targetIsPlayer = true;
+  std::string resolvedName = targetName;
+  if (target && reinterpret_cast<uintptr_t>(target) >= 0x1000) {
+    try {
+      targetIsPlayer = target->isPlayerCharacter();
+      const std::string currentName = TrimChatLine(target->getName());
+      if (!currentName.empty()) {
+        resolvedName = currentName;
+      }
+    } catch (...) {
+      target = nullptr;
+    }
+  }
+
+  if (!world || !target || targetIsPlayer || resolvedName.empty()) {
+    if (world) {
+      world->showPlayerAMessage_withLog(
+          "Rename failed: the right-clicked NPC is no longer available.", true);
+    }
+    return;
+  }
+
+  CreateRenameUI(resolvedName, resolvedName, ToString(targetHand.serial));
 }
 
 void OnRenameInputChange(MyGUI::EditBox *sender) {
