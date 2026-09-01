@@ -45,6 +45,7 @@ bool g_speedDialogue = true;
 bool g_enableRegularDialogueCapture = false;
 bool g_enableItemImageSync = false;
 bool g_enableStatusHud = false;
+bool g_enableNpcRename = false;
 int g_dynamicProfileIntervalHours = 24;
 std::string g_narratorDisplayName = "The Narrator";
 

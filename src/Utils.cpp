@@ -481,7 +481,11 @@ void SetPushToTalkHotkeyFromString(const std::string &keyStr) {
   std::string normalized = TrimCopy(keyStr);
   if (normalized.size() == 1 && normalized[0] >= 'a' && normalized[0] <= 'z')
     normalized[0] = static_cast<char>(normalized[0] - ('a' - 'A'));
-  if (normalized.size() == 1 && normalized[0] >= 'A' && normalized[0] <= 'Z') {
+  if (normalized == "-") {
+    g_pushToTalkHotkey = 0;
+    g_pushToTalkHotkeyStr = "-";
+  } else if (normalized.size() == 1 && normalized[0] >= 'A' &&
+             normalized[0] <= 'Z') {
     g_pushToTalkHotkey = normalized[0];
     g_pushToTalkHotkeyStr = normalized;
   } else {
@@ -556,6 +560,9 @@ void LoadStobeRuntimeConfig() {
   g_enableStatusHud =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                         "EnableStatusHud", 0) != 0;
+  g_enableNpcRename =
+      ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
+                        "EnableNpcRename", 0) != 0;
   int boredEventIntervalHours = ReadLayeredIniInt(
       baseIniPath, customIniPath, "Settings", "BoredEventTimerHours", -1);
   if (boredEventIntervalHours < 1) {
@@ -622,6 +629,7 @@ void LoadStobeRuntimeConfig() {
       (g_enableRegularDialogueCapture ? "true" : "false") +
        ", ItemImageSync=" + (g_enableItemImageSync ? "true" : "false") +
        ", StatusHud=" + (g_enableStatusHud ? "true" : "false") +
+       ", NpcRename=" + (g_enableNpcRename ? "true" : "false") +
       ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
       ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
       "h" +
@@ -686,6 +694,9 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableStatusHud",
                              g_enableStatusHud ? "1" : "0",
+                             iniPath.c_str());
+  WritePrivateProfileStringA("Settings", "EnableNpcRename",
+                             g_enableNpcRename ? "1" : "0",
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
                              ToString(g_boredEventIntervalHours).c_str(),
@@ -1306,7 +1317,21 @@ static std::string BuildEventStreamData(const std::string &type,
   }
 
   std::string line = "";
-  if (normalizedType == "knockout" &&
+  if (normalizedType == "combat_start" && !listener.empty() &&
+      listener != speaker) {
+    line = speaker + ": " + body + " with " + listener;
+  } else if (normalizedType == "combat_end" && !listener.empty() &&
+             listener != speaker) {
+    const std::string combatEndedPrefix = "combat ended";
+    std::string trimmedBody = TrimCopy(body);
+    std::string normalizedBody = ToLowerAsciiCopy(trimmedBody);
+    if (normalizedBody.rfind(combatEndedPrefix, 0) == 0) {
+      line = speaker + ": combat with " + listener +
+             trimmedBody.substr(std::string("combat").length());
+    } else {
+      line = speaker + ": " + body + " with " + listener;
+    }
+  } else if (normalizedType == "knockout" &&
       ToLowerAsciiCopy(TrimCopy(body)).rfind("was ", 0) == 0) {
     line = speaker + " " + body;
   } else {
@@ -1315,7 +1340,9 @@ static std::string BuildEventStreamData(const std::string &type,
   if (!listener.empty() && listener != speaker &&
       normalizedType != "action" && normalizedType != "infoaction" &&
       normalizedType != "trade" && normalizedType != "healing" &&
-      normalizedType != "limb_loss" && normalizedType != "horn_cut") {
+      normalizedType != "combat_start" && normalizedType != "combat_end" &&
+      normalizedType != "limb_loss" && normalizedType != "horn_cut" &&
+      normalizedType != "major_damage") {
     line += " (talking to: " + listener + ")";
   }
   return line;

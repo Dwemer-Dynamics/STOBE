@@ -76,8 +76,14 @@ inline std::string SafeFaction(RootObjectBase *obj) {
 
 void (*playerUpdate_orig)(PlayerInterface *) = nullptr;
 void (*attackingYou_orig)(Character *, Character *, bool, bool) = nullptr;
-void (*applyDamage_orig)(MedicalSystem::HealthPartStatus *,
-                         const Damages &) = nullptr;
+bool (*aiIsEnemyRoot_orig)(AI *, RootObjectBase *) = nullptr;
+bool (*aiIsEnemyHand_orig)(AI *, const hand &, const Ogre::Vector3 &) = nullptr;
+Character *(*aiGetCharacter)(AI *) = nullptr;
+void (*newPlayerTaskSelectedCharacters_orig)(PlayerInterface *, TaskType,
+                                              const hand &, Building *,
+                                              const Ogre::Vector3 &, bool) =
+    nullptr;
+void (*attackTarget_orig)(Character *, Character *) = nullptr;
 bool (*applyFirstAid_orig)(MedicalSystem *, float, Item *, float,
                            Character *) = nullptr;
 bool (*characterGettingEaten_orig)(Character *, float, Character *) = nullptr;
@@ -1407,6 +1413,7 @@ struct NpcWorldEventState {
   int lockpickingSkill;
   std::string lastSpeechLine;
   InventoryEventSnapshot inventory;
+  std::map<uintptr_t, float> fleshHealthByPart;
   DWORD lastSeenTick;
 
   NpcWorldEventState()
@@ -1422,6 +1429,39 @@ struct NpcWorldEventState {
         currentTaskSubjectName(""), constructionAction(0),
         constructionSubjectSerial(0), constructionSubjectName(""),
         lockpickingSkill(0), lastSpeechLine(""), lastSeenTick(0) {}
+};
+
+struct CombatParticipantState {
+  std::string name;
+  std::string faction;
+  bool playerSide;
+  bool dead;
+  bool unconscious;
+  bool fled;
+  DWORD lastSeenTick;
+
+  CombatParticipantState()
+      : name("Unknown"), faction("None"), playerSide(false), dead(false),
+        unconscious(false), fled(false), lastSeenTick(0) {}
+};
+
+struct CombatLifecycleState {
+  bool active;
+  DWORD startedTick;
+  DWORD lastObservedTick;
+  std::string actorName;
+  std::string actorFaction;
+  unsigned int actorSerial;
+  std::string targetName;
+  std::string targetFaction;
+  unsigned int targetSerial;
+  bool sawOpponent;
+  std::map<unsigned int, CombatParticipantState> participants;
+
+  CombatLifecycleState()
+      : active(false), startedTick(0), lastObservedTick(0), actorName(""),
+        actorFaction("None"), actorSerial(0), targetName("None"),
+        targetFaction("None"), targetSerial(0), sawOpponent(false) {}
 };
 
 struct PendingMedicalItemUseState {
@@ -1496,6 +1536,12 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
+static CombatLifecycleState g_combatLifecycleState;
+static const DWORD kCombatEndGraceMs = 12 * 1000;
+static const DWORD kRecentCombatSignalMs = 8 * 1000;
+static const float kMajorDamageThreshold = 15.0f;
+static const size_t kCombatParticipantLimit = 64;
+static std::map<unsigned int, DWORD> g_recentCombatSignalTickBySerial;
 static DWORD g_lastIdentityRenameSweepTick = 0;
 static const DWORD kIdentityRenameSweepIntervalMs = 2500;
 static const size_t kIdentityRenameSweepCandidateLimit = 24;
@@ -1513,8 +1559,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.1.1";
-static const char *kStobePluginReleaseDate = "2026-08-10";
+static const char *kStobePluginVersion = "1.2.3";
+static const char *kStobePluginReleaseDate = "2026-08-31";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -5221,6 +5267,67 @@ static bool ResolveLimbPartPresent(Character *npc, RobotLimbs::Limb limb) {
   return part && (uintptr_t)part >= 0x1000;
 }
 
+// Capture body-part health for qualitative events without relying on damage
+// hook callbacks.
+static bool CollectFleshHealthByPart(
+    Character *npc, std::map<uintptr_t, float> &healthByPartOut) {
+  healthByPartOut.clear();
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return false;
+  }
+
+  MedicalSystem *med = nullptr;
+  try {
+    med = npc->getMedical();
+  } catch (...) {
+    med = nullptr;
+  }
+  if (!med || (uintptr_t)med < 0x1000) {
+    return false;
+  }
+
+  try {
+    for (uint32_t i = 0; i < med->anatomy.size(); ++i) {
+      MedicalSystem::HealthPartStatus *part = med->anatomy[i];
+      if (part && (uintptr_t)part >= 0x1000) {
+        healthByPartOut[(uintptr_t)part] = part->flesh;
+      }
+    }
+  } catch (...) {
+    healthByPartOut.clear();
+    return false;
+  }
+  return !healthByPartOut.empty();
+}
+
+static void EmitMajorDamageEvent(Character *victim) {
+  CombatAttribution attribution = ResolveCombatAttribution(victim);
+  std::string victimName = ResolveCharacterNameSafe(victim);
+  std::string attackerName = TrimCopy(attribution.actorName);
+  std::string weaponName = TrimCopy(attribution.weaponName);
+  std::string attackerLower = ToLowerAsciiCopy(attackerName);
+  std::string weaponLower = ToLowerAsciiCopy(weaponName);
+  bool knownAttacker = !attackerName.empty() && attackerLower != "unknown" &&
+                       attackerLower != ToLowerAsciiCopy(victimName);
+  bool knownWeapon = !weaponName.empty() && weaponLower != "unknown" &&
+                     weaponLower != "unknown weapon" && weaponLower != "none";
+
+  std::string message = "took a major hit";
+  if (knownAttacker) {
+    message += " from " + attackerName;
+    if (knownWeapon) {
+      message += weaponLower == "unarmed" ? " using unarmed attacks"
+                                           : " using " + weaponName;
+    }
+  }
+
+  LogGameEvent("major_damage", victimName, SafeFaction(victim),
+               knownAttacker ? attackerName : "None",
+               knownAttacker ? attribution.actorFaction : "None", message,
+               ResolveCharacterSerialForEvent(victim),
+               knownAttacker ? attribution.actorSerial : 0);
+}
+
 static bool ResolveNpcHungerMetrics(Character *npc, float &hungerOut,
                                     float &fedOut, float &satietyOut) {
   hungerOut = 0.0f;
@@ -6539,6 +6646,328 @@ static void PruneNpcWorldEventState() {
   PrunePredationEventSessionState(nowTick);
 }
 
+struct CombatCharacterObservation {
+  bool dead;
+  bool unconscious;
+  bool fleeing;
+  bool evidence;
+  Character *attackTarget;
+  std::vector<Character *> attackers;
+
+  CombatCharacterObservation()
+      : dead(false), unconscious(false), fleeing(false), evidence(false),
+        attackTarget(nullptr) {}
+};
+
+static void MarkRecentCombatSignal(Character *npc, DWORD nowTick) {
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  if (serial != 0) {
+    g_recentCombatSignalTickBySerial[serial] = nowTick;
+  }
+}
+
+static bool HasRecentCombatSignal(unsigned int serial, DWORD nowTick) {
+  std::map<unsigned int, DWORD>::const_iterator it =
+      g_recentCombatSignalTickBySerial.find(serial);
+  return it != g_recentCombatSignalTickBySerial.end() &&
+         nowTick - it->second <= kRecentCombatSignalMs;
+}
+
+static void QueueCombatCharacter(Character *npc,
+                                 std::vector<Character *> &queue,
+                                 std::set<unsigned int> &queuedSerials) {
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  if (!npc || (uintptr_t)npc < 0x1000 || serial == 0 ||
+      queuedSerials.count(serial) != 0 ||
+      queue.size() >= kCombatParticipantLimit) {
+    return;
+  }
+  queuedSerials.insert(serial);
+  queue.push_back(npc);
+}
+
+// Combines Kenshi's current combat flags with recent attack/damage hooks so a
+// brief engine-state gap cannot split one encounter into multiple lifecycle events.
+static CombatCharacterObservation ObserveCombatCharacter(Character *npc,
+                                                           DWORD nowTick) {
+  CombatCharacterObservation observation;
+  if (!npc || (uintptr_t)npc < 0x1000) {
+    return observation;
+  }
+
+  unsigned int serial = ResolveCharacterSerialForEvent(npc);
+  try {
+    observation.dead = npc->isDead();
+    observation.unconscious = npc->isUnconcious();
+    observation.fleeing = npc->isFleeing();
+  } catch (...) {
+  }
+
+  bool inCombat = false;
+  bool rangedCombat = false;
+  bool underMeleeAttack = false;
+  try {
+    inCombat = npc->isInCombatMode(true, true);
+  } catch (...) {
+  }
+  try {
+    rangedCombat = npc->isInRangedCombatMode();
+  } catch (...) {
+  }
+  try {
+    underMeleeAttack = npc->isLiterallyUnderMeleeAttackRightNowForSure();
+  } catch (...) {
+  }
+
+  try {
+    observation.attackTarget =
+        ResolveCharacterFromHandSafe(npc->getAttackTarget());
+  } catch (...) {
+    observation.attackTarget = nullptr;
+  }
+
+  lektor<hand> attackerHandles;
+  try {
+    npc->getAllAttackers(attackerHandles);
+  } catch (...) {
+  }
+  for (uint32_t i = 0; i < attackerHandles.size(); ++i) {
+    Character *attacker = ResolveCharacterFromHandSafe(attackerHandles.stuff[i]);
+    if (attacker && attacker != npc) {
+      observation.attackers.push_back(attacker);
+    }
+  }
+
+  observation.evidence =
+      !observation.dead && !observation.unconscious &&
+      (inCombat || rangedCombat || underMeleeAttack ||
+       observation.attackTarget != nullptr || !observation.attackers.empty() ||
+       HasRecentCombatSignal(serial, nowTick));
+  return observation;
+}
+
+// Tracks a player-squad encounter by its confirmed attack graph, rather than by
+// whoever happens to remain inside the original nearby-NPC scan radius.
+static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
+  if (!world || !world->player) {
+    return;
+  }
+
+  std::set<unsigned int> playerSquadSerials;
+  std::map<unsigned int, Character *> loadedBySerial;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
+      playerSquadSerials.insert(serial);
+      loadedBySerial[serial] = member;
+    }
+  }
+  try {
+    const ogre_unordered_set<Character *>::type &loadedCharacters =
+        world->getCharacterUpdateList();
+    for (ogre_unordered_set<Character *>::type::const_iterator it =
+             loadedCharacters.begin();
+         it != loadedCharacters.end(); ++it) {
+      Character *candidate = *it;
+      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
+      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
+        loadedBySerial[serial] = candidate;
+      }
+    }
+  } catch (...) {
+  }
+
+  Character *seedActor = nullptr;
+  Character *seedTarget = nullptr;
+  if (!g_combatLifecycleState.active) {
+    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+      Character *member = world->player->playerCharacters[i];
+      CombatCharacterObservation observation =
+          ObserveCombatCharacter(member, nowTick);
+      if (!observation.evidence) {
+        continue;
+      }
+      seedActor = member;
+      seedTarget = observation.attackTarget;
+      if (!seedTarget && !observation.attackers.empty()) {
+        seedTarget = observation.attackers[0];
+      }
+      break;
+    }
+    if (!seedActor) {
+      return;
+    }
+
+    g_combatLifecycleState.active = true;
+    g_combatLifecycleState.startedTick = nowTick;
+    g_combatLifecycleState.lastObservedTick = nowTick;
+    g_combatLifecycleState.actorName = ResolveCharacterNameSafe(seedActor);
+    g_combatLifecycleState.actorFaction = SafeFaction(seedActor);
+    g_combatLifecycleState.actorSerial =
+        ResolveCharacterSerialForEvent(seedActor);
+    if (seedTarget && (uintptr_t)seedTarget >= 0x1000) {
+      g_combatLifecycleState.targetName = ResolveCharacterNameSafe(seedTarget);
+      g_combatLifecycleState.targetFaction = SafeFaction(seedTarget);
+      g_combatLifecycleState.targetSerial =
+          ResolveCharacterSerialForEvent(seedTarget);
+    }
+    LogGameEvent("combat_start", g_combatLifecycleState.actorName,
+                 g_combatLifecycleState.actorFaction,
+                 g_combatLifecycleState.targetName,
+                 g_combatLifecycleState.targetFaction,
+                 "entered active combat", g_combatLifecycleState.actorSerial,
+                 g_combatLifecycleState.targetSerial);
+  }
+
+  std::vector<Character *> queue;
+  std::set<unsigned int> queuedSerials;
+  queue.reserve(kCombatParticipantLimit);
+  if (seedActor) {
+    QueueCombatCharacter(seedActor, queue, queuedSerials);
+  } else {
+    for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+             g_combatLifecycleState.participants.begin();
+         it != g_combatLifecycleState.participants.end(); ++it) {
+      std::map<unsigned int, Character *>::const_iterator loadedIt =
+          loadedBySerial.find(it->first);
+      if (loadedIt != loadedBySerial.end()) {
+        QueueCombatCharacter(loadedIt->second, queue, queuedSerials);
+      }
+    }
+    // A squad member can join or resume the same player-centric encounter.
+    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+      Character *member = world->player->playerCharacters[i];
+      if (ObserveCombatCharacter(member, nowTick).evidence) {
+        QueueCombatCharacter(member, queue, queuedSerials);
+      }
+    }
+  }
+
+  bool combatObserved = false;
+  for (size_t queueIndex = 0; queueIndex < queue.size(); ++queueIndex) {
+    Character *npc = queue[queueIndex];
+    unsigned int serial = ResolveCharacterSerialForEvent(npc);
+    if (serial == 0) {
+      continue;
+    }
+    CombatCharacterObservation observation = ObserveCombatCharacter(npc, nowTick);
+    CombatParticipantState &participant =
+        g_combatLifecycleState.participants[serial];
+    participant.name = ResolveCharacterNameSafe(npc);
+    participant.faction = SafeFaction(npc);
+    participant.playerSide = participant.playerSide ||
+                             playerSquadSerials.count(serial) != 0;
+    participant.dead = observation.dead;
+    participant.unconscious = observation.unconscious;
+    participant.fled = observation.fleeing;
+    participant.lastSeenTick = nowTick;
+
+    if (!participant.playerSide) {
+      g_combatLifecycleState.sawOpponent = true;
+      if (g_combatLifecycleState.targetSerial == 0) {
+        g_combatLifecycleState.targetName = participant.name;
+        g_combatLifecycleState.targetFaction = participant.faction;
+        g_combatLifecycleState.targetSerial = serial;
+      }
+    }
+
+    if (!observation.evidence) {
+      continue;
+    }
+    combatObserved = true;
+    QueueCombatCharacter(observation.attackTarget, queue, queuedSerials);
+    for (size_t i = 0; i < observation.attackers.size(); ++i) {
+      QueueCombatCharacter(observation.attackers[i], queue, queuedSerials);
+    }
+  }
+
+  if (combatObserved) {
+    g_combatLifecycleState.lastObservedTick = nowTick;
+    return;
+  }
+  if (nowTick - g_combatLifecycleState.lastObservedTick < kCombatEndGraceMs) {
+    return;
+  }
+
+  int deadCount = 0;
+  int unconsciousCount = 0;
+  int fledCount = 0;
+  int friendlyStanding = 0;
+  int opponentStanding = 0;
+  bool lostTracking = !g_combatLifecycleState.sawOpponent;
+  for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+           g_combatLifecycleState.participants.begin();
+       it != g_combatLifecycleState.participants.end(); ++it) {
+    const CombatParticipantState &participant = it->second;
+    if (participant.dead) {
+      ++deadCount;
+    } else if (participant.unconscious) {
+      ++unconsciousCount;
+    }
+    if (participant.fled && !participant.dead && !participant.unconscious) {
+      ++fledCount;
+    }
+
+    bool standing = !participant.dead && !participant.unconscious &&
+                    !participant.fled;
+    bool missing = participant.lastSeenTick == 0 ||
+                   nowTick - participant.lastSeenTick >= kCombatEndGraceMs;
+    if (standing && missing) {
+      lostTracking = true;
+    } else if (standing) {
+      if (participant.playerSide) {
+        ++friendlyStanding;
+      } else {
+        ++opponentStanding;
+      }
+    }
+  }
+
+  std::string outcome = "disengaged";
+  if (lostTracking) {
+    outcome = "lost_tracking";
+  } else if (fledCount > 0) {
+    outcome = "escape";
+  } else if (friendlyStanding > 0 && opponentStanding == 0) {
+    outcome = "victory";
+  } else if (friendlyStanding == 0 && opponentStanding > 0) {
+    outcome = "defeat";
+  }
+
+  DWORD durationSeconds =
+      (nowTick - g_combatLifecycleState.startedTick + 500) / 1000;
+  if (durationSeconds < 1) {
+    durationSeconds = 1;
+  }
+  std::string message =
+      "combat ended after " + ToString((int)durationSeconds) +
+      " seconds (outcome: " + outcome + "; participants: " +
+      ToString((int)g_combatLifecycleState.participants.size()) +
+      "; friendly side standing: " + ToString(friendlyStanding) +
+      "; opponents standing: " + ToString(opponentStanding) +
+      "; knocked out: " + ToString(unconsciousCount) +
+      "; dead: " + ToString(deadCount) + "; fled: " +
+      ToString(fledCount) + ")";
+  LogGameEvent("combat_end", g_combatLifecycleState.actorName,
+               g_combatLifecycleState.actorFaction,
+               g_combatLifecycleState.targetName,
+               g_combatLifecycleState.targetFaction, message,
+               g_combatLifecycleState.actorSerial,
+               g_combatLifecycleState.targetSerial);
+  g_combatLifecycleState = CombatLifecycleState();
+
+  for (std::map<unsigned int, DWORD>::iterator it =
+           g_recentCombatSignalTickBySerial.begin();
+       it != g_recentCombatSignalTickBySerial.end();) {
+    if (nowTick - it->second > kCombatEndGraceMs) {
+      it = g_recentCombatSignalTickBySerial.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static std::string NormalizeInfoTelemetryToken(const std::string &rawValue) {
   std::string value = TrimCopy(rawValue);
   if (value.empty()) {
@@ -7341,6 +7770,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     float hungerNow = 0.0f;
     float fedNow = 0.0f;
     float satietyNow = 0.0f;
+    std::map<uintptr_t, float> fleshHealthByPartNow;
     int lockpickingNow = 0;
     try {
       deadNow = npc->isDead();
@@ -7352,6 +7782,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
     hasMoneyNow = TryResolveCharacterMoneySafe(npc, moneyNow);
     hasHungerNow = ResolveNpcHungerMetrics(npc, hungerNow, fedNow, satietyNow);
+    CollectFleshHealthByPart(npc, fleshHealthByPartNow);
 
     int leftArmState = ResolveLimbState(npc, RobotLimbs::LEFT_ARM);
     int rightArmState = ResolveLimbState(npc, RobotLimbs::RIGHT_ARM);
@@ -7482,6 +7913,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
       state.lockpickingSkill = lockpickingNow;
       state.lastSpeechLine = normalizedSpeechLine;
       state.inventory = inventorySnapshot;
+      state.fleshHealthByPart = fleshHealthByPartNow;
       state.lastSeenTick = nowTick;
       if (!isPlayerActor && IsAnyPredationTask(currentTaskNow)) {
         EmitPredationEventFromTask(npc, currentTaskSubject, nowTick,
@@ -7506,6 +7938,22 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     }
 
     NpcWorldEventState previousState = state;
+    bool majorDamageNow = false;
+    for (std::map<uintptr_t, float>::const_iterator it =
+             fleshHealthByPartNow.begin();
+         it != fleshHealthByPartNow.end(); ++it) {
+      std::map<uintptr_t, float>::const_iterator previousIt =
+          previousState.fleshHealthByPart.find(it->first);
+      if (previousIt != previousState.fleshHealthByPart.end() &&
+          previousIt->second - it->second > kMajorDamageThreshold) {
+        majorDamageNow = true;
+        break;
+      }
+    }
+    if (majorDamageNow && ObserveCombatCharacter(npc, nowTick).evidence) {
+      MarkRecentCombatSignal(npc, nowTick);
+      EmitMajorDamageEvent(npc);
+    }
     std::map<std::string, int> gainByKey;
     std::map<std::string, int> lossByKey;
     bool suppressPickupEvent = false;
@@ -7776,6 +8224,7 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
     state.lockpickingSkill = lockpickingNow;
     state.lastSpeechLine = normalizedSpeechLine;
     state.inventory = inventorySnapshot;
+    state.fleshHealthByPart = fleshHealthByPartNow;
     state.lastSeenTick = nowTick;
   }
 
@@ -7794,6 +8243,8 @@ static void RunNpcWorldEventSweepUnsafe(GameWorld *world, Character *selection) 
                     pickupEvent.currentSnapshot, matchedGain,
                     pickupEvent.hasMoneyAfter, pickupEvent.moneyAfter);
   }
+
+  UpdateCombatLifecycleEvent(world, nowTick);
 
   static DWORD lastPruneTick = 0;
   if (nowTick - lastPruneTick >= 60000) {
@@ -8873,6 +9324,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                      actionCommand == "ROLEPLAY-ACTION" ||
                      actionCommand == "NOTIFY") {
             actionCommand = "ROLEPLAY_ACTION";
+          } else if (actionCommand == "STOPATTACK") {
+            actionCommand = "STOP_ATTACK";
           }
           if (ShouldDropDuplicateNpcAction(
                   targetHand.isValid() ? targetHand.serial : 0, actionCommand,
@@ -9849,6 +10302,30 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             LeaveCriticalSection(&g_uiMutex);
             Log("HOOK_MSG_PROC: ATTACK target resolved arg='" + actionArgument +
                 "' target_serial=" + ToString((int)act.target.serial));
+          } else if (actionCommand == "STOP_ATTACK") {
+            if (shouldSkipSpeakerBoundAction(actionCommand)) {
+              continue;
+            }
+            hand resolvedTarget =
+                resolveActionTargetHand(actionArgument, targetHand);
+            if (!resolvedTarget.isValid() || resolvedTarget.isNull() ||
+                resolvedTarget.serial == targetHand.serial) {
+              Log("HOOK_MSG_PROC: STOP_ATTACK ignored; explicit opposing "
+                  "target could not be resolved arg='" +
+                  actionArgument + "'");
+              continue;
+            }
+            EnterCriticalSection(&g_uiMutex);
+            QueuedAction act;
+            act.type = ACT_STOP_ATTACK;
+            act.actor = targetHand;
+            act.target = resolvedTarget;
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
+            Log("HOOK_MSG_PROC: STOP_ATTACK queued actor_serial=" +
+                ToString((int)targetHand.serial) + " target_serial=" +
+                ToString((int)resolvedTarget.serial) + " arg='" +
+                actionArgument + "'");
           } else if (actionCommand == "SUICIDE") {
             EnterCriticalSection(&g_uiMutex);
             QueuedAction act;
@@ -11217,7 +11694,18 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
 void attackingYou_hook(Character *npc, Character *attacker, bool so,
                        bool doAwarenessCheck) {
-  if (attacker && npc) {
+  if (so && attacker && npc) {
+    BreakFactionCeasefireForPlayerOrder(attacker, npc,
+                                        "player_order_attacking_you");
+    if (ShouldSuppressFactionCeasefireAttack(npc, attacker)) {
+      RejectFactionCeasefireAttack(attacker, npc, "attacking_you");
+      return;
+    }
+  }
+  if (so && attacker && npc) {
+    DWORD nowTick = GetTickCount();
+    MarkRecentCombatSignal(attacker, nowTick);
+    MarkRecentCombatSignal(npc, nowTick);
     LogGameEvent("combat", attacker->getName(), SafeFaction(attacker),
                  npc->getName(), SafeFaction(npc), "Initiated attack",
                  ResolveCharacterSerialForEvent(attacker),
@@ -11227,16 +11715,111 @@ void attackingYou_hook(Character *npc, Character *attacker, bool so,
     attackingYou_orig(npc, attacker, so, doAwarenessCheck);
 }
 
-void applyDamage_hook(MedicalSystem::HealthPartStatus *part,
-                      const Damages &damage) {
-  if (part && part->me && damage.total() > 15.0f) {
-    LogGameEvent("combat", "Unknown", "None", part->me->getName(),
-                 SafeFaction(part->me),
-                 "Took substantial damage: " + ToString((int)damage.total()), 0,
-                 ResolveCharacterSerialForEvent(part->me));
+bool aiIsEnemyRoot_hook(AI *ai, RootObjectBase *target) {
+  Character *observer = nullptr;
+  Character *targetCharacter = nullptr;
+  try {
+    observer = ai && aiGetCharacter ? aiGetCharacter(ai) : nullptr;
+    if (target && (target->getDataType() == HUMAN_CHARACTER ||
+                   target->getDataType() == ANIMAL_CHARACTER)) {
+      targetCharacter = static_cast<Character *>(target);
+    }
+  } catch (...) {
+    observer = nullptr;
+    targetCharacter = nullptr;
   }
-  if (applyDamage_orig)
-    applyDamage_orig(part, damage);
+  if (observer && targetCharacter) {
+    BreakFactionCeasefireForPlayerOrder(observer, targetCharacter,
+                                        "player_order_enemy_root");
+  }
+  if (observer && ShouldTreatFactionCeasefireTargetAsNeutral(observer, target)) {
+    return false;
+  }
+  return aiIsEnemyRoot_orig ? aiIsEnemyRoot_orig(ai, target) : false;
+}
+
+bool aiIsEnemyHand_hook(AI *ai, const hand &subject,
+                        const Ogre::Vector3 &position) {
+  Character *observer = nullptr;
+  Character *targetCharacter = nullptr;
+  RootObjectBase *target = nullptr;
+  try {
+    observer = ai && aiGetCharacter ? aiGetCharacter(ai) : nullptr;
+    if (subject.isValid() && !subject.isNull()) {
+      target = subject.getRootObjectBase();
+      targetCharacter = subject.getCharacter();
+    }
+  } catch (...) {
+    observer = nullptr;
+    targetCharacter = nullptr;
+    target = nullptr;
+  }
+  if (observer && targetCharacter) {
+    BreakFactionCeasefireForPlayerOrder(observer, targetCharacter,
+                                        "player_order_enemy_hand");
+  }
+  if (observer && ShouldTreatFactionCeasefireTargetAsNeutral(observer, target)) {
+    return false;
+  }
+  return aiIsEnemyHand_orig ? aiIsEnemyHand_orig(ai, subject, position) : false;
+}
+
+void newPlayerTaskSelectedCharacters_hook(PlayerInterface *playerInterface,
+                                          TaskType task, const hand &subject,
+                                          Building *destinationIndoors,
+                                          const Ogre::Vector3 &position,
+                                          bool addDontClear) {
+  if (playerInterface &&
+      (task == UNPROVOKED_FOCUSED_MELEE_ATTACK ||
+       task == FOCUSED_MELEE_ATTACK ||
+       task == RANGED_ATTACK_FOCUSED_UNPROVOKED ||
+       task == RANGED_ATTACK_FOCUSED)) {
+    try {
+      Character *target = subject.isValid() && !subject.isNull()
+                              ? subject.getCharacter()
+                              : nullptr;
+      if (target) {
+        bool truceBroken = false;
+        for (ogre_unordered_set<hand>::type::const_iterator it =
+                 playerInterface->selectedCharacters.begin();
+             it != playerInterface->selectedCharacters.end(); ++it) {
+          Character *attacker = it->getCharacter();
+          if (attacker && BreakFactionCeasefireForExplicitAttack(
+                              attacker, target, "player_attack_order")) {
+            truceBroken = true;
+            break;
+          }
+        }
+        if (!truceBroken && playerInterface->selectedCharacter.isValid() &&
+            !playerInterface->selectedCharacter.isNull()) {
+          Character *attacker =
+              playerInterface->selectedCharacter.getCharacter();
+          BreakFactionCeasefireForExplicitAttack(attacker, target,
+                                                 "player_attack_order");
+        }
+      }
+    } catch (...) {
+    }
+  }
+  if (newPlayerTaskSelectedCharacters_orig) {
+    newPlayerTaskSelectedCharacters_orig(playerInterface, task, subject,
+                                         destinationIndoors, position,
+                                         addDontClear);
+  }
+}
+
+void attackTarget_hook(Character *attacker, Character *target) {
+  if (attacker && target) {
+    BreakFactionCeasefireForPlayerOrder(attacker, target,
+                                        "player_order_attack_target");
+    if (ShouldSuppressFactionCeasefireAttack(attacker, target)) {
+      RejectFactionCeasefireAttack(attacker, target, "attack_target");
+      return;
+    }
+  }
+  if (attackTarget_orig) {
+    attackTarget_orig(attacker, target);
+  }
 }
 
 bool applyFirstAid_hook(MedicalSystem *med, float skill, Item *equipment,
@@ -12237,6 +12820,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    Stobe::UI::ResetNpcContextRenameAction(false);
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -12252,6 +12836,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   if (!worldStable) {
+    Stobe::UI::ResetNpcContextRenameAction();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -12278,6 +12863,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_activatedAnimalSerials.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
+      g_combatLifecycleState = CombatLifecycleState();
+      g_recentCombatSignalTickBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
       g_lastInventorySweepTick = 0;
       g_lastInfoNpcTelemetryCheckTick = 0;
@@ -12409,13 +12996,21 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::UI::UpdateNpcContextRenameAction(thisptr);
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
 
   static bool pushToTalkWasDown = false;
-  bool pushToTalkDown = (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
-  if (pushToTalkDown && !pushToTalkWasDown && !IsAnyStobeMenuUIOpen()) {
+  bool pushToTalkEnabled = g_pushToTalkHotkey != 0;
+  bool pushToTalkDown =
+      pushToTalkEnabled &&
+      (GetAsyncKeyState(g_pushToTalkHotkey) & 0x8000) != 0;
+  if (!pushToTalkEnabled) {
+    if (Stobe::Voice::IsRecording())
+      Stobe::Voice::Cancel();
+  } else if (pushToTalkDown && !pushToTalkWasDown &&
+             !IsAnyStobeMenuUIOpen()) {
     std::string voiceMode = Stobe::ChatMode::Normalize(g_chatMode);
     bool narratorMode = (voiceMode == "narrator");
     Character *speaker = nullptr;
@@ -12492,7 +13087,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       worldUi->showPlayerAMessage_withLog("Transcribing...", false);
   }
   pushToTalkWasDown = pushToTalkDown;
-  Stobe::Voice::Update();
+  if (pushToTalkEnabled)
+    Stobe::Voice::Update();
 
   // Detect Selection Change
   EnterCriticalSection(&g_stateMutex);
@@ -13115,6 +13711,119 @@ __declspec(dllexport) void startPlugin() {
   Log("HOOK_DIAG: AddHook status=" + ToString((int)status) +
       " orig=" + ToString((unsigned int)(uintptr_t)playerUpdate_orig));
   Log("HOOK: PlayerInterface::update installed (UI-only mode).");
+
+  void *thunkAttackingYou = (void *)GetProcAddress(
+      hLib, "?attackingYou@Character@@QEAAXPEAV1@_N1@Z");
+  if (!thunkAttackingYou) {
+    Log("HOOK_WARN: Character::attackingYou symbol not found.");
+  } else {
+    __int64 realAttackingYou = KenshiLib::GetRealAddress(thunkAttackingYou);
+    if (!realAttackingYou) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::attackingYou.");
+    } else {
+      KenshiLib::HookStatus attackingYouStatus = KenshiLib::AddHook(
+          (void *)realAttackingYou, (void *)attackingYou_hook,
+          (void **)&attackingYou_orig);
+      Log("HOOK_DIAG: Character::attackingYou AddHook status=" +
+          ToString((int)attackingYouStatus) + " orig=" +
+          ToString((unsigned int)(uintptr_t)attackingYou_orig));
+    }
+  }
+
+  void *thunkAiGetCharacter =
+      (void *)GetProcAddress(hLib, "?getCharacter@AI@@QEAAPEAVCharacter@@XZ");
+  if (!thunkAiGetCharacter) {
+    Log("HOOK_WARN: AI::getCharacter symbol not found.");
+  } else {
+    __int64 realAiGetCharacter =
+        KenshiLib::GetRealAddress(thunkAiGetCharacter);
+    if (!realAiGetCharacter) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::getCharacter.");
+    } else {
+      aiGetCharacter = reinterpret_cast<Character *(*)(AI *)>(
+          realAiGetCharacter);
+      Log("HOOK_DIAG: AI::getCharacter resolved address=" +
+          ToString((unsigned int)(uintptr_t)aiGetCharacter));
+    }
+  }
+
+  void *thunkAiIsEnemyRoot =
+      (void *)GetProcAddress(hLib,
+                             "?isEnemy@AI@@QEAA_NPEAVRootObjectBase@@@Z");
+  if (!thunkAiIsEnemyRoot) {
+    Log("HOOK_WARN: AI::isEnemy(RootObjectBase*) symbol not found.");
+  } else {
+    __int64 realAiIsEnemyRoot = KenshiLib::GetRealAddress(thunkAiIsEnemyRoot);
+    if (!realAiIsEnemyRoot) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::isEnemy(RootObjectBase*).");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAiIsEnemyRoot, (void *)aiIsEnemyRoot_hook,
+          (void **)&aiIsEnemyRoot_orig);
+      Log("HOOK_DIAG: AI::isEnemy(RootObjectBase*) AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)aiIsEnemyRoot_orig));
+    }
+  }
+
+  void *thunkAiIsEnemyHand = (void *)GetProcAddress(
+      hLib, "?isEnemy@AI@@QEAA_NAEBVhand@@AEBVVector3@Ogre@@@Z");
+  if (!thunkAiIsEnemyHand) {
+    Log("HOOK_WARN: AI::isEnemy(hand) symbol not found.");
+  } else {
+    __int64 realAiIsEnemyHand = KenshiLib::GetRealAddress(thunkAiIsEnemyHand);
+    if (!realAiIsEnemyHand) {
+      Log("HOOK_WARN: GetRealAddress failed for AI::isEnemy(hand).");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAiIsEnemyHand, (void *)aiIsEnemyHand_hook,
+          (void **)&aiIsEnemyHand_orig);
+      Log("HOOK_DIAG: AI::isEnemy(hand) AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)aiIsEnemyHand_orig));
+    }
+  }
+
+  void *thunkAttackTarget = (void *)GetProcAddress(
+      hLib, "?attackTarget@Character@@QEAAXPEAV1@@Z");
+  if (!thunkAttackTarget) {
+    Log("HOOK_WARN: Character::attackTarget symbol not found.");
+  } else {
+    __int64 realAttackTarget = KenshiLib::GetRealAddress(thunkAttackTarget);
+    if (!realAttackTarget) {
+      Log("HOOK_WARN: GetRealAddress failed for Character::attackTarget.");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realAttackTarget, (void *)attackTarget_hook,
+          (void **)&attackTarget_orig);
+      Log("HOOK_DIAG: Character::attackTarget AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)attackTarget_orig));
+    }
+  }
+
+  void *thunkNewPlayerTaskSelectedCharacters = (void *)GetProcAddress(
+      hLib,
+      "?newPlayerTaskSelectedCharacters@PlayerInterface@@QEAAXW4TaskType@@AEBVhand@@PEAVBuilding@@AEBVVector3@Ogre@@_N@Z");
+  if (!thunkNewPlayerTaskSelectedCharacters) {
+    Log("HOOK_WARN: PlayerInterface::newPlayerTaskSelectedCharacters symbol not found.");
+  } else {
+    __int64 realNewPlayerTaskSelectedCharacters =
+        KenshiLib::GetRealAddress(thunkNewPlayerTaskSelectedCharacters);
+    if (!realNewPlayerTaskSelectedCharacters) {
+      Log("HOOK_WARN: GetRealAddress failed for "
+          "PlayerInterface::newPlayerTaskSelectedCharacters.");
+    } else {
+      KenshiLib::HookStatus status = KenshiLib::AddHook(
+          (void *)realNewPlayerTaskSelectedCharacters,
+          (void *)newPlayerTaskSelectedCharacters_hook,
+          (void **)&newPlayerTaskSelectedCharacters_orig);
+      Log("HOOK_DIAG: PlayerInterface::newPlayerTaskSelectedCharacters "
+          "AddHook status=" +
+          ToString((int)status) + " orig=" +
+          ToString((unsigned int)(uintptr_t)newPlayerTaskSelectedCharacters_orig));
+    }
+  }
 
   void *thunkInventoryBuyItem = (void *)GetProcAddress(
       hLib, "?buyItem@Inventory@@QEAAPEAVItem@@PEAV2@PEAVRootObject@@@Z");

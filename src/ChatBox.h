@@ -3,6 +3,7 @@
 
 class GameWorld;
 class Character;
+class PlayerInterface;
 
 namespace Stobe {
 namespace UI {
@@ -34,7 +35,8 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam);
 void OnChatInputChange(MyGUI::EditBox *sender);
 void OnChatInputAccept(MyGUI::EditBox *sender);
 void OnChatSendClick(MyGUI::Widget *sender);
-void SubmitChatTextForCurrentContext(const std::string &submittedText);
+void SubmitChatTextForCurrentContext(const std::string &submittedText,
+                                     bool fromVoice = false);
 void SubmitVoiceChatText(const std::string &submittedText,
                          const std::string &speakerName,
                          const std::string &speakerSerial,
@@ -66,6 +68,8 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);
 void OnChatWindowButtonPressed(MyGUI::Window *sender, const std::string &name);
+void UpdateNpcContextRenameAction(PlayerInterface *playerInterface);
+void ResetNpcContextRenameAction(bool destroyWidget = true);
 
 } // namespace UI
 } // namespace Stobe

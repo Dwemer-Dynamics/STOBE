@@ -2566,6 +2566,8 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   std::string equipment = GetVisibleEquipment(npc);
   int bountyTotal = 0;
   std::string bountyPayload = BuildBountyPayload(npc, bountyTotal);
+  ActivitySnapshot activity;
+  CaptureActivitySnapshot(npc, "", activity);
 
   int gameTs = 0;
   GameWorld *world = GetWorldSafe();
@@ -2623,6 +2625,16 @@ std::string BuildIdentityBootstrapContext(Character *npc) {
   json += "\"factionID\":\"" + EscapeJSON(factionID) + "\",";
   json += "\"faction_id\":\"" + EscapeJSON(factionID) + "\",";
   json += "\"gender\":\"" + EscapeJSON(gender) + "\",";
+  json += "\"current_action\":\"" + EscapeJSON(activity.currentAction) +
+          "\",";
+  json += "\"is_in_combat\":" +
+          std::string(activity.isInCombat ? "true" : "false") + ",";
+  json += "\"is_attacking\":" +
+          std::string(activity.isAttacking ? "true" : "false") + ",";
+  if (!activity.attackTargetName.empty()) {
+    json += "\"attack_target\":\"" + EscapeJSON(activity.attackTargetName) +
+            "\",";
+  }
   json += "\"has_beard\": " + std::string(hasBeard ? "true" : "false") + ",";
   json += "\"is_shaved\": " + std::string(isShaved ? "true" : "false") + ",";
   json += "\"is_flayed\": " + std::string(isFlayed ? "true" : "false") + ",";

@@ -759,6 +759,10 @@ DispatchResult DispatchDecision(GameWorld *world,
       character->endCombatMode();
       character->playerMoveOrderDefault(NULL, NULL, location);
     } else {
+      if (decision.command == DECISION_COMMAND_ATTACK) {
+        BreakFactionCeasefireForExplicitAttack(character, targetCharacter,
+                                               "autonomy_attack_action");
+      }
       orders->addOrder(task, subject, location, false, false);
       if (decision.command == DECISION_COMMAND_ATTACK) {
         character->attackTarget(targetCharacter);
