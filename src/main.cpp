@@ -12820,6 +12820,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
+    Stobe::UI::ResetNpcContextRenameAction(false);
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -12835,6 +12836,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   }
 
   if (!worldStable) {
+    Stobe::UI::ResetNpcContextRenameAction();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -12994,6 +12996,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   // 1. Core Selection Tracking
   Character *sel = ResolveSelectedCharacterSehSafe(thisptr);
+  Stobe::UI::UpdateNpcContextRenameAction(thisptr);
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
