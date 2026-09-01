@@ -1334,7 +1334,8 @@ static std::string BuildEventStreamData(const std::string &type,
       normalizedType != "action" && normalizedType != "infoaction" &&
       normalizedType != "trade" && normalizedType != "healing" &&
       normalizedType != "combat_start" && normalizedType != "combat_end" &&
-      normalizedType != "limb_loss" && normalizedType != "horn_cut") {
+      normalizedType != "limb_loss" && normalizedType != "horn_cut" &&
+      normalizedType != "major_damage") {
     line += " (talking to: " + listener + ")";
   }
   return line;
