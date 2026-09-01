@@ -401,8 +401,9 @@ void UpdateNpcContextRenameAction(PlayerInterface *playerInterface) {
     return;
   }
 
-  if (!playerInterface || reinterpret_cast<uintptr_t>(playerInterface) < 0x1000 ||
-      g_chatWindow || g_renameWindow) {
+  if (!g_enableNpcRename || !playerInterface ||
+      reinterpret_cast<uintptr_t>(playerInterface) < 0x1000 || g_chatWindow ||
+      g_renameWindow) {
     ResetNpcContextRenameAction(true);
     return;
   }
