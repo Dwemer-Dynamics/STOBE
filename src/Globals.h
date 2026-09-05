@@ -105,7 +105,8 @@ enum ActionType {
   ACT_CUT_HORNS,
   ACT_USE_OBJECT,
   ACT_KNOCKOUT,
-  ACT_KILL
+  ACT_KILL,
+  ACT_MOVE_TO
 };
 
 struct GameEvent {

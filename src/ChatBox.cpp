@@ -3186,7 +3186,7 @@ DWORD WINAPI ManualDiaryResponseThread(LPVOID lpParam) {
 void ExtractActionTags(std::string &speech, std::vector<std::string> &actions) {
   static const char *commandNames[] = {
       "ATTACK",           "STOP_ATTACK",   "STOPATTACK",
-      "FOLLOW",           "STOP_FOLLOW",
+      "FOLLOW",           "STOP_FOLLOW", "MOVE_TO", "MOVETO",
       "JOIN_PARTY",       "LEAVE",
       "IDLE",             "STOP_CARRYING", "RELEASE_PLAYER",
       "RELEASE_PRISONER",
@@ -4471,6 +4471,10 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
       ToString((int)peopleJson.length()));
   endpoint += L"&people=" + ToWide(UrlEncode(peopleJson));
   AppendGeoQueryFromPlayer(endpoint, player);
+  // Capture the initiating character before selection changes during the response.
+  if (player && (uintptr_t)player > 0x1000) {
+    endpoint += L"&initiator_sid=" + ToWide(ToString(player->getHandle().serial));
+  }
   StreamChatTask *streamTask = new StreamChatTask();
   streamTask->endpoint = endpoint;
   streamTask->npcName = profileName;
