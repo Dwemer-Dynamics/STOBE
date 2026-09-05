@@ -11283,6 +11283,17 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             thisptr->showPlayerAMessage_withLog(
                 "Spawn item action is currently disabled.", true);
             continue;
+          } else if (actionCommand == "MOVE_TO" || actionCommand == "MOVETO") {
+            if (!targetHand.isValid()) {
+              continue;
+            }
+            QueuedAction act;
+            act.type = ACT_MOVE_TO;
+            act.actor = targetHand;
+            act.message = actionArgument;
+            EnterCriticalSection(&g_uiMutex);
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
           } else if (actionCommand == "TRAVEL_LOCATION") {
             if (!targetHand.isValid()) {
               Log("HOOK_MSG_PROC: TRAVEL_LOCATION ignored; invalid actor handle");
@@ -12821,6 +12832,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     Stobe::UI::ResetNpcContextRenameAction(false);
+    ResetMoveToActions();
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -12837,6 +12849,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   if (!worldStable) {
     Stobe::UI::ResetNpcContextRenameAction();
+    ResetMoveToActions();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -13189,6 +13202,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
+    UpdateMoveToActions(world);
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();

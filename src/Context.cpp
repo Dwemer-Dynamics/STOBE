@@ -4122,6 +4122,7 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
                                     oHighHungerRateMultiplier);
 
         json += "{\"name\":\"" + EscapeJSON(o_name) + "\",";
+        json += "\"refid\":\"hand_" + ToString(other->getHandle().serial) + "\",";
         json += "\"race\":\"" + EscapeJSON(o_rn) + "\",";
         json += "\"race_is_robot\":" +
                 std::string(o_raceIsRobot ? "true" : "false") + ",";
@@ -4392,7 +4393,8 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
           continue;
         }
 
-        std::string dedupeKey = poiName + "|" + typeLabel;
+        unsigned int poiSerial = poi->getHandle().serial;
+        std::string dedupeKey = poiName + "|" + typeLabel + "|" + ToString(poiSerial);
         for (size_t c = 0; c < dedupeKey.size(); ++c) {
           dedupeKey[c] = (char)std::tolower((unsigned char)dedupeKey[c]);
         }
@@ -4406,6 +4408,7 @@ std::string BuildNpcContextEnvelope(Character *npc, const std::string &type) {
           json += ",";
         }
         json += "{\"name\":\"" + EscapeJSON(poiName) + "\",";
+        json += "\"refid\":\"hand_" + ToString(poiSerial) + "\",";
         json += "\"type\":\"" + EscapeJSON(typeLabel) + "\",";
         json += "\"dist\":" + ToString(poiDist) + "}";
         poiCount++;
