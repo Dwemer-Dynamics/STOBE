@@ -8335,18 +8335,11 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                       ? (" (partial " + ToString(transferredCount) + "/" +
                          ToString(requestedCount) + ")")
                       : "";
-              if (recipient == primaryPlayer) {
-                thisptr->showPlayerAMessage_withLog(
-                    SafeCharacterName(npc) + " gave you " + quantityPrefix +
-                        givenItemName + partialSuffix + ".",
-                    true);
-              } else {
-                thisptr->showPlayerAMessage_withLog(
-                    SafeCharacterName(npc) + " gave " + quantityPrefix +
-                        givenItemName + " to " + SafeCharacterName(recipient) +
-                        partialSuffix + ".",
-                    true);
-              }
+              thisptr->showPlayerAMessage_withLog(
+                  SafeCharacterName(npc) + " gave " + quantityPrefix +
+                      givenItemName + " to " + SafeCharacterName(recipient) +
+                      partialSuffix + ".",
+                  true);
               Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
                   " recipient=" + SafeCharacterName(recipient) +
                   " requested=" + ToString(requestedCount) +
