@@ -6510,6 +6510,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static DWORD pausedQueueLogTick = 0;
   static double speechDelayRemainingScaledMs = 0.0;
   static DWORD speechDelayLastTick = 0;
+  static std::string directorTextUtterance;
+  static LONG directorTextGeneration = 0;
 
   UpdateNarratorTimedPopupLifecycle();
 
@@ -6627,7 +6629,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       speechDelayLastTick = 0;
     }
 
-    while (!g_uiActionQueue.empty()) {
+    if (!directorTextUtterance.empty() &&
+        (!IsChatInterruptGenerationCurrent(directorTextGeneration) || g_nextSpeechActionTick == 0)) {
+      if (GetSpeechDeliveryState(directorTextUtterance) == SPEECH_DELIVERY_PENDING)
+        PostSpeechDeliveryState(directorTextUtterance,
+            IsChatInterruptGenerationCurrent(directorTextGeneration) ? "spoken" : "cancelled");
+      directorTextUtterance.clear();
+    }
+    size_t remainingThisFrame = g_uiActionQueue.size();
+    while (!g_uiActionQueue.empty() && remainingThisFrame-- > 0) {
       DWORD nowTick = GetTickCount();
       const QueuedAction &nextAction = g_uiActionQueue.front();
       bool nextActionIsSpeech =
@@ -6829,7 +6839,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             playbackQueued =
                 QueueTtsPlayback(act.ttsHash, ttsVolumePercent,
                                  act.target.serial,
-                                 ResolveDialogueGameSpeedMultiplier(thisptr));
+                                 ResolveDialogueGameSpeedMultiplier(thisptr), TTS_PLAYBACK_OWNER_DEFAULT,
+                                 act.utteranceId.find("director-") == 0 ? act.utteranceId : "");
           } else {
             ttsSkipReason =
                 ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
@@ -6877,7 +6888,16 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         }
         if (speechExecuted) {
           if (!act.utteranceId.empty()) {
-            PostSpeechDeliveryState(act.utteranceId, "spoken");
+            if (act.utteranceId.find("director-") == 0) {
+              if (hasTtsClip && !playbackQueued) {
+                PostSpeechDeliveryState(act.utteranceId, "cancelled");
+              } else if (!playbackQueued) {
+                directorTextUtterance = act.utteranceId;
+                directorTextGeneration = GetChatInterruptGeneration();
+              }
+            } else {
+              PostSpeechDeliveryState(act.utteranceId, "spoken");
+            }
           }
         } else if (!act.utteranceId.empty()) {
           PostSpeechDeliveryState(act.utteranceId, "cancelled");
@@ -10231,7 +10251,17 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         lockReacquired = true;
       }
       if (queueDeferredAction) {
-        g_uiActionQueue.push_front(deferredAction);
+        if (act.directorAction) {
+          deferredAction.directorAction = true;
+          g_uiActionQueue.push_back(deferredAction);
+        } else {
+          g_uiActionQueue.push_front(deferredAction);
+        }
+      }
+      if (act.directorAction && act.type != ACT_SAY && act.type != ACT_PLAY_TTS) {
+        // A close-range action may keep approaching while the next actor speaks.
+        blockSpeechQueue = false;
+        deferActionQueue = false;
       }
       if (blockSpeechQueue) {
         DWORD gateNowTick = GetTickCount();
@@ -10259,8 +10289,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                             reason);
       }
       if (blockSpeechQueue || deferActionQueue) {
-        break;
+        return;
       }
+      EnterCriticalSection(&g_uiMutex);
     }
+    LeaveCriticalSection(&g_uiMutex);
   }
 }
