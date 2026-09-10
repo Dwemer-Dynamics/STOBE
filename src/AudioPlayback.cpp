@@ -21,6 +21,7 @@ struct TtsPlaybackTask {
   unsigned int speakerSerial;
   float playbackSpeedMultiplier;
   int owner;
+  std::string utteranceId;
 };
 
 LONG g_ttsPlaybackBusy = 0;
@@ -462,6 +463,16 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
   unsigned int speakerSerial = task->speakerSerial;
   float playbackSpeedMultiplier = task->playbackSpeedMultiplier;
   int owner = task->owner;
+  // Director history is committed only after the complete clip, including failure and interrupt exits.
+  struct DeliveryCompletion {
+    std::string id;
+    bool spoken;
+    DeliveryCompletion(const std::string &value) : id(value), spoken(false) {}
+    ~DeliveryCompletion() {
+      if (!id.empty() && GetSpeechDeliveryState(id) == SPEECH_DELIVERY_PENDING)
+        PostSpeechDeliveryState(id, spoken ? "spoken" : "cancelled");
+    }
+  } delivery(task->utteranceId);
   delete task;
   DWORD threadStartTick = GetTickCount();
 
@@ -576,13 +587,14 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " interrupted=" + std::string(interrupted ? "1" : "0"));
 
   ReleasePlaybackSlot(generation);
+  delivery.spoken = !interrupted && generation == CurrentTtsPlaybackGeneration();
   return 0;
 }
 } // namespace
 
 bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
                       unsigned int speakerSerial,
-                      float playbackSpeedMultiplier, int owner) {
+                      float playbackSpeedMultiplier, int owner, const std::string &utteranceId) {
   if (!IsHexHash(ttsHash)) {
     Log("TTS_PLAYBACK: rejected invalid hash");
     return false;
@@ -603,6 +615,7 @@ bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
   task->speakerSerial = speakerSerial;
   task->playbackSpeedMultiplier = playbackSpeedMultiplier;
   task->owner = owner;
+  task->utteranceId = utteranceId;
   InterlockedExchange(&g_ttsPlaybackOwner, owner);
   LONG taskGeneration = task->generation;
 

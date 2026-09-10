@@ -8749,7 +8749,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       const bool autonomyCatalogMessage =
           ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);
       size_t autonomyQueueSizeBefore = 0;
-      if (autonomyCatalogMessage) {
+      const std::string directorMarker = " [DIRECTOR_ACTION]";
+      const bool directorAction = msg.find("NPC_ACTION: ") == 0 &&
+          msg.size() >= directorMarker.size() &&
+          msg.compare(msg.size() - directorMarker.size(), directorMarker.size(), directorMarker) == 0;
+      if (directorAction) msg.erase(msg.size() - directorMarker.size());
+      if (autonomyCatalogMessage || directorAction) {
         EnterCriticalSection(&g_uiMutex);
         autonomyQueueSizeBefore = g_uiActionQueue.size();
         LeaveCriticalSection(&g_uiMutex);
@@ -11679,6 +11684,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           }
         }
       }
+      if (directorAction) {
+        EnterCriticalSection(&g_uiMutex);
+        for (size_t index = autonomyQueueSizeBefore; index < g_uiActionQueue.size(); ++index)
+          g_uiActionQueue[index].directorAction = true;
+        LeaveCriticalSection(&g_uiMutex);
+      }
       if (autonomyCatalogMessage) {
         size_t tagged = 0;
         EnterCriticalSection(&g_uiMutex);
@@ -13331,7 +13342,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         ((nowGameTs - g_lastBoredEventGameTs) >= intervalGamets);
 
     if (forceTrigger || periodicDue) {
-      bool speechBusy = IsTtsPlaybackActive();
+      bool speechBusy = IsTtsPlaybackActive() || IsDirectorSceneActive();
       if (speechBusy) {
         if (forceTrigger) {
           EnterCriticalSection(&g_stateMutex);

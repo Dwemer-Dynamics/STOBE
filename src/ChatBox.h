@@ -50,6 +50,7 @@ void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
 bool IsAiRequestActive();
+bool IsDirectorSceneActive();
 void RefreshChatModeControls();
 void OnBoredEventClick(MyGUI::Widget *sender);
 void OnWriteDiaryClick(MyGUI::Widget *sender);
@@ -63,7 +64,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerSerial = "",
                        LONG generationOverride = 0,
                        const std::string &preferredListenerName = "",
-                       const std::string &preferredListenerSerial = "");
+                       const std::string &preferredListenerSerial = "",
+                       const std::string &direction = "");
 bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);

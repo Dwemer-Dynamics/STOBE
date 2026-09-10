@@ -359,7 +359,7 @@ LONG BeginChatInterruptGeneration() {
       std::remove_if(g_uiActionQueue.begin(), g_uiActionQueue.end(),
                      [&cancelledUtterances](const QueuedAction &act) -> bool {
                        bool shouldRemove =
-                           act.type == ACT_SAY || act.type == ACT_PLAY_TTS;
+                           act.type == ACT_SAY || act.type == ACT_PLAY_TTS || act.directorAction;
                        if (shouldRemove && !act.utteranceId.empty()) {
                          cancelledUtterances.insert(act.utteranceId);
                        }

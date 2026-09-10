@@ -79,6 +79,7 @@ bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
 LONG g_activeChatStreamCount = 0;
+LONG g_activeDirectorGeneration = 0;
 LONG g_profileModelSlot = 1;
 LONG g_profileModelRevision = 0;
 LONG g_profileModelRefreshInFlight = 0;
@@ -98,8 +99,15 @@ const int kPlayerCustomMoodMaxChars = 80;
 
 class ActiveChatStreamScope {
 public:
-  ActiveChatStreamScope() { InterlockedIncrement(&g_activeChatStreamCount); }
-  ~ActiveChatStreamScope() { InterlockedDecrement(&g_activeChatStreamCount); }
+  explicit ActiveChatStreamScope(LONG directorGeneration = 0) : directorGeneration_(directorGeneration) {
+    InterlockedIncrement(&g_activeChatStreamCount);
+  }
+  ~ActiveChatStreamScope() {
+    InterlockedDecrement(&g_activeChatStreamCount);
+    if (directorGeneration_ != 0) InterlockedCompareExchange(&g_activeDirectorGeneration, 0, directorGeneration_);
+  }
+private:
+  LONG directorGeneration_;
 };
 
 struct ChatTargetOption {
@@ -3352,10 +3360,90 @@ static bool QueueStreamActionIfNew(StreamChatParseState *state,
   return true;
 }
 
+// The HTTP worker sequences authored turns using the existing playback acknowledgements.
+// Actions enter the normal game-thread queue; their completion never gates the next turn.
+static bool PlayDirectorScene(StreamChatParseState *state, const std::string &scene) {
+  const std::string id = JsonReadField(scene, "id");
+  const int count = atoi(JsonReadField(scene, "line_count").c_str());
+  if (JsonReadField(scene, "schema") != "stobe.director_scene.v1" ||
+      id.length() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
+      count < 1 || count > 5 || !state->speechUtteranceIds.empty()) return false;
+  std::vector<std::string> turns;
+  std::vector<std::string> ids;
+  bool valid = true;
+  int totalActions = 0;
+  for (int i = 0; i < count; ++i) {
+    const std::string turn = JsonReadField(scene, "turn_" + ToString(i));
+    const std::string uid = "director-" + id + "-" + ToString(i);
+    ids.push_back(uid);
+    turns.push_back(turn);
+    const std::string speaker = JsonReadField(turn, "speaker");
+    const std::string serial = JsonReadField(turn, "actor_id");
+    const std::string text = JsonReadField(turn, "text");
+    const std::string listener = JsonReadField(turn, "listener");
+    const std::string hash = JsonReadField(turn, "tts_hash");
+    const int actions = atoi(JsonReadField(turn, "action_count").c_str());
+    totalActions += actions;
+    // Bind every actor to the identities sent with this request, never historical name lookup.
+    const std::string identity = "\"" + EscapeJSON(speaker + "|" + serial) + "\"";
+    if (JsonReadField(turn, "utterance_id") != uid || speaker.empty() || serial.empty() ||
+        serial.find_first_not_of("0123456789") != std::string::npos ||
+        state->task->peopleJson.find(identity) == std::string::npos ||
+        text.empty() || text.size() > 2400 || text.find_first_of("|[]\r\n") != std::string::npos ||
+        speaker.find_first_of("|[]\r\n") != std::string::npos ||
+        listener.empty() || listener.find_first_of("|[]\r\n") != std::string::npos ||
+        actions < 0 || actions > 3 || totalActions > 3 ||
+        (!hash.empty() && (hash.size() != 32 || hash.find_first_not_of("0123456789abcdef") != std::string::npos))) valid = false;
+    for (int a = 0; a < actions && a < 3; ++a) {
+      const std::string action = JsonReadField(turn, "action_" + ToString(a));
+      if (action.empty() || action.find_first_of("\r\n") != std::string::npos) valid = false;
+    }
+  }
+  state->speechUtteranceIds = ids;
+  if (!valid) { PostSpeechDeliveryStates(ids, "cancelled"); return false; }
+  for (size_t i = 0; i < ids.size(); ++i) TrackSpeechDeliveryState(ids[i]);
+  size_t played = 0;
+  for (; played < turns.size() && IsChatInterruptGenerationCurrent(state->generation); ++played) {
+    const std::string &turn = turns[played];
+    const std::string actor = JsonReadField(turn, "speaker");
+    const std::string header = actor + "|" + JsonReadField(turn, "actor_id");
+    std::string say = "NPC_SAY: " + header + ": " + JsonReadField(turn, "text") +
+        " [TALKTARGET:" + BuildTalkTargetMetadataToken(JsonReadField(turn, "listener"), "") + "]" +
+        " [UTTERANCEID:" + ids[played] + "]";
+    const std::string hash = JsonReadField(turn, "tts_hash");
+    if (g_ttsEnabled && !hash.empty()) say += " [TTSHASH:" + hash + "]";
+    say += " [TTSDUR:" + JsonReadField(turn, "tts_duration_ms") + "]";
+    if (!QueueChatPipeLine(say, state->generation)) break;
+    ++state->lineCount;
+    DWORD started = GetTickCount();
+    while (IsChatInterruptGenerationCurrent(state->generation) &&
+           GetSpeechDeliveryState(ids[played]) == SPEECH_DELIVERY_PENDING &&
+           GetTickCount() - started < 600000) SleepIfPaused(50);
+    if (!IsChatInterruptGenerationCurrent(state->generation) ||
+        GetSpeechDeliveryState(ids[played]) != SPEECH_DELIVERY_SPOKEN) break;
+    int actions = atoi(JsonReadField(turn, "action_count").c_str());
+    for (int a = 0; a < actions; ++a) {
+      if (QueueChatPipeLine("NPC_ACTION: " + header + ": " +
+          JsonReadField(turn, "action_" + ToString(a)) + " [DIRECTOR_ACTION]", state->generation)) ++state->actionCount;
+    }
+    Log("DIRECTOR: spoken scene=" + id + " turn=" + ToString(static_cast<int>(played + 1)));
+  }
+  if (played < ids.size()) {
+    std::vector<std::string> cancelled(ids.begin() + played, ids.end());
+    PostSpeechDeliveryStates(cancelled, "cancelled");
+  }
+  return played == ids.size();
+}
+
 bool ProcessStreamChatResponseLine(StreamChatParseState *state,
                                    const std::string &rawLine) {
   if (!state || !state->task) {
     return false;
+  }
+
+  const std::string directorPrefix = "rolemaster|DirectorScene|";
+  if (rawLine.find(directorPrefix) == 0 && state->task->requestMode == "director") {
+    return PlayDirectorScene(state, TrimChatLine(rawLine.substr(directorPrefix.size())));
   }
 
   if (!IsChatInterruptGenerationCurrent(state->generation)) {
@@ -3570,7 +3658,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
-  ActiveChatStreamScope activeStream;
+  ActiveChatStreamScope activeStream(task->requestMode == "director" ? task->generation : 0);
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3589,6 +3677,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   bool requestOk =
       PostToStobeWithResponseStream(task->endpoint, "", OnStreamChatHttpLine,
                                     &parseState);
+  if (task->requestMode == "director") {
+    // All replies were authored and played by the scene callback. Never request a rechat.
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
+    delete task;
+    return 0;
+  }
   if (!IsChatInterruptGenerationCurrent(generation)) {
     ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
     delete task;
@@ -3695,6 +3789,11 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
 
 bool IsAiRequestActive() {
   return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
+}
+
+bool IsDirectorSceneActive() {
+  LONG generation = InterlockedCompareExchange(&g_activeDirectorGeneration, 0, 0);
+  return generation != 0 && IsChatInterruptGenerationCurrent(generation);
 }
 
 void OnChatInputChange(MyGUI::EditBox *sender) {
@@ -4825,7 +4924,8 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
   bool dispatched =
       TriggerBoredEvent(world, true, preferredSpeakerName, preferredSpeakerSerial,
                         generation, preferredListenerName,
-                        preferredListenerSerial);
+                        preferredListenerSerial,
+                        g_chatInput ? g_chatInput->getCaption().asUTF8() : "");
   if (!dispatched) {
     Log("BORED_EVENT: button trigger failed for selected NPC '" +
         preferredSpeakerName + "' serial=" + preferredSpeakerSerial);
@@ -4977,7 +5077,9 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredSpeakerSerial,
                        LONG generationOverride,
                        const std::string &preferredListenerName,
-                       const std::string &preferredListenerSerial) {
+                       const std::string &preferredListenerSerial,
+                       const std::string &direction) {
+  if (!forceDirectorMode && IsDirectorSceneActive()) return false;
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return false;
   }
@@ -5303,7 +5405,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       L"&profile=" + ToWide(UrlEncode(speaker.name)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
-      L"&people=" + ToWide(UrlEncode(peopleJson));
+      L"&people=" + ToWide(UrlEncode(peopleJson)) +
+      L"&direction=" + ToWide(UrlEncode(direction));
   AppendGeoQueryFromPlayer(endpoint, player);
 
   StreamChatTask *task = new StreamChatTask();
@@ -5333,8 +5436,12 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   task->rechatDepth = 0;
   task->allowUnavailableTargetSpeech = false;
 
+  const LONG directorGeneration = task->generation;
+  const std::string dispatchedListenerHandle = task->previousSpeakerHandle;
+  if (forceDirectorMode) InterlockedExchange(&g_activeDirectorGeneration, directorGeneration);
   HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
+    if (forceDirectorMode) InterlockedCompareExchange(&g_activeDirectorGeneration, 0, directorGeneration);
     delete task;
     Log("BORED_EVENT: failed to start stream thread");
     return false;
@@ -5347,8 +5454,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       std::string(speaker.indoors ? "true" : "false") + " speaker_building=" +
       ToString((int)speaker.buildingSerial) + " speaker_floor=" +
       ToString(speaker.floor) + " listener_serial=" +
-      task->previousSpeakerHandle + " gen=" +
-      ToString((int)task->generation));
+      dispatchedListenerHandle + " gen=" +
+      ToString((int)directorGeneration));
   return true;
 }
 
