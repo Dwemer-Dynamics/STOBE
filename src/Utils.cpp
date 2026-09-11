@@ -1222,10 +1222,10 @@ static std::string BuildEventPeopleJson(GameWorld *world,
 
   Character *actorNpc = FindCharacterBySerialForEvent(world, actorSerial);
   Character *targetNpc = FindCharacterBySerialForEvent(world, targetSerial);
-  if (!actorNpc && !NormalizeEventName(actor).empty()) {
+  if (!actorNpc && actorSerial == 0 && !NormalizeEventName(actor).empty()) {
     actorNpc = FindCharacterByNameForEvent(world, actor);
   }
-  if (!targetNpc && !NormalizeEventName(target).empty()) {
+  if (!targetNpc && targetSerial == 0 && !NormalizeEventName(target).empty()) {
     targetNpc = FindCharacterByNameForEvent(world, target);
   }
 
@@ -1290,6 +1290,15 @@ static std::string BuildEventPeopleJson(GameWorld *world,
   return BuildEventPeopleJsonArray(people);
 }
 
+// Capture observers at the local event site when the summary is emitted.
+std::string BuildLocalEventPeople(Character *anchor) {
+  int count = 0, anchorA = 0, anchorB = 0, dropped = 0;
+  bool secondAnchor = false;
+  return BuildEventPeopleJson(GetWorldSafe(), "combat_end",
+      ResolveCharacterNameForEvent(anchor), "", ResolveCharacterSerialSafe(anchor),
+      0, count, anchorA, anchorB, dropped, secondAnchor);
+}
+
 static std::string BuildEventStreamData(const std::string &type,
                                         const std::string &actor,
                                         const std::string &target,
@@ -1352,7 +1361,8 @@ void LogGameEvent(const std::string &type, const std::string &actor,
                   const std::string &actorFaction, const std::string &target,
                   const std::string &targetFaction,
                   const std::string &message, unsigned int actorSerial,
-                  unsigned int targetSerial) {
+                  unsigned int targetSerial, const std::string *peopleOverride,
+                  unsigned int locationSerial) {
   std::string normalizedType = ToLowerAsciiCopy(TrimCopy(type));
   if (normalizedType == "limb_loss" &&
       ShouldDropDuplicateLimbLossEvent(target, targetSerial, message)) {
@@ -1403,7 +1413,9 @@ void LogGameEvent(const std::string &type, const std::string &actor,
   int droppedByCap = 0;
   bool usedSecondAnchor = false;
   std::string peopleJson = "[]";
-  if (normalizedType != "init") {
+  if (peopleOverride) {
+    peopleJson = *peopleOverride;
+  } else if (normalizedType != "init") {
     peopleJson = BuildEventPeopleJson(GetWorldSafe(), eventType, actor, target, actorSerial,
                                       targetSerial, peopleCount, anchorACount,
                                       anchorBCount, droppedByCap,
@@ -1415,14 +1427,15 @@ void LogGameEvent(const std::string &type, const std::string &actor,
   endpoint += L"&people=" + ToWide(UrlEncode(peopleJson));
 
   GameWorld *world = GetWorldSafe();
-  Character *geoAnchor = FindCharacterBySerialForEvent(world, actorSerial);
-  if (!geoAnchor && targetSerial != 0) {
+  Character *geoAnchor = FindCharacterBySerialForEvent(world,
+      peopleOverride ? locationSerial : actorSerial);
+  if (!peopleOverride && !geoAnchor && targetSerial != 0) {
     geoAnchor = FindCharacterBySerialForEvent(world, targetSerial);
   }
-  if (!geoAnchor && !NormalizeEventName(actor).empty()) {
+  if (!peopleOverride && !geoAnchor && actorSerial == 0 && !NormalizeEventName(actor).empty()) {
     geoAnchor = FindCharacterByNameForEvent(world, actor);
   }
-  if (!geoAnchor && !NormalizeEventName(target).empty()) {
+  if (!peopleOverride && !geoAnchor && targetSerial == 0 && !NormalizeEventName(target).empty()) {
     geoAnchor = FindCharacterByNameForEvent(world, target);
   }
   AppendEventGeoQueryFromCharacter(endpoint, geoAnchor);

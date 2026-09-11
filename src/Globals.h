@@ -125,7 +125,10 @@ void LogGameEvent(const std::string &type, const std::string &actor,
                   const std::string &actorFaction, const std::string &target,
                   const std::string &targetFaction, const std::string &message,
                   unsigned int actorSerial = 0,
-                  unsigned int targetSerial = 0);
+                  unsigned int targetSerial = 0,
+                  const std::string *peopleOverride = nullptr,
+                  unsigned int locationSerial = 0);
+std::string BuildLocalEventPeople(Character *anchor);
 
 struct QueuedAction {
   ActionType type;

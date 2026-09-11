@@ -1456,6 +1456,7 @@ struct CombatLifecycleState {
   std::string targetFaction;
   unsigned int targetSerial;
   bool sawOpponent;
+  Ogre::Vector3 origin;
   std::map<unsigned int, CombatParticipantState> participants;
 
   CombatLifecycleState()
@@ -1536,7 +1537,8 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
-static CombatLifecycleState g_combatLifecycleState;
+static std::map<unsigned int, CombatLifecycleState> g_combatEncounters;
+static unsigned int g_nextCombatEncounterId = 1;
 static const DWORD kCombatEndGraceMs = 12 * 1000;
 static const DWORD kRecentCombatSignalMs = 8 * 1000;
 static const float kMajorDamageThreshold = 15.0f;
@@ -6746,78 +6748,39 @@ static CombatCharacterObservation ObserveCombatCharacter(Character *npc,
   return observation;
 }
 
-// Tracks a player-squad encounter by its confirmed attack graph, rather than by
-// whoever happens to remain inside the original nearby-NPC scan radius.
-static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
-  if (!world || !world->player) {
-    return;
-  }
-
-  std::set<unsigned int> playerSquadSerials;
-  std::map<unsigned int, Character *> loadedBySerial;
-  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-    Character *member = world->player->playerCharacters[i];
-    unsigned int serial = ResolveCharacterSerialForEvent(member);
-    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
-      playerSquadSerials.insert(serial);
-      loadedBySerial[serial] = member;
-    }
-  }
-  try {
-    const ogre_unordered_set<Character *>::type &loadedCharacters =
-        world->getCharacterUpdateList();
-    for (ogre_unordered_set<Character *>::type::const_iterator it =
-             loadedCharacters.begin();
-         it != loadedCharacters.end(); ++it) {
-      Character *candidate = *it;
-      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
-      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
-        loadedBySerial[serial] = candidate;
-      }
-    }
-  } catch (...) {
-  }
-
-  Character *seedActor = nullptr;
+// Follow only this encounter's local attack graph.
+static void UpdateLocalCombatEncounter(
+    CombatLifecycleState &combatState, Character *seedActor, DWORD nowTick,
+    const std::map<unsigned int, Character *> &loadedBySerial,
+    const std::set<unsigned int> &playerSquadSerials,
+    std::set<unsigned int> &claimed) {
   Character *seedTarget = nullptr;
-  if (!g_combatLifecycleState.active) {
-    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-      Character *member = world->player->playerCharacters[i];
-      CombatCharacterObservation observation =
-          ObserveCombatCharacter(member, nowTick);
-      if (!observation.evidence) {
-        continue;
-      }
-      seedActor = member;
-      seedTarget = observation.attackTarget;
-      if (!seedTarget && !observation.attackers.empty()) {
-        seedTarget = observation.attackers[0];
-      }
-      break;
+  if (!combatState.active) {
+    CombatCharacterObservation observation = ObserveCombatCharacter(seedActor, nowTick);
+    seedTarget = observation.attackTarget;
+    if (!seedTarget && !observation.attackers.empty()) {
+      seedTarget = observation.attackers[0];
     }
-    if (!seedActor) {
-      return;
-    }
-
-    g_combatLifecycleState.active = true;
-    g_combatLifecycleState.startedTick = nowTick;
-    g_combatLifecycleState.lastObservedTick = nowTick;
-    g_combatLifecycleState.actorName = ResolveCharacterNameSafe(seedActor);
-    g_combatLifecycleState.actorFaction = SafeFaction(seedActor);
-    g_combatLifecycleState.actorSerial =
+    combatState.origin = seedActor->getPosition();
+    combatState.active = true;
+    combatState.startedTick = nowTick;
+    combatState.lastObservedTick = nowTick;
+    combatState.actorName = ResolveCharacterNameSafe(seedActor);
+    combatState.actorFaction = SafeFaction(seedActor);
+    combatState.actorSerial =
         ResolveCharacterSerialForEvent(seedActor);
     if (seedTarget && (uintptr_t)seedTarget >= 0x1000) {
-      g_combatLifecycleState.targetName = ResolveCharacterNameSafe(seedTarget);
-      g_combatLifecycleState.targetFaction = SafeFaction(seedTarget);
-      g_combatLifecycleState.targetSerial =
+      combatState.targetName = ResolveCharacterNameSafe(seedTarget);
+      combatState.targetFaction = SafeFaction(seedTarget);
+      combatState.targetSerial =
           ResolveCharacterSerialForEvent(seedTarget);
     }
-    LogGameEvent("combat_start", g_combatLifecycleState.actorName,
-                 g_combatLifecycleState.actorFaction,
-                 g_combatLifecycleState.targetName,
-                 g_combatLifecycleState.targetFaction,
-                 "entered active combat", g_combatLifecycleState.actorSerial,
-                 g_combatLifecycleState.targetSerial);
+    LogGameEvent("combat_start", combatState.actorName,
+                 combatState.actorFaction,
+                 combatState.targetName,
+                 combatState.targetFaction,
+                 "entered active combat", combatState.actorSerial,
+                 combatState.targetSerial);
   }
 
   std::vector<Character *> queue;
@@ -6827,19 +6790,12 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
     QueueCombatCharacter(seedActor, queue, queuedSerials);
   } else {
     for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
-             g_combatLifecycleState.participants.begin();
-         it != g_combatLifecycleState.participants.end(); ++it) {
+             combatState.participants.begin();
+         it != combatState.participants.end(); ++it) {
       std::map<unsigned int, Character *>::const_iterator loadedIt =
           loadedBySerial.find(it->first);
       if (loadedIt != loadedBySerial.end()) {
         QueueCombatCharacter(loadedIt->second, queue, queuedSerials);
-      }
-    }
-    // A squad member can join or resume the same player-centric encounter.
-    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-      Character *member = world->player->playerCharacters[i];
-      if (ObserveCombatCharacter(member, nowTick).evidence) {
-        QueueCombatCharacter(member, queue, queuedSerials);
       }
     }
   }
@@ -6848,12 +6804,14 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   for (size_t queueIndex = 0; queueIndex < queue.size(); ++queueIndex) {
     Character *npc = queue[queueIndex];
     unsigned int serial = ResolveCharacterSerialForEvent(npc);
-    if (serial == 0) {
+    if (serial == 0 || claimed.count(serial) != 0 ||
+        npc->getPosition().distance(combatState.origin) > 600.0f) {
       continue;
     }
+    claimed.insert(serial);
     CombatCharacterObservation observation = ObserveCombatCharacter(npc, nowTick);
     CombatParticipantState &participant =
-        g_combatLifecycleState.participants[serial];
+        combatState.participants[serial];
     participant.name = ResolveCharacterNameSafe(npc);
     participant.faction = SafeFaction(npc);
     participant.playerSide = participant.playerSide ||
@@ -6864,11 +6822,11 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
     participant.lastSeenTick = nowTick;
 
     if (!participant.playerSide) {
-      g_combatLifecycleState.sawOpponent = true;
-      if (g_combatLifecycleState.targetSerial == 0) {
-        g_combatLifecycleState.targetName = participant.name;
-        g_combatLifecycleState.targetFaction = participant.faction;
-        g_combatLifecycleState.targetSerial = serial;
+      combatState.sawOpponent = true;
+      if (combatState.targetSerial == 0) {
+        combatState.targetName = participant.name;
+        combatState.targetFaction = participant.faction;
+        combatState.targetSerial = serial;
       }
     }
 
@@ -6883,10 +6841,10 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   }
 
   if (combatObserved) {
-    g_combatLifecycleState.lastObservedTick = nowTick;
+    combatState.lastObservedTick = nowTick;
     return;
   }
-  if (nowTick - g_combatLifecycleState.lastObservedTick < kCombatEndGraceMs) {
+  if (nowTick - combatState.lastObservedTick < kCombatEndGraceMs) {
     return;
   }
 
@@ -6895,10 +6853,10 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   int fledCount = 0;
   int friendlyStanding = 0;
   int opponentStanding = 0;
-  bool lostTracking = !g_combatLifecycleState.sawOpponent;
+  bool lostTracking = !combatState.sawOpponent;
   for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
-           g_combatLifecycleState.participants.begin();
-       it != g_combatLifecycleState.participants.end(); ++it) {
+           combatState.participants.begin();
+       it != combatState.participants.end(); ++it) {
     const CombatParticipantState &participant = it->second;
     if (participant.dead) {
       ++deadCount;
@@ -6936,26 +6894,98 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   }
 
   DWORD durationSeconds =
-      (nowTick - g_combatLifecycleState.startedTick + 500) / 1000;
+      (nowTick - combatState.startedTick + 500) / 1000;
   if (durationSeconds < 1) {
     durationSeconds = 1;
   }
   std::string message =
       "combat ended after " + ToString((int)durationSeconds) +
       " seconds (outcome: " + outcome + "; participants: " +
-      ToString((int)g_combatLifecycleState.participants.size()) +
+      ToString((int)combatState.participants.size()) +
       "; friendly side standing: " + ToString(friendlyStanding) +
       "; opponents standing: " + ToString(opponentStanding) +
       "; knocked out: " + ToString(unconsciousCount) +
       "; dead: " + ToString(deadCount) + "; fled: " +
       ToString(fledCount) + ")";
-  LogGameEvent("combat_end", g_combatLifecycleState.actorName,
-               g_combatLifecycleState.actorFaction,
-               g_combatLifecycleState.targetName,
-               g_combatLifecycleState.targetFaction, message,
-               g_combatLifecycleState.actorSerial,
-               g_combatLifecycleState.targetSerial);
-  g_combatLifecycleState = CombatLifecycleState();
+  // Ending a fight must not give its outcome to people the seed actor later visits.
+  Character *localAnchor = nullptr;
+  for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+           combatState.participants.begin(); it != combatState.participants.end(); ++it) {
+    std::map<unsigned int, Character *>::const_iterator loaded = loadedBySerial.find(it->first);
+    if (loaded != loadedBySerial.end() &&
+        loaded->second->getPosition().distance(combatState.origin) <= 600.0f) {
+      localAnchor = loaded->second;
+      break;
+    }
+  }
+  std::string endPeople = BuildLocalEventPeople(localAnchor);
+  LogGameEvent("combat_end", combatState.actorName,
+               combatState.actorFaction,
+               combatState.targetName,
+               combatState.targetFaction, message,
+               combatState.actorSerial,
+               combatState.targetSerial, &endPeople,
+               ResolveCharacterSerialForEvent(localAnchor));
+  combatState.active = false;
+
+}
+
+// Keep disconnected battles in separate local encounters; never seed from all squads
+// into an existing fight. The claimed set also bounds work to one visit per actor.
+static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
+  if (!world || !world->player) {
+    return;
+  }
+  std::set<unsigned int> playerSquadSerials;
+  std::map<unsigned int, Character *> loadedBySerial;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
+      playerSquadSerials.insert(serial);
+      loadedBySerial[serial] = member;
+    }
+  }
+  try {
+    const ogre_unordered_set<Character *>::type &loadedCharacters =
+        world->getCharacterUpdateList();
+    for (ogre_unordered_set<Character *>::type::const_iterator it =
+             loadedCharacters.begin();
+         it != loadedCharacters.end(); ++it) {
+      Character *candidate = *it;
+      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
+      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
+        loadedBySerial[serial] = candidate;
+      }
+    }
+  } catch (...) {
+  }
+
+  std::set<unsigned int> claimed;
+  for (std::map<unsigned int, CombatLifecycleState>::iterator it =
+           g_combatEncounters.begin(); it != g_combatEncounters.end();) {
+    UpdateLocalCombatEncounter(it->second, nullptr, nowTick, loadedBySerial,
+                               playerSquadSerials, claimed);
+    if (!it->second.active) {
+      it = g_combatEncounters.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (serial == 0 || claimed.count(serial) != 0 ||
+        !ObserveCombatCharacter(member, nowTick).evidence) {
+      continue;
+    }
+    // The same character may leave one ongoing fight and enter another.
+    while (g_combatEncounters.count(g_nextCombatEncounterId) != 0) {
+      ++g_nextCombatEncounterId;
+    }
+    UpdateLocalCombatEncounter(g_combatEncounters[g_nextCombatEncounterId++], member, nowTick,
+                               loadedBySerial, playerSquadSerials, claimed);
+  }
 
   for (std::map<unsigned int, DWORD>::iterator it =
            g_recentCombatSignalTickBySerial.begin();
@@ -12887,7 +12917,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_activatedAnimalSerials.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
-      g_combatLifecycleState = CombatLifecycleState();
+      g_combatEncounters.clear();
       g_recentCombatSignalTickBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
       g_lastInventorySweepTick = 0;
