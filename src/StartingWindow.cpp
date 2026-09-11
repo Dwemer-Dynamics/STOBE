@@ -3,6 +3,7 @@
 #include "AiNpcInfoWindow.h"
 #include "JournalWindow.h"
 #include "SettingsWindow.h"
+#include "SupportReportLauncher.h"
 #include "Utils.h"
 #include "WelcomeWindow.h"
 #include <kenshi/GameWorld.h>
@@ -10,7 +11,9 @@
 #include <mygui/MyGUI_Button.h>
 #include <mygui/MyGUI_Colour.h>
 #include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Gui.h>
+#include <mygui/MyGUI_InputManager.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
@@ -21,6 +24,9 @@ MyGUI::Window *g_startingWindow = nullptr;
 bool g_startingPausedGame = false;
 
 namespace {
+MyGUI::Window *g_reportConfirmation = nullptr;
+std::string g_reportStatus;
+
 bool TryReleaseUserPauseIfNeeded(GameWorld *world) {
   if (!world) {
     return true;
@@ -70,9 +76,91 @@ bool TryDestroyWidgetSafe(MyGUI::Widget *widget) {
     return false;
   }
 }
+
+void CloseReportConfirmation() {
+  if (g_reportConfirmation) {
+    MyGUI::InputManager *input = MyGUI::InputManager::getInstancePtr();
+    if (input) input->removeWidgetModal(g_reportConfirmation);
+    TryDestroyWidgetSafe(g_reportConfirmation);
+    g_reportConfirmation = nullptr;
+  }
+}
+
+void OnReportCancel(MyGUI::Widget *) { CloseReportConfirmation(); }
+
+void OnReportWindowClose(MyGUI::Window *, const std::string &name) {
+  if (name == "close") CloseReportConfirmation();
+}
+
+void OnReportGenerate(MyGUI::Widget *) {
+  CloseReportConfirmation();
+  SupportReportLauncher::Start();
+  g_reportStatus = "Generating logs...";
+  RefreshStartingUI();
+}
+
+void OnReportKey(MyGUI::Widget *sender, MyGUI::KeyCode key, MyGUI::Char) {
+  if (key == MyGUI::KeyCode::Escape) {
+    CloseReportConfirmation();
+  } else if (key == MyGUI::KeyCode::Return) {
+    if (sender->getName() == "Stobe_ReportGenerate") OnReportGenerate(sender);
+    else CloseReportConfirmation();
+  } else if (key == MyGUI::KeyCode::Tab && g_reportConfirmation) {
+    const char *next = sender->getName() == "Stobe_ReportGenerate"
+        ? "Stobe_ReportCancel" : "Stobe_ReportGenerate";
+    MyGUI::InputManager::getInstance().setKeyFocusWidget(
+        g_reportConfirmation->getClientWidget()->findWidget(next));
+  }
+}
+
+void OnStartingGenerateLogsClick(MyGUI::Widget *) {
+  if (SupportReportLauncher::IsRunning()) return;
+  CloseStobeChildWindows();
+  MyGUI::Gui *gui = MyGUI::Gui::getInstancePtr();
+  if (!gui) return;
+  g_reportConfirmation = gui->createWidgetReal<MyGUI::Window>(
+      "Kenshi_WindowCX", 0.28f, 0.32f, 0.44f, 0.30f,
+      MyGUI::Align::Center, "Popup", "Stobe_ReportConfirmation");
+  g_reportConfirmation->setCaption(WideFromUtf8("Generate Logs").c_str());
+  g_reportConfirmation->eventWindowButtonPressed += MyGUI::newDelegate(OnReportWindowClose);
+  MyGUI::Widget *client = g_reportConfirmation->getClientWidget();
+  MyGUI::EditBox *copy = client->createWidgetReal<MyGUI::EditBox>(
+      "Kenshi_EditBox", 0.05f, 0.05f, 0.9f, 0.60f,
+      MyGUI::Align::Default, "Stobe_ReportCopy");
+  copy->setCaption(WideFromUtf8("Generate debugging logs, including available Stobe, server and AI logs. Saved to your Desktop.").c_str());
+  copy->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top);
+  copy->setEditReadOnly(true);
+  copy->setEditStatic(true);
+  copy->setEditMultiLine(true);
+  copy->setEditWordWrap(true);
+  MyGUI::Button *cancel = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.72f, 0.42f, 0.22f,
+      MyGUI::Align::Default, "Stobe_ReportCancel");
+  cancel->setCaption(WideFromUtf8("Cancel").c_str());
+  cancel->eventMouseButtonClick += MyGUI::newDelegate(OnReportCancel);
+  MyGUI::Button *generate = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.53f, 0.72f, 0.42f, 0.22f,
+      MyGUI::Align::Default, "Stobe_ReportGenerate");
+  generate->setCaption(WideFromUtf8("Generate").c_str());
+  generate->eventMouseButtonClick += MyGUI::newDelegate(OnReportGenerate);
+  cancel->eventKeyButtonPressed += MyGUI::newDelegate(OnReportKey);
+  generate->eventKeyButtonPressed += MyGUI::newDelegate(OnReportKey);
+  copy->eventKeyButtonPressed += MyGUI::newDelegate(OnReportKey);
+  g_reportConfirmation->eventKeyButtonPressed += MyGUI::newDelegate(OnReportKey);
+  MyGUI::InputManager::getInstance().addWidgetModal(g_reportConfirmation);
+  MyGUI::InputManager::getInstance().setKeyFocusWidget(cancel);
+}
 } // namespace
 
+void UpdateSupportReportUI() {
+  if (!SupportReportLauncher::TakeResult(g_reportStatus)) return;
+  RefreshStartingUI();
+  GameWorld *world = GetWorldSafe();
+  if (world) world->showPlayerAMessage_withLog("[STOBE] " + g_reportStatus, true);
+}
+
 void CloseStartingUI() {
+  CloseReportConfirmation();
   if (g_startingPausedGame) {
     GameWorld *world = GetWorldSafe();
     if (!TryReleaseUserPauseIfNeeded(world)) {
@@ -90,6 +178,7 @@ void CloseStartingUI() {
 }
 
 void CloseStobeChildWindows() {
+  CloseReportConfirmation();
   CloseAiNpcInfoUI();
   CloseAiDiaryUI();
   CloseRecentHistoryUI();
@@ -183,35 +272,40 @@ void CreateStartingUI() {
   hotkeyLabel->setTextAlign(MyGUI::Align::Center);
 
   MyGUI::Button *aiNpcsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.204f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.18f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiNpcsBtn");
   aiNpcsBtn->setCaption(WideFromUtf8(T("Stobe NPCs")).c_str());
   aiNpcsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingAiNpcsClick);
 
   MyGUI::Button *aiDiariesBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.323f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.28f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiDiariesBtn");
   aiDiariesBtn->setCaption(WideFromUtf8(T("Stobe Diaries")).c_str());
   aiDiariesBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingAiDiariesClick);
 
   MyGUI::Button *historyBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.441f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.38f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHistoryBtn");
   historyBtn->setCaption(WideFromUtf8(T("Recent History")).c_str());
   historyBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingHistoryClick);
 
   MyGUI::Button *pluginSettingsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.560f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.48f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
   pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
   pluginSettingsBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
+  MyGUI::Button *logsBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.58f, 0.9f, 0.085f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_GenerateLogsBtn");
+  logsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingGenerateLogsClick);
+
   MyGUI::Button *statusHudBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.679f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.68f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingStatusHudBtn");
   statusHudBtn->setCaption(
@@ -222,11 +316,18 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingStatusHudClick);
 
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.798f, 0.9f, 0.096f,
+      "Kenshi_Button1", 0.05f, 0.78f, 0.9f, 0.085f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
 
+  MyGUI::EditBox *status = client->createWidgetReal<MyGUI::EditBox>(
+      "Kenshi_EditBox", 0.05f, 0.88f, 0.9f, 0.115f,
+      MyGUI::Align::Default, "Stobe_ReportStatus");
+  status->setEditReadOnly(true);
+  status->setEditMultiLine(true);
+  status->setEditWordWrap(true);
+  RefreshStartingUI();
   Log("UI: starting window created.");
 }
 
@@ -237,6 +338,14 @@ void RefreshStartingUI() {
   MyGUI::Widget *client = g_startingWindow->getClientWidget();
   if (!client)
     return;
+
+  MyGUI::Button *logs = client->findWidget("Stobe_GenerateLogsBtn")->castType<MyGUI::Button>();
+  const bool running = SupportReportLauncher::IsRunning();
+  logs->setEnabled(!running);
+  logs->setCaption(WideFromUtf8(running ? "Generating logs..." : "Generate Logs").c_str());
+  MyGUI::Widget *status = client->findWidget("Stobe_ReportStatus");
+  status->setVisible(!g_reportStatus.empty());
+  status->castType<MyGUI::TextBox>()->setCaption(WideFromUtf8(g_reportStatus).c_str());
 
   struct RefreshMap {
     std::string name;
