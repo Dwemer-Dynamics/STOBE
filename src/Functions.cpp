@@ -1,3 +1,4 @@
+#include "PlaythroughNotices.h"
 #include "Functions.h"
 #include "AudioPlayback.h"
 #include "AutonomyController.h"
@@ -6503,6 +6504,9 @@ void UpdateMoveToActions(GameWorld *world) {
 
 
 void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
+  // This update is entered only after Kenshi's post-load world gate is ready.
+  PlaythroughNotices::Notice saveNotice;
+  if (thisptr && PlaythroughNotices::Take(saveNotice)) thisptr->showPlayerAMessage_withLog("[STOBE] " + saveNotice.text, true);
   static bool holdForTtsPlayback = false;
   static hand activeSpeechTarget;
   static unsigned int activeSpeechTargetSerial = 0;
