@@ -1319,6 +1319,10 @@ void AppendUniquePerson(std::vector<std::string> &people,
   people.push_back(entry);
 }
 
+Character *ResolveChatTargetCharacter(GameWorld *world,
+                                      const std::string &targetName,
+                                      const std::string &targetHandle);
+
 std::string BuildPeopleJson(GameWorld *world, const std::string &playerName,
                             const std::string &targetName,
                             const std::string &targetHandle,
@@ -1346,7 +1350,15 @@ std::string BuildPeopleJson(GameWorld *world, const std::string &playerName,
     }
   }
 
-  if (!targetName.empty()) {
+  bool targetNearby = narratorMode;
+  if (!narratorMode && player && !targetName.empty()) {
+    Character *target = ResolveChatTargetCharacter(world, targetName, targetHandle);
+    float radius = IsIndoorsHandleValid(player->isIndoors())
+                       ? GetSearchRadiusForMode(mode) : g_proximityRadius;
+    targetNearby = target && IsConversationAreaCompatible(player, target) &&
+                   player->getPosition().distance(target->getPosition()) <= radius;
+  }
+  if (!targetName.empty() && targetNearby) {
     if (!targetHandle.empty() && !narratorMode)
       AppendUniquePerson(people, targetName + "|" + targetHandle);
     else
@@ -5127,6 +5139,9 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     searchRadius = 10.0f;
   }
 
+  const bool playerCanHear = IsConversationAreaCompatible(searchAnchor, player) &&
+      searchAnchor->getPosition().distance(player->getPosition()) <= searchRadius;
+
   bool preferredPresent = false;
 
   const ogre_unordered_set<Character *>::type &chars =
@@ -5186,7 +5201,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (!areaCompatible && !(forceDirectorMode && preferredMatch)) {
       continue;
     }
-    if (dist > searchRadius && !preferredMatch) {
+    if (dist > searchRadius) {
       continue;
     }
     CandidateNpc c;
@@ -5207,7 +5222,9 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       (uintptr_t)preferredCharacter > 0x1000 &&
       (targetLockedSpeaker ||
        !IsCharacterUnavailableForConversation(preferredCharacter)) &&
-      ShouldIncludeAnimalForTalk(preferredCharacter)) {
+      ShouldIncludeAnimalForTalk(preferredCharacter) &&
+      IsConversationAreaCompatible(searchAnchor, preferredCharacter) &&
+      searchAnchor->getPosition().distance(preferredCharacter->getPosition()) <= searchRadius) {
     try {
       CandidateNpc c;
       c.name = preferredCharacter->getName();
@@ -5304,7 +5321,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (!preferredListenerNameTrim.empty() || !preferredListenerSerialTrim.empty()) {
       if (!sameIdentity(preferredListenerNameTrim, preferredListenerSerialTrim,
                         speaker.name, speaker.serial) &&
-          !playerName.empty() &&
+          playerCanHear && !playerName.empty() &&
           sameIdentity(preferredListenerNameTrim, preferredListenerSerialTrim,
                        playerName, playerSerial)) {
         listener = playerName;
@@ -5328,7 +5345,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       }
     }
 
-    if (listener.empty() && !playerName.empty() &&
+    if (listener.empty() && playerCanHear && !playerName.empty() &&
         !sameIdentity(playerName, playerSerial, speaker.name, speaker.serial)) {
       listener = playerName;
       listenerSerial = playerSerial;
@@ -5380,7 +5397,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       AppendUniquePerson(people, listener);
     }
   }
-  if (!playerName.empty() && !playerSerial.empty()) {
+  if (playerCanHear && !playerName.empty() && !playerSerial.empty()) {
     AppendUniquePerson(people, playerName + "|" + playerSerial);
   }
   for (size_t i = 0; i < candidates.size(); ++i) {
