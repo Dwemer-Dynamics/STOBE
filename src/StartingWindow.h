@@ -9,6 +9,7 @@ extern MyGUI::Window *g_startingWindow;
 void CreateStartingUI();
 void CloseStartingUI();
 void RefreshStartingUI();
+void UpdateSupportReportUI();
 void CloseStobeChildWindows();
 void CloseAllStobeMenuUI();
 bool IsAnyStobeMenuUIOpen();

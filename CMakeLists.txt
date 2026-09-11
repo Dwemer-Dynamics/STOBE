@@ -83,6 +83,7 @@ add_library(Stobe SHARED
   src/KenshiAiCompat.cpp
   src/JournalWindow.cpp
   src/StartingWindow.cpp
+  src/SupportReportLauncher.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiBuildingStatus.cpp
   src/KenshiRvaCompat.cpp

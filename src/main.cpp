@@ -13054,6 +13054,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
+  UpdateSupportReportUI();
 
   static bool pushToTalkWasDown = false;
   bool pushToTalkEnabled = g_pushToTalkHotkey != 0;
