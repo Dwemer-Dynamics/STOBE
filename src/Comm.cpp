@@ -1,4 +1,5 @@
 #include "Comm.h"
+#include "PlaythroughNotices.h"
 #include "Globals.h"
 #include "Utils.h"
 #include <algorithm>
@@ -620,6 +621,21 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   if (sendOk) {
     if (WinHttpReceiveResponse(hRequest, NULL)) {
       UpdateNarratorDisplayNameFromResponse(hRequest);
+      wchar_t saveHeader[96] = {0}; DWORD saveHeaderBytes = sizeof(saveHeader);
+      if (WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_CUSTOM,L"X-Playthrough-Save",saveHeader,&saveHeaderBytes,WINHTTP_NO_HEADER_INDEX)) {
+        const std::wstring value(saveHeader);
+        std::string ascii;
+        for (std::size_t i=0; i<value.size(); ++i) { if (value[i] > 127) { ascii.clear(); break; } ascii.push_back(static_cast<char>(value[i])); }
+        PlaythroughNotices::Accept(ascii);
+      }
+      DWORD responseStatus = 0; DWORD responseStatusBytes = sizeof(responseStatus);
+      WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,
+                          &responseStatus,&responseStatusBytes,WINHTTP_NO_HEADER_INDEX);
+      if (responseStatus >= 400) {
+        if (responseOut) *responseOut = "";
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+      }
       if (expectResponse) {
         bool readResult = true;
         if (lineCallback) {
