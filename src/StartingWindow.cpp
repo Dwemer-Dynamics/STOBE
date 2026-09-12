@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include "StartingWindow.h"
 #include "Globals.h"
 #include "AiNpcInfoWindow.h"
@@ -152,7 +153,41 @@ void OnStartingGenerateLogsClick(MyGUI::Widget *) {
 }
 } // namespace
 
+void OnInteractionClick(MyGUI::Widget *) {
+  Stobe::Interaction::Toggle();
+  RefreshInteractionUI();
+}
+
+void RefreshInteractionUI() {
+  const int state = Stobe::Interaction::Status();
+  const std::string caption = state == 1 ? "Stobe: On" : state == 0 ? "Stobe: Off"
+      : state == 2 ? "Stobe: Syncing..." : "Stobe is off. Retry";
+  MyGUI::Window *windows[] = {g_startingWindow, g_settingsWindow};
+  const char *names[] = {"Stobe_Interaction", "Stobe_SettingsInteraction"};
+  for (int i = 0; i < 2; ++i) {
+    if (!windows[i]) continue;
+    MyGUI::Widget *widget = windows[i]->getClientWidget()->findWidget(names[i]);
+    if (!widget) continue;
+    MyGUI::Button *button = widget->castType<MyGUI::Button>();
+    button->setCaption(WideFromUtf8(caption).c_str());
+    button->setEnabled(state != 2);
+    button->setTextColour(state == 1 ? MyGUI::Colour(0.25f, 1.f, 0.35f) : MyGUI::Colour(1.f, 0.25f, 0.25f));
+  }
+  if (g_startingWindow) {
+    MyGUI::TextBox *hint = g_startingWindow->getClientWidget()->findWidget("Stobe_StartingHotkeys")->castType<MyGUI::TextBox>();
+    if (state != 1) {
+      hint->setCaption(WideFromUtf8(state == 3 ? "Could not sync. Stobe is off.\nGame events are still recorded."
+          : "AI dialogue and actions are off.\nGame events are still recorded.").c_str());
+      hint->setTextColour(MyGUI::Colour(1.f, 0.25f, 0.25f));
+    }
+  }
+}
+
 void UpdateSupportReportUI() {
+  Stobe::Interaction::Update();
+  static int previousState = -1;
+  const int state = Stobe::Interaction::Status();
+  if (state != previousState) { previousState = state; RefreshStartingUI(); RefreshInteractionUI(); }
   if (!SupportReportLauncher::TakeResult(g_reportStatus)) return;
   RefreshStartingUI();
   GameWorld *world = GetWorldSafe();
@@ -271,28 +306,33 @@ void CreateStartingUI() {
   hotkeyLabel->setTextColour(MyGUI::Colour(1.0f, 0.86f, 0.20f));
   hotkeyLabel->setTextAlign(MyGUI::Align::Center);
 
+  MyGUI::Button *interaction = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.05f, 0.18f, 0.9f, 0.075f,
+      MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_Interaction");
+  interaction->eventMouseButtonClick += MyGUI::newDelegate(OnInteractionClick);
+
   MyGUI::Button *aiNpcsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.18f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.265f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiNpcsBtn");
   aiNpcsBtn->setCaption(WideFromUtf8(T("Stobe NPCs")).c_str());
   aiNpcsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingAiNpcsClick);
 
   MyGUI::Button *aiDiariesBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.28f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.350f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingAiDiariesBtn");
   aiDiariesBtn->setCaption(WideFromUtf8(T("Stobe Diaries")).c_str());
   aiDiariesBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingAiDiariesClick);
 
   MyGUI::Button *historyBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.38f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.435f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingHistoryBtn");
   historyBtn->setCaption(WideFromUtf8(T("Recent History")).c_str());
   historyBtn->eventMouseButtonClick +=
       MyGUI::newDelegate(OnStartingHistoryClick);
 
   MyGUI::Button *pluginSettingsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.48f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.520f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingPluginSetBtn");
   pluginSettingsBtn->setCaption(WideFromUtf8(T("Settings")).c_str());
@@ -300,12 +340,12 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingPluginSettingsClick);
 
   MyGUI::Button *logsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.58f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.605f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_GenerateLogsBtn");
   logsBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingGenerateLogsClick);
 
   MyGUI::Button *statusHudBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.68f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.690f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch,
       "Stobe_StartingStatusHudBtn");
   statusHudBtn->setCaption(
@@ -316,7 +356,7 @@ void CreateStartingUI() {
       MyGUI::newDelegate(OnStartingStatusHudClick);
 
   MyGUI::Button *welcomeBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", 0.05f, 0.78f, 0.9f, 0.085f,
+      "Kenshi_Button1", 0.05f, 0.775f, 0.9f, 0.075f,
       MyGUI::Align::Top | MyGUI::Align::HStretch, "Stobe_StartingWelBtn");
   welcomeBtn->setCaption(WideFromUtf8(T("MOTD")).c_str());
   welcomeBtn->eventMouseButtonClick += MyGUI::newDelegate(OnStartingWelcomeClick);
@@ -328,6 +368,7 @@ void CreateStartingUI() {
   status->setEditMultiLine(true);
   status->setEditWordWrap(true);
   RefreshStartingUI();
+  RefreshInteractionUI();
   Log("UI: starting window created.");
 }
 

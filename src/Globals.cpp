@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include "Globals.h"
 #include "AudioPlayback.h"
 #include "Comm.h"
@@ -235,7 +236,7 @@ LONG GetChatInterruptGeneration() {
 }
 
 bool IsChatInterruptGenerationCurrent(LONG generation) {
-  return generation == GetChatInterruptGeneration();
+  return Stobe::Interaction::Allowed() && generation == GetChatInterruptGeneration();
 }
 
 void MarkAnimalActivated(unsigned int serial) {
@@ -325,14 +326,14 @@ std::map<unsigned int, TravelTarget> SnapshotTravelTargets() {
   return copy;
 }
 
-LONG BeginChatInterruptGeneration() {
+LONG BeginChatInterruptGeneration(bool interruptPlaying) {
   LONG generation = InterlockedIncrement(&g_chatInterruptGeneration);
   std::set<std::string> cancelledUtterances;
 
   InterlockedExchange(&g_playerTtsBarrierGeneration, 0);
   InterlockedExchange(&g_playerTtsBarrierStartTick, 0);
 
-  InterruptTtsPlayback();
+  if (interruptPlaying) InterruptTtsPlayback();
 
   EnterCriticalSection(&g_msgMutex);
   g_messageQueue.erase(
@@ -357,9 +358,9 @@ LONG BeginChatInterruptGeneration() {
   EnterCriticalSection(&g_uiMutex);
   g_uiActionQueue.erase(
       std::remove_if(g_uiActionQueue.begin(), g_uiActionQueue.end(),
-                     [&cancelledUtterances](const QueuedAction &act) -> bool {
+                     [&cancelledUtterances, interruptPlaying](const QueuedAction &act) -> bool {
                        bool shouldRemove =
-                           act.type == ACT_SAY || act.type == ACT_PLAY_TTS || act.directorAction;
+                           !interruptPlaying || act.type == ACT_SAY || act.type == ACT_PLAY_TTS || act.directorAction;
                        if (shouldRemove && !act.utteranceId.empty()) {
                          cancelledUtterances.insert(act.utteranceId);
                        }
@@ -371,8 +372,10 @@ LONG BeginChatInterruptGeneration() {
   EnterCriticalSection(&g_stateMutex);
   g_nextSpeechActionTick = 0;
   g_lastRechatDispatchTick = 0;
-  g_followTargets.clear();
-  g_travelTargets.clear();
+  if (interruptPlaying) {
+    g_followTargets.clear();
+    g_travelTargets.clear();
+  }
   LeaveCriticalSection(&g_stateMutex);
 
   if (!cancelledUtterances.empty()) {
