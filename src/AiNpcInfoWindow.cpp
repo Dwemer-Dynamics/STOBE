@@ -1,4 +1,5 @@
 #include "AiNpcInfoWindow.h"
+#include "Interaction.h"
 #include "AudioPlayback.h"
 #include "Comm.h"
 #include "Globals.h"
@@ -45,6 +46,7 @@ int g_aiDiaryAudioState = 0;
 struct AiDiaryAudioTask {
   std::string entryId;
   LONG generation;
+  LONG interactionEpoch;
 };
 
 LONG CurrentAiDiaryAudioGeneration() {
@@ -647,11 +649,12 @@ DWORD WINAPI AiDiaryAudioThread(LPVOID lpParam) {
   AiDiaryAudioTask *task = static_cast<AiDiaryAudioTask *>(lpParam);
   std::string entryId = task->entryId;
   LONG generation = task->generation;
+  LONG interactionEpoch = task->interactionEpoch;
   delete task;
 
   std::string response = PostToStobeWithResponse(
       L"/diary_audio", "{\"rowid\":" + entryId + "}");
-  if (generation != CurrentAiDiaryAudioGeneration()) {
+  if (generation != CurrentAiDiaryAudioGeneration() || !Interaction::IsCurrent(interactionEpoch)) {
     return 0;
   }
 
@@ -692,6 +695,7 @@ DWORD WINAPI AiDiaryAudioThread(LPVOID lpParam) {
 }
 
 void OnAiDiaryAudioClick(MyGUI::Widget *sender) {
+  if (!Interaction::ManualInputAllowed()) return;
   if (g_aiDiaryPendingEntry.empty()) {
     return;
   }
@@ -711,6 +715,7 @@ void OnAiDiaryAudioClick(MyGUI::Widget *sender) {
   AiDiaryAudioTask *task = new AiDiaryAudioTask();
   task->entryId = g_aiDiaryPendingEntry;
   task->generation = generation;
+  task->interactionEpoch = Interaction::Epoch();
   StartUiWorker(AiDiaryAudioThread, task, "diary audio");
 }
 

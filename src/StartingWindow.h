@@ -10,6 +10,8 @@ void CreateStartingUI();
 void CloseStartingUI();
 void RefreshStartingUI();
 void UpdateSupportReportUI();
+void RefreshInteractionUI();
+void OnInteractionClick(MyGUI::Widget *sender);
 void CloseStobeChildWindows();
 void CloseAllStobeMenuUI();
 bool IsAnyStobeMenuUIOpen();

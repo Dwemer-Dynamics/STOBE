@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include <deque>
 #include <map>
 #include <set>
@@ -131,6 +132,7 @@ void LogGameEvent(const std::string &type, const std::string &actor,
 std::string BuildLocalEventPeople(Character *anchor);
 
 struct QueuedAction {
+  LONG interactionEpoch;
   ActionType type;
   hand actor;
   hand target;
@@ -147,7 +149,7 @@ struct QueuedAction {
   std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
-      : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
+      : interactionEpoch(Stobe::Interaction::Epoch()), type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
         proximityMoveIssued(false), narratorNotification(false),
         allowUnavailableSpeech(false), directorAction(false) {}
 };
@@ -206,7 +208,7 @@ GameWorld *GetWorldSafe();
 
 // Increments generation, flushes stale chat/TTS queue entries, and interrupts
 // active TTS playback. Returns the new generation token.
-LONG BeginChatInterruptGeneration();
+LONG BeginChatInterruptGeneration(bool interruptPlaying = true);
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
 void BeginPlayerTtsPlaybackBarrier(LONG generation);

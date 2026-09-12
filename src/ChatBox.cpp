@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include "ChatBox.h"
 #include "AudioPlayback.h"
 #include "Comm.h"
@@ -3858,6 +3859,7 @@ void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
 void SubmitChatTextForCurrentContext(const std::string &submittedText,
                                      bool fromVoice) {
+  if (!Stobe::Interaction::ManualInputAllowed()) return;
   std::string text = submittedText;
   if (text.empty())
     return;
@@ -4833,6 +4835,7 @@ void OnRenameWindowButtonPressed(MyGUI::Window *sender,
 }
 
 void OnBoredEventClick(MyGUI::Widget *sender) {
+  if (!Stobe::Interaction::ManualInputAllowed()) return;
   GameWorld *world = GetWorldSafe();
   std::string targetName = TrimChatLine(g_chatTargetNameStr);
   std::string targetSerial = TrimChatLine(g_chatTargetHandleStr);
@@ -4946,6 +4949,7 @@ void OnBoredEventClick(MyGUI::Widget *sender) {
 }
 
 void OnWriteDiaryClick(MyGUI::Widget *sender) {
+  if (!Stobe::Interaction::ManualInputAllowed()) return;
   GameWorld *world = GetWorldSafe();
   if (!world || !world->player ||
       !world->player->selectedCharacter.isValid()) {
@@ -5037,6 +5041,7 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
 }
 
 void OnWriteNarratorDiaryClick(MyGUI::Widget *sender) {
+  if (!Stobe::Interaction::ManualInputAllowed()) return;
   GameWorld *world = GetWorldSafe();
   Character *player = nullptr;
   if (world && world->player && world->player->playerCharacters.size() > 0) {
@@ -5091,6 +5096,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredListenerName,
                        const std::string &preferredListenerSerial,
                        const std::string &direction) {
+  if (!Stobe::Interaction::Allowed()) return false;
   if (!forceDirectorMode && IsDirectorSceneActive()) return false;
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return false;

@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(Stobe VERSION 1.2.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
@@ -75,6 +75,7 @@ add_library(Stobe SHARED
   src/ChatUI.cpp
   src/ChatUIGlobals.cpp
   src/ChatBox.cpp
+  src/Interaction.cpp
   src/Comm.cpp
   src/Context.cpp
   src/DialogueMenuTts.cpp

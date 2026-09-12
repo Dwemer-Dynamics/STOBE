@@ -1,3 +1,4 @@
+#include "Interaction.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? This project has strict threading and memory safety rules.
 #include <string>
@@ -8775,6 +8776,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
     while (!g_messageQueue.empty()) {
       std::string msg = g_messageQueue.front();
       g_messageQueue.pop_front();
+      if (!Stobe::Interaction::Allowed() && (msg.find("NPC_SAY: ") == 0
+          || msg.find("NPC_ACTION: ") == 0 || msg.find("PLAYER_TTS: ") == 0)) continue;
       std::string autonomyDecisionId;
       const bool autonomyCatalogMessage =
           ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);

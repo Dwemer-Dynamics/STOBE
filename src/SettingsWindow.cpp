@@ -1,3 +1,5 @@
+#include "Interaction.h"
+#include "StartingWindow.h"
 #include "SettingsWindow.h"
 #include "AudioPlayback.h"
 #include "ChatBox.h"
@@ -748,6 +750,11 @@ void CreateSettingsUI() {
       "Kenshi_Button1", 0.05f, y, 0.28f, toggleH,
       MyGUI::Align::Top | MyGUI::Align::Left,
       "Stobe_Plugin_NpcRenameToggle");
+  MyGUI::Button *interaction = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", 0.36f, y, 0.59f, toggleH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_SettingsInteraction");
+  interaction->eventMouseButtonClick += MyGUI::newDelegate(OnInteractionClick);
+  RefreshInteractionUI();
   g_npcRenameToggle->eventMouseButtonClick +=
       MyGUI::newDelegate(OnPluginNpcRenameToggleClick);
   y += toggleRowGap;

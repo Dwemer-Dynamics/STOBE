@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include "PlaythroughNotices.h"
 #include "Functions.h"
 #include "AudioPlayback.h"
@@ -6644,6 +6645,12 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
     while (!g_uiActionQueue.empty() && remainingThisFrame-- > 0) {
       DWORD nowTick = GetTickCount();
       const QueuedAction &nextAction = g_uiActionQueue.front();
+      if (!Stobe::Interaction::IsCurrent(nextAction.interactionEpoch)
+          && (nextAction.type != ACT_NOTIFY || nextAction.narratorNotification)) {
+        if (!nextAction.utteranceId.empty()) PostSpeechDeliveryState(nextAction.utteranceId, "cancelled");
+        g_uiActionQueue.pop_front();
+        continue;
+      }
       bool nextActionIsSpeech =
           nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS ||
           (nextAction.type == ACT_NOTIFY &&
