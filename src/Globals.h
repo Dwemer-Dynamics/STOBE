@@ -49,7 +49,6 @@ extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;
 extern bool g_enableStatusHud;
 extern bool g_enableNpcRename;
-extern int g_dynamicProfileIntervalHours;
 extern std::string g_narratorDisplayName;
 
 // State tracking for inventory/debugger

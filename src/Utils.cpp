@@ -590,24 +590,6 @@ void LoadStobeRuntimeConfig() {
   } else if (g_boredEventIntervalHours > 720) {
     g_boredEventIntervalHours = 720;
   }
-  int dynamicProfileIntervalHours = ReadLayeredIniInt(
-      baseIniPath, customIniPath, "Settings", "DynamicProfileIntervalHours", -1);
-  if (dynamicProfileIntervalHours < 1) {
-    int legacyIntervalMinutes =
-        ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
-                          "DynamicProfileIntervalMinutes", 24 * 60);
-    if (legacyIntervalMinutes < 1) {
-      legacyIntervalMinutes = 60;
-    }
-    dynamicProfileIntervalHours = (legacyIntervalMinutes + 59) / 60;
-  }
-  g_dynamicProfileIntervalHours = dynamicProfileIntervalHours;
-  if (g_dynamicProfileIntervalHours < 1) {
-    g_dynamicProfileIntervalHours = 1;
-  } else if (g_dynamicProfileIntervalHours > 720) {
-    g_dynamicProfileIntervalHours = 720;
-  }
-
   g_enableBoredEvents =
       ReadLayeredIniInt(baseIniPath, customIniPath, "Settings",
                         "EnableBoredEventConversations", 1) != 0;
@@ -631,8 +613,6 @@ void LoadStobeRuntimeConfig() {
        ", StatusHud=" + (g_enableStatusHud ? "true" : "false") +
        ", NpcRename=" + (g_enableNpcRename ? "true" : "false") +
       ", BoredEventTimer=" + ToString(g_boredEventIntervalHours) + "h" +
-      ", DynamicProfileInterval=" + ToString(g_dynamicProfileIntervalHours) +
-      "h" +
       ", AnimalTalks=" + (g_enableAnimalTalks ? "true" : "false") +
       ", NearestSpeaker=" +
       (g_useNearestPlayerSpeaker ? "true" : "false") +
@@ -700,9 +680,6 @@ void SaveStobeRuntimeConfig() {
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "BoredEventTimerHours",
                              ToString(g_boredEventIntervalHours).c_str(),
-                             iniPath.c_str());
-  WritePrivateProfileStringA("Settings", "DynamicProfileIntervalHours",
-                             ToString(g_dynamicProfileIntervalHours).c_str(),
                              iniPath.c_str());
   WritePrivateProfileStringA("Settings", "EnableBoredEventConversations",
                              g_enableBoredEvents ? "1" : "0", iniPath.c_str());
