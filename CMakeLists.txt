@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 1.2.3 LANGUAGES CXX)
+project(Stobe VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
