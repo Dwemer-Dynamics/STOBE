@@ -1571,10 +1571,6 @@ static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
 static const DWORD kNpcWorldEventWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
-static bool g_dynamicProfileIntervalSyncHasValue = false;
-static int g_dynamicProfileIntervalSyncLastValue = 0;
-static DWORD g_dynamicProfileIntervalSyncLastSentTick = 0;
-static const DWORD kDynamicProfileIntervalResendIntervalMs = 5 * 60 * 1000;
 static const DWORD kSelectionContextDebounceMs = 1500;
 static const DWORD kSelectionContextMinIntervalMs = 8000;
 static std::map<unsigned int, PendingMedicalItemUseState>
@@ -2437,13 +2433,6 @@ static void ResetPlayerCatsSyncState() {
   LeaveCriticalSection(&g_stateMutex);
 }
 
-static void ResetDynamicProfileIntervalSyncState() {
-  EnterCriticalSection(&g_stateMutex);
-  g_dynamicProfileIntervalSyncHasValue = false;
-  g_dynamicProfileIntervalSyncLastValue = 0;
-  g_dynamicProfileIntervalSyncLastSentTick = 0;
-  LeaveCriticalSection(&g_stateMutex);
-}
 
 static void ResetPlayerSquadsSyncState() {
   EnterCriticalSection(&g_stateMutex);
@@ -2669,47 +2658,6 @@ static bool SyncPlayerCatsValue(Character *player, bool force,
   return true;
 }
 
-static bool SyncDynamicProfileIntervalToConfOpts(bool force,
-                                                 const std::string &reason) {
-  int intervalHours = g_dynamicProfileIntervalHours;
-  if (intervalHours < 1) {
-    intervalHours = 1;
-  } else if (intervalHours > 720) {
-    intervalHours = 720;
-  }
-
-  DWORD nowTick = GetTickCount();
-  bool shouldSend = false;
-  bool changed = false;
-  DWORD sinceLastSent = 0;
-  EnterCriticalSection(&g_stateMutex);
-  changed = (!g_dynamicProfileIntervalSyncHasValue ||
-             intervalHours != g_dynamicProfileIntervalSyncLastValue);
-  sinceLastSent = g_dynamicProfileIntervalSyncHasValue
-                      ? (nowTick - g_dynamicProfileIntervalSyncLastSentTick)
-                      : 0;
-  if (force || !g_dynamicProfileIntervalSyncHasValue || changed ||
-      sinceLastSent >= kDynamicProfileIntervalResendIntervalMs) {
-    shouldSend = true;
-    g_dynamicProfileIntervalSyncHasValue = true;
-    g_dynamicProfileIntervalSyncLastValue = intervalHours;
-    g_dynamicProfileIntervalSyncLastSentTick = nowTick;
-  }
-  LeaveCriticalSection(&g_stateMutex);
-
-  if (!shouldSend) {
-    return false;
-  }
-
-  std::string payload =
-      "{\"id\":\"DYNAMIC_PROFILE_INTERVAL_HOURS\",\"value\":\"" +
-      ToString(intervalHours) + "\",\"only_if_changed\":true}";
-  AsyncPostToStobe(L"/conf_opts", payload);
-  Log("DYNAMIC_PROFILE_SYNC: sent interval_hours=" +
-      ToString(intervalHours) + " changed=" +
-      std::string(changed ? "1" : "0") + " reason=" + reason);
-  return true;
-}
 
 static bool SyncPluginVersionToConfOpts(bool force, const std::string &reason) {
   const std::string pluginVersion =
@@ -12932,7 +12880,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInfoLocTelemetryDigest = "";
       ResetPortraitSyncState();
       ResetPlayerCatsSyncState();
-      ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       ResetTownKnowledgeSyncState();
@@ -13713,7 +13660,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
     // Keep main thread lightweight and avoid direct world/player reads.
     // Runtime game-state sync now runs from the hooked PlayerInterface update path.
-    SyncDynamicProfileIntervalToConfOpts(false, "main_loop");
     SyncPluginVersionToConfOpts(false, "main_loop");
     Sleep(2000);
   }

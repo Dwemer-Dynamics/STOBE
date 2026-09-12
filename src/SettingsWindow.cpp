@@ -39,7 +39,6 @@ MyGUI::EditBox *g_shoutRadiusEdit = nullptr;
 MyGUI::EditBox *g_ttsVolumeEdit = nullptr;
 MyGUI::EditBox *g_boredRangeEdit = nullptr;
 MyGUI::EditBox *g_boredIntervalEdit = nullptr;
-MyGUI::EditBox *g_dynamicProfileIntervalEdit = nullptr;
 MyGUI::Button *g_autoChatToggle = nullptr;
 MyGUI::Button *g_boredEventsToggle = nullptr;
 MyGUI::Button *g_animalTalksToggle = nullptr;
@@ -273,10 +272,6 @@ void RefreshPluginSettingsUI() {
     g_boredIntervalEdit->setCaption(
         WideFromUtf8(ToString(g_boredEventIntervalHours)).c_str());
   }
-  if (g_dynamicProfileIntervalEdit) {
-    g_dynamicProfileIntervalEdit->setCaption(
-        WideFromUtf8(ToString(g_dynamicProfileIntervalHours)).c_str());
-  }
   if (g_ttsVolumeEdit) {
     g_ttsVolumeEdit->setCaption(
         WideFromUtf8(ToString(g_ttsVolumePercent)).c_str());
@@ -357,17 +352,12 @@ void OnSettingsSaveClick(MyGUI::Widget *sender) {
   int ttsVolume = ParseIntOrDefault(
       g_ttsVolumeEdit ? g_ttsVolumeEdit->getCaption() : "",
       g_ttsVolumePercent);
-  int dynamicProfileInterval = ParseIntOrDefault(
-      g_dynamicProfileIntervalEdit ? g_dynamicProfileIntervalEdit->getCaption()
-                                   : "",
-      g_dynamicProfileIntervalHours);
 
   g_proximityRadius = (float)ClampInt(talkRadius, 1, 5000);
   g_shoutRadius = (float)ClampInt(shoutRadius, 1, 5000);
   g_boredEventRange = (float)ClampInt(boredRange, 1, 5000);
   g_boredEventIntervalHours = ClampInt(boredInterval, 1, 720);
   g_ttsVolumePercent = ClampInt(ttsVolume, 0, 100);
-  g_dynamicProfileIntervalHours = ClampInt(dynamicProfileInterval, 1, 720);
 
   SaveStobeRuntimeConfig();
   if (previousTtsEnabled && !g_ttsEnabled) {
@@ -511,7 +501,6 @@ void CloseSettingsUI() {
   g_ttsVolumeEdit = nullptr;
   g_boredRangeEdit = nullptr;
   g_boredIntervalEdit = nullptr;
-  g_dynamicProfileIntervalEdit = nullptr;
   g_autoChatToggle = nullptr;
   g_boredEventsToggle = nullptr;
   g_animalTalksToggle = nullptr;
@@ -670,13 +659,7 @@ void CreateSettingsUI() {
       "Stobe_Plugin_BoredIntervalEdit");
   y += rowH + rowGap;
 
-  CreateLabel(client, labelX, y, labelW, rowH, "Dynamic Profile Timer (hours/ingame)",
-              "Stobe_Plugin_DynProfileIntervalLabel");
-  g_dynamicProfileIntervalEdit = client->createWidgetReal<MyGUI::EditBox>(
-      "Kenshi_EditBox", fieldX, y, fieldW, rowH,
-      MyGUI::Align::Top | MyGUI::Align::Left,
-      "Stobe_Plugin_DynProfileIntervalEdit");
-  y += rowH + sectionGap;
+  y += sectionGap;
 
   MyGUI::TextBox *featuresHeader =
       CreateLabel(client, labelX, y, 0.90f, sectionHeaderH, "Features",
