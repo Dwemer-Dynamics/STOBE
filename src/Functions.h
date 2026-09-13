@@ -48,3 +48,7 @@ void RejectFactionCeasefireAttack(Character *attacker, Character *target,
 void PerformLeaveSquad(Character *npc, GameWorld *world,
                        const std::string &originFaction);
 void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer);
+
+// One-time movement lifecycle on the game thread.
+void UpdateMoveToActions(GameWorld *world);
+void ResetMoveToActions();

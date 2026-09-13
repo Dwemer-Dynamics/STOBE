@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include "AudioPlayback.h"
 
 #include "Comm.h"
@@ -15,12 +16,14 @@
 
 namespace {
 struct TtsPlaybackTask {
+  LONG interactionEpoch;
   std::string hash;
   LONG generation;
   int volumePercentOverride;
   unsigned int speakerSerial;
   float playbackSpeedMultiplier;
   int owner;
+  std::string utteranceId;
 };
 
 LONG g_ttsPlaybackBusy = 0;
@@ -458,10 +461,21 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 
   std::string hash = task->hash;
   LONG generation = task->generation;
+  LONG interactionEpoch = task->interactionEpoch;
   int volumePercentOverride = task->volumePercentOverride;
   unsigned int speakerSerial = task->speakerSerial;
   float playbackSpeedMultiplier = task->playbackSpeedMultiplier;
   int owner = task->owner;
+  // Director history is committed only after the complete clip, including failure and interrupt exits.
+  struct DeliveryCompletion {
+    std::string id;
+    bool spoken;
+    DeliveryCompletion(const std::string &value) : id(value), spoken(false) {}
+    ~DeliveryCompletion() {
+      if (!id.empty() && GetSpeechDeliveryState(id) == SPEECH_DELIVERY_PENDING)
+        PostSpeechDeliveryState(id, spoken ? "spoken" : "cancelled");
+    }
+  } delivery(task->utteranceId);
   delete task;
   DWORD threadStartTick = GetTickCount();
 
@@ -545,6 +559,7 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
 #ifdef SND_SYSTEM
   playFlags |= SND_SYSTEM;
 #endif
+  if (!Stobe::Interaction::IsCurrent(interactionEpoch)) { ReleasePlaybackSlot(generation); return 0; }
   if (!PlaySoundW(wideFilePath.c_str(), NULL, playFlags)) {
     Log("TTS_PLAYBACK: PlaySound failed for hash " + hash);
     ReleasePlaybackSlot(generation);
@@ -576,13 +591,15 @@ DWORD WINAPI PlaybackThreadProc(LPVOID lpParam) {
       " interrupted=" + std::string(interrupted ? "1" : "0"));
 
   ReleasePlaybackSlot(generation);
+  delivery.spoken = !interrupted && generation == CurrentTtsPlaybackGeneration();
   return 0;
 }
 } // namespace
 
 bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
                       unsigned int speakerSerial,
-                      float playbackSpeedMultiplier, int owner) {
+                      float playbackSpeedMultiplier, int owner, const std::string &utteranceId) {
+  if (!Stobe::Interaction::Allowed()) return false;
   if (!IsHexHash(ttsHash)) {
     Log("TTS_PLAYBACK: rejected invalid hash");
     return false;
@@ -599,10 +616,12 @@ bool QueueTtsPlayback(const std::string &ttsHash, int volumePercentOverride,
   TtsPlaybackTask *task = new TtsPlaybackTask();
   task->hash = ttsHash;
   task->generation = CurrentTtsPlaybackGeneration();
+  task->interactionEpoch = Stobe::Interaction::Epoch();
   task->volumePercentOverride = volumePercentOverride;
   task->speakerSerial = speakerSerial;
   task->playbackSpeedMultiplier = playbackSpeedMultiplier;
   task->owner = owner;
+  task->utteranceId = utteranceId;
   InterlockedExchange(&g_ttsPlaybackOwner, owner);
   LONG taskGeneration = task->generation;
 

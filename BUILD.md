@@ -54,7 +54,14 @@ Snapshot root:
 
 ## KenshiLib Revision
 
-Stobe is compiled against the exact KenshiLib commit recorded in
+Stobe uses [BFrizzleFoShizzle/KenshiLib](https://github.com/BFrizzleFoShizzle/KenshiLib),
+branch `RE_Kenshi_mods`, at the exact commit recorded in
 `KENSHILIB_REVISION`. The SDK preparation step rejects a standalone KenshiLib
 checkout at any other revision so newer headers cannot be paired with an older
 runtime DLL or import library.
+
+The local SDK checkout is `third_party\kenshi\KenshiLib-BFrizzle`. Build its
+matching import library and runtime DLL with the monorepo script
+`scripts/build-stobe-mod.ps1 -SkipKenshiLibBuild:$false` before preparing the
+locked snapshot. The SDK and Stobe both require x64 v100. Do not substitute
+the old KenshiReclaimer headers, prebuilt import library, or runtime DLL.

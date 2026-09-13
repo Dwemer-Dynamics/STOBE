@@ -1,4 +1,6 @@
+#include "Interaction.h"
 #include "Comm.h"
+#include "PlaythroughNotices.h"
 #include "Globals.h"
 #include "Utils.h"
 #include <algorithm>
@@ -580,7 +582,7 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   }
 
   int timeoutMs = expectResponse ? (lineCallback ? 120000 : 60000) : 8000;
-  if (PathContains(request.path, L"/autonomy_")) {
+  if (PathContains(request.path, L"/autonomy_") || PathContains(request.path, L"/interaction.php")) {
     timeoutMs = 5000;
   }
   WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
@@ -606,6 +608,8 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
     return false;
   }
 
+  const std::wstring interactionHeaders = Stobe::Interaction::Headers();
+  WinHttpAddRequestHeaders(hRequest, interactionHeaders.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
   if (request.method == L"POST") {
     sendOk = WinHttpSendRequest(
         hRequest, L"Content-Type: application/json\r\n", (DWORD)-1L,
@@ -620,6 +624,21 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   if (sendOk) {
     if (WinHttpReceiveResponse(hRequest, NULL)) {
       UpdateNarratorDisplayNameFromResponse(hRequest);
+      wchar_t saveHeader[96] = {0}; DWORD saveHeaderBytes = sizeof(saveHeader);
+      if (WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_CUSTOM,L"X-Playthrough-Save",saveHeader,&saveHeaderBytes,WINHTTP_NO_HEADER_INDEX)) {
+        const std::wstring value(saveHeader);
+        std::string ascii;
+        for (std::size_t i=0; i<value.size(); ++i) { if (value[i] > 127) { ascii.clear(); break; } ascii.push_back(static_cast<char>(value[i])); }
+        PlaythroughNotices::Accept(ascii);
+      }
+      DWORD responseStatus = 0; DWORD responseStatusBytes = sizeof(responseStatus);
+      WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,
+                          &responseStatus,&responseStatusBytes,WINHTTP_NO_HEADER_INDEX);
+      if (responseStatus >= 400) {
+        if (responseOut) *responseOut = "";
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+      }
       if (expectResponse) {
         bool readResult = true;
         if (lineCallback) {
@@ -1041,7 +1060,7 @@ std::string BuildStreamQueryData(const std::string &eventType,
   }
   std::string packet = eventType + "|" + ToString((int)time(NULL)) + "|" +
                        ToString(gameTs) + "|" + eventData;
-  return UrlEncode(Base64Encode(packet));
+  return UrlEncode(Base64Encode(packet)) + Stobe::Interaction::Query();
 }
 
 void PostToStobe(const std::wstring &endpoint, const std::string &jsonData) {
@@ -1090,7 +1109,16 @@ bool PostToStobeWithResponseStream(const std::wstring &endpoint,
   }
 
   std::string ignoredBody;
-  return SendRawHttp(request, true, &ignoredBody, callback, userData);
+  struct GuardedStream {
+    LONG epoch;
+    StobeStreamLineCallback callback;
+    void *data;
+    static bool Receive(const std::string &line, void *context) {
+      GuardedStream *self = static_cast<GuardedStream *>(context);
+      return Stobe::Interaction::IsCurrent(self->epoch) && self->callback(line, self->data);
+    }
+  } guarded = {Stobe::Interaction::Epoch(), callback, userData};
+  return SendRawHttp(request, true, &ignoredBody, callback ? GuardedStream::Receive : NULL, &guarded);
 }
 
 void PostSpeechDeliveryState(const std::string &utteranceId,

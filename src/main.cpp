@@ -1,3 +1,4 @@
+#include "Interaction.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? This project has strict threading and memory safety rules.
 #include <string>
@@ -1456,6 +1457,7 @@ struct CombatLifecycleState {
   std::string targetFaction;
   unsigned int targetSerial;
   bool sawOpponent;
+  Ogre::Vector3 origin;
   std::map<unsigned int, CombatParticipantState> participants;
 
   CombatLifecycleState()
@@ -1536,7 +1538,8 @@ static DWORD g_lastNpcWorldEventSweepTick = 0;
 static const DWORD kNpcWorldEventSweepIntervalMs = 3000;
 static const size_t kNpcWorldEventCandidateLimit = 32;
 static const DWORD kNpcWorldEventStateRetentionMs = 10 * 60 * 1000;
-static CombatLifecycleState g_combatLifecycleState;
+static std::map<unsigned int, CombatLifecycleState> g_combatEncounters;
+static unsigned int g_nextCombatEncounterId = 1;
 static const DWORD kCombatEndGraceMs = 12 * 1000;
 static const DWORD kRecentCombatSignalMs = 8 * 1000;
 static const float kMajorDamageThreshold = 15.0f;
@@ -1559,8 +1562,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.2.3";
-static const char *kStobePluginReleaseDate = "2026-08-31";
+static const char *kStobePluginVersion = "1.3.0";
+static const char *kStobePluginReleaseDate = "2026-09-12";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -1568,10 +1571,6 @@ static const DWORD kHookHeavySyncWarmupMs = 45 * 1000;
 static const DWORD kNpcWorldEventWarmupMs = 45 * 1000;
 static const DWORD kSelectionContextStartupDelayMs = 60 * 1000;
 static const DWORD kPluginVersionResendIntervalMs = 10 * 60 * 1000;
-static bool g_dynamicProfileIntervalSyncHasValue = false;
-static int g_dynamicProfileIntervalSyncLastValue = 0;
-static DWORD g_dynamicProfileIntervalSyncLastSentTick = 0;
-static const DWORD kDynamicProfileIntervalResendIntervalMs = 5 * 60 * 1000;
 static const DWORD kSelectionContextDebounceMs = 1500;
 static const DWORD kSelectionContextMinIntervalMs = 8000;
 static std::map<unsigned int, PendingMedicalItemUseState>
@@ -2434,13 +2433,6 @@ static void ResetPlayerCatsSyncState() {
   LeaveCriticalSection(&g_stateMutex);
 }
 
-static void ResetDynamicProfileIntervalSyncState() {
-  EnterCriticalSection(&g_stateMutex);
-  g_dynamicProfileIntervalSyncHasValue = false;
-  g_dynamicProfileIntervalSyncLastValue = 0;
-  g_dynamicProfileIntervalSyncLastSentTick = 0;
-  LeaveCriticalSection(&g_stateMutex);
-}
 
 static void ResetPlayerSquadsSyncState() {
   EnterCriticalSection(&g_stateMutex);
@@ -2666,47 +2658,6 @@ static bool SyncPlayerCatsValue(Character *player, bool force,
   return true;
 }
 
-static bool SyncDynamicProfileIntervalToConfOpts(bool force,
-                                                 const std::string &reason) {
-  int intervalHours = g_dynamicProfileIntervalHours;
-  if (intervalHours < 1) {
-    intervalHours = 1;
-  } else if (intervalHours > 720) {
-    intervalHours = 720;
-  }
-
-  DWORD nowTick = GetTickCount();
-  bool shouldSend = false;
-  bool changed = false;
-  DWORD sinceLastSent = 0;
-  EnterCriticalSection(&g_stateMutex);
-  changed = (!g_dynamicProfileIntervalSyncHasValue ||
-             intervalHours != g_dynamicProfileIntervalSyncLastValue);
-  sinceLastSent = g_dynamicProfileIntervalSyncHasValue
-                      ? (nowTick - g_dynamicProfileIntervalSyncLastSentTick)
-                      : 0;
-  if (force || !g_dynamicProfileIntervalSyncHasValue || changed ||
-      sinceLastSent >= kDynamicProfileIntervalResendIntervalMs) {
-    shouldSend = true;
-    g_dynamicProfileIntervalSyncHasValue = true;
-    g_dynamicProfileIntervalSyncLastValue = intervalHours;
-    g_dynamicProfileIntervalSyncLastSentTick = nowTick;
-  }
-  LeaveCriticalSection(&g_stateMutex);
-
-  if (!shouldSend) {
-    return false;
-  }
-
-  std::string payload =
-      "{\"id\":\"DYNAMIC_PROFILE_INTERVAL_HOURS\",\"value\":\"" +
-      ToString(intervalHours) + "\",\"only_if_changed\":true}";
-  AsyncPostToStobe(L"/conf_opts", payload);
-  Log("DYNAMIC_PROFILE_SYNC: sent interval_hours=" +
-      ToString(intervalHours) + " changed=" +
-      std::string(changed ? "1" : "0") + " reason=" + reason);
-  return true;
-}
 
 static bool SyncPluginVersionToConfOpts(bool force, const std::string &reason) {
   const std::string pluginVersion =
@@ -6746,78 +6697,39 @@ static CombatCharacterObservation ObserveCombatCharacter(Character *npc,
   return observation;
 }
 
-// Tracks a player-squad encounter by its confirmed attack graph, rather than by
-// whoever happens to remain inside the original nearby-NPC scan radius.
-static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
-  if (!world || !world->player) {
-    return;
-  }
-
-  std::set<unsigned int> playerSquadSerials;
-  std::map<unsigned int, Character *> loadedBySerial;
-  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-    Character *member = world->player->playerCharacters[i];
-    unsigned int serial = ResolveCharacterSerialForEvent(member);
-    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
-      playerSquadSerials.insert(serial);
-      loadedBySerial[serial] = member;
-    }
-  }
-  try {
-    const ogre_unordered_set<Character *>::type &loadedCharacters =
-        world->getCharacterUpdateList();
-    for (ogre_unordered_set<Character *>::type::const_iterator it =
-             loadedCharacters.begin();
-         it != loadedCharacters.end(); ++it) {
-      Character *candidate = *it;
-      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
-      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
-        loadedBySerial[serial] = candidate;
-      }
-    }
-  } catch (...) {
-  }
-
-  Character *seedActor = nullptr;
+// Follow only this encounter's local attack graph.
+static void UpdateLocalCombatEncounter(
+    CombatLifecycleState &combatState, Character *seedActor, DWORD nowTick,
+    const std::map<unsigned int, Character *> &loadedBySerial,
+    const std::set<unsigned int> &playerSquadSerials,
+    std::set<unsigned int> &claimed) {
   Character *seedTarget = nullptr;
-  if (!g_combatLifecycleState.active) {
-    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-      Character *member = world->player->playerCharacters[i];
-      CombatCharacterObservation observation =
-          ObserveCombatCharacter(member, nowTick);
-      if (!observation.evidence) {
-        continue;
-      }
-      seedActor = member;
-      seedTarget = observation.attackTarget;
-      if (!seedTarget && !observation.attackers.empty()) {
-        seedTarget = observation.attackers[0];
-      }
-      break;
+  if (!combatState.active) {
+    CombatCharacterObservation observation = ObserveCombatCharacter(seedActor, nowTick);
+    seedTarget = observation.attackTarget;
+    if (!seedTarget && !observation.attackers.empty()) {
+      seedTarget = observation.attackers[0];
     }
-    if (!seedActor) {
-      return;
-    }
-
-    g_combatLifecycleState.active = true;
-    g_combatLifecycleState.startedTick = nowTick;
-    g_combatLifecycleState.lastObservedTick = nowTick;
-    g_combatLifecycleState.actorName = ResolveCharacterNameSafe(seedActor);
-    g_combatLifecycleState.actorFaction = SafeFaction(seedActor);
-    g_combatLifecycleState.actorSerial =
+    combatState.origin = seedActor->getPosition();
+    combatState.active = true;
+    combatState.startedTick = nowTick;
+    combatState.lastObservedTick = nowTick;
+    combatState.actorName = ResolveCharacterNameSafe(seedActor);
+    combatState.actorFaction = SafeFaction(seedActor);
+    combatState.actorSerial =
         ResolveCharacterSerialForEvent(seedActor);
     if (seedTarget && (uintptr_t)seedTarget >= 0x1000) {
-      g_combatLifecycleState.targetName = ResolveCharacterNameSafe(seedTarget);
-      g_combatLifecycleState.targetFaction = SafeFaction(seedTarget);
-      g_combatLifecycleState.targetSerial =
+      combatState.targetName = ResolveCharacterNameSafe(seedTarget);
+      combatState.targetFaction = SafeFaction(seedTarget);
+      combatState.targetSerial =
           ResolveCharacterSerialForEvent(seedTarget);
     }
-    LogGameEvent("combat_start", g_combatLifecycleState.actorName,
-                 g_combatLifecycleState.actorFaction,
-                 g_combatLifecycleState.targetName,
-                 g_combatLifecycleState.targetFaction,
-                 "entered active combat", g_combatLifecycleState.actorSerial,
-                 g_combatLifecycleState.targetSerial);
+    LogGameEvent("combat_start", combatState.actorName,
+                 combatState.actorFaction,
+                 combatState.targetName,
+                 combatState.targetFaction,
+                 "entered active combat", combatState.actorSerial,
+                 combatState.targetSerial);
   }
 
   std::vector<Character *> queue;
@@ -6827,19 +6739,12 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
     QueueCombatCharacter(seedActor, queue, queuedSerials);
   } else {
     for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
-             g_combatLifecycleState.participants.begin();
-         it != g_combatLifecycleState.participants.end(); ++it) {
+             combatState.participants.begin();
+         it != combatState.participants.end(); ++it) {
       std::map<unsigned int, Character *>::const_iterator loadedIt =
           loadedBySerial.find(it->first);
       if (loadedIt != loadedBySerial.end()) {
         QueueCombatCharacter(loadedIt->second, queue, queuedSerials);
-      }
-    }
-    // A squad member can join or resume the same player-centric encounter.
-    for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
-      Character *member = world->player->playerCharacters[i];
-      if (ObserveCombatCharacter(member, nowTick).evidence) {
-        QueueCombatCharacter(member, queue, queuedSerials);
       }
     }
   }
@@ -6848,12 +6753,14 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   for (size_t queueIndex = 0; queueIndex < queue.size(); ++queueIndex) {
     Character *npc = queue[queueIndex];
     unsigned int serial = ResolveCharacterSerialForEvent(npc);
-    if (serial == 0) {
+    if (serial == 0 || claimed.count(serial) != 0 ||
+        npc->getPosition().distance(combatState.origin) > 600.0f) {
       continue;
     }
+    claimed.insert(serial);
     CombatCharacterObservation observation = ObserveCombatCharacter(npc, nowTick);
     CombatParticipantState &participant =
-        g_combatLifecycleState.participants[serial];
+        combatState.participants[serial];
     participant.name = ResolveCharacterNameSafe(npc);
     participant.faction = SafeFaction(npc);
     participant.playerSide = participant.playerSide ||
@@ -6864,11 +6771,11 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
     participant.lastSeenTick = nowTick;
 
     if (!participant.playerSide) {
-      g_combatLifecycleState.sawOpponent = true;
-      if (g_combatLifecycleState.targetSerial == 0) {
-        g_combatLifecycleState.targetName = participant.name;
-        g_combatLifecycleState.targetFaction = participant.faction;
-        g_combatLifecycleState.targetSerial = serial;
+      combatState.sawOpponent = true;
+      if (combatState.targetSerial == 0) {
+        combatState.targetName = participant.name;
+        combatState.targetFaction = participant.faction;
+        combatState.targetSerial = serial;
       }
     }
 
@@ -6883,10 +6790,10 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   }
 
   if (combatObserved) {
-    g_combatLifecycleState.lastObservedTick = nowTick;
+    combatState.lastObservedTick = nowTick;
     return;
   }
-  if (nowTick - g_combatLifecycleState.lastObservedTick < kCombatEndGraceMs) {
+  if (nowTick - combatState.lastObservedTick < kCombatEndGraceMs) {
     return;
   }
 
@@ -6895,10 +6802,10 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   int fledCount = 0;
   int friendlyStanding = 0;
   int opponentStanding = 0;
-  bool lostTracking = !g_combatLifecycleState.sawOpponent;
+  bool lostTracking = !combatState.sawOpponent;
   for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
-           g_combatLifecycleState.participants.begin();
-       it != g_combatLifecycleState.participants.end(); ++it) {
+           combatState.participants.begin();
+       it != combatState.participants.end(); ++it) {
     const CombatParticipantState &participant = it->second;
     if (participant.dead) {
       ++deadCount;
@@ -6936,26 +6843,98 @@ static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
   }
 
   DWORD durationSeconds =
-      (nowTick - g_combatLifecycleState.startedTick + 500) / 1000;
+      (nowTick - combatState.startedTick + 500) / 1000;
   if (durationSeconds < 1) {
     durationSeconds = 1;
   }
   std::string message =
       "combat ended after " + ToString((int)durationSeconds) +
       " seconds (outcome: " + outcome + "; participants: " +
-      ToString((int)g_combatLifecycleState.participants.size()) +
+      ToString((int)combatState.participants.size()) +
       "; friendly side standing: " + ToString(friendlyStanding) +
       "; opponents standing: " + ToString(opponentStanding) +
       "; knocked out: " + ToString(unconsciousCount) +
       "; dead: " + ToString(deadCount) + "; fled: " +
       ToString(fledCount) + ")";
-  LogGameEvent("combat_end", g_combatLifecycleState.actorName,
-               g_combatLifecycleState.actorFaction,
-               g_combatLifecycleState.targetName,
-               g_combatLifecycleState.targetFaction, message,
-               g_combatLifecycleState.actorSerial,
-               g_combatLifecycleState.targetSerial);
-  g_combatLifecycleState = CombatLifecycleState();
+  // Ending a fight must not give its outcome to people the seed actor later visits.
+  Character *localAnchor = nullptr;
+  for (std::map<unsigned int, CombatParticipantState>::const_iterator it =
+           combatState.participants.begin(); it != combatState.participants.end(); ++it) {
+    std::map<unsigned int, Character *>::const_iterator loaded = loadedBySerial.find(it->first);
+    if (loaded != loadedBySerial.end() &&
+        loaded->second->getPosition().distance(combatState.origin) <= 600.0f) {
+      localAnchor = loaded->second;
+      break;
+    }
+  }
+  std::string endPeople = BuildLocalEventPeople(localAnchor);
+  LogGameEvent("combat_end", combatState.actorName,
+               combatState.actorFaction,
+               combatState.targetName,
+               combatState.targetFaction, message,
+               combatState.actorSerial,
+               combatState.targetSerial, &endPeople,
+               ResolveCharacterSerialForEvent(localAnchor));
+  combatState.active = false;
+
+}
+
+// Keep disconnected battles in separate local encounters; never seed from all squads
+// into an existing fight. The claimed set also bounds work to one visit per actor.
+static void UpdateCombatLifecycleEvent(GameWorld *world, DWORD nowTick) {
+  if (!world || !world->player) {
+    return;
+  }
+  std::set<unsigned int> playerSquadSerials;
+  std::map<unsigned int, Character *> loadedBySerial;
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (member && (uintptr_t)member >= 0x1000 && serial != 0) {
+      playerSquadSerials.insert(serial);
+      loadedBySerial[serial] = member;
+    }
+  }
+  try {
+    const ogre_unordered_set<Character *>::type &loadedCharacters =
+        world->getCharacterUpdateList();
+    for (ogre_unordered_set<Character *>::type::const_iterator it =
+             loadedCharacters.begin();
+         it != loadedCharacters.end(); ++it) {
+      Character *candidate = *it;
+      unsigned int serial = ResolveCharacterSerialForEvent(candidate);
+      if (candidate && (uintptr_t)candidate >= 0x1000 && serial != 0) {
+        loadedBySerial[serial] = candidate;
+      }
+    }
+  } catch (...) {
+  }
+
+  std::set<unsigned int> claimed;
+  for (std::map<unsigned int, CombatLifecycleState>::iterator it =
+           g_combatEncounters.begin(); it != g_combatEncounters.end();) {
+    UpdateLocalCombatEncounter(it->second, nullptr, nowTick, loadedBySerial,
+                               playerSquadSerials, claimed);
+    if (!it->second.active) {
+      it = g_combatEncounters.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+    Character *member = world->player->playerCharacters[i];
+    unsigned int serial = ResolveCharacterSerialForEvent(member);
+    if (serial == 0 || claimed.count(serial) != 0 ||
+        !ObserveCombatCharacter(member, nowTick).evidence) {
+      continue;
+    }
+    // The same character may leave one ongoing fight and enter another.
+    while (g_combatEncounters.count(g_nextCombatEncounterId) != 0) {
+      ++g_nextCombatEncounterId;
+    }
+    UpdateLocalCombatEncounter(g_combatEncounters[g_nextCombatEncounterId++], member, nowTick,
+                               loadedBySerial, playerSquadSerials, claimed);
+  }
 
   for (std::map<unsigned int, DWORD>::iterator it =
            g_recentCombatSignalTickBySerial.begin();
@@ -8745,11 +8724,18 @@ void ProcessMessageQueue(GameWorld *thisptr) {
     while (!g_messageQueue.empty()) {
       std::string msg = g_messageQueue.front();
       g_messageQueue.pop_front();
+      if (!Stobe::Interaction::Allowed() && (msg.find("NPC_SAY: ") == 0
+          || msg.find("NPC_ACTION: ") == 0 || msg.find("PLAYER_TTS: ") == 0)) continue;
       std::string autonomyDecisionId;
       const bool autonomyCatalogMessage =
           ClaimPendingAutonomyCatalogMessageLocked(msg, autonomyDecisionId);
       size_t autonomyQueueSizeBefore = 0;
-      if (autonomyCatalogMessage) {
+      const std::string directorMarker = " [DIRECTOR_ACTION]";
+      const bool directorAction = msg.find("NPC_ACTION: ") == 0 &&
+          msg.size() >= directorMarker.size() &&
+          msg.compare(msg.size() - directorMarker.size(), directorMarker.size(), directorMarker) == 0;
+      if (directorAction) msg.erase(msg.size() - directorMarker.size());
+      if (autonomyCatalogMessage || directorAction) {
         EnterCriticalSection(&g_uiMutex);
         autonomyQueueSizeBefore = g_uiActionQueue.size();
         LeaveCriticalSection(&g_uiMutex);
@@ -11283,6 +11269,17 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             thisptr->showPlayerAMessage_withLog(
                 "Spawn item action is currently disabled.", true);
             continue;
+          } else if (actionCommand == "MOVE_TO" || actionCommand == "MOVETO") {
+            if (!targetHand.isValid()) {
+              continue;
+            }
+            QueuedAction act;
+            act.type = ACT_MOVE_TO;
+            act.actor = targetHand;
+            act.message = actionArgument;
+            EnterCriticalSection(&g_uiMutex);
+            g_uiActionQueue.push_back(act);
+            LeaveCriticalSection(&g_uiMutex);
           } else if (actionCommand == "TRAVEL_LOCATION") {
             if (!targetHand.isValid()) {
               Log("HOOK_MSG_PROC: TRAVEL_LOCATION ignored; invalid actor handle");
@@ -11667,6 +11664,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 std::string(tc ? tc->getName() : "Unknown"));
           }
         }
+      }
+      if (directorAction) {
+        EnterCriticalSection(&g_uiMutex);
+        for (size_t index = autonomyQueueSizeBefore; index < g_uiActionQueue.size(); ++index)
+          g_uiActionQueue[index].directorAction = true;
+        LeaveCriticalSection(&g_uiMutex);
       }
       if (autonomyCatalogMessage) {
         size_t tagged = 0;
@@ -12821,6 +12824,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!gui) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     Stobe::UI::ResetNpcContextRenameAction(false);
+    ResetMoveToActions();
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -12837,6 +12841,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
 
   if (!worldStable) {
     Stobe::UI::ResetNpcContextRenameAction();
+    ResetMoveToActions();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -12863,7 +12868,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_activatedAnimalSerials.clear();
       LeaveCriticalSection(&g_stateMutex);
       g_npcWorldEventStateBySerial.clear();
-      g_combatLifecycleState = CombatLifecycleState();
+      g_combatEncounters.clear();
       g_recentCombatSignalTickBySerial.clear();
       g_lastNpcWorldEventSweepTick = 0;
       g_lastInventorySweepTick = 0;
@@ -12875,7 +12880,6 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
       g_lastInfoLocTelemetryDigest = "";
       ResetPortraitSyncState();
       ResetPlayerCatsSyncState();
-      ResetDynamicProfileIntervalSyncState();
       ResetPlayerSquadsSyncState();
       ResetFactionRelationSyncState();
       ResetTownKnowledgeSyncState();
@@ -13000,6 +13004,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   Stobe::DialogueMenuTts::Update();
   Stobe::PlayerBase::Update(worldUi, sel);
   UpdateStatusHud(worldUi);
+  UpdateSupportReportUI();
 
   static bool pushToTalkWasDown = false;
   bool pushToTalkEnabled = g_pushToTalkHotkey != 0;
@@ -13189,6 +13194,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     ProcessMessageQueue(world);
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
+    UpdateMoveToActions(world);
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
@@ -13317,7 +13323,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         ((nowGameTs - g_lastBoredEventGameTs) >= intervalGamets);
 
     if (forceTrigger || periodicDue) {
-      bool speechBusy = IsTtsPlaybackActive();
+      bool speechBusy = IsTtsPlaybackActive() || IsDirectorSceneActive();
       if (speechBusy) {
         if (forceTrigger) {
           EnterCriticalSection(&g_stateMutex);
@@ -13654,7 +13660,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
     // Keep main thread lightweight and avoid direct world/player reads.
     // Runtime game-state sync now runs from the hooked PlayerInterface update path.
-    SyncDynamicProfileIntervalToConfOpts(false, "main_loop");
     SyncPluginVersionToConfOpts(false, "main_loop");
     Sleep(2000);
   }

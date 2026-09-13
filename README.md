@@ -29,7 +29,7 @@ This preserves user settings while still allowing newly added defaults to flow i
 ## Dependencies
 
 - [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi)
-- [KenshiLib](https://github.com/KenshiReclaimer/KenshiLib)
+- [KenshiLib](https://github.com/BFrizzleFoShizzle/KenshiLib)
 - [nlohmann/json](https://github.com/nlohmann/json)
 
 ## Build
