@@ -1,3 +1,7 @@
+#include "PlaythroughSession.h"
+#include <kenshi/SaveFileSystem.h>
+#include <kenshi/SaveManager.h>
+#include <kenshi/SaveInfo.h>
 #include "Interaction.h"
 // ???? AGENT PROTOCOL: Before editing this file, you MUST read PROJECT_CONTEXT.md
 // ???? This project has strict threading and memory safety rules.
@@ -12569,6 +12573,73 @@ void setChainedMode_hook(Character *npc, bool on, const hand &owner) {
     setChainedMode_orig(npc, on, owner);
 }
 
+
+// Campaign identity travels through Kenshi's save filesystem, including save-as and autosaves.
+namespace {
+const char* kCampaignFile = "stobe-playthrough.id";
+bool g_campaignHooksReady = false;
+bool (__fastcall *saveCampaignOriginal)(SaveFileSystem*, const std::string&) = NULL;
+void (__fastcall *loadCampaignOriginal)(SaveFileSystem*, const std::string&) = NULL;
+void (__fastcall *newCampaignOriginal)(SaveManager*, const std::string&) = NULL;
+void (__fastcall *importCampaignOriginal)(SaveManager*, const SaveInfo&, int) = NULL;
+
+void ReadCampaignFile(const std::string& path) {
+    std::ifstream file((path + "/" + kCampaignFile).c_str(), std::ios::binary);
+    char record[34]={0};file.read(record,sizeof(record));
+    if(file.gcount()==33 && (record[32]=='0'||record[32]=='1'))
+        PlaythroughSession::RestoreCharacter(std::string(record,32),record[32]=='1');
+}
+bool __fastcall SaveCampaign(SaveFileSystem* fs, const std::string& path) {
+    const std::string id=PlaythroughSession::Character();
+    if(PlaythroughSession::ValidId(id)) {
+        try {
+            const std::string target=fs->writeFile(kCampaignFile);
+            std::ofstream file(target.c_str(),std::ios::binary|std::ios::trunc);
+            file << id << (PlaythroughSession::NewCharacter()?'1':'0'); file.flush();
+            if(!file)Log("PLAYTHROUGH: could not persist campaign identity.");
+        } catch(...) { Log("PLAYTHROUGH: campaign identity write failed."); }
+    }
+    return saveCampaignOriginal(fs,path);
+}
+void __fastcall LoadCampaign(SaveFileSystem* fs, const std::string& path) {
+    PlaythroughSession::BeginLoad();
+    BeginChatInterruptGeneration(false);
+    Stobe::Voice::Cancel();
+    EnterCriticalSection(&g_msgMutex);g_messageQueue.clear();LeaveCriticalSection(&g_msgMutex);
+    ReadCampaignFile(path);
+    loadCampaignOriginal(fs,path);
+}
+void __fastcall NewCampaign(SaveManager* manager, const std::string& start) {
+    PlaythroughSession::BeginLoad(true);
+    BeginChatInterruptGeneration(false);
+    Stobe::Voice::Cancel();
+    EnterCriticalSection(&g_msgMutex);g_messageQueue.clear();LeaveCriticalSection(&g_msgMutex);
+    newCampaignOriginal(manager,start);
+}
+void __fastcall ImportCampaign(SaveManager* manager, const SaveInfo& save, int flags) {
+    PlaythroughSession::BeginLoad();
+    BeginChatInterruptGeneration(false);
+    Stobe::Voice::Cancel();
+    EnterCriticalSection(&g_msgMutex);g_messageQueue.clear();LeaveCriticalSection(&g_msgMutex);
+    ReadCampaignFile(save.location + "/" + save.name);
+    const std::string id=PlaythroughSession::Character();
+    const bool isNew=PlaythroughSession::NewCharacter();
+    importCampaignOriginal(manager,save,flags);
+    // Import may internally take the new-game path. Retain the source campaign identity.
+    PlaythroughSession::BeginLoad();
+    PlaythroughSession::RestoreCharacter(id,isNew);
+}
+void InstallCampaignHooks() {
+    bool ok=true;
+    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::saveGame),(void*)SaveCampaign,(void**)&saveCampaignOriginal)==KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::loadGame),(void*)LoadCampaign,(void**)&loadCampaignOriginal)==KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::newGame),(void*)NewCampaign,(void**)&newCampaignOriginal)==KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::import),(void*)ImportCampaign,(void**)&importCampaignOriginal)==KenshiLib::SUCCESS && ok;
+    g_campaignHooksReady=ok;
+    Log(ok?"PLAYTHROUGH: campaign save/load hooks ready.":"PLAYTHROUGH: campaign hooks unavailable; automatic connection blocked.");
+}
+}
+
 static bool IsWorldStableForUI(GameWorld *world) {
   if (!world || reinterpret_cast<uintptr_t>(world) < 0x10000) {
     return false;
@@ -12991,6 +13062,28 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
         Log("UI: CreateStartingUI done.");
       }
     }
+  }
+
+  if (worldUi->isLoadingFromASaveGame()) return;
+  std::string playthroughMessage;
+  if (PlaythroughSession::TakeNotice(playthroughMessage)) worldUi->showPlayerAMessage_withLog("[STOBE] " + playthroughMessage, true);
+  if (!PlaythroughSession::Allowed(PlaythroughSession::Generation())) {
+    if (!g_campaignHooksReady) return;
+    std::set<std::string> members;
+    for (size_t i=0;i<worldUi->player->playerCharacters.size();++i) {
+      Character* member=worldUi->player->playerCharacters[i];
+      if (member && members.size()<128) members.insert(member->getName());
+    }
+    std::string roster="[";
+    for(std::set<std::string>::const_iterator it=members.begin();it!=members.end();++it) {
+      if(it!=members.begin())roster+=",";roster+="\""+EscapeJSON(*it)+"\"";
+    }
+    roster+="]";
+    Character* first=worldUi->player->playerCharacters[0];
+    std::string name=SafeFactionName(first->getFaction());
+    if(name.empty() || name=="None")name="Campaign";
+    PlaythroughSession::Connect(name,ResolveCurrentGameTsSafe(worldUi),roster);
+    return;
   }
 
   bool probePostLoadPipeline = !postLoadPipelineProbed;
@@ -13647,6 +13740,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     Sleep(500);
     hLib = GetModuleHandleA("KenshiLib.dll");
   }
+  InstallCampaignHooks();
   ppWorld = (GameWorld **)GetProcAddress(hLib, "?ou@@3PEAVGameWorld@@EA");
   if (!ppWorld)
     return 1;

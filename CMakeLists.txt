@@ -77,6 +77,7 @@ add_library(Stobe SHARED
   src/ChatBox.cpp
   src/Interaction.cpp
   src/Comm.cpp
+  src/PlaythroughSession.cpp
   src/Context.cpp
   src/DialogueMenuTts.cpp
   src/Functions.cpp

@@ -1,3 +1,4 @@
+#include "PlaythroughSession.h"
 #include "Interaction.h"
 #include "VoiceCapture.h"
 
@@ -483,7 +484,7 @@ bool EnsureCaptureWorker(bool waitUntilReady) {
       InterlockedExchange(&g_captureWorkerStarted, 0);
       return false;
     }
-    HANDLE thread = CreateThread(NULL, 0, CaptureWorkerThread, NULL, 0, NULL);
+    HANDLE thread = PlaythroughSession::StartTask(NULL, 0, CaptureWorkerThread, NULL, 0, NULL);
     if (!thread) {
       Log("STT_CAPTURE: could not start capture worker");
       CloseHandle(g_captureStartEvent);
