@@ -1,3 +1,4 @@
+#include "PlaythroughSession.h"
 #include "Interaction.h"
 #include "ChatBox.h"
 #include "AudioPlayback.h"
@@ -224,7 +225,7 @@ DWORD WINAPI ProfileModelRequestThread(LPVOID lpParam) {
 
 bool StartProfileModelRequest(ProfileModelRequestTask *task) {
   HANDLE thread =
-      CreateThread(NULL, 0, ProfileModelRequestThread, task, 0, NULL);
+      PlaythroughSession::StartTask(NULL, 0, ProfileModelRequestThread, task, 0, NULL);
   if (!thread) {
     if (!task->write) {
       InterlockedExchange(&g_profileModelRefreshInFlight, 0);
@@ -3050,7 +3051,7 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
   nextTask->allowUnavailableTargetSpeech = false;
 
   HANDLE followupThread =
-      CreateThread(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
+      PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, nextTask, 0, NULL);
   if (followupThread) {
     CloseHandle(followupThread);
     Log("RECHAT: dispatched follow-up speaker=" + speaker +
@@ -4535,7 +4536,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
     Log("CHAT_TIMING: PLAYER_TTS request dispatched, text_len=" +
         ToString((int)text.length()) + " gen=" + ToString((int)chatGeneration));
     HANDLE playerTtsThread =
-        CreateThread(NULL, 0, PlayerTtsResponseThread, playerTtsTask, 0, NULL);
+        PlaythroughSession::StartTask(NULL, 0, PlayerTtsResponseThread, playerTtsTask, 0, NULL);
     if (playerTtsThread) {
       CloseHandle(playerTtsThread);
     } else {
@@ -4607,7 +4608,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   streamTask->allowUnavailableTargetSpeech =
       manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
   HANDLE chatThread =
-      CreateThread(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
+      PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
     CloseHandle(chatThread);
   } else {
@@ -5024,7 +5025,7 @@ void OnWriteDiaryClick(MyGUI::Widget *sender) {
   QueueUiNotifyAction("Diary: request sent for " + targetNpcName + ".");
 
   HANDLE diaryThread =
-      CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
+      PlaythroughSession::StartTask(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
   if (diaryThread) {
     CloseHandle(diaryThread);
     Log("DIARY: manual diary trigger dispatched for selected NPC '" +
@@ -5077,7 +5078,7 @@ void OnWriteNarratorDiaryClick(MyGUI::Widget *sender) {
   task->requestStartTick = GetTickCount();
   QueueUiNotifyAction("Diary: narrator request sent.");
   HANDLE diaryThread =
-      CreateThread(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
+      PlaythroughSession::StartTask(NULL, 0, ManualDiaryResponseThread, task, 0, NULL);
   if (diaryThread) {
     CloseHandle(diaryThread);
     Log("DIARY: manual narrator diary trigger dispatched.");
@@ -5462,7 +5463,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   const LONG directorGeneration = task->generation;
   const std::string dispatchedListenerHandle = task->previousSpeakerHandle;
   if (forceDirectorMode) InterlockedExchange(&g_activeDirectorGeneration, directorGeneration);
-  HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
+  HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
     if (forceDirectorMode) InterlockedCompareExchange(&g_activeDirectorGeneration, 0, directorGeneration);
     delete task;
@@ -5538,7 +5539,7 @@ bool TriggerNarratorWelcomeOnLoad(GameWorld *world, Character *preferredSpeaker,
   task->rechatDepth = 0;
   task->allowUnavailableTargetSpeech = false;
 
-  HANDLE thread = CreateThread(NULL, 0, StreamChatResponseThread, task, 0, NULL);
+  HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
     delete task;
     Log("LOAD_SYNC: failed to start narrator welcome stream thread");
