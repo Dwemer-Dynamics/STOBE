@@ -3418,7 +3418,7 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
   state->speechUtteranceIds = ids;
   if (!valid) { PostSpeechDeliveryStates(ids, "cancelled"); return false; }
   for (size_t i = 0; i < ids.size(); ++i) TrackSpeechDeliveryState(ids[i]);
-  Log("DIRECTOR: Scene start: " + id);
+  QueueUiNotifyAction("Director scene started.");
   size_t played = 0;
   for (; played < turns.size() && IsChatInterruptGenerationCurrent(state->generation); ++played) {
     const std::string &turn = turns[played];
@@ -3448,8 +3448,7 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     std::vector<std::string> cancelled(ids.begin() + played, ids.end());
     PostSpeechDeliveryStates(cancelled, "cancelled");
   }
-  Log("DIRECTOR: Scene stop: " + id + (played == ids.size() ? " (completed)" :
-      IsChatInterruptGenerationCurrent(state->generation) ? " (failed)" : " (cancelled)"));
+  QueueUiNotifyAction("Director scene stopped.");
   return played == ids.size();
 }
 
