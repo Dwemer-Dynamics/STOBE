@@ -4,7 +4,7 @@
 
 Build from a [STOBE source checkout](https://github.com/Dwemer-Dynamics/STOBE), not an installed mod folder. Paths and commands below assume its root.
 
-- Windows, CMake 3.20 or newer, Visual Studio/MSBuild, and the MSVC 2010 x64 (`v100`) toolchain. Visual Studio 2022 may host the build, but the compiler must remain v100 for Kenshi/MyGUI ABI compatibility.
+- Windows, CMake 3.21 or newer for the Visual Studio 2022 commands below, Visual Studio/MSBuild, and the MSVC 2010 x64 (`v100`) toolchain. Visual Studio 2022 may host the build, but the compiler must remain v100 for Kenshi/MyGUI ABI compatibility.
 - [KenshiLib](https://github.com/BFrizzleFoShizzle/KenshiLib), `RE_Kenshi_mods` branch at the exact commit in `KENSHILIB_REVISION`; build its matching x64 v100 import library and runtime DLL using its instructions.
 - Matching KenshiLib headers and MyGUI/Ogre libraries, plus Boost 1.60.0 headers. Supply one coherent SDK tree; mixing headers and runtime binaries can compile successfully and fail in game.
 - Compatible [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) and its matching RVA data for runtime testing.
