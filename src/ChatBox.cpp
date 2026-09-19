@@ -3379,9 +3379,11 @@ static bool QueueStreamActionIfNew(StreamChatParseState *state,
 static bool PlayDirectorScene(StreamChatParseState *state, const std::string &scene) {
   const std::string id = JsonReadField(scene, "id");
   const int count = atoi(JsonReadField(scene, "line_count").c_str());
-  if (JsonReadField(scene, "schema") != "stobe.director_scene.v1" ||
+  const std::string schema = JsonReadField(scene, "schema");
+  const bool chunked = schema == "stobe.director_scene.v2";
+  if ((!chunked && schema != "stobe.director_scene.v1") ||
       id.length() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
-      count < 1 || count > 5 || !state->speechUtteranceIds.empty()) return false;
+      count < 1 || count > (chunked ? 128 : 5) || !state->speechUtteranceIds.empty()) return false;
   std::vector<std::string> turns;
   std::vector<std::string> ids;
   bool valid = true;
@@ -3416,6 +3418,7 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
   state->speechUtteranceIds = ids;
   if (!valid) { PostSpeechDeliveryStates(ids, "cancelled"); return false; }
   for (size_t i = 0; i < ids.size(); ++i) TrackSpeechDeliveryState(ids[i]);
+  QueueUiNotifyAction("Director scene started.");
   size_t played = 0;
   for (; played < turns.size() && IsChatInterruptGenerationCurrent(state->generation); ++played) {
     const std::string &turn = turns[played];
@@ -3440,12 +3443,12 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
       if (QueueChatPipeLine("NPC_ACTION: " + header + ": " +
           JsonReadField(turn, "action_" + ToString(a)) + " [DIRECTOR_ACTION]", state->generation)) ++state->actionCount;
     }
-    Log("DIRECTOR: spoken scene=" + id + " turn=" + ToString(static_cast<int>(played + 1)));
   }
   if (played < ids.size()) {
     std::vector<std::string> cancelled(ids.begin() + played, ids.end());
     PostSpeechDeliveryStates(cancelled, "cancelled");
   }
+  QueueUiNotifyAction("Director scene stopped.");
   return played == ids.size();
 }
 
