@@ -12629,12 +12629,31 @@ void __fastcall ImportCampaign(SaveManager* manager, const SaveInfo& save, int f
     PlaythroughSession::BeginLoad();
     PlaythroughSession::RestoreCharacter(id,isNew);
 }
-void InstallCampaignHooks() {
-    bool ok=true;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::saveGame),(void*)SaveCampaign,(void**)&saveCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::loadGame),(void*)LoadCampaign,(void**)&loadCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::newGame),(void*)NewCampaign,(void**)&newCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::import),(void*)ImportCampaign,(void**)&importCampaignOriginal)==KenshiLib::SUCCESS && ok;
+void InstallCampaignHooks(HMODULE kenshiLib) {
+    // GetRealAddress requires KenshiLib exports, not the linker stubs in Stobe.dll.
+    void *saveGame = (void *)GetProcAddress(kenshiLib,
+        "?saveGame@SaveFileSystem@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *loadGame = (void *)GetProcAddress(kenshiLib,
+        "?loadGame@SaveFileSystem@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *newGame = (void *)GetProcAddress(kenshiLib,
+        "?newGame@SaveManager@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *importGame = (void *)GetProcAddress(kenshiLib,
+        "?import@SaveManager@@QEAAXAEBUSaveInfo@@H@Z");
+    if (!saveGame || !loadGame || !newGame || !importGame) {
+        g_campaignHooksReady = false;
+        Log("PLAYTHROUGH: campaign hook exports unavailable; automatic connection blocked.");
+        return;
+    }
+
+    bool ok = true;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(saveGame),
+        (void *)SaveCampaign, (void **)&saveCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(loadGame),
+        (void *)LoadCampaign, (void **)&loadCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(newGame),
+        (void *)NewCampaign, (void **)&newCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(importGame),
+        (void *)ImportCampaign, (void **)&importCampaignOriginal) == KenshiLib::SUCCESS && ok;
     g_campaignHooksReady=ok;
     Log(ok?"PLAYTHROUGH: campaign save/load hooks ready.":"PLAYTHROUGH: campaign hooks unavailable; automatic connection blocked.");
 }
@@ -13740,7 +13759,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     Sleep(500);
     hLib = GetModuleHandleA("KenshiLib.dll");
   }
-  InstallCampaignHooks();
+  InstallCampaignHooks(hLib);
   ppWorld = (GameWorld **)GetProcAddress(hLib, "?ou@@3PEAVGameWorld@@EA");
   if (!ppWorld)
     return 1;
