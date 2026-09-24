@@ -1566,8 +1566,8 @@ static bool g_playerCatsSyncHasValue = false;
 static int g_playerCatsSyncLastValue = 0;
 static DWORD g_playerCatsSyncLastSentTick = 0;
 static const DWORD kPlayerCatsResendIntervalMs = 5 * 60 * 1000;
-static const char *kStobePluginVersion = "1.3.1";
-static const char *kStobePluginReleaseDate = "2026-09-19";
+static const char *kStobePluginVersion = "1.3.2";
+static const char *kStobePluginReleaseDate = "2026-09-23";
 static bool g_pluginVersionSyncHasValue = false;
 static std::string g_pluginVersionSyncLastValue = "";
 static DWORD g_pluginVersionSyncLastSentTick = 0;
@@ -8750,6 +8750,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isPlayerTts = (msg.find("PLAYER_TTS: ") == 0);
       bool isPlayerSay = (msg.find("PLAYER_SAY: ") == 0);
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
+      const bool directorSpeech = isNPCSay && msg.find("[UTTERANCEID:director-") != std::string::npos;
+      unsigned int directorSpeakerSerial = 0;
       bool isNotify = (msg.find("NOTIFY:") == 0);
       bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
@@ -9070,7 +9072,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           std::string name = "";
           unsigned int tSerial = 0;
 
-          if (colon != std::string::npos && colon < 64 && remainder[0] != '[') {
+          if (colon != std::string::npos && (colon < 64 || directorSpeech || directorAction) && remainder[0] != '[') {
             header_processed = true;
             std::string header = remainder.substr(0, colon);
             name = header;
@@ -9083,6 +9085,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 sStr = sStr.substr(0, endS);
               tSerial = (unsigned int)strtoul(sStr.c_str(), NULL, 10);
             }
+            if (directorSpeech || directorAction) directorSpeakerSerial = tSerial;
 
             std::string nLow = name;
             std::transform(nLow.begin(), nLow.end(), nLow.begin(), ::tolower);
@@ -9228,6 +9231,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       }
 
       if (isNPCAction) {
+        // Authored actions must never inherit the ordinary name/selection fallback.
+        if (directorAction && (!directorSpeakerSerial ||
+            targetHand.serial != directorSpeakerSerial || !speakerResolvedFromHeader)) {
+          Log("DIRECTOR: action skipped reason=speaker_unresolved");
+          continue;
+        }
         std::string actStr = TrimCopy(msg.substr(12));
         if (!actStr.empty()) {
           auto parseActionToken = [](const std::string &rawAction,
@@ -11520,6 +11529,13 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
         if (!bubbleContent.empty()) {
           Character *tc = ResolveCharacterFromHandSafe(thisptr, targetHand);
+          // Missing Director actors are skipped, never replaced by the selection or a namesake.
+          if (directorSpeech && (!tc || !directorSpeakerSerial ||
+              tc->getHandle().serial != directorSpeakerSerial || !speakerResolvedFromHeader)) {
+            PostSpeechDeliveryState(utteranceId, "unavailable");
+            Log("DIRECTOR: turn skipped reason=speaker_unresolved utterance=" + utteranceId);
+            continue;
+          }
           if (!tc && !isPlayerSay) {
             tc = ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
           }
@@ -12629,12 +12645,31 @@ void __fastcall ImportCampaign(SaveManager* manager, const SaveInfo& save, int f
     PlaythroughSession::BeginLoad();
     PlaythroughSession::RestoreCharacter(id,isNew);
 }
-void InstallCampaignHooks() {
-    bool ok=true;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::saveGame),(void*)SaveCampaign,(void**)&saveCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveFileSystem::loadGame),(void*)LoadCampaign,(void**)&loadCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::newGame),(void*)NewCampaign,(void**)&newCampaignOriginal)==KenshiLib::SUCCESS && ok;
-    ok = KenshiLib::AddHook((void*)KenshiLib::GetRealAddress(&SaveManager::import),(void*)ImportCampaign,(void**)&importCampaignOriginal)==KenshiLib::SUCCESS && ok;
+void InstallCampaignHooks(HMODULE kenshiLib) {
+    // GetRealAddress requires KenshiLib exports, not the linker stubs in Stobe.dll.
+    void *saveGame = (void *)GetProcAddress(kenshiLib,
+        "?saveGame@SaveFileSystem@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *loadGame = (void *)GetProcAddress(kenshiLib,
+        "?loadGame@SaveFileSystem@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *newGame = (void *)GetProcAddress(kenshiLib,
+        "?newGame@SaveManager@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z");
+    void *importGame = (void *)GetProcAddress(kenshiLib,
+        "?import@SaveManager@@QEAAXAEBUSaveInfo@@H@Z");
+    if (!saveGame || !loadGame || !newGame || !importGame) {
+        g_campaignHooksReady = false;
+        Log("PLAYTHROUGH: campaign hook exports unavailable; automatic connection blocked.");
+        return;
+    }
+
+    bool ok = true;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(saveGame),
+        (void *)SaveCampaign, (void **)&saveCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(loadGame),
+        (void *)LoadCampaign, (void **)&loadCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(newGame),
+        (void *)NewCampaign, (void **)&newCampaignOriginal) == KenshiLib::SUCCESS && ok;
+    ok = KenshiLib::AddHook((void *)KenshiLib::GetRealAddress(importGame),
+        (void *)ImportCampaign, (void **)&importCampaignOriginal) == KenshiLib::SUCCESS && ok;
     g_campaignHooksReady=ok;
     Log(ok?"PLAYTHROUGH: campaign save/load hooks ready.":"PLAYTHROUGH: campaign hooks unavailable; automatic connection blocked.");
 }
@@ -13740,7 +13775,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     Sleep(500);
     hLib = GetModuleHandleA("KenshiLib.dll");
   }
-  InstallCampaignHooks();
+  InstallCampaignHooks(hLib);
   ppWorld = (GameWorld **)GetProcAddress(hLib, "?ou@@3PEAVGameWorld@@EA");
   if (!ppWorld)
     return 1;
