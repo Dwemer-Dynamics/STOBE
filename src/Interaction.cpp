@@ -2,7 +2,6 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "Utils.h"
-#include "VoiceCapture.h"
 #include <kenshi/GameWorld.h>
 #include <cstdlib>
 
@@ -58,7 +57,6 @@ void Toggle() {
   if (Status() != 3) InterlockedExchange(&desired, Allowed() ? 0 : 1);
   InterlockedExchange(&status, 2);
   InterlockedIncrement(&epoch);
-  Stobe::Voice::Cancel();
   // Invalidate requests and pending actions, preserving the line already playing.
   BeginChatInterruptGeneration(false);
   nextAttempt = 0;
