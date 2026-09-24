@@ -6997,13 +6997,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             SafeCharacterName(target) + " action_type=" + ToString((int)act.type));
         ClearCharacterSpeechBubble(target);
         if (act.type == ACT_SAY && !act.utteranceId.empty()) {
-          PostSpeechDeliveryState(act.utteranceId, "cancelled");
+          PostSpeechDeliveryState(act.utteranceId,
+              act.utteranceId.find("director-") == 0 ? "unavailable" : "cancelled");
         }
       } else if (act.type == ACT_SAY || act.type == ACT_PLAY_TTS) {
         Log("ACTION_EXEC: Skipping speech with unresolved target action_type=" +
             ToString((int)act.type));
         if (act.type == ACT_SAY && !act.utteranceId.empty()) {
-          PostSpeechDeliveryState(act.utteranceId, "cancelled");
+          PostSpeechDeliveryState(act.utteranceId,
+              act.utteranceId.find("director-") == 0 ? "unavailable" : "cancelled");
         }
       } else if (npc) {
         if (act.type != ACT_SUICIDE && IsCharacterUnavailableForDialogue(npc)) {

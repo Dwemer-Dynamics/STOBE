@@ -9,7 +9,8 @@ enum SpeechDeliveryState {
   SPEECH_DELIVERY_UNKNOWN = 0,
   SPEECH_DELIVERY_PENDING,
   SPEECH_DELIVERY_SPOKEN,
-  SPEECH_DELIVERY_CANCELLED
+  SPEECH_DELIVERY_CANCELLED,
+  SPEECH_DELIVERY_UNAVAILABLE // Local reason only; server delivery remains cancelled.
 };
 
 void AsyncPostToStobe(const std::wstring &endpoint, const std::string &jsonData);

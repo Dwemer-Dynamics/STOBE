@@ -3383,7 +3383,10 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
   const bool chunked = schema == "stobe.director_scene.v2";
   if ((!chunked && schema != "stobe.director_scene.v1") ||
       id.length() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
-      count < 1 || count > (chunked ? 128 : 5) || !state->speechUtteranceIds.empty()) return false;
+      count < 1 || count > (chunked ? 128 : 5) || !state->speechUtteranceIds.empty()) {
+    Log("DIRECTOR: scene rejected reason=invalid_envelope");
+    return false;
+  }
   std::vector<std::string> turns;
   std::vector<std::string> ids;
   bool valid = true;
@@ -3416,10 +3419,16 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     }
   }
   state->speechUtteranceIds = ids;
-  if (!valid) { PostSpeechDeliveryStates(ids, "cancelled"); return false; }
+  if (!valid) {
+    Log("DIRECTOR: scene rejected reason=invalid_turn scene=" + id);
+    PostSpeechDeliveryStates(ids, "cancelled");
+    return false;
+  }
   for (size_t i = 0; i < ids.size(); ++i) TrackSpeechDeliveryState(ids[i]);
   QueueUiNotifyAction("Director scene started.");
   size_t played = 0;
+  size_t skipped = 0;
+  std::string stopReason = "complete";
   for (; played < turns.size() && IsChatInterruptGenerationCurrent(state->generation); ++played) {
     const std::string &turn = turns[played];
     const std::string actor = JsonReadField(turn, "speaker");
@@ -3430,14 +3439,23 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     const std::string hash = JsonReadField(turn, "tts_hash");
     if (g_ttsEnabled && !hash.empty()) say += " [TTSHASH:" + hash + "]";
     say += " [TTSDUR:" + JsonReadField(turn, "tts_duration_ms") + "]";
-    if (!QueueChatPipeLine(say, state->generation)) break;
+    if (!QueueChatPipeLine(say, state->generation)) { stopReason = "queue_rejected"; break; }
     ++state->lineCount;
     DWORD started = GetTickCount();
     while (IsChatInterruptGenerationCurrent(state->generation) &&
            GetSpeechDeliveryState(ids[played]) == SPEECH_DELIVERY_PENDING &&
            GetTickCount() - started < 600000) SleepIfPaused(50);
-    if (!IsChatInterruptGenerationCurrent(state->generation) ||
-        GetSpeechDeliveryState(ids[played]) != SPEECH_DELIVERY_SPOKEN) break;
+    if (!IsChatInterruptGenerationCurrent(state->generation)) { stopReason = "interrupted"; break; }
+    const SpeechDeliveryState delivery = GetSpeechDeliveryState(ids[played]);
+    if (delivery == SPEECH_DELIVERY_UNAVAILABLE) {
+      Log("DIRECTOR: turn skipped reason=speaker_unavailable utterance=" + ids[played]);
+      ++skipped;
+      continue; // Never run actions for an unspoken turn.
+    }
+    if (delivery != SPEECH_DELIVERY_SPOKEN) {
+      stopReason = delivery == SPEECH_DELIVERY_PENDING ? "delivery_timeout" : "delivery_cancelled";
+      break;
+    }
     int actions = atoi(JsonReadField(turn, "action_count").c_str());
     for (int a = 0; a < actions; ++a) {
       if (QueueChatPipeLine("NPC_ACTION: " + header + ": " +
@@ -3445,9 +3463,12 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     }
   }
   if (played < ids.size()) {
+    if (!IsChatInterruptGenerationCurrent(state->generation)) stopReason = "interrupted";
     std::vector<std::string> cancelled(ids.begin() + played, ids.end());
     PostSpeechDeliveryStates(cancelled, "cancelled");
   }
+  Log("DIRECTOR: scene ended scene=" + id + " reason=" + stopReason +
+      " spoken=" + ToString((int)(played - skipped)) + " skipped=" + ToString((int)skipped));
   QueueUiNotifyAction("Director scene stopped.");
   return played == ids.size();
 }
@@ -3738,6 +3759,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
         SpeechDeliveryState deliveryState =
             GetSpeechDeliveryState(parseState.speechUtteranceIds[i]);
         if (deliveryState == SPEECH_DELIVERY_CANCELLED ||
+            deliveryState == SPEECH_DELIVERY_UNAVAILABLE ||
             deliveryState == SPEECH_DELIVERY_UNKNOWN) {
           speechDelivered = false;
           break;
