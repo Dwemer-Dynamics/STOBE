@@ -8750,6 +8750,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isPlayerTts = (msg.find("PLAYER_TTS: ") == 0);
       bool isPlayerSay = (msg.find("PLAYER_SAY: ") == 0);
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
+      const bool directorSpeech = isNPCSay && msg.find("[UTTERANCEID:director-") != std::string::npos;
+      unsigned int directorSpeakerSerial = 0;
       bool isNotify = (msg.find("NOTIFY:") == 0);
       bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
@@ -9070,7 +9072,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           std::string name = "";
           unsigned int tSerial = 0;
 
-          if (colon != std::string::npos && colon < 64 && remainder[0] != '[') {
+          if (colon != std::string::npos && (colon < 64 || directorSpeech || directorAction) && remainder[0] != '[') {
             header_processed = true;
             std::string header = remainder.substr(0, colon);
             name = header;
@@ -9083,6 +9085,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                 sStr = sStr.substr(0, endS);
               tSerial = (unsigned int)strtoul(sStr.c_str(), NULL, 10);
             }
+            if (directorSpeech || directorAction) directorSpeakerSerial = tSerial;
 
             std::string nLow = name;
             std::transform(nLow.begin(), nLow.end(), nLow.begin(), ::tolower);
@@ -9228,6 +9231,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       }
 
       if (isNPCAction) {
+        // Authored actions must never inherit the ordinary name/selection fallback.
+        if (directorAction && (!directorSpeakerSerial ||
+            targetHand.serial != directorSpeakerSerial || !speakerResolvedFromHeader)) {
+          Log("DIRECTOR: action skipped reason=speaker_unresolved");
+          continue;
+        }
         std::string actStr = TrimCopy(msg.substr(12));
         if (!actStr.empty()) {
           auto parseActionToken = [](const std::string &rawAction,
@@ -11520,6 +11529,13 @@ void ProcessMessageQueue(GameWorld *thisptr) {
 
         if (!bubbleContent.empty()) {
           Character *tc = ResolveCharacterFromHandSafe(thisptr, targetHand);
+          // Missing Director actors are skipped, never replaced by the selection or a namesake.
+          if (directorSpeech && (!tc || !directorSpeakerSerial ||
+              tc->getHandle().serial != directorSpeakerSerial || !speakerResolvedFromHeader)) {
+            PostSpeechDeliveryState(utteranceId, "unavailable");
+            Log("DIRECTOR: turn skipped reason=speaker_unresolved utterance=" + utteranceId);
+            continue;
+          }
           if (!tc && !isPlayerSay) {
             tc = ResolveCharacterFromHandSafe(thisptr, g_talkTargetHand);
           }
