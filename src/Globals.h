@@ -1,3 +1,4 @@
+#include "Interaction.h"
 #include <deque>
 #include <map>
 #include <set>
@@ -48,7 +49,6 @@ extern bool g_enableRegularDialogueCapture;
 extern bool g_enableItemImageSync;
 extern bool g_enableStatusHud;
 extern bool g_enableNpcRename;
-extern int g_dynamicProfileIntervalHours;
 extern std::string g_narratorDisplayName;
 
 // State tracking for inventory/debugger
@@ -105,7 +105,8 @@ enum ActionType {
   ACT_CUT_HORNS,
   ACT_USE_OBJECT,
   ACT_KNOCKOUT,
-  ACT_KILL
+  ACT_KILL,
+  ACT_MOVE_TO
 };
 
 struct GameEvent {
@@ -124,9 +125,13 @@ void LogGameEvent(const std::string &type, const std::string &actor,
                   const std::string &actorFaction, const std::string &target,
                   const std::string &targetFaction, const std::string &message,
                   unsigned int actorSerial = 0,
-                  unsigned int targetSerial = 0);
+                  unsigned int targetSerial = 0,
+                  const std::string *peopleOverride = nullptr,
+                  unsigned int locationSerial = 0);
+std::string BuildLocalEventPeople(Character *anchor);
 
 struct QueuedAction {
+  LONG interactionEpoch;
   ActionType type;
   hand actor;
   hand target;
@@ -139,12 +144,13 @@ struct QueuedAction {
   bool proximityMoveIssued; // True after at least one approach move order.
   bool narratorNotification; // Queue narrator popups with speech timing.
   bool allowUnavailableSpeech; // Preserve reactions to forced limb removal.
+  bool directorAction; // Dispatch without holding the following authored dialogue for completion.
   std::string autonomyDecisionId; // Set only for validated autonomy actions.
 
   QueuedAction()
-      : type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
+      : interactionEpoch(Stobe::Interaction::Epoch()), type(ACT_NOTIFY), taskValue(0), proximityStartTick(0),
         proximityMoveIssued(false), narratorNotification(false),
-        allowUnavailableSpeech(false) {}
+        allowUnavailableSpeech(false), directorAction(false) {}
 };
 
 struct PendingAutonomyCatalogMessage {
@@ -201,7 +207,7 @@ GameWorld *GetWorldSafe();
 
 // Increments generation, flushes stale chat/TTS queue entries, and interrupts
 // active TTS playback. Returns the new generation token.
-LONG BeginChatInterruptGeneration();
+LONG BeginChatInterruptGeneration(bool interruptPlaying = true);
 LONG GetChatInterruptGeneration();
 bool IsChatInterruptGenerationCurrent(LONG generation);
 void BeginPlayerTtsPlaybackBarrier(LONG generation);

@@ -1,3 +1,5 @@
+#include "Interaction.h"
+#include "PlaythroughNotices.h"
 #include "Functions.h"
 #include "AudioPlayback.h"
 #include "AutonomyController.h"
@@ -43,6 +45,7 @@
 #include <ogre/OgreColourValue.h>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 std::string TrimCopySimple(const std::string &value);
@@ -6257,7 +6260,254 @@ bool EvaluateAutonomyQueuedActionPostcondition(
   return false;
 }
 
+namespace {
+struct MoveToState {
+  hand actor;
+  hand target;
+  Ogre::Vector3 point;
+  Ogre::Vector3 issuedPosition;
+  Ogre::Vector3 progressPosition;
+  std::string label;
+  Tasker *order;
+  DWORD elapsed;
+  DWORD stalled;
+  MoveToState() : point(Ogre::Vector3::ZERO),
+      issuedPosition(Ogre::Vector3::ZERO), progressPosition(Ogre::Vector3::ZERO),
+      order(NULL), elapsed(0), stalled(0) {}
+};
+// Main-thread only; handles are resolved afresh rather than retaining world pointers.
+std::map<unsigned int, MoveToState> s_moveToStates;
+DWORD s_moveToTick = 0;
+
+bool MoveToOwnsOrder(OrdersReceiver *orders, const MoveToState &state) {
+  return orders && orders->orders.list.size() == 1 &&
+         orders->getFirstOrder() == state.order &&
+         orders->hasPlayerOrder(MOVE_CUS_ORDERED);
+}
+
+// Release only our movement order; never clear a newer player order or change job settings.
+void FinishMoveTo(GameWorld *world, Character *actor, const MoveToState &state,
+                  const std::string &result, bool halt) {
+  if (actor) {
+    try {
+      OrdersReceiver *orders = actor->getOrdersReciever();
+      CharMovement *movement = actor->getMovement();
+      if (MoveToOwnsOrder(orders, state) && movement &&
+          movement->getDestination().distance(state.issuedPosition) <= 2.0f) {
+        orders->clearOrders();
+        if (halt) {
+          movement->halt();
+        }
+      }
+      actor->reThinkCurrentAIAction();
+    } catch (...) {
+      Log("MOVE_TO: could not release movement order");
+    }
+  }
+  const std::string name = actor ? SafeCharacterName(actor) : "NPC";
+  const std::string message = name + " " + result + " " + state.label + ".";
+  Log("MOVE_TO: actor_serial=" + ToString(state.actor.serial) + " " + message);
+  if (world) {
+    world->showPlayerAMessage_withLog(message, true);
+    LogGameEvent("infoaction", name, "", state.label, "", message,
+                 state.actor.serial, state.target.serial);
+  }
+}
+
+bool ParseMoveToNumber(const std::string &token, float &value) {
+  char *end = NULL;
+  value = (float)strtod(token.c_str(), &end);
+  return !token.empty() && end && *end == '\0' &&
+         value == value && value > -1000000.0f && value < 1000000.0f;
+}
+
+// Resolve a scene reference once, then keep its full handle for subsequent ticks.
+bool StartMoveTo(GameWorld *world, Character *actor, const std::string &payload) {
+  std::vector<std::string> fields;
+  std::istringstream input(payload);
+  std::string field;
+  while (std::getline(input, field, ';')) {
+    fields.push_back(field);
+  }
+  MoveToState state;
+  state.actor = actor->getHandle();
+  RootObjectBase *reference = NULL;
+  if (fields.size() == 3 && fields[0] == "ref") {
+    char *end = NULL;
+    unsigned long serial = strtoul(fields[1].c_str(), &end, 10);
+    if (fields[1].empty() || fields[1].find_first_not_of("0123456789") != std::string::npos ||
+        !end || *end || serial == 0) {
+      return false;
+    }
+    if (world->player) {
+      for (uint32_t i = 0; i < world->player->playerCharacters.size(); ++i) {
+        Character *candidate = world->player->playerCharacters[i];
+        if (candidate && candidate->getHandle().serial == serial) {
+          reference = candidate;
+          break;
+        }
+      }
+    }
+    // Match the live types emitted by Context.cpp; towns/locations use known points.
+    const itemType types[] = {CHARACTER, BUILDING, ITEM};
+    for (size_t typeIndex = 0; !reference && typeIndex < 3; ++typeIndex) {
+      lektor<RootObject *> candidates;
+      world->getObjectsWithinSphere(candidates, actor->getPosition(),
+          std::max(600.0f, g_visionRange), types[typeIndex], 128, (RootObject *)actor);
+      for (uint32_t i = 0; i < candidates.size(); ++i) {
+        RootObjectBase *candidate = candidates.stuff[i];
+        if (candidate && (uintptr_t)candidate > 0x1000 &&
+            candidate->getHandle().serial == serial) {
+          reference = candidate;
+          break;
+        }
+      }
+    }
+    if (!reference || reference == actor) {
+      return false;
+    }
+    state.target = reference->getHandle();
+    state.point = reference->getPositionForWaypoint(actor->getPosition());
+    state.label = reference->getName();
+  } else if (fields.size() == 5 && fields[0] == "point") {
+    if (!ParseMoveToNumber(fields[1], state.point.x) ||
+        !ParseMoveToNumber(fields[2], state.point.y) ||
+        !ParseMoveToNumber(fields[3], state.point.z)) {
+      return false;
+    }
+    state.label = fields[4];
+  } else {
+    return false;
+  }
+  if (state.label.empty()) {
+    state.label = "the destination";
+  }
+  if (actor->isDead() || actor->isUnconcious() || actor->isInCombatMode(true, true)) {
+    return false;
+  }
+  OrdersReceiver *orders = actor->getOrdersReciever();
+  CharMovement *movement = actor->getMovement();
+  if (!orders || !movement) {
+    return false;
+  }
+  state.progressPosition = actor->getPosition();
+  if (state.progressPosition.distance(state.point) <= 3.0f) {
+    FinishMoveTo(world, actor, state, "is already near", false);
+    return true;
+  }
+  ClearFollowTarget(state.actor.serial);
+  ClearTravelTarget(state.actor.serial);
+  // A direct movement order takes precedence over jobs without deleting or disabling them.
+  s_moveToStates[state.actor.serial] = state;
+  MoveToState &active = s_moveToStates[state.actor.serial];
+  try {
+    if (actor->dialogue) {
+      actor->dialogue->endDialogue(true);
+      actor->dialogue->setInDialog(false);
+    }
+    orders->addOrder(MOVE_CUS_ORDERED, hand(), state.point, true, false);
+    active.order = orders->getFirstOrder();
+    if (!active.order) {
+      throw std::runtime_error("movement order rejected");
+    }
+    actor->reThinkCurrentAIAction();
+    movement->setDestination(state.point, HIGH_PRIORITY, false);
+    active.issuedPosition = movement->getDestination();
+    world->showPlayerAMessage_withLog(actor->getName() + " is moving to " + state.label + ".", true);
+    Log("MOVE_TO: started actor_serial=" + ToString(state.actor.serial) +
+        " target_serial=" + ToString(state.target.serial));
+  } catch (...) {
+    FinishMoveTo(world, actor, active, "could not reach", true);
+    s_moveToStates.erase(state.actor.serial);
+    return true; // Failure was already reported and the temporary state was removed.
+  }
+  return true;
+}
+}
+
+// Called at the existing world-transition boundaries; never dereference a previous world.
+void ResetMoveToActions() {
+  s_moveToStates.clear();
+  s_moveToTick = 0;
+}
+
+// Advance bounded movement without network requests, world scans, or permanent job deletion.
+void UpdateMoveToActions(GameWorld *world) {
+  DWORD now = GetTickCount();
+  DWORD elapsed = s_moveToTick ? now - s_moveToTick : 0;
+  if (elapsed < 250 && s_moveToTick) {
+    return;
+  }
+  s_moveToTick = now;
+  if (!world || world->isPaused()) {
+    return;
+  }
+  elapsed = std::min(elapsed, (DWORD)1000);
+  for (std::map<unsigned int, MoveToState>::iterator it = s_moveToStates.begin();
+       it != s_moveToStates.end();) {
+    MoveToState &state = it->second;
+    Character *actor = ResolveLiveCharacter(world, state.actor);
+    std::string result;
+    bool halt = true;
+    try {
+      if (!actor || actor->isDead() || actor->isUnconcious()) {
+        result = "could not reach";
+      } else {
+        OrdersReceiver *orders = actor->getOrdersReciever();
+        CharMovement *movement = actor->getMovement();
+        state.elapsed += elapsed;
+        state.stalled += elapsed;
+        if (state.target.serial != 0) {
+          RootObjectBase *target = state.target.isValid() ? state.target.getRootObjectBase() : NULL;
+          if (!target || target->getHandle() != state.target) {
+            result = "could not reach";
+          } else {
+            state.point = target->getPositionForWaypoint(actor->getPosition());
+          }
+        }
+        if (result.empty() && actor->isInCombatMode(true, true)) {
+          result = "stopped moving to";
+          halt = false;
+        } else if (result.empty() && movement && MoveToOwnsOrder(orders, state) &&
+                   movement->getDestination().distance(state.issuedPosition) > 2.0f) {
+          result = "stopped moving to";
+          halt = false;
+        } else if (result.empty() && actor->getPosition().distance(state.point) <= 3.0f) {
+          result = "arrived near";
+        } else if (result.empty() && (!movement || !MoveToOwnsOrder(orders, state))) {
+          result = "stopped moving to";
+          halt = false;
+        } else if (result.empty()) {
+          if (actor->getPosition().distance(state.progressPosition) >= 1.0f) {
+            state.progressPosition = actor->getPosition();
+            state.stalled = 0;
+          }
+          if (state.elapsed >= 300000 || state.stalled >= 30000 || movement->pathFailed()) {
+            result = "could not reach";
+          } else if (state.point.distance(state.issuedPosition) > 1.0f) {
+            orders->updateLastOrder(MOVE_CUS_ORDERED, hand(), state.point);
+            movement->setDestination(state.point, HIGH_PRIORITY, false);
+            state.issuedPosition = movement->getDestination();
+          }
+        }
+      }
+    } catch (...) {
+      result = "could not reach";
+    }
+    if (!result.empty()) {
+      FinishMoveTo(world, actor, state, result, halt);
+      s_moveToStates.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+}
+
+
 void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
+  // This update is entered only after Kenshi's post-load world gate is ready.
+  PlaythroughNotices::Notice saveNotice;
+  if (thisptr && PlaythroughNotices::Take(saveNotice)) thisptr->showPlayerAMessage_withLog("[STOBE] " + saveNotice.text, true);
   static bool holdForTtsPlayback = false;
   static hand activeSpeechTarget;
   static unsigned int activeSpeechTargetSerial = 0;
@@ -6265,6 +6515,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
   static DWORD pausedQueueLogTick = 0;
   static double speechDelayRemainingScaledMs = 0.0;
   static DWORD speechDelayLastTick = 0;
+  static std::string directorTextUtterance;
+  static LONG directorTextGeneration = 0;
 
   UpdateNarratorTimedPopupLifecycle();
 
@@ -6382,9 +6634,23 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       speechDelayLastTick = 0;
     }
 
-    while (!g_uiActionQueue.empty()) {
+    if (!directorTextUtterance.empty() &&
+        (!IsChatInterruptGenerationCurrent(directorTextGeneration) || g_nextSpeechActionTick == 0)) {
+      if (GetSpeechDeliveryState(directorTextUtterance) == SPEECH_DELIVERY_PENDING)
+        PostSpeechDeliveryState(directorTextUtterance,
+            IsChatInterruptGenerationCurrent(directorTextGeneration) ? "spoken" : "cancelled");
+      directorTextUtterance.clear();
+    }
+    size_t remainingThisFrame = g_uiActionQueue.size();
+    while (!g_uiActionQueue.empty() && remainingThisFrame-- > 0) {
       DWORD nowTick = GetTickCount();
       const QueuedAction &nextAction = g_uiActionQueue.front();
+      if (!Stobe::Interaction::IsCurrent(nextAction.interactionEpoch)
+          && (nextAction.type != ACT_NOTIFY || nextAction.narratorNotification)) {
+        if (!nextAction.utteranceId.empty()) PostSpeechDeliveryState(nextAction.utteranceId, "cancelled");
+        g_uiActionQueue.pop_front();
+        continue;
+      }
       bool nextActionIsSpeech =
           nextAction.type == ACT_SAY || nextAction.type == ACT_PLAY_TTS ||
           (nextAction.type == ACT_NOTIFY &&
@@ -6417,6 +6683,13 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
 
       Character *npc = ResolveLiveCharacter(thisptr, act.actor);
       Character *target = ResolveLiveCharacter(thisptr, act.target);
+      if (npc && act.type != ACT_SAY && act.type != ACT_PLAY_TTS && act.type != ACT_NOTIFY) {
+        std::map<unsigned int, MoveToState>::iterator previous = s_moveToStates.find(act.actor.serial);
+        if (previous != s_moveToStates.end()) {
+          FinishMoveTo(thisptr, npc, previous->second, "stopped moving to", true);
+          s_moveToStates.erase(previous);
+        }
+      }
       if (!npc && act.type != ACT_NOTIFY && act.type != ACT_SAY &&
           act.type != ACT_PLAY_TTS) {
         Log("ACTION_EXEC: Failed to resolve actor serial=" +
@@ -6577,7 +6850,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             playbackQueued =
                 QueueTtsPlayback(act.ttsHash, ttsVolumePercent,
                                  act.target.serial,
-                                 ResolveDialogueGameSpeedMultiplier(thisptr));
+                                 ResolveDialogueGameSpeedMultiplier(thisptr), TTS_PLAYBACK_OWNER_DEFAULT,
+                                 act.utteranceId.find("director-") == 0 ? act.utteranceId : "");
           } else {
             ttsSkipReason =
                 ttsSpeakerLoaded ? "camera_out_of_range" : "speaker_not_loaded";
@@ -6625,7 +6899,16 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         }
         if (speechExecuted) {
           if (!act.utteranceId.empty()) {
-            PostSpeechDeliveryState(act.utteranceId, "spoken");
+            if (act.utteranceId.find("director-") == 0) {
+              if (hasTtsClip && !playbackQueued) {
+                PostSpeechDeliveryState(act.utteranceId, "cancelled");
+              } else if (!playbackQueued) {
+                directorTextUtterance = act.utteranceId;
+                directorTextGeneration = GetChatInterruptGeneration();
+              }
+            } else {
+              PostSpeechDeliveryState(act.utteranceId, "spoken");
+            }
           }
         } else if (!act.utteranceId.empty()) {
           PostSpeechDeliveryState(act.utteranceId, "cancelled");
@@ -7039,6 +7322,11 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 npc->getName() + " left your squad.", true);
           }
 
+        } else if (act.type == ACT_MOVE_TO) {
+          if (!StartMoveTo(thisptr, npc, act.message)) {
+            thisptr->showPlayerAMessage_withLog(npc->getName() + " could not reach that destination.", true);
+            Log("MOVE_TO: rejected actor_serial=" + ToString(act.actor.serial));
+          }
         } else if (act.type == ACT_START_FOLLOW) {
           unsigned int followerSerial = 0;
           try {
@@ -8078,18 +8366,11 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                       ? (" (partial " + ToString(transferredCount) + "/" +
                          ToString(requestedCount) + ")")
                       : "";
-              if (recipient == primaryPlayer) {
-                thisptr->showPlayerAMessage_withLog(
-                    SafeCharacterName(npc) + " gave you " + quantityPrefix +
-                        givenItemName + partialSuffix + ".",
-                    true);
-              } else {
-                thisptr->showPlayerAMessage_withLog(
-                    SafeCharacterName(npc) + " gave " + quantityPrefix +
-                        givenItemName + " to " + SafeCharacterName(recipient) +
-                        partialSuffix + ".",
-                    true);
-              }
+              thisptr->showPlayerAMessage_withLog(
+                  SafeCharacterName(npc) + " gave " + quantityPrefix +
+                      givenItemName + " to " + SafeCharacterName(recipient) +
+                      partialSuffix + ".",
+                  true);
               Log("ACTION_EXEC: GIVE_ITEM actor=" + SafeCharacterName(npc) +
                   " recipient=" + SafeCharacterName(recipient) +
                   " requested=" + ToString(requestedCount) +
@@ -9981,7 +10262,17 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
         lockReacquired = true;
       }
       if (queueDeferredAction) {
-        g_uiActionQueue.push_front(deferredAction);
+        if (act.directorAction) {
+          deferredAction.directorAction = true;
+          g_uiActionQueue.push_back(deferredAction);
+        } else {
+          g_uiActionQueue.push_front(deferredAction);
+        }
+      }
+      if (act.directorAction && act.type != ACT_SAY && act.type != ACT_PLAY_TTS) {
+        // A close-range action may keep approaching while the next actor speaks.
+        blockSpeechQueue = false;
+        deferActionQueue = false;
       }
       if (blockSpeechQueue) {
         DWORD gateNowTick = GetTickCount();
@@ -10009,8 +10300,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                                             reason);
       }
       if (blockSpeechQueue || deferActionQueue) {
-        break;
+        return;
       }
+      EnterCriticalSection(&g_uiMutex);
     }
+    LeaveCriticalSection(&g_uiMutex);
   }
 }

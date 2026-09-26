@@ -1,4 +1,5 @@
 #include "DialogueMenuTts.h"
+#include "Interaction.h"
 
 #include "AudioPlayback.h"
 #include "Comm.h"
@@ -41,6 +42,7 @@ struct DialogueSnapshot {
 };
 
 struct DialogueTtsTask {
+  LONG interactionEpoch;
   std::string key;
   std::string actorName;
   std::string actorStorageId;
@@ -274,6 +276,12 @@ DWORD WINAPI WorkerThread(LPVOID) {
       if (!hasTask) {
         break;
       }
+      if (!Stobe::Interaction::IsCurrent(task.interactionEpoch)) {
+        EnterCriticalSection(&g_mutex);
+        g_pending.erase(task.key);
+        LeaveCriticalSection(&g_mutex);
+        continue;
+      }
 
       std::string payload = "{\"actor\":\"" +
                             Stobe::Text::EscapeJSON(task.actorName) +
@@ -295,7 +303,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
       EnterCriticalSection(&g_mutex);
       const LONG currentGeneration =
           InterlockedCompareExchange(&g_generation, 0, 0);
-      bool current = task.generation == currentGeneration &&
+      bool current = Stobe::Interaction::IsCurrent(task.interactionEpoch) && task.generation == currentGeneration &&
                      g_menuActive && task.actorStorageId == g_actorStorageId;
       if (task.generation == currentGeneration) {
         g_pending.erase(task.key);
@@ -342,7 +350,7 @@ void EnsureInitialized() {
 
 void QueueLine(const DialogueSnapshot &snapshot, const std::string &line,
                bool priority) {
-  if (line.empty() || !g_signal) {
+  if (!Stobe::Interaction::Allowed() || line.empty() || !g_signal) {
     return;
   }
   std::string key = MakeLineKey(snapshot.actorStorageId, line);
@@ -381,6 +389,7 @@ void QueueLine(const DialogueSnapshot &snapshot, const std::string &line,
   task.actorStorageId = snapshot.actorStorageId;
   task.line = line;
   task.generation = InterlockedCompareExchange(&g_generation, 0, 0);
+  task.interactionEpoch = Stobe::Interaction::Epoch();
   g_pending.insert(key);
   if (priority) {
     g_queue.push_front(task);

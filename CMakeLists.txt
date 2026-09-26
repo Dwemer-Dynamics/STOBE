@@ -1,5 +1,5 @@
-﻿cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 1.2.3 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(Stobe VERSION 1.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,7 +75,9 @@ add_library(Stobe SHARED
   src/ChatUI.cpp
   src/ChatUIGlobals.cpp
   src/ChatBox.cpp
+  src/Interaction.cpp
   src/Comm.cpp
+  src/PlaythroughSession.cpp
   src/Context.cpp
   src/DialogueMenuTts.cpp
   src/Functions.cpp
@@ -83,6 +85,7 @@ add_library(Stobe SHARED
   src/KenshiAiCompat.cpp
   src/JournalWindow.cpp
   src/StartingWindow.cpp
+  src/SupportReportLauncher.cpp
   src/AiNpcInfoWindow.cpp
   src/KenshiBuildingStatus.cpp
   src/KenshiRvaCompat.cpp

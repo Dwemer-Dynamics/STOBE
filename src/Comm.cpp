@@ -1,4 +1,7 @@
+#include "PlaythroughSession.h"
+#include "Interaction.h"
 #include "Comm.h"
+#include "PlaythroughNotices.h"
 #include "Globals.h"
 #include "Utils.h"
 #include <algorithm>
@@ -28,6 +31,7 @@ DWORD g_dwemerDistroLastSuccessTick = 0;
 struct SerialHttpTask {
   std::wstring endpoint;
   std::string data;
+  unsigned long playthroughEpoch;
 };
 
 std::deque<SerialHttpTask> g_serialHttpQueue;
@@ -566,7 +570,10 @@ bool TryApplyConfiguredServerTarget() {
 
 bool SendRawHttp(const RequestPlan &request, bool expectResponse,
                  std::string *responseOut,
-                 StobeStreamLineCallback lineCallback, void *lineUserData) {
+                 StobeStreamLineCallback lineCallback, void *lineUserData, unsigned long* statusOut = NULL) {
+  const unsigned long playthroughEpoch=PlaythroughSession::Context();
+  const bool control=PathContains(request.path,L"/playthrough_session.php") || PathContains(request.path,L"/interaction.php");
+  if (!control && !PlaythroughSession::Allowed(playthroughEpoch)) return false;
   HINTERNET hSession = NULL;
   HINTERNET hConnect = NULL;
   HINTERNET hRequest = NULL;
@@ -580,7 +587,7 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   }
 
   int timeoutMs = expectResponse ? (lineCallback ? 120000 : 60000) : 8000;
-  if (PathContains(request.path, L"/autonomy_")) {
+  if (PathContains(request.path, L"/autonomy_") || PathContains(request.path, L"/interaction.php")) {
     timeoutMs = 5000;
   }
   WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
@@ -606,6 +613,10 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
     return false;
   }
 
+  const std::wstring playthroughHeaders=PlaythroughSession::Headers(playthroughEpoch);
+  if (!control) WinHttpAddRequestHeaders(hRequest,playthroughHeaders.c_str()+2,(DWORD)-1L,WINHTTP_ADDREQ_FLAG_ADD);
+  const std::wstring interactionHeaders = Stobe::Interaction::Headers();
+  WinHttpAddRequestHeaders(hRequest, interactionHeaders.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
   if (request.method == L"POST") {
     sendOk = WinHttpSendRequest(
         hRequest, L"Content-Type: application/json\r\n", (DWORD)-1L,
@@ -620,6 +631,22 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   if (sendOk) {
     if (WinHttpReceiveResponse(hRequest, NULL)) {
       UpdateNarratorDisplayNameFromResponse(hRequest);
+      wchar_t saveHeader[96] = {0}; DWORD saveHeaderBytes = sizeof(saveHeader);
+      if (WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_CUSTOM,L"X-Playthrough-Save",saveHeader,&saveHeaderBytes,WINHTTP_NO_HEADER_INDEX)) {
+        const std::wstring value(saveHeader);
+        std::string ascii;
+        for (std::size_t i=0; i<value.size(); ++i) { if (value[i] > 127) { ascii.clear(); break; } ascii.push_back(static_cast<char>(value[i])); }
+        PlaythroughNotices::Accept(ascii);
+      }
+      DWORD responseStatus = 0; DWORD responseStatusBytes = sizeof(responseStatus);
+      WinHttpQueryHeaders(hRequest,WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,
+                          &responseStatus,&responseStatusBytes,WINHTTP_NO_HEADER_INDEX);
+      if (statusOut) *statusOut=responseStatus;
+      if (responseStatus >= 400 && !statusOut) {
+        if (responseOut) *responseOut = "";
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+      }
       if (expectResponse) {
         bool readResult = true;
         if (lineCallback) {
@@ -654,6 +681,7 @@ bool SendRawHttp(const RequestPlan &request, bool expectResponse,
   WinHttpCloseHandle(hRequest);
   WinHttpCloseHandle(hConnect);
   WinHttpCloseHandle(hSession);
+  if (!control && !PlaythroughSession::Allowed(playthroughEpoch)) { if(responseOut)responseOut->clear();return false; }
   return success;
 }
 
@@ -930,6 +958,7 @@ DWORD WINAPI SerialHttpWorkerThread(LPVOID) {
 
     SerialHttpTask task;
     while (PopSerialHttpTask(task)) {
+      const PlaythroughSession::Scope scope(task.playthroughEpoch);
       PostToStobe(task.endpoint, task.data);
     }
   }
@@ -985,6 +1014,7 @@ void EnqueueSerialHttpPost(const std::wstring &endpoint,
     InterlockedIncrement(&g_serialHttpDropped);
   }
   SerialHttpTask task;
+  task.playthroughEpoch = PlaythroughSession::Context();
   task.endpoint = endpoint;
   task.data = jsonData;
   g_serialHttpQueue.push_back(task);
@@ -1041,7 +1071,7 @@ std::string BuildStreamQueryData(const std::string &eventType,
   }
   std::string packet = eventType + "|" + ToString((int)time(NULL)) + "|" +
                        ToString(gameTs) + "|" + eventData;
-  return UrlEncode(Base64Encode(packet));
+  return UrlEncode(Base64Encode(packet)) + Stobe::Interaction::Query();
 }
 
 void PostToStobe(const std::wstring &endpoint, const std::string &jsonData) {
@@ -1090,7 +1120,17 @@ bool PostToStobeWithResponseStream(const std::wstring &endpoint,
   }
 
   std::string ignoredBody;
-  return SendRawHttp(request, true, &ignoredBody, callback, userData);
+  struct GuardedStream {
+    LONG epoch;
+    unsigned long playthroughEpoch;
+    StobeStreamLineCallback callback;
+    void *data;
+    static bool Receive(const std::string &line, void *context) {
+      GuardedStream *self = static_cast<GuardedStream *>(context);
+      return PlaythroughSession::Allowed(self->playthroughEpoch) && Stobe::Interaction::IsCurrent(self->epoch) && self->callback(line, self->data);
+    }
+  } guarded = {Stobe::Interaction::Epoch(), PlaythroughSession::Context(), callback, userData};
+  return SendRawHttp(request, true, &ignoredBody, callback ? GuardedStream::Receive : NULL, &guarded);
 }
 
 void PostSpeechDeliveryState(const std::string &utteranceId,
@@ -1194,6 +1234,8 @@ void ForgetSpeechDeliveryStates(
 std::string UploadCsvImportToStobe(const std::string &csvData,
                                    const std::string &filename,
                                    const std::string &importType) {
+  const unsigned long playthroughEpoch=PlaythroughSession::Context();
+  if(!PlaythroughSession::Allowed(playthroughEpoch))return "";
   EnsureDiscovered();
 
   if (csvData.empty()) {
@@ -1284,6 +1326,8 @@ std::string UploadCsvImportToStobe(const std::string &csvData,
   }
 
   DWORD totalSizeDword = static_cast<DWORD>(totalSize);
+  const std::wstring playthroughHeaders=PlaythroughSession::Headers(playthroughEpoch);
+  WinHttpAddRequestHeaders(hRequest,playthroughHeaders.c_str()+2,(DWORD)-1L,WINHTTP_ADDREQ_FLAG_ADD);
   if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                           WINHTTP_NO_REQUEST_DATA, 0, totalSizeDword, 0)) {
     InterlockedExchange(&g_dwemerDistroConnected, 0);
@@ -1363,10 +1407,12 @@ std::string UploadCsvImportToStobe(const std::string &csvData,
   WinHttpCloseHandle(hRequest);
   WinHttpCloseHandle(hConnect);
   WinHttpCloseHandle(hSession);
-  return response;
+  return PlaythroughSession::Allowed(playthroughEpoch)?response:std::string();
 }
 
 std::string UploadWavToStobe(const std::vector<unsigned char> &wavData) {
+  const unsigned long playthroughEpoch=PlaythroughSession::Context();
+  if(!PlaythroughSession::Allowed(playthroughEpoch))return "";
   EnsureDiscovered();
   if (wavData.size() <= 44 || wavData.size() > 4u * 1024u * 1024u) {
     Log("STT_UPLOAD: invalid WAV size=" + ToString((int)wavData.size()));
@@ -1397,6 +1443,8 @@ std::string UploadWavToStobe(const std::vector<unsigned char> &wavData) {
                                          NULL, WINHTTP_NO_REFERER,
                                          WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
   std::wstring contentType = ToWide("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
+  const std::wstring playthroughHeaders=PlaythroughSession::Headers(playthroughEpoch);
+  if(request)WinHttpAddRequestHeaders(request,playthroughHeaders.c_str()+2,(DWORD)-1L,WINHTTP_ADDREQ_FLAG_ADD);
   BOOL sent = request && WinHttpSendRequest(
       request, contentType.c_str(), (DWORD)-1L, &body[0], (DWORD)body.size(),
       (DWORD)body.size(), 0);
@@ -1420,16 +1468,18 @@ std::string UploadWavToStobe(const std::vector<unsigned char> &wavData) {
   if (request) WinHttpCloseHandle(request);
   WinHttpCloseHandle(connection);
   WinHttpCloseHandle(session);
-  return response;
+  return PlaythroughSession::Allowed(playthroughEpoch)?response:std::string();
 }
 
 struct HttpTask {
   std::wstring endpoint;
   std::string data;
+  unsigned long playthroughEpoch;
 };
 
 DWORD WINAPI AsyncHttpThread(LPVOID lpParam) {
   HttpTask *task = (HttpTask *)lpParam;
+  const PlaythroughSession::Scope scope(task->playthroughEpoch);
   PostToStobe(task->endpoint, task->data);
   delete task;
   return 0;
@@ -1437,10 +1487,12 @@ DWORD WINAPI AsyncHttpThread(LPVOID lpParam) {
 
 void AsyncPostToStobe(const std::wstring &endpoint,
                       const std::string &jsonData) {
+  if (!PlaythroughSession::Allowed(PlaythroughSession::Context())) return;
   if (ShouldSuppressDuplicateAsyncPost(endpoint, jsonData)) {
     return;
   }
   HttpTask *task = new HttpTask();
+  task->playthroughEpoch = PlaythroughSession::Context();
   task->endpoint = endpoint;
   task->data = jsonData;
   CreateThread(NULL, 0, AsyncHttpThread, task, 0, NULL);
@@ -1448,6 +1500,7 @@ void AsyncPostToStobe(const std::wstring &endpoint,
 
 void AsyncPostToStobeSerial(const std::wstring &endpoint,
                             const std::string &jsonData) {
+  if (!PlaythroughSession::Allowed(PlaythroughSession::Context())) return;
   EnqueueSerialHttpPost(endpoint, jsonData);
 }
 
@@ -1585,4 +1638,12 @@ std::string GetStobeServerHomeUrl() {
     host = "127.0.0.1";
   }
   return "http://" + host + ":" + ToString((int)g_stobePort) + "/StobeServer/";
+}
+
+std::string PlaythroughSession::Transport(const std::string& body, unsigned long& status) {
+  EnsureDiscovered();
+  RequestPlan request=ResolveRequest(L"/StobeServer/playthrough_session.php",body,true);
+  std::string response;
+  SendRawHttp(request,true,&response,NULL,NULL,&status);
+  return response;
 }
