@@ -204,6 +204,7 @@ void PopulateChatModeCombo() {
   g_pluginChatModeCombo->addItem(WideFromUtf8("narrator").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("inject").c_str());
   g_pluginChatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
+  g_pluginChatModeCombo->addItem(WideFromUtf8("hypnosis").c_str());
 
   g_pluginChatModeCombo->setIndexSelected(
       Stobe::ChatMode::ToIndex(g_chatMode));

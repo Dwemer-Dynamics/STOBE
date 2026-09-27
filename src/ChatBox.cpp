@@ -3479,6 +3479,13 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     return false;
   }
 
+  const std::string hypnosisPrefix = "rolemaster|HypnosisStatus|";
+  if (rawLine.find(hypnosisPrefix) == 0 && state->task->requestMode == "hypnosis") {
+    if (IsChatInterruptGenerationCurrent(state->generation))
+      QueueUiNotifyAction(TrimChatLine(rawLine.substr(hypnosisPrefix.size())));
+    return true;
+  }
+
   const std::string directorPrefix = "rolemaster|DirectorScene|";
   if (rawLine.find(directorPrefix) == 0 && state->task->requestMode == "director") {
     return PlayDirectorScene(state, TrimChatLine(rawLine.substr(directorPrefix.size())));
@@ -4049,6 +4056,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   Log("CHAT_SEND_STAGE: resolved_target ptr=" +
       ToString((int)((uintptr_t)targetNpc & 0x7fffffff)) + " has_target=" +
       std::string(targetNpc ? "1" : "0"));
+  if (mode == "hypnosis" && (!targetNpc || targetNpc == player ||
+      BuildStorageIdForCharacter(targetNpc) != "hand_" + handleStr)) {
+    if (world) world->showPlayerAMessage_withLog("Hypnosis needs one current NPC target. Select the NPC again.", true);
+    return;
+  }
   if (player && targetNpc) {
     Log("CHAT_SEND_STAGE: resolved_speaker=" + player->getName() +
         " dist_to_target=" +
@@ -4580,6 +4592,9 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
       L"&profile=" + ToWide(UrlEncode(profileName)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0");
+  if (mode == "hypnosis") {
+    endpoint += L"&target_storage_id=" + ToWide(UrlEncode(BuildStorageIdForCharacter(targetNpc)));
+  }
   if (manualActionPromptEligible &&
       manualActionChoice.manualActionKey &&
       manualActionChoice.manualActionKey[0] != '\0') {
@@ -4635,6 +4650,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   HANDLE chatThread =
       PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
+    if (mode == "hypnosis") {
+      g_chatMode = "chat";
+      g_lastChatModeIndex = 0;
+      SaveStobeRuntimeConfig();
+    }
     CloseHandle(chatThread);
   } else {
     delete streamTask;
@@ -5717,6 +5737,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatModeCombo->addItem(WideFromUtf8("narrator").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("inject").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("hypnosis").c_str());
   g_chatModeCombo->eventComboAccept += MyGUI::newDelegate(OnChatModeChange);
   g_chatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatModeChange);

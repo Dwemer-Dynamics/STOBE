@@ -941,6 +941,13 @@ int main() {
                5);
   ExpectUInt32("Inject and chat mode index",
                static_cast<unsigned int>(ToIndex("inject_chat")), 6);
+  ExpectEq("Hypnosis normalizes", Normalize("HYPNOSIS"), "hypnosis");
+  ExpectUInt32("Hypnosis mode index", static_cast<unsigned int>(ToIndex("hypnosis")), 7);
+  ExpectEq("Hypnosis display label", DisplayLabel("hypnosis"), "Hypnosis");
+  ExpectEq("Hypnosis overrides autochat", ResolveRequestMode("hypnosis", true), "hypnosis");
+  ExpectBool("Hypnosis blocks manual actions", AllowsManualActions("hypnosis"), false);
+  ExpectBool("Hypnosis suppresses speech", ShouldQueueLocalPlayerSpeech("hypnosis"), false);
+  ExpectBool("Hypnosis suppresses rechat", AllowsAutomaticRechat("hypnosis"), false);
   ExpectEq("Chat display label", DisplayLabel("chat"), "Chat");
   ExpectEq("Whisper display label", DisplayLabel("whisper"), "Whisper");
   ExpectEq("Inject and chat display label", DisplayLabel("inject_chat"),
