@@ -482,5 +482,164 @@ unsigned int ResolveInteractionTicket(long ticketSeq, long requestedSeq,
   return STOBE_CONTROL_PENDING;
 }
 
+std::string SelectSidToken(const std::vector<std::string> &sidTokens) {
+  for (size_t i = 1; i < sidTokens.size(); ++i) {
+    if (sidTokens[i] != sidTokens[0]) {
+      return "";
+    }
+  }
+  return sidTokens.empty() ? std::string() : sidTokens[0];
+}
+
+bool SidTokensRejected(const std::vector<std::string> &sidTokens) {
+  unsigned int sid = 0;
+  return !sidTokens.empty() && !ParseStrictSerial(SelectSidToken(sidTokens), sid);
+}
+
+unsigned int SelectFollowupAid(const std::vector<std::string> &aidTokens,
+                               const std::string &sidToken,
+                               unsigned int boundSerial) {
+  unsigned int aid = 0;
+  unsigned int sid = 0;
+  // The server writes canonical decimals; a leading zero is not its aid.
+  if (aidTokens.size() != 1 || aidTokens[0].empty() || aidTokens[0][0] == '0' ||
+      !ParseStrictSerial(aidTokens[0], aid) ||
+      !ParseStrictSerial(sidToken, sid) || sid != boundSerial) {
+    return 0;
+  }
+  return aid;
+}
+
+namespace {
+const char kHeaderAid[] = "|aid=";
+std::string Decimal(unsigned int value) {
+  char buffer[16];
+  int n = 0;
+  do {
+    buffer[n++] = static_cast<char>('0' + value % 10);
+    value /= 10;
+  } while (value != 0);
+  std::string out;
+  while (n > 0) {
+    out += buffer[--n];
+  }
+  return out;
+}
+
+std::string QueryEncode(const std::string &value) {
+  static const char hex[] = "0123456789ABCDEF";
+  std::string out;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(value[i]);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+        c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 15];
+    }
+  }
+  return out;
+}
+} // namespace
+
+std::string BuildFollowupQuery(unsigned int aid, unsigned int sid,
+                               unsigned int arid, const std::string &peopleJson,
+                               bool ttsEnabled) {
+  if (aid == 0 || sid == 0 || arid == 0 || peopleJson.empty()) {
+    return "";
+  }
+  return "&addon_followup=1&aid=" + Decimal(aid) + "&sid=" + Decimal(sid) +
+         "&arid=" + Decimal(arid) + "&people=" + QueryEncode(peopleJson) +
+         "&tts_enabled=" + (ttsEnabled ? "1" : "0");
+}
+
+std::string AppendHeaderAid(const std::string &header, unsigned int aid) {
+  return aid == 0 ? header : header + kHeaderAid + Decimal(aid);
+}
+
+bool TakeHeaderAid(std::string &header, unsigned int &aid) {
+  aid = 0;
+  const size_t pos = header.find(kHeaderAid);
+  if (pos == std::string::npos) {
+    return true;
+  }
+  // Only after "<name>|<serial>"; one canonical positive id ends the header.
+  const std::string value = header.substr(pos + sizeof(kHeaderAid) - 1);
+  const size_t pipe = header.find('|');
+  if (pipe == pos || value.empty() || value[0] == '0' ||
+      !ParseStrictSerial(value, aid)) {
+    aid = 0;
+    return false;
+  }
+  header.erase(pos);
+  return true;
+}
+
+bool FollowupLineAllowed(const std::string &actor, const std::string &sidToken,
+                         const std::string &capturedName,
+                         unsigned int capturedSerial) {
+  if (actor.empty() || actor != capturedName || capturedSerial == 0) {
+    return false;
+  }
+  unsigned int sid = 0;
+  return sidToken.empty() ||
+         (ParseStrictSerial(sidToken, sid) && sid == capturedSerial);
+}
+
+size_t FollowupQueue::RemoveCompleted(unsigned int owner) {
+  size_t dropped = 0;
+  for (size_t i = 0; i < entries_.size();) {
+    if (owner != 0 && entries_[i].completed && entries_[i].owner == owner) {
+      entries_.erase(entries_.begin() + i);
+      ++dropped;
+    } else {
+      ++i;
+    }
+  }
+  return dropped;
+}
+
+bool FollowupQueue::Add(const FollowupReport &report) {
+  if (report.aid == 0 || entries_.size() >= capacity_) {
+    return false;
+  }
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    if (entries_[i].aid == report.aid) {
+      return false;
+    }
+  }
+  entries_.push_back(report);
+  return true;
+}
+
+size_t FollowupQueue::Prune(unsigned long generation, long interactionEpoch) {
+  size_t dropped = 0;
+  for (size_t i = 0; i < entries_.size();) {
+    const FollowupReport &entry = entries_[i];
+    if (entry.generation != generation ||
+        (entry.completed && entry.interactionEpoch != interactionEpoch)) {
+      entries_.erase(entries_.begin() + i);
+      ++dropped;
+    } else {
+      ++i;
+    }
+  }
+  return dropped;
+}
+
+bool FollowupQueue::Take(bool pipelineIdle, FollowupReport &out) {
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    if (!entries_[i].completed || pipelineIdle) {
+      out = entries_[i];
+      entries_.erase(entries_.begin() + i);
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace AddonProtocol
 } // namespace Stobe

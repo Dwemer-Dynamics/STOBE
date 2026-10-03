@@ -104,8 +104,9 @@ const int kPlayerCustomMoodMaxChars = 80;
 
 class ActiveChatStreamScope {
 public:
-  explicit ActiveChatStreamScope(LONG directorGeneration = 0) : directorGeneration_(directorGeneration) {
-    InterlockedIncrement(&g_activeChatStreamCount);
+  // alreadyCounted adopts a slot the starter reserved before the thread ran.
+  explicit ActiveChatStreamScope(LONG directorGeneration = 0, bool alreadyCounted = false) : directorGeneration_(directorGeneration) {
+    if (!alreadyCounted) InterlockedIncrement(&g_activeChatStreamCount);
   }
   ~ActiveChatStreamScope() {
     InterlockedDecrement(&g_activeChatStreamCount);
@@ -2487,6 +2488,7 @@ struct StreamChatTask {
   LONG generation;
   int rechatDepth;
   bool allowUnavailableTargetSpeech;
+  bool streamSlotReserved; // g_activeChatStreamCount already holds this task
 };
 
 struct PlayerTtsTask {
@@ -3041,7 +3043,8 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
                           ToWide(BuildStreamQueryData("rechat", eventData, gameTs)) +
                           L"&profile=" + ToWide(UrlEncode(selectedResponder)) +
                           L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
-                          L"&rechat_depth=" + ToWide(ToString(nextRechatDepth));
+                          L"&rechat_depth=" + ToWide(ToString(nextRechatDepth)) +
+                          L"&addon_followup=1";
   if (!selectedResponder.empty()) {
     endpoint += L"&rechat_target=" + ToWide(UrlEncode(selectedResponder));
   }
@@ -3475,7 +3478,8 @@ static bool IsUnregisteredSecondarySpeaker(StreamChatParseState *state,
 static bool QueueStreamActionIfNew(StreamChatParseState *state,
                                    const std::string &actor,
                                    const std::string &speakerHeader,
-                                   const std::string &rawAction) {
+                                   const std::string &rawAction,
+                                   unsigned int followupAid = 0) {
   if (!state) {
     return false;
   }
@@ -3496,7 +3500,11 @@ static bool QueueStreamActionIfNew(StreamChatParseState *state,
   state->seenActions.insert(dedupeKey);
   Log("CHAT_TIMING: STREAM_ACTION actor=" + actor + " action=" + actionLine +
       " gen=" + ToString((int)state->generation));
-  QueueChatPipeLine("NPC_ACTION: " + speakerHeader + ": " + actionLine,
+  // The aid rides on the header; the action parameter stays byte-exact.
+  QueueChatPipeLine("NPC_ACTION: " +
+                        Stobe::AddonProtocol::AppendHeaderAid(speakerHeader,
+                                                              followupAid) +
+                        ": " + actionLine,
                     state->generation);
   state->actionCount++;
   state->firstLine = false;
@@ -3639,6 +3647,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   int ttsDurationMs = 0;
   std::string utteranceId = "";
   std::string actionSerialToken = "";
+  std::vector<std::string> sidTokens;
+  std::vector<std::string> aidTokens;
+  const bool followupStream = state->task->requestMode == "addon_followup";
 
   size_t bar1 = line.find('|');
   size_t bar2 =
@@ -3669,7 +3680,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         std::string parsedHash = ParseTtsHashToken(token);
         const std::string trimmedToken = TrimChatLine(token);
         if (trimmedToken.find("sid=") == 0) {
-          actionSerialToken = trimmedToken.substr(4);
+          sidTokens.push_back(trimmedToken.substr(4));
+        } else if (trimmedToken.find("aid=") == 0) {
+          aidTokens.push_back(trimmedToken.substr(4));
         } else if (!parsedHash.empty()) {
           ttsHash = parsedHash;
         } else {
@@ -3689,6 +3702,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         tokenStart = tokenEnd + 1;
       }
     }
+    actionSerialToken = Stobe::AddonProtocol::SelectSidToken(sidTokens);
     if (!g_ttsEnabled) {
       ttsHash.clear();
       ttsDurationMs = 0;
@@ -3703,16 +3717,60 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     }
   }
 
+  const bool isAction = EqualsIgnoreCase(actionKind, "ActionQueue") ||
+                        EqualsIgnoreCase(actionKind, "Action");
+  if (isAction && Stobe::AddonProtocol::SidTokensRejected(sidTokens)) {
+    // Present but malformed or conflicting sid tokens never fall back to the
+    // request's own actor.
+    Log("CHAT_ACTION: action dropped, invalid sid actor=" + actor);
+    return true;
+  }
+  if (followupStream) {
+    // An addon follow-up turn applies only lines of the captured actor and
+    // serial. Actions appear only when the server opted in
+    // (use_functions_again); the server issues no aid in this turn, so any aid
+    // token is discarded and a follow-up cannot chain another follow-up.
+    unsigned int capturedSerial = 0;
+    Stobe::AddonProtocol::ParseStrictSerial(state->task->handleStr,
+                                            capturedSerial);
+    aidTokens.clear();
+    if ((bar2 != std::string::npos && !isAction &&
+         !EqualsIgnoreCase(actionKind, "ScriptQueue")) ||
+        !Stobe::AddonProtocol::FollowupLineAllowed(
+            actor, sidTokens.empty() ? std::string() : actionSerialToken,
+            state->task->npcName, capturedSerial) ||
+        (sidTokens.size() > 1 && actionSerialToken.empty())) {
+      if (!utteranceId.empty()) {
+        PostSpeechDeliveryState(utteranceId, "cancelled");
+      }
+      Log("ADDON_FOLLOWUP: line dropped actor=" + actor + " kind=" +
+          actionKind);
+      return true;
+    }
+  }
+
   std::string speakerHeader = actor;
   bool narratorSpeaker = IsNarratorName(actor);
   if (!state->task->handleStr.empty() && actor == state->task->npcName) {
     speakerHeader = actor + "|" + state->task->handleStr;
   }
-  if ((EqualsIgnoreCase(actionKind, "ActionQueue") ||
-       EqualsIgnoreCase(actionKind, "Action")) &&
-      !subtitle.empty()) {
+  if (isAction && !subtitle.empty()) {
+    unsigned int followupAid = 0;
     if (!narratorSpeaker && Stobe::AddonProtocol::IsExtCommand(subtitle)) {
       speakerHeader = ExtActionSpeakerHeader(state, actor, actionSerialToken);
+      unsigned int boundSerial = 0;
+      const size_t pipe = speakerHeader.find('|');
+      if (pipe != std::string::npos) {
+        Stobe::AddonProtocol::ParseStrictSerial(speakerHeader.substr(pipe + 1),
+                                                boundSerial);
+      }
+      followupAid = Stobe::AddonProtocol::SelectFollowupAid(
+          aidTokens, actionSerialToken, boundSerial);
+    }
+    if (followupAid == 0 && !aidTokens.empty()) {
+      // A present but unusable aid fails closed rather than running legacy.
+      Log("CHAT_ACTION: action dropped, invalid aid actor=" + actor);
+      return true;
     }
     if (narratorSpeaker) {
       Log("CHAT_TIMING: narrator action ignored actor=" + actor +
@@ -3726,7 +3784,8 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
           actor);
       return true;
     }
-    QueueStreamActionIfNew(state, actor, speakerHeader, subtitle);
+    QueueStreamActionIfNew(state, actor, speakerHeader, subtitle,
+                           followupAid);
     return true;
   }
 
@@ -3853,7 +3912,8 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
-  ActiveChatStreamScope activeStream(task->requestMode == "director" ? task->generation : 0);
+  ActiveChatStreamScope activeStream(task->requestMode == "director" ? task->generation : 0,
+                                     task->streamSlotReserved);
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3872,6 +3932,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   bool requestOk =
       PostToStobeWithResponseStream(task->endpoint, "", OnStreamChatHttpLine,
                                     &parseState);
+  if (task->requestMode == "addon_followup") {
+    // One reply per addon outcome; never a rechat chain.
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
+    delete task;
+    return 0;
+  }
   if (task->requestMode == "director") {
     // All replies were authored and played by the scene callback. Never request a rechat.
     ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
@@ -3981,6 +4047,34 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
   delete task;
   return 0;
+}
+
+bool StartAddonFollowupStream(const std::wstring &endpoint,
+                              const std::string &actorName,
+                              unsigned int actorSerial,
+                              const std::string &peopleJson) {
+  StreamChatTask *task = new StreamChatTask();
+  task->endpoint = endpoint;
+  task->npcName = actorName;
+  task->handleStr = ToString(actorSerial);
+  task->peopleJson = peopleJson;
+  task->requestMode = "addon_followup";
+  task->generation = GetChatInterruptGeneration();
+  task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
+  // Reserve the stream slot before the thread exists so IsAiRequestActive
+  // reports busy from now on; the worker's scope releases it.
+  task->streamSlotReserved = true;
+  InterlockedIncrement(&g_activeChatStreamCount);
+  HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread,
+                                                task, 0, NULL);
+  if (!thread) {
+    InterlockedDecrement(&g_activeChatStreamCount);
+    delete task;
+    return false;
+  }
+  CloseHandle(thread);
+  return true;
 }
 
 bool IsAiRequestActive() {
@@ -4745,7 +4839,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
                                   eventData, gameTs)) +
       L"&profile=" + ToWide(UrlEncode(profileName)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
-      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0");
+      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") + L"&addon_followup=1";
   if (mode == "hypnosis") {
     endpoint += L"&target_storage_id=" + ToWide(UrlEncode(BuildStorageIdForCharacter(targetNpc)));
   }
@@ -5672,7 +5766,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
       L"&people=" + ToWide(UrlEncode(peopleJson)) +
-      L"&direction=" + ToWide(UrlEncode(direction));
+      L"&direction=" + ToWide(UrlEncode(direction)) + L"&addon_followup=1";
   AppendGeoQueryFromPlayer(endpoint, player);
 
   StreamChatTask *task = new StreamChatTask();

@@ -7,6 +7,7 @@
 #include <kenshi/util/hand.h>
 
 #include "AddonProtocol.h"
+#include "AudioPlayback.h"
 #include "ChatBox.h"
 #include "Comm.h"
 #include "Globals.h"
@@ -42,6 +43,7 @@ const size_t kMaxTickets = 128;
 const size_t kMaxActorLocks = 64;
 const size_t kMaxAgentRegistrations = 64;
 const size_t kMaxRefreshRequests = 32;
+const size_t kMaxFollowupReports = 16; // the server's open-row cap
 const size_t kMaxAgentScan = 512; // loaded characters examined per query
 const size_t kWorkPerTick = 8;
 const DWORD kPendingRequestLifetimeMs = 10 * 60 * 1000;
@@ -118,6 +120,7 @@ struct PendingRequest {
   std::string command;
   std::string parameter;
   DWORD createdTick;
+  StobeU32 aid; // stobe.addon_followup.v1 id, 0 for legacy actions
 };
 
 // The terminal result of an accepted request, reported on the game thread.
@@ -156,6 +159,8 @@ struct State {
   unsigned long lockGeneration; // Game thread only.
   // Pending refresh parts by actor and requesting addon.
   Stobe::AddonProtocol::RefreshTable refresh;
+  // Aid outcomes waiting for the follow-up transport; the game thread drains.
+  Stobe::AddonProtocol::FollowupQueue followups;
   StobeAddonId nextAddonId;
   StobeU32 nextRequestId;
   StobeU32 nextTicket;
@@ -169,6 +174,7 @@ struct State {
         locks(kMaxActorLocks), busy(kMaxActorLocks),
         agentIn(kMaxAgentRegistrations), agentOut(kMaxAgentRegistrations),
         lockGeneration(0), refresh(kMaxRefreshRequests),
+        followups(kMaxFollowupReports),
         nextAddonId(1),
         nextRequestId(1), nextTicket(1), lastExpiryTick(0),
         expiryGeneration(0) {
@@ -415,6 +421,8 @@ void RemoveAddonLocked(State &state, StobeAddonId id, const std::string &detail)
   PublishLockCountLocked(state);
   ReleaseSRWLockExclusive(&state.locksLock);
   state.refresh.RemoveOwner(id);
+  // Its unsent completions start no model turn; failures still close rows.
+  state.followups.RemoveCompleted(id);
 }
 
 void DisableFaultingAddon(StobeAddonId id, const std::string &where) {
@@ -563,11 +571,18 @@ int CurrentGameTs(GameWorld *world) {
 
 // Sends the CHIM-compatible funcret record "command@<cmd>@<param>@<result>"
 // and a readable infoaction line for the NPC's event history.
+//
+// An action that carried a server aid appends the follow-up query and is
+// queued for the native stream path (DrainFollowupReports). arid is the bridge
+// request id; a failure before any bridge accepted gets a fresh id from the
+// same sequence that no handler ever received, so the server can close its row
+// without that id naming a handler request. Only accepted requests complete.
 void ReportExternalActionOutcome(GameWorld *world, unsigned int actorSerial,
                                  const std::string &actorName,
                                  const std::string &command,
                                  const std::string &parameter, bool succeeded,
-                                 const std::string &detail) {
+                                 const std::string &detail, StobeU32 aid = 0,
+                                 StobeU32 arid = 0, StobeAddonId owner = 0) {
   Character *actor = ResolveLiveCharacterBySerial(world, actorSerial);
   std::string name = SafeName(actor);
   if (name.empty()) {
@@ -580,10 +595,50 @@ void ReportExternalActionOutcome(GameWorld *world, unsigned int actorSerial,
   const std::string data = "command@" + WithoutSeparators(command) + "@" +
                            WithoutSeparators(parameter) + "@" +
                            WithoutSeparators(result);
-  AsyncPostToStobeSerial(
-      L"/StobeServer/stream.php?DATA=" +
-          ToWide(BuildStreamQueryData("funcret", data, CurrentGameTs(world))),
-      "");
+  const std::string query =
+      "/StobeServer/stream.php?DATA=" +
+      BuildStreamQueryData("funcret", data, CurrentGameTs(world));
+  bool queued = false;
+  if (aid != 0 && actorSerial != 0) {
+    State &state = Get();
+    Lock lock(state.lock);
+    // A completion whose addon has since unregistered or faulted starts no
+    // model turn (aid kept only for the log); the plain funcret reports it.
+    const bool ownerGone =
+        succeeded && state.addons.find(owner) == state.addons.end();
+    if (!ownerGone && arid == 0) {
+      arid = state.nextRequestId++;
+      if (state.nextRequestId == 0) {
+        state.nextRequestId = 1;
+      }
+    }
+    Stobe::AddonProtocol::FollowupReport report;
+    report.aid = aid;
+    report.sid = actorSerial;
+    report.arid = arid;
+    report.generation = PlaythroughSession::Generation();
+    report.interactionEpoch = Stobe::Interaction::Epoch();
+    report.completed = succeeded;
+    report.owner = succeeded ? owner : 0;
+    report.actorName = name;
+    const std::string people =
+        "[\"" +
+        Stobe::AddonProtocol::JsonEscape(name + "|" + ToString(actorSerial)) +
+        "\"]";
+    report.query = query + Stobe::AddonProtocol::BuildFollowupQuery(
+                               aid, actorSerial, arid, people, g_ttsEnabled);
+    queued = !ownerGone && state.followups.Add(report);
+  }
+  if (!queued) {
+    // Legacy lines and servers. A full queue also lands here, so observers
+    // still see the result and the server row expires unclaimed.
+    if (aid != 0) {
+      Log("ADDON_FOLLOWUP: aid=" + ToString(aid) +
+          " reported without follow-up (queue full, actor unresolved or "
+          "addon removed)");
+    }
+    AsyncPostToStobeSerial(ToWide(query), "");
+  }
   const std::string message = "external action " + command + " " + result;
   Log("ADDON_ACTION: actor_serial=" + ToString(actorSerial) + " " + message);
   LogGameEvent("infoaction", name, SafeFactionName(actor), "None", "None",
@@ -720,7 +775,8 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
     ReportExternalActionOutcome(world, actorSerial, actorName, item.key,
                                 item.text, false,
                                 item.flag != 0 ? "parameter too long"
-                                               : "malformed command");
+                                               : "malformed command",
+                                item.number);
     return;
   }
   if (actorSerial == 0) {
@@ -741,7 +797,8 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
     ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
                                 item.text, false,
                                 IsCharacterUsable(actor) ? "actor unavailable"
-                                                         : "actor not loaded");
+                                                         : "actor not loaded",
+                                item.number);
     return;
   }
   // The dialogue lock does not gate actions; a busy flag refuses every
@@ -782,6 +839,7 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
         request.command = parsed.command;
         request.parameter = item.text;
         request.createdTick = GetTickCount();
+        request.aid = item.number;
         state.pending[requestId] = request;
       }
     }
@@ -809,7 +867,8 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
                                 !bridgeFound ? "no registered handler for bridge " +
                                                    parsed.bridge
                                 : gate != STOBE_OK ? std::string("actor busy")
-                                                   : std::string("too many pending requests"));
+                                                   : std::string("too many pending requests"),
+                                item.number);
     return;
   }
   if (verdict == STOBE_ACTION_ACCEPTED && !faulted) {
@@ -831,7 +890,8 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
   if (closed) {
     ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
                                 item.text, false,
-                                faulted ? "handler fault" : "rejected by handler");
+                                faulted ? "handler fault" : "rejected by handler",
+                                item.number, requestId);
   }
 }
 
@@ -883,7 +943,60 @@ void ReportOutcome(GameWorld *world, const Outcome &outcome) {
   ReportExternalActionOutcome(world, outcome.request.actorSerial,
                               outcome.request.actorName,
                               outcome.request.command, outcome.request.parameter,
-                              outcome.succeeded, outcome.detail);
+                              outcome.succeeded, outcome.detail,
+                              outcome.request.aid, outcome.requestId,
+                              outcome.request.owner);
+}
+
+// Sends at most one queued aid outcome per tick while no stream request or
+// Director scene runs. A completed outcome also waits for idle dialogue
+// (interaction on, chat closed, no queued speech or playback), so its reply
+// never interrupts the player, another stream or speech. A failure only
+// closes the server row; its stream applies no line.
+void DrainFollowupReports() {
+  State &state = Get();
+  {
+    Lock lock(state.lock);
+    state.followups.Prune(PlaythroughSession::Generation(),
+                          Stobe::Interaction::Epoch());
+    if (state.followups.Size() == 0) {
+      return;
+    }
+  }
+  if (Stobe::UI::IsAiRequestActive() || Stobe::UI::IsDirectorSceneActive()) {
+    return;
+  }
+  bool dialogueIdle = Stobe::Interaction::Allowed() &&
+                      !Stobe::UI::g_chatWindow && !IsTtsPlaybackActive();
+  if (dialogueIdle) {
+    if (TryEnterCriticalSection(&g_uiMutex)) {
+      for (std::deque<QueuedAction>::const_iterator it =
+               g_uiActionQueue.begin();
+           it != g_uiActionQueue.end() && dialogueIdle; ++it) {
+        dialogueIdle = it->type != ACT_SAY && it->type != ACT_PLAY_TTS;
+      }
+      LeaveCriticalSection(&g_uiMutex);
+    } else {
+      dialogueIdle = false;
+    }
+  }
+  Stobe::AddonProtocol::FollowupReport report;
+  {
+    Lock lock(state.lock);
+    if (!state.followups.Take(dialogueIdle, report)) {
+      return;
+    }
+  }
+  // A locked or busy actor cannot speak: the stream applies no line.
+  const bool speak =
+      report.completed && DialogueGate(report.sid) == STOBE_OK;
+  const bool started = Stobe::UI::StartAddonFollowupStream(
+      ToWide(report.query), speak ? report.actorName : std::string(),
+      report.sid, "[]");
+  Log("ADDON_FOLLOWUP: aid=" + ToString(report.aid) + " arid=" +
+      ToString(report.arid) + " sid=" + ToString(report.sid) +
+      (report.completed ? " completed" : " failed") +
+      (speak ? "" : " no_speech") + (started ? " sent" : " transport_failed"));
 }
 
 // Settles interaction tickets. Scans only while some are pending and the
@@ -1825,6 +1938,7 @@ void GameThreadTick(GameWorld *world) {
           " actor lock(s)/busy flag(s)/agent registration(s)");
     }
   }
+  DrainFollowupReports();
   {
     Lock lock(state.lock);
     if (state.work.empty() && state.pending.empty() &&
@@ -1949,9 +2063,11 @@ size_t TakeRefreshRequests(RefreshRequest *out, size_t max) {
 }
 
 void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand,
-                         const std::string &parameter) {
+                         const std::string &parameter,
+                         unsigned int followupAid) {
   WorkItem item;
   item.kind = WORK_EXT_ACTION;
+  item.number = actorSerial != 0 ? followupAid : 0;
   item.generation = PlaythroughSession::Generation();
   item.first.serial = actorSerial;
   item.first.generation = static_cast<StobeU32>(item.generation);

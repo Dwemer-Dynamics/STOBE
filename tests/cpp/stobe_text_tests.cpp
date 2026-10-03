@@ -1248,6 +1248,127 @@ int main() {
                refresh.RemoveOtherGenerations(6) == 1 &&
                    refresh.Take(6, 4, taken) == 1 && taken[0].first == 51u,
                true);
+
+    std::vector<std::string> sids, aids;
+    sids.push_back("9101");
+    sids.push_back("9101");
+    aids.push_back("77");
+    ExpectBool("Followup: aid needs one strict aid bound to the sid",
+               AP::SelectSidToken(sids) == "9101" &&
+                   AP::SelectFollowupAid(aids, "9101", 9101u) == 77u &&
+                   AP::SelectFollowupAid(aids, "9101", 0u) == 0u &&
+                   AP::SelectFollowupAid(aids, "", 9101u) == 0u &&
+                   AP::SelectFollowupAid(std::vector<std::string>(), "9101",
+                                         9101u) == 0u,
+               true);
+    ExpectBool("Followup: absent sid is legacy, one strict sid is usable",
+               !AP::SidTokensRejected(std::vector<std::string>()) &&
+                   !AP::SidTokensRejected(sids),
+               true);
+    sids.push_back("9102");
+    std::vector<std::string> malformedSid(1, std::string("91x"));
+    ExpectBool("Followup: conflicting or malformed sid drops the action",
+               AP::SidTokensRejected(sids) &&
+                   AP::SidTokensRejected(malformedSid),
+               true);
+    {
+      // Queued line as ChatBox writes it; the parameter carries look-alike
+      // markers that must survive byte-exact.
+      const std::string param = "x [ADDON_AID:9]|aid=4";
+      std::string line = "NPC_ACTION: " + AP::AppendHeaderAid("SRP Beep|9101", 77u) +
+                         ": ExtCmdParityProbe_Report@" + param;
+      const size_t end = line.find(':', 12);
+      std::string header = line.substr(12, end - 12);
+      unsigned int aid = 0;
+      const bool ok = AP::TakeHeaderAid(header, aid);
+      line.replace(12, end - 12, header);
+      ExpectBool("Followup: aid rides the header, parameter unchanged",
+                 ok && aid == 77u && header == "SRP Beep|9101" &&
+                     line == "NPC_ACTION: SRP Beep|9101: "
+                             "ExtCmdParityProbe_Report@" + param,
+                 true);
+      std::string legacy = "SRP Beep|9101";
+      std::string noSerial = "SRP Beep|aid=7";
+      std::string zero = "SRP Beep|9101|aid=07";
+      std::string twice = "SRP Beep|9101|aid=7|aid=7";
+      ExpectBool("Followup: header aid absent is legacy, malformed fails",
+                 AP::TakeHeaderAid(legacy, aid) && aid == 0u &&
+                     legacy == "SRP Beep|9101" &&
+                     AP::AppendHeaderAid(legacy, 0u) == legacy &&
+                     !AP::TakeHeaderAid(noSerial, aid) &&
+                     !AP::TakeHeaderAid(zero, aid) &&
+                     !AP::TakeHeaderAid(twice, aid) &&
+                     twice == "SRP Beep|9101|aid=7|aid=7",
+                 true);
+    }
+    std::vector<std::string> badAids;
+    badAids.push_back("077");
+    std::vector<std::string> twoAids(2, std::string("77"));
+    ExpectBool("Followup: conflicting sid, duplicate or malformed aid fail closed",
+               AP::SelectSidToken(sids).empty() &&
+                   AP::SelectFollowupAid(twoAids, "9101", 9101u) == 0u &&
+                   AP::SelectFollowupAid(badAids, "9101", 9101u) == 0u,
+               true);
+    ExpectEq("Followup: query matches the server contract",
+                 AP::BuildFollowupQuery(77u, 9101u, 3u, "[\"SRP Beep|9101\"]",
+                                        false),
+                 "&addon_followup=1&aid=77&sid=9101&arid=3&people=%5B%22SRP%20"
+                 "Beep%7C9101%22%5D&tts_enabled=0");
+    ExpectBool("Followup: query needs every id",
+               AP::BuildFollowupQuery(77u, 9101u, 0u, "[]", true).empty(),
+               true);
+    ExpectBool("Followup: lines bind to the captured actor and serial",
+               AP::FollowupLineAllowed("SRP Beep", "", "SRP Beep", 9101u) &&
+                   AP::FollowupLineAllowed("SRP Beep", "9101", "SRP Beep",
+                                           9101u) &&
+                   !AP::FollowupLineAllowed("SRP Beep", "9102", "SRP Beep",
+                                            9101u) &&
+                   !AP::FollowupLineAllowed("srp beep", "", "SRP Beep", 9101u) &&
+                   !AP::FollowupLineAllowed("SRP Drifter", "9101", "SRP Beep",
+                                            9101u),
+               true);
+
+    AP::FollowupQueue followups(2);
+    AP::FollowupReport report;
+    report.aid = 5;
+    report.sid = 9101;
+    report.arid = 1;
+    report.generation = 3;
+    report.interactionEpoch = 8;
+    report.completed = true;
+    report.owner = 2;
+    AP::FollowupReport failure = report;
+    failure.aid = 6;
+    failure.completed = false;
+    AP::FollowupReport next;
+    ExpectBool("Followup queue: one outcome per aid, bounded",
+               followups.Add(report) && !followups.Add(report) &&
+                   followups.Add(failure) && !followups.Add(report) &&
+                   followups.Size() == 2,
+               true);
+    ExpectBool("Followup queue: completed waits for idle, failure does not",
+               followups.Take(false, next) && next.aid == 6u &&
+                   !followups.Take(false, next) &&
+                   followups.Take(true, next) && next.aid == 5u,
+               true);
+    followups.Add(report);
+    followups.Add(failure);
+    ExpectBool("Followup queue: interaction change drops completed only",
+               followups.Prune(3, 9) == 1 && followups.Size() == 1 &&
+                   followups.Prune(4, 9) == 1 && followups.Size() == 0,
+               true);
+    AP::FollowupReport other = report;
+    other.aid = 7;
+    other.owner = 3;
+    AP::FollowupQueue owned(4);
+    owned.Add(report);
+    owned.Add(failure);
+    owned.Add(other);
+    ExpectBool("Followup queue: removed addon drops its completions only",
+               owned.RemoveCompleted(2) == 1 && owned.Size() == 2 &&
+                   owned.Take(false, next) && next.aid == 6u &&
+                   owned.Take(true, next) && next.aid == 7u,
+               true);
   }
 
   if (g_failures != 0) {

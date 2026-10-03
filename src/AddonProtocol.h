@@ -40,6 +40,72 @@ bool ParseStrictSerial(const std::string &value, unsigned int &out);
 unsigned int SelectExtActionSerial(const std::string &sidToken,
                                    unsigned int primarySerial, bool sidListed);
 
+// Addon follow-up contract stobe.addon_followup.v1 (StobeServer
+// docs/plugin-runtime.md). Every "sid=" token of a line, in order; returns the
+// common value, or "" when absent or when two tokens disagree (fail closed).
+std::string SelectSidToken(const std::vector<std::string> &sidTokens);
+// True when sid tokens are present but do not name one strict serial; such an
+// action line is dropped. Absent tokens (legacy servers) are never rejected.
+bool SidTokensRejected(const std::vector<std::string> &sidTokens);
+// The line's aid, or 0. Requires exactly one "aid=" token that is a strict
+// uint32, a strict sid, and an action bound to exactly that serial
+// (boundSerial from SelectExtActionSerial). Duplicates fail closed; a line
+// with any aid token that yields 0 must be dropped, not run as legacy.
+unsigned int SelectFollowupAid(const std::vector<std::string> &aidTokens,
+                               const std::string &sidToken,
+                               unsigned int boundSerial);
+// The aid travels on the queued NPC_ACTION speaker header "<name>|<serial>"
+// as "<name>|<serial>|aid=<n>", never in the action parameter.
+// TakeHeaderAid removes that suffix from a header and returns true with aid 0
+// when there is none; false (header unchanged) for a malformed aid suffix.
+std::string AppendHeaderAid(const std::string &header, unsigned int aid);
+bool TakeHeaderAid(std::string &header, unsigned int &aid);
+// Query suffix appended to the unchanged funcret request for an aid outcome.
+// Empty when any id is 0 or peopleJson is empty.
+std::string BuildFollowupQuery(unsigned int aid, unsigned int sid,
+                               unsigned int arid, const std::string &peopleJson,
+                               bool ttsEnabled);
+// True when a follow-up stream line may be applied: the actor is exactly the
+// captured name and any sid token equals the captured serial.
+bool FollowupLineAllowed(const std::string &actor, const std::string &sidToken,
+                         const std::string &capturedName,
+                         unsigned int capturedSerial);
+
+// Bounded outcome reports waiting for the follow-up transport. One entry per
+// aid (a second outcome for the same aid is dropped). Completed entries wait
+// for an idle dialogue pipeline; failures only need the transport.
+struct FollowupReport {
+  unsigned int aid;
+  unsigned int sid;
+  unsigned int arid;
+  unsigned long generation;  // load generation
+  long interactionEpoch;
+  bool completed;
+  unsigned int owner;        // addon that reported a completion, else 0
+  std::string actorName;
+  std::string query;         // funcret DATA query, already encoded
+};
+class FollowupQueue {
+public:
+  explicit FollowupQueue(size_t capacity) : capacity_(capacity) {}
+  // False (nothing stored) when full, aid is 0 or aid is already queued.
+  bool Add(const FollowupReport &report);
+  // Drops entries of other load generations, and completed entries whose
+  // interaction epoch differs (the server would skip them anyway). Returns
+  // the number dropped.
+  size_t Prune(unsigned long generation, long interactionEpoch);
+  // Drops the owner's completed entries (unregister or fault); failures stay
+  // so their server rows still close. Returns the number dropped.
+  size_t RemoveCompleted(unsigned int owner);
+  // Takes the oldest failure, or when pipelineIdle the oldest entry.
+  bool Take(bool pipelineIdle, FollowupReport &out);
+  size_t Size() const { return entries_.size(); }
+
+private:
+  std::vector<FollowupReport> entries_;
+  size_t capacity_;
+};
+
 // Matches the server package manager's plugin-name and version rules.
 bool IsSafePackageName(const std::string &value);
 bool IsSafePackageVersion(const std::string &value);

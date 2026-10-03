@@ -19,8 +19,11 @@ void GameThreadTick(GameWorld *world);
 // dead or unconscious at dispatch, are reported as failed actions. actorSerial
 // 0 means the speaker was not resolved exactly and is reported as failed
 // without calling a bridge. rawCommand keeps its original case.
+// followupAid is the server's stobe.addon_followup.v1 id for this exact
+// actor (0 for legacy lines); its outcome is reported on the follow-up path.
 void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand,
-                         const std::string &parameter);
+                         const std::string &parameter,
+                         unsigned int followupAid = 0);
 
 // True when an addon holds a dialogue lock on the serial in the current load.
 // Stobe's automatic selection, rechat, autonomy, request starts and spoken

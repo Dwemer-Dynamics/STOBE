@@ -50,6 +50,14 @@ void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
 bool IsAiRequestActive();
+// Sends an addon action outcome (stobe.addon_followup.v1) on the native stream
+// path. Only lines of the captured actor/serial are applied (actions only if
+// the server opted in, never with an aid); no rechat. The stream slot is
+// reserved before return. False when the worker could not start.
+bool StartAddonFollowupStream(const std::wstring &endpoint,
+                              const std::string &actorName,
+                              unsigned int actorSerial,
+                              const std::string &peopleJson);
 // Game thread. True when the loaded character is one Stobe's normal chat would
 // offer as a target (alive, conscious, in talk range and area of the player
 // speaker); distanceOut is the chat interaction distance.
