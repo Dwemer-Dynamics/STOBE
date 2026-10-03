@@ -52,3 +52,5 @@ When the model selects the action for an NPC:
 - The server receives `funcret` data `command@ExtCmdParityProbe_Ping@<parameter>@completed: pong …` and an `infoaction` line for the NPC.
 
 An unknown action such as `ExtCmdParityProbe_Explode` is rejected by the handler and reported as failed. If the addon is not installed, Stobe reports `failed: no registered handler for bridge ParityProbe`.
+
+For another speaker in a group or rechat response, the server must send the speaker serial (`|sid=<serial>` on the action line; see [ADDON_API.md](../../docs/ADDON_API.md#speaker-serial)). An older server, or a serial that does not match an identity Stobe sent with the request, gives `failed: speaker unresolved`. A dead, unconscious or unloaded speaker gives `failed: actor unavailable` or `failed: actor not loaded` without calling the handler.

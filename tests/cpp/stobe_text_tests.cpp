@@ -1012,6 +1012,20 @@ int main() {
                false);
     ExpectBool("Strict serial accepts plain decimal",
                AP::ParseStrictSerial("123", serial) && serial == 123u, true);
+    ExpectUInt32("ExtCmd serial: legacy server keeps primary",
+                 AP::SelectExtActionSerial("", 42u, false), 42u);
+    ExpectUInt32("ExtCmd serial: legacy secondary fails closed",
+                 AP::SelectExtActionSerial("", 0u, false), 0u);
+    ExpectUInt32("ExtCmd serial: listed group speaker",
+                 AP::SelectExtActionSerial("77", 0u, true), 77u);
+    ExpectUInt32("ExtCmd serial: unlisted sid rejected",
+                 AP::SelectExtActionSerial("77", 0u, false), 0u);
+    ExpectUInt32("ExtCmd serial: sid conflicting with primary rejected",
+                 AP::SelectExtActionSerial("77", 42u, true), 0u);
+    ExpectUInt32("ExtCmd serial: sid matching primary",
+                 AP::SelectExtActionSerial("42", 42u, false), 42u);
+    ExpectUInt32("ExtCmd serial: malformed sid rejected",
+                 AP::SelectExtActionSerial("77x", 0u, true), 0u);
     std::string stem;
     ExpectBool("Package archive accepts dwpkg",
                AP::SplitPackageArchiveName("1.2.0.DWPKG", stem), true);

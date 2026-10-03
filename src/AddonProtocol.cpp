@@ -88,6 +88,21 @@ bool ParseStrictSerial(const std::string &value, unsigned int &out) {
   return true;
 }
 
+unsigned int SelectExtActionSerial(const std::string &sidToken,
+                                   unsigned int primarySerial, bool sidListed) {
+  if (sidToken.empty()) {
+    return primarySerial;
+  }
+  unsigned int sid = 0;
+  if (!ParseStrictSerial(sidToken, sid)) {
+    return 0;
+  }
+  if (primarySerial != 0) {
+    return sid == primarySerial ? sid : 0;
+  }
+  return sidListed ? sid : 0;
+}
+
 bool IsValidToken(const std::string &value) {
   if (value.empty() || value.size() > kMaxNameBytes || value[0] == '.' ||
       value[0] == '-') {

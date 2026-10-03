@@ -37,7 +37,7 @@ Actors are addressed by `StobeActorRef { serial, generation }`. `serial` is the 
 
 | Function | Behavior |
 | --- | --- |
-| `RegisterAddon` / `UnregisterAddon` | Unique addon name (`[A-Za-z0-9_.-]`, ≤ 48). Up to 16 addons. Unregistering removes bridges, queued work and pending requests. |
+| `RegisterAddon` / `UnregisterAddon` | Unique addon name (`[A-Za-z0-9_.-]`, ≤ 48). Up to 16 addons. Unregistering removes bridges and queued work, and reports the addon's unreported accepted requests as `failed: addon unregistered`. |
 | `MakeActorRef` | See identity above. |
 | `GetRuntimeFlags` | Interaction toggle on, AI response streaming, director/continue scene active, world updated within 2 s. |
 | `GetActorState` | Loaded, alive, conscious, player squad, and whether Stobe currently routes speech to the actor (talk target or queued line). Game thread only. |
@@ -46,7 +46,7 @@ Actors are addressed by `StobeActorRef { serial, generation }`. `serial` is the 
 | `SendEvent` | `STOBE_EVENT_INFO`: `infoaction` stream event (`Actor: text`, or the addon name when no actor). `STOBE_EVENT_PLUGIN_STATE`: `addon_state` stream event with `<key>=<value>` from the addon name. Rate limited to 20 events per 10 s per addon. |
 | `CancelDialogue` | Starts a new Stobe interrupt generation: clears queued speech/actions and stops playing TTS, like a new player send. |
 | `RegisterActionBridge` | Owns `ExtCmd<Bridge>_*` actions. Bridge names are `[A-Za-z0-9]`, ≤ 48, matched case-insensitively, one owner each, 64 total. |
-| `ReportActionResult` | Reports one outcome for an accepted request. |
+| `ReportActionResult` | Reports the outcome of an accepted request. The first report wins; a repeat or a report after the timeout returns `STOBE_E_NOT_FOUND`, and a request from an earlier load `STOBE_E_STALE`. Results bypass the work queue, so a full queue cannot lose them. |
 | `QueueGameThreadCallback` | Runs a function once on the game thread unless the load generation changes first. |
 
 StobeServer builds that include the plugin runtime acknowledge `addon_state` and `funcret` with `ok`. They do not store them as unhandled events or call the model; a server extension's `prerequest.php` observes them (see the paired `parity_probe` example). Older servers store `addon_state` through the unhandled-event path with a warning per event. Keep plugin-state events infrequent.
@@ -55,16 +55,24 @@ StobeServer builds that include the plugin runtime acknowledge `addon_state` and
 
 When StobeServer returns an action `ExtCmd<Bridge>_<Action>@<parameter>` for an NPC, Stobe:
 
-1. Parses it in the existing NPC action path, after speaker resolution, duplicate suppression and the existing `action command received` `infoaction` event. Unlike built-in actions, an `ExtCmd` action never uses the name, prefix or talk-target fallbacks: the action header must carry the speaker serial and that exact NPC must be loaded. Otherwise Stobe reports `failed: speaker unresolved` without calling the addon. Streamed responses currently carry a serial only for the conversation's primary NPC, so `ExtCmd` actions selected for other speakers in a group response fail this way. A resolved actor that is dead or unconscious is skipped and logged, like other speaker-bound actions.
-2. Queues dispatch to the game-thread tick and calls the bridge handler with `StobeActionRequest` (request id, actor reference and display name, full command in its original case, bridge, action and raw parameter).
-3. Treats a handler return of `STOBE_ACTION_ACCEPTED` as pending until `ReportActionResult`. Nothing is reported for a request that is merely accepted.
+1. Parses it in the existing NPC action path, after speaker resolution, duplicate suppression and the existing `action command received` `infoaction` event. Unlike built-in actions, an `ExtCmd` action never uses the name, prefix or talk-target fallbacks: the action header must carry the exact speaker serial. Otherwise Stobe reports `failed: speaker unresolved` without calling the addon.
+2. Queues dispatch to the game-thread tick. An actor that is no longer loaded, or is dead or unconscious, fails with `actor not loaded` or `actor unavailable`. Otherwise Stobe calls the bridge handler with `StobeActionRequest` (request id, actor reference and display name, full command in its original case, bridge, action and raw parameter).
+3. Treats a handler return of `STOBE_ACTION_ACCEPTED` as pending until `ReportActionResult`.
 
-An outcome is sent only when it is known: the addon reports success/failure, the handler rejects or faults, no bridge is registered, the speaker is unresolved, the command is malformed or the parameter exceeds 1000 bytes. Each outcome produces:
+### Speaker serial
+
+The request's own NPC uses the handle Stobe sent with the request. For any other speaker in a streamed (group, rechat or continue) response, StobeServer appends `sid=<serial>` metadata to the `ExtCmd` action line: `<actor>|ActionQueue|ExtCmd…@<parameter>|sid=<serial>`. The server takes the serial only from the request's `people` list and omits it when that name is unlisted, listed without a serial, or listed with more than one serial. Stobe accepts the serial only when `<actor>|<serial>` is one of the identities it sent with that request (ASCII case-insensitive) and, for the request's own NPC, it equals the request handle. A missing, malformed, unlisted or conflicting serial fails as `speaker unresolved`; Stobe never picks an NPC by name. Built-in action lines carry no `sid` and are unchanged.
+
+Compatibility: older clients ignore the unknown metadata token. With an older server, only the request's own NPC can run `ExtCmd` actions, as before.
+
+### Outcomes
+
+Within the load that created it, each accepted request gets exactly one outcome. Stobe sends it when the addon reports success or failure, or fails the request itself: `rejected by handler`, `handler fault` (the addon is also disabled), `addon unregistered`, or `timed out` after 10 minutes without a report. Whichever happens first wins; later reports return `STOBE_E_NOT_FOUND`. Outcomes are also sent when no request is created: no bridge is registered, too many requests are pending (128), the speaker is unresolved, the actor is unavailable, the command is malformed or the parameter exceeds 1000 bytes. Each outcome produces:
 
 - `funcret` stream event with CHIM's data shape `command@<Command>@<parameter>@<completed|failed[: detail]>` (`@` and newlines in fields become spaces), for server extensions that observe completions.
 - `infoaction` event `external action <Command> completed|failed[: detail]` for the NPC's event history.
 
-A pending request with no report expires after 10 minutes or on load with a local log line only; Stobe does not invent a result. An action whose resolved NPC unloads, dies or is knocked out before dispatch is also dropped with a log line and no outcome. Dialectic differs: it reports `speaker_not_in_current_scene` and times out unreported requests as failed after 30 seconds, so a shared server extension can see no `funcret` from Stobe where Dialectic sends a failure. Built-in Stobe actions keep their existing paths unchanged.
+Outcomes are reported on the game thread, at most 8 per frame together with other addon work, with no Stobe lock held. A save load or new game cancels pending requests and unsent outcomes locally: nothing from an earlier load is sent to the server, and Stobe's transport also refuses requests while the new playthrough session is not ready. An `ExtCmd` line dropped because the addon work queue is full (128) is logged only. Dialectic reports `speaker_not_in_current_scene` and times out after 30 seconds instead of 10 minutes, so detail text and timing differ between products. Built-in Stobe actions keep their existing paths unchanged.
 
 The autonomy catalog adapter only recognizes built-in queued actions. If an autonomy decision selects an `ExtCmd` action, the adapter reports that decision as failed (`catalog_adapter_no_queued_action`) after the action is dispatched; addon bridges are intended for dialogue-selected actions.
 
@@ -118,4 +126,4 @@ Limitations: changing the server target during a session needs a game restart to
 
 ## Validation status
 
-Portable tests cover `ExtCmd` parsing, package name/version/archive rules and the package API field readers. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events and package upload against a live server require in-game testing.
+Portable tests cover `ExtCmd` parsing, strict serials, the `ExtCmd` speaker-serial decision, package name/version/archive rules and the package API field readers. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events and package upload against a live server require in-game testing.

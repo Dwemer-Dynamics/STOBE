@@ -6,6 +6,7 @@
 #include "Context.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "AddonProtocol.h"
 #include "StobeChatMode.h"
 #include "StobeTiming.h"
 #include "Utils.h"
@@ -3343,6 +3344,39 @@ static std::string MaybeInjectGiveItemTarget(const StreamChatParseState *state,
   return rewritten;
 }
 
+// ExtCmd actions are bound to an exact serial, never a name. The request's own
+// NPC keeps its handle; another speaker needs the server's sid= value, and that
+// actor|serial pair must be one of the people identities this request sent.
+// Otherwise the header has no serial and the addon runtime reports the action
+// as unresolved.
+static std::string ExtActionSpeakerHeader(StreamChatParseState *state,
+                                          const std::string &actor,
+                                          const std::string &sidToken) {
+  unsigned int primarySerial = 0;
+  if (actor != state->task->npcName ||
+      !Stobe::AddonProtocol::ParseStrictSerial(state->task->handleStr,
+                                               primarySerial)) {
+    primarySerial = 0;
+  }
+  unsigned int sid = 0;
+  bool sidListed = false;
+  if (Stobe::AddonProtocol::ParseStrictSerial(sidToken, sid)) {
+    const std::string identity =
+        "\"" + EscapeJSON(actor + "|" + ToString(sid)) + "\"";
+    sidListed = Stobe::AddonProtocol::LowerAscii(state->task->peopleJson)
+                    .find(Stobe::AddonProtocol::LowerAscii(identity)) !=
+                std::string::npos;
+  }
+  const unsigned int serial = Stobe::AddonProtocol::SelectExtActionSerial(
+      sidToken, primarySerial, sidListed);
+  if (serial == 0) {
+    Log("CHAT_ACTION: EXTCMD speaker serial unavailable actor=" + actor +
+        " sid=" + sidToken.substr(0, 16));
+    return actor;
+  }
+  return actor + "|" + ToString(serial);
+}
+
 static bool QueueStreamActionIfNew(StreamChatParseState *state,
                                    const std::string &actor,
                                    const std::string &speakerHeader,
@@ -3509,6 +3543,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   std::string ttsHash = "";
   int ttsDurationMs = 0;
   std::string utteranceId = "";
+  std::string actionSerialToken = "";
 
   size_t bar1 = line.find('|');
   size_t bar2 =
@@ -3537,7 +3572,10 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
                                 : metadata.substr(tokenStart,
                                                   tokenEnd - tokenStart);
         std::string parsedHash = ParseTtsHashToken(token);
-        if (!parsedHash.empty()) {
+        const std::string trimmedToken = TrimChatLine(token);
+        if (trimmedToken.find("sid=") == 0) {
+          actionSerialToken = trimmedToken.substr(4);
+        } else if (!parsedHash.empty()) {
           ttsHash = parsedHash;
         } else {
           std::string parsedUtteranceId = ParseUtteranceIdToken(token);
@@ -3578,6 +3616,9 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   if ((EqualsIgnoreCase(actionKind, "ActionQueue") ||
        EqualsIgnoreCase(actionKind, "Action")) &&
       !subtitle.empty()) {
+    if (!narratorSpeaker && Stobe::AddonProtocol::IsExtCommand(subtitle)) {
+      speakerHeader = ExtActionSpeakerHeader(state, actor, actionSerialToken);
+    }
     if (narratorSpeaker) {
       Log("CHAT_TIMING: narrator action ignored actor=" + actor +
           " action=" + subtitle + " gen=" + ToString((int)state->generation));

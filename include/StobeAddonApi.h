@@ -116,7 +116,8 @@ typedef struct StobeAddonApiV1 {
   const char *stobe_version;
 
   int(STOBE_CALL *RegisterAddon)(const StobeAddonInfo *info, StobeAddonId *out_id);
-  /* Removes bridges and drops queued work and pending requests of the addon. */
+  /* Removes bridges and drops queued work. Accepted requests not yet reported
+   * are reported to the server as failed ("addon unregistered"). */
   int(STOBE_CALL *UnregisterAddon)(StobeAddonId id);
 
   /* Stamps the current load generation. Validated when the work runs. */
@@ -145,7 +146,8 @@ typedef struct StobeAddonApiV1 {
                                         StobeActionHandler handler,
                                         void *user_data);
   int(STOBE_CALL *UnregisterActionBridge)(StobeAddonId id, const char *bridge);
-  /* message may be NULL; reported once per accepted request. */
+  /* message may be NULL. The first report for an accepted request wins;
+   * a repeat, or a report after the 10-minute timeout, is STOBE_E_NOT_FOUND. */
   int(STOBE_CALL *ReportActionResult)(StobeAddonId id, StobeU32 request_id,
                                       int succeeded, const char *message);
   /* Runs fn once on the game thread unless the load generation changes. */
