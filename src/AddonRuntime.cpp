@@ -249,6 +249,13 @@ std::string SafeFactionName(Character *character) {
   }
 }
 
+// True when the ref was issued before the current load. Entry points reject
+// these at the call; ResolveActor re-checks at dispatch because a load can
+// still happen while the work is queued.
+bool IsStaleRef(const StobeActorRef &ref) {
+  return ref.generation != PlaythroughSession::Generation();
+}
+
 // Resolves a reference on the game thread; rejects earlier load generations.
 int ResolveActor(GameWorld *world, const StobeActorRef &ref,
                  Character *&characterOut) {
@@ -256,7 +263,7 @@ int ResolveActor(GameWorld *world, const StobeActorRef &ref,
   if (ref.serial == 0) {
     return STOBE_E_INVALID_ARGUMENT;
   }
-  if (ref.generation != PlaythroughSession::Generation()) {
+  if (IsStaleRef(ref)) {
     return STOBE_E_STALE;
   }
   Character *character = ResolveLiveCharacterBySerial(world, ref.serial);
@@ -424,7 +431,8 @@ void RunContextRequest(GameWorld *world, const WorkItem &item) {
     dispatched = Stobe::UI::TriggerBoredEvent(
         world, true, SafeName(speaker), ToString(item.first.serial), 0,
         listener ? SafeName(listener) : std::string(),
-        listener ? ToString(item.second.serial) : std::string(), item.text);
+        listener ? ToString(item.second.serial) : std::string(), item.text,
+        true);
   }
   Log("ADDON_API: contextual request speaker_serial=" +
       ToString(item.first.serial) + " result=" +
@@ -509,6 +517,12 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
                                 item.text, false,
                                 item.flag != 0 ? "parameter too long"
                                                : "malformed command");
+    return;
+  }
+  if (actorSerial == 0) {
+    // The response did not name an exact actor; addons never get a guess.
+    ReportExternalActionOutcome(world, 0, std::string(), parsed.command,
+                                item.text, false, "speaker unresolved");
     return;
   }
   if (!IsCharacterUsable(actor)) {
@@ -739,6 +753,9 @@ int STOBE_CALL ApiSendPlayerInput(StobeAddonId id, StobeActorRef target,
       !CopyBoundedText(text, STOBE_MAX_TEXT_BYTES, false, item.text)) {
     return STOBE_E_INVALID_ARGUMENT;
   }
+  if (IsStaleRef(target)) {
+    return STOBE_E_STALE;
+  }
   item.kind = WORK_PLAYER_INPUT;
   item.owner = id;
   item.generation = target.generation;
@@ -754,6 +771,9 @@ int STOBE_CALL ApiRequestContextualResponse(StobeAddonId id,
   if (speaker.serial == 0 || listener.serial == speaker.serial ||
       !CopyBoundedText(direction, STOBE_MAX_TEXT_BYTES, true, item.text)) {
     return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(speaker) || (listener.serial != 0 && IsStaleRef(listener))) {
+    return STOBE_E_STALE;
   }
   item.kind = WORK_CONTEXT_REQUEST;
   item.owner = id;
@@ -784,6 +804,9 @@ int STOBE_CALL ApiSendEvent(StobeAddonId id, StobeU32 kind, StobeActorRef actor,
     }
   } else {
     return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (actor.serial != 0 && IsStaleRef(actor)) {
+    return STOBE_E_STALE;
   }
   State &state = Get();
   {

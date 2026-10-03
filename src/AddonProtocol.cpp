@@ -65,6 +65,29 @@ bool IsValidBridgeName(const std::string &value) {
   return true;
 }
 
+bool ParseStrictSerial(const std::string &value, unsigned int &out) {
+  out = 0;
+  if (value.empty()) {
+    return false;
+  }
+  unsigned long long parsed = 0;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const char c = value[i];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    parsed = parsed * 10 + static_cast<unsigned long long>(c - '0');
+    if (parsed > 0xFFFFFFFFull) {
+      return false;
+    }
+  }
+  if (parsed == 0) {
+    return false;
+  }
+  out = static_cast<unsigned int>(parsed);
+  return true;
+}
+
 bool IsValidToken(const std::string &value) {
   if (value.empty() || value.size() > kMaxNameBytes || value[0] == '.' ||
       value[0] == '-') {

@@ -8755,6 +8755,7 @@ void ProcessMessageQueue(GameWorld *thisptr) {
       bool isNPCSay = (msg.find("NPC_SAY: ") == 0);
       const bool directorSpeech = isNPCSay && msg.find("[UTTERANCEID:director-") != std::string::npos;
       unsigned int directorSpeakerSerial = 0;
+      unsigned int headerSpeakerSerial = 0;
       bool isNotify = (msg.find("NOTIFY:") == 0);
       bool isNarratorNotify = (msg.find("NARRATOR_NOTIFY:") == 0);
       bool isCmd = (msg.find("CMD:") == 0);
@@ -9083,6 +9084,12 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             if (piper != std::string::npos) {
               name = header.substr(0, piper);
               std::string sStr = header.substr(piper + 1);
+              // ExtCmd trusts only a fully valid serial token; core paths keep
+              // the lenient digit-prefix parse below.
+              if (!Stobe::AddonProtocol::ParseStrictSerial(sStr,
+                                                           headerSpeakerSerial)) {
+                headerSpeakerSerial = 0;
+              }
               size_t endS = sStr.find_first_not_of("0123456789");
               if (endS != std::string::npos)
                 sStr = sStr.substr(0, endS);
@@ -10280,7 +10287,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           };
 
           if (Stobe::AddonProtocol::IsExtCommand(actionCommand)) {
-            if (!shouldSkipSpeakerBoundAction("EXTCMD")) {
+            // Addon actions require the exact header serial; the name and
+            // talk-target fallbacks used by core actions are not trusted here.
+            if (!headerSpeakerSerial || !speakerResolvedFromHeader ||
+                targetHand.serial != headerSpeakerSerial) {
+              Log("HOOK_MSG_PROC: EXTCMD speaker unresolved header_serial=" +
+                  ToString(headerSpeakerSerial) + " resolved_serial=" +
+                  ToString((unsigned int)targetHand.serial));
+              Stobe::Addon::QueueExternalAction(0, rawActionCommand,
+                                                actionArgument);
+            } else if (!shouldSkipSpeakerBoundAction("EXTCMD")) {
               Stobe::Addon::QueueExternalAction(targetHand.serial,
                                                 rawActionCommand,
                                                 actionArgument);
