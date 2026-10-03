@@ -8767,6 +8767,20 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           msg.size() >= directorMarker.size() &&
           msg.compare(msg.size() - directorMarker.size(), directorMarker.size(), directorMarker) == 0;
       if (directorAction) msg.erase(msg.size() - directorMarker.size());
+      // Server follow-up correlation id for an exact-serial ExtCmd action. It
+      // rides on the speaker header only, so the parameter is never parsed.
+      unsigned int addonFollowupAid = 0;
+      if (msg.find("NPC_ACTION: ") == 0) {
+        const size_t headerEnd = msg.find(':', 12);
+        if (headerEnd != std::string::npos) {
+          std::string header = msg.substr(12, headerEnd - 12);
+          if (!Stobe::AddonProtocol::TakeHeaderAid(header, addonFollowupAid)) {
+            Log("HOOK_MSG_PROC: action dropped, malformed aid header");
+            continue;
+          }
+          msg.replace(12, headerEnd - 12, header);
+        }
+      }
       if (autonomyCatalogMessage || directorAction) {
         EnterCriticalSection(&g_uiMutex);
         autonomyQueueSizeBefore = g_uiActionQueue.size();
@@ -10344,7 +10358,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               // Availability is checked, and failures reported, at dispatch.
               Stobe::Addon::QueueExternalAction(targetHand.serial,
                                                 rawActionCommand,
-                                                actionArgument);
+                                                actionArgument,
+                                                addonFollowupAid);
             }
           } else if (actionCommand == "JOIN_PARTY") {
             if (!targetHand.isValid()) {

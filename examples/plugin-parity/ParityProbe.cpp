@@ -1,6 +1,8 @@
 // ParityProbe: minimal Stobe native addon used to test the public addon API.
 // It registers the ParityProbe bridge, answers ExtCmdParityProbe_Ping with a
-// result report and never changes game state. With API version 2 it also
+// result report and never changes game state. ExtCmdParityProbe_Report is the
+// read-only fixture for the server's opt-in follow-up (stobe.addon_followup.v1):
+// it reports "completed: green ..." so the server can voice one reply line. With API version 2 it also
 // exercises control calls whose net effect is nothing: it re-requests the
 // interaction state only when it is already On, and releases a lock and a
 // busy flag in the same callback that set them. With API version 3 it only
@@ -128,7 +130,8 @@ void ExerciseAgents(StobeActorRef actor) {
 // Runs on Kenshi's game thread. Reads state only, then reports the result.
 int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
   if (!request || request->struct_size < sizeof(StobeActionRequest) ||
-      _stricmp(request->action, "Ping") != 0) {
+      (_stricmp(request->action, "Ping") != 0 &&
+       _stricmp(request->action, "Report") != 0)) {
     LogLine("rejected unsupported ParityProbe action");
     return STOBE_ACTION_REJECTED;
   }
@@ -138,9 +141,17 @@ int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
   state.flags = 0;
   const int stateCode = g_api->GetActorState(request->actor, &state);
 
+  const bool report = _stricmp(request->action, "Report") == 0;
   char result[200];
-  sprintf_s(result, sizeof(result), "pong serial=%u state=%d flags=0x%02x target=%.64s",
-            request->actor.serial, stateCode, state.flags, request->parameter);
+  if (report) {
+    sprintf_s(result, sizeof(result), "green serial=%u state=%d",
+              request->actor.serial, stateCode);
+  } else {
+    sprintf_s(result, sizeof(result),
+              "pong serial=%u state=%d flags=0x%02x target=%.64s",
+              request->actor.serial, stateCode, state.flags,
+              request->parameter);
+  }
   const int reported =
       g_api->ReportActionResult(g_addon, request->request_id, 1, result);
 
@@ -149,8 +160,10 @@ int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
             request->command, request->request_id, request->actor.serial,
             reported, result);
   LogLine(line);
-  ExerciseControl(request->actor);
-  ExerciseAgents(request->actor);
+  if (!report) {
+    ExerciseControl(request->actor);
+    ExerciseAgents(request->actor);
+  }
   return reported >= 0 ? STOBE_ACTION_ACCEPTED : STOBE_ACTION_REJECTED;
 }
 
