@@ -50,6 +50,11 @@ void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
 bool IsAiRequestActive();
+// Game thread. True when the loaded character is one Stobe's normal chat would
+// offer as a target (alive, conscious, in talk range and area of the player
+// speaker); distanceOut is the chat interaction distance.
+bool IsAutoAgentCandidate(GameWorld *world, Character *candidate,
+                          float &distanceOut);
 // Counts chat requests whose stream worker started; never decreases.
 LONG ChatRequestStartCount();
 bool IsDirectorSceneActive();

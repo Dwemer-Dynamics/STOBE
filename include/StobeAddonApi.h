@@ -57,6 +57,8 @@ typedef StobeU32 StobeAddonId; /* 0 is never a valid id */
 #define STOBE_E_UNCONFIRMED (-12) /* StobeServer did not confirm the change */
 #define STOBE_E_SUPERSEDED (-13)  /* a later interaction change replaced it */
 #define STOBE_E_ACTOR_BUSY (-14)  /* actor is animation-busy for an addon */
+/* Added with version 3. */
+#define STOBE_E_AMBIGUOUS (-15)   /* a name matched more than one agent */
 
 /* Bounds. Longer strings are rejected, not truncated. */
 #define STOBE_MAX_NAME_BYTES 48u  /* addon and bridge names */
@@ -266,6 +268,89 @@ typedef struct StobeAddonApiV2 {
   int(STOBE_CALL *GetActorBusyOwner)(StobeActorRef actor,
                                      StobeAddonId *out_owner);
 } StobeAddonApiV2;
+
+/* ---- Version 3: agents and context -----------------------------------------
+ * Stobe_GetApi(STOBE_ADDON_API_VERSION_3) returns a StobeAddonApiV3 whose
+ * first member is a complete V2 table (v2.v1.struct_size = sizeof(V3),
+ * api_version 3), or NULL from an older Stobe. Check api_version >= 3 and
+ * struct_size >= sizeof(StobeAddonApiV3) before casting, then the
+ * capabilities bit. Versions 1 and 2 keep their unchanged tables.
+ *
+ * An "agent" is a loaded character Stobe's normal chat would offer as a
+ * target (alive, conscious, in talk range and area of the player speaker),
+ * plus actors an addon registered, minus actors an addon unregistered.
+ * Agents are found from Kenshi's loaded-character list when asked; Stobe
+ * keeps no separate actor registry and does no per-frame scan.
+ */
+#define STOBE_ADDON_API_VERSION_3 3u
+
+#define STOBE_CAP_AGENTS 0x10u          /* ListAgents, Find*, registration */
+#define STOBE_CAP_CONTEXT_REFRESH 0x20u /* RequestContextRefresh */
+
+/* Agent registration modes, owned by one addon per actor. */
+#define STOBE_AGENT_AUTO 0u         /* no override; clears the caller's */
+#define STOBE_AGENT_REGISTERED 1u   /* agent regardless of talk range */
+#define STOBE_AGENT_UNREGISTERED 2u /* skipped by default selection */
+
+/* Extra StobeAgentInfo.flags bit (with the STOBE_ACTOR_* flags). */
+#define STOBE_ACTOR_AUTO_AGENT 0x20u /* eligible without a registration */
+
+#define STOBE_MAX_AGENTS 64u /* per ListAgents call */
+
+typedef struct StobeAgentInfo {
+  StobeU32 struct_size;  /* caller sets sizeof(StobeAgentInfo) in out[0] */
+  StobeU32 flags;        /* STOBE_ACTOR_* | STOBE_ACTOR_AUTO_AGENT */
+  StobeActorRef actor;   /* current load generation */
+  float distance;        /* chat interaction distance; -1 when unknown */
+  StobeU32 registration; /* STOBE_AGENT_* in effect */
+  char name[48];         /* display only, NUL-terminated, may be cut */
+} StobeAgentInfo;        /* 72 bytes */
+
+/* RequestContextRefresh parts. */
+#define STOBE_REFRESH_CONTEXT 0x1u   /* NPC context snapshot */
+#define STOBE_REFRESH_INVENTORY 0x2u /* inventory snapshot */
+
+typedef struct StobeAddonApiV3 {
+  StobeAddonApiV2 v2;
+  /* Game thread only (inside a Stobe callback). Fills up to capacity
+   * (<= STOBE_MAX_AGENTS) agents nearest first; *out_count is the number
+   * written. */
+  int(STOBE_CALL *ListAgents)(StobeAddonId id, StobeAgentInfo *out,
+                              StobeU32 capacity, StobeU32 *out_count);
+  /* Game thread only. Exact ASCII case-insensitive display-name match among
+   * agents. STOBE_E_NOT_FOUND for none, STOBE_E_AMBIGUOUS when two different
+   * actors match; Stobe never guesses. STOBE_E_LIMIT when the bounded scan
+   * could not examine every loaded character, so uniqueness is unknown. */
+  int(STOBE_CALL *FindAgentByName)(StobeAddonId id, const char *name,
+                                   StobeActorRef *out_actor);
+  /* Game thread only. Nearest agent to origin (serial 0: the player
+   * speaker), excluding origin itself. */
+  int(STOBE_CALL *FindClosestAgent)(StobeAddonId id, StobeActorRef origin,
+                                    StobeActorRef *out_actor);
+  /* Sets this addon's STOBE_AGENT_* override. REGISTERED also queues a basic
+   * profile/context upload (STOBE_QUEUED), or is STOBE_E_LIMIT with nothing
+   * changed when the refresh queue is full. UNREGISTERED keeps Stobe from
+   * choosing the actor as an AI speaker or listener by itself (default chat
+   * target, rechat, bored events, secondary speakers in a streamed reply) and
+   * removes it from agent queries; it stays in the nearby context, profiles,
+   * memories, followers and factions are untouched, and explicit chat or
+   * addon requests naming it still work. At most 64 actors are REGISTERED
+   * and 64 UNREGISTERED at a time; past either, STOBE_E_LIMIT leaves the
+   * current mode. Ownership, conflict and cleanup are as for SetActorLock.
+   * Any thread. */
+  int(STOBE_CALL *SetAgentRegistration)(StobeAddonId id, StobeActorRef actor,
+                                        StobeU32 mode);
+  /* *out_mode is STOBE_AGENT_*, *out_owner the owning addon or 0. */
+  int(STOBE_CALL *GetAgentRegistration)(StobeActorRef actor, StobeU32 *out_mode,
+                                        StobeAddonId *out_owner);
+  /* Asks Stobe to resend the actor's context and/or inventory (STOBE_REFRESH_*)
+   * through its normal background upload. Requests for one actor coalesce;
+   * they run on Stobe's next inventory sweep (about every 6 s, 4 actors per
+   * sweep) if the actor is still loaded. STOBE_QUEUED is not a server
+   * confirmation. Any thread. */
+  int(STOBE_CALL *RequestContextRefresh)(StobeAddonId id, StobeActorRef actor,
+                                         StobeU32 parts);
+} StobeAddonApiV3;
 
 #ifdef __cplusplus
 }

@@ -3,7 +3,9 @@
 // result report and never changes game state. With API version 2 it also
 // exercises control calls whose net effect is nothing: it re-requests the
 // interaction state only when it is already On, and releases a lock and a
-// busy flag in the same callback that set them. Without Stobe it stays inert.
+// busy flag in the same callback that set them. With API version 3 it only
+// reads agents (list, closest, registration); it never registers, unregisters
+// or refreshes anyone. Without Stobe it stays inert.
 #include <windows.h>
 
 #include <stdio.h>
@@ -15,6 +17,7 @@ namespace {
 
 const StobeAddonApiV1 *g_api = NULL;
 const StobeAddonApiV2 *g_v2 = NULL; // NULL with a version 1 Stobe.
+const StobeAddonApiV3 *g_v3 = NULL; // NULL before version 3.
 StobeAddonId g_addon = 0;
 char g_logPath[MAX_PATH] = {0};
 
@@ -98,6 +101,30 @@ void ExerciseControl(StobeActorRef actor) {
   LogLine(line);
 }
 
+// Version 3 agent queries, read-only. Game thread.
+void ExerciseAgents(StobeActorRef actor) {
+  if (!g_v3 || !(g_v3->v2.capabilities & STOBE_CAP_AGENTS)) {
+    return;
+  }
+  StobeAgentInfo agents[8];
+  agents[0].struct_size = sizeof(StobeAgentInfo);
+  StobeU32 count = 0;
+  const int listCode = g_v3->ListAgents(g_addon, agents, 8, &count);
+  StobeActorRef closest = {0, 0};
+  const StobeActorRef player = {0, 0};
+  const int closestCode = g_v3->FindClosestAgent(g_addon, player, &closest);
+  StobeU32 mode = 0;
+  StobeAddonId owner = 0;
+  const int modeCode = g_v3->GetAgentRegistration(actor, &mode, &owner);
+  char line[200];
+  sprintf_s(line, sizeof(line),
+            "v3 agents=%d count=%u first=%.32s closest=%d serial=%u "
+            "registration=%d mode=%u owner=%u",
+            listCode, count, count > 0 ? agents[0].name : "", closestCode,
+            closest.serial, modeCode, mode, owner);
+  LogLine(line);
+}
+
 // Runs on Kenshi's game thread. Reads state only, then reports the result.
 int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
   if (!request || request->struct_size < sizeof(StobeActionRequest) ||
@@ -123,12 +150,20 @@ int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
             reported, result);
   LogLine(line);
   ExerciseControl(request->actor);
+  ExerciseAgents(request->actor);
   return reported >= 0 ? STOBE_ACTION_ACCEPTED : STOBE_ACTION_REJECTED;
 }
 
-// Prefers version 2; a Stobe without it returns NULL, so fall back to 1.
+// Prefers version 3, then 2; an older Stobe returns NULL for newer versions.
 const StobeAddonApiV1 *GetStobeApi(StobeGetApiFn getApi) {
-  const StobeAddonApiV1 *api = getApi(STOBE_ADDON_API_VERSION_2);
+  const StobeAddonApiV1 *api = getApi(STOBE_ADDON_API_VERSION_3);
+  if (api && api->api_version >= STOBE_ADDON_API_VERSION_3 &&
+      api->struct_size >= sizeof(StobeAddonApiV3)) {
+    g_v3 = reinterpret_cast<const StobeAddonApiV3 *>(api);
+    g_v2 = &g_v3->v2;
+    return api;
+  }
+  api = getApi(STOBE_ADDON_API_VERSION_2);
   if (api && api->api_version >= STOBE_ADDON_API_VERSION_2 &&
       api->struct_size >= sizeof(StobeAddonApiV2)) {
     g_v2 = reinterpret_cast<const StobeAddonApiV2 *>(api);

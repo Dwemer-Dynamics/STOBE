@@ -2,6 +2,8 @@
 
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 // Game-independent parsing and control state shared by the addon runtime and
 // server package sync. Kept free of Windows and KenshiLib types for portable
@@ -86,6 +88,59 @@ enum ActorWork {
 // actions, except the busy owner's own ExtCmd actions. Owners are 0 when unset.
 int ActorGate(ActorWork work, unsigned int lockOwner, unsigned int busyOwner,
               unsigned int addon);
+
+// Sets owner's agent registration mode (STOBE_AGENT_*) for serial, kept as
+// one entry in either registered or unregistered. Another owner's entry in
+// either table is STOBE_E_CONFLICT and nothing changes; AUTO clears the
+// owner's entry. Returns STOBE_OK, STOBE_E_CONFLICT or STOBE_E_LIMIT.
+int SetAgentMode(ActorLockTable &registered, ActorLockTable &unregistered,
+                 unsigned int owner, unsigned int serial,
+                 unsigned long generation, unsigned int mode);
+
+// Exact ASCII case-insensitive name lookup among (name, serial) agents.
+// STOBE_OK with serialOut, STOBE_E_NOT_FOUND, or STOBE_E_AMBIGUOUS when
+// different serials share the name. When the list is not complete (the scan
+// stopped at its bound) a unique match or no match is STOBE_E_LIMIT, since an
+// unscanned namesake may exist. Names never route to a guessed actor.
+int MatchAgentName(const std::vector<std::pair<std::string, unsigned int> > &agents,
+                   const std::string &name, bool complete,
+                   unsigned int &serialOut);
+
+// Index of the first option not excluded: the option the chat target dropdown
+// selects by itself (options are nearest first). Returns excluded.size() when
+// every option is excluded, so nothing is selected until the player picks.
+size_t FirstIncludedIndex(const std::vector<bool> &excluded);
+
+// Pending refresh parts per actor, coalesced per actor but kept per requesting
+// owner so one owner's cleanup leaves other owners' requests. At most capacity
+// actors; owners are registered addons, so each entry holds few shares.
+class RefreshTable {
+public:
+  explicit RefreshTable(size_t capacity) : capacity_(capacity) {}
+  // True when Add for serial would fit.
+  bool CanAdd(unsigned int serial) const;
+  // Merges parts into owner's share of serial; an entry from another
+  // generation is replaced. False and no change when full.
+  bool Add(unsigned int owner, unsigned int serial, unsigned long generation,
+           unsigned int parts);
+  // Clears parts from owner's share of serial, dropping empty shares/entries.
+  void Cancel(unsigned int owner, unsigned int serial, unsigned int parts);
+  void RemoveOwner(unsigned int owner);
+  size_t RemoveOtherGenerations(unsigned long generation);
+  // Moves up to max entries of generation into out as (serial, all owners'
+  // parts), discarding other generations it passes.
+  size_t Take(unsigned long generation, size_t max,
+              std::vector<std::pair<unsigned int, unsigned int> > &out);
+  size_t Size() const { return entries_.size(); }
+
+private:
+  struct Entry {
+    unsigned long generation;
+    std::map<unsigned int, unsigned int> parts; // owner -> parts
+  };
+  std::map<unsigned int, Entry> entries_;
+  size_t capacity_;
+};
 
 // State of an interaction-change ticket for request sequence ticketSeq, given
 // the newest requested sequence, the newest settled sequence and the status

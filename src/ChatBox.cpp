@@ -1165,6 +1165,19 @@ bool IsAddonLockedCharacter(Character *character) {
   }
 }
 
+// An addon agent unregistration keeps the character out of automatic selection
+// only; explicit player chat to it still works.
+bool IsAddonExcludedAgent(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    return Stobe::Addon::IsAgentExcluded(character->getHandle().serial);
+  } catch (...) {
+    return false;
+  }
+}
+
 bool IsDigitsOnlyToken(const std::string &value) {
   if (value.empty()) {
     return false;
@@ -1716,7 +1729,7 @@ bool TrySelectRechatResponder(GameWorld *world, Character *player,
       return false;
     }
     if (IsCharacterUnavailableForConversation(candidate) ||
-        IsAddonLockedCharacter(candidate)) {
+        IsAddonLockedCharacter(candidate) || IsAddonExcludedAgent(candidate)) {
       return false;
     }
     if (!ShouldIncludeAnimalForTalk(candidate)) {
@@ -2100,6 +2113,22 @@ bool TryBuildChatTargetOption(GameWorld *world, Character *candidate,
   return true;
 }
 
+bool IsAutoAgentCandidate(GameWorld *world, Character *candidate,
+                          float &distanceOut) {
+  distanceOut = -1.0f;
+  if (!world || !candidate || (uintptr_t)candidate <= 0x1000 ||
+      IsCharacterUnavailableForConversation(candidate) ||
+      !ShouldIncludeAnimalForTalk(candidate)) {
+    return false;
+  }
+  Character *speaker = ResolveSelectedOrConfiguredPlayerSpeaker(world, candidate);
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return false;
+  }
+  return IsDropdownTargetEligible(world, speaker, candidate, "chat",
+                                  distanceOut);
+}
+
 void RefreshChatHeaderLabel() {
   if (!g_chatLabel) {
     return;
@@ -2252,7 +2281,16 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
         WideFromUtf8(g_chatTargetOptions[i].label).c_str());
   }
 
-  size_t selectedIndex = 0;
+  // The automatic default is the nearest option an addon has not unregistered
+  // as an agent; unregistered actors stay listed for an explicit pick, and
+  // when every option is unregistered nothing is selected by itself.
+  std::vector<bool> excluded(g_chatTargetOptions.size(), false);
+  for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
+    unsigned int serial = 0;
+    excluded[i] = TryParseSerial(g_chatTargetOptions[i].handle, serial) &&
+                  Stobe::Addon::IsAgentExcluded(serial);
+  }
+  size_t selectedIndex = Stobe::AddonProtocol::FirstIncludedIndex(excluded);
   if (preserveSelection) {
     for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
       if (DoesChatTargetOptionMatch(g_chatTargetOptions[i], preferredName,
@@ -2261,6 +2299,15 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
         break;
       }
     }
+  }
+
+  if (selectedIndex >= g_chatTargetOptions.size()) {
+    g_chatTargetCombo->setIndexSelected(MyGUI::ITEM_NONE);
+    g_chatTargetNameStr.clear();
+    g_chatTargetHandleStr.clear();
+    g_talkTargetHand = hand();
+    g_chatTargetRefreshInProgress = false;
+    return;
   }
 
   g_chatTargetCombo->setIndexSelected(selectedIndex);
@@ -3398,6 +3445,33 @@ static std::string ExtActionSpeakerHeader(StreamChatParseState *state,
   return actor + "|" + ToString(serial);
 }
 
+// True when a streamed line or action names a speaker other than the request's
+// own speaker that an addon unregistered as an agent; such a secondary speaker
+// is never applied. resolvedSerial gets the serial behind a name-only header.
+static bool IsUnregisteredSecondarySpeaker(StreamChatParseState *state,
+                                           const std::string &actor,
+                                           const std::string &speakerHeader,
+                                           unsigned int &resolvedSerial) {
+  resolvedSerial = 0;
+  unsigned int serial = 0;
+  const size_t pipe = speakerHeader.find('|');
+  if (pipe != std::string::npos) {
+    TryParseSerial(TrimChatLine(speakerHeader.substr(pipe + 1)), serial);
+  } else {
+    GameWorld *world = GetWorldSafe();
+    Character *resolved =
+        world ? ResolveChatTargetCharacter(world, actor, "") : nullptr;
+    if (resolved && (uintptr_t)resolved > 0x1000) {
+      serial = resolved->getHandle().serial;
+      resolvedSerial = serial;
+    }
+  }
+  unsigned int primarySerial = 0;
+  TryParseSerial(TrimChatLine(state->task->handleStr), primarySerial);
+  return serial != 0 && serial != primarySerial &&
+         Stobe::Addon::IsAgentExcluded(serial);
+}
+
 static bool QueueStreamActionIfNew(StreamChatParseState *state,
                                    const std::string &actor,
                                    const std::string &speakerHeader,
@@ -3645,7 +3719,27 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
           " action=" + subtitle + " gen=" + ToString((int)state->generation));
       return true;
     }
+    unsigned int unusedSerial = 0;
+    if (IsUnregisteredSecondarySpeaker(state, actor, speakerHeader,
+                                       unusedSerial)) {
+      Log("CHAT_ACTION: dropped for unregistered secondary speaker actor=" +
+          actor);
+      return true;
+    }
     QueueStreamActionIfNew(state, actor, speakerHeader, subtitle);
+    return true;
+  }
+
+  unsigned int resolvedSpeakerSerial = 0;
+  if (!narratorSpeaker &&
+      IsUnregisteredSecondarySpeaker(state, actor, speakerHeader,
+                                     resolvedSpeakerSerial)) {
+    if (!utteranceId.empty()) {
+      PostSpeechDeliveryState(utteranceId, "cancelled");
+    }
+    Log("CHAT_TIMING: STREAM_LINE dropped unregistered secondary speaker actor=" +
+        actor + " gen=" + ToString((int)state->generation));
+    state->firstLine = false;
     return true;
   }
 
@@ -3681,14 +3775,8 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     } else {
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       if (speakerHeader == actor) {
-        GameWorld *worldForSpeaker = GetWorldSafe();
-        if (worldForSpeaker) {
-          Character *resolvedSpeaker =
-              ResolveChatTargetCharacter(worldForSpeaker, actor, "");
-          if (resolvedSpeaker && (uintptr_t)resolvedSpeaker > 0x1000) {
-            speakerHeader =
-                actor + "|" + ToString(resolvedSpeaker->getHandle().serial);
-          }
+        if (resolvedSpeakerSerial != 0) {
+          speakerHeader = actor + "|" + ToString(resolvedSpeakerSerial);
         }
         queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       }
@@ -5235,6 +5323,10 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   std::string preferredSerial = TrimChatLine(preferredSpeakerSerial);
   bool hasPreferred = !preferredName.empty() || !preferredSerial.empty();
   const bool targetLockedSpeaker = forceDirectorMode && hasPreferred;
+  const std::string preferredListenerNameTrim =
+      TrimChatLine(preferredListenerName);
+  const std::string preferredListenerSerialTrim =
+      TrimChatLine(preferredListenerSerial);
   Character *preferredCharacter = nullptr;
   if (hasPreferred) {
     preferredCharacter =
@@ -5317,6 +5409,16 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       continue;
     }
     if (!ShouldIncludeAnimalForTalk(other) || IsAddonLockedCharacter(other)) {
+      continue;
+    }
+    // Unregistered agents are never picked automatically; an explicitly named
+    // speaker or listener still takes part.
+    if (IsAddonExcludedAgent(other) && !preferredMatch &&
+        !(targetLockedSpeaker &&
+          (!preferredListenerSerialTrim.empty()
+               ? serial == preferredListenerSerialTrim
+               : !preferredListenerNameTrim.empty() &&
+                     EqualsIgnoreCase(otherName, preferredListenerNameTrim)))) {
       continue;
     }
 
@@ -5442,9 +5544,6 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   std::string listenerSerial = "";
   std::string playerName = player->getName();
   std::string playerSerial = ToString(player->getHandle().serial);
-  std::string preferredListenerNameTrim = TrimChatLine(preferredListenerName);
-  std::string preferredListenerSerialTrim =
-      TrimChatLine(preferredListenerSerial);
   std::vector<size_t> listenerIndices;
   listenerIndices.reserve(candidates.size());
   for (size_t i = 0; i < candidates.size(); ++i) {

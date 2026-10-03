@@ -36,5 +36,23 @@ bool IsActorBusy(unsigned int serial);
 // starts and spoken lines. Any thread.
 int DialogueGate(unsigned int serial);
 
+// True when an addon unregistered the serial as an agent in the current load.
+// Stobe's default chat target, rechat responder, bored-event speaker and
+// listener selection and secondary streamed speakers skip it; explicit chat
+// and addon requests do not. Any thread; no lock taken when none exist.
+bool IsAgentExcluded(unsigned int serial);
+
+// Coalesced addon refresh requests for loaded actors. parts holds
+// STOBE_REFRESH_* bits and REFRESH_PROFILE (identity/profile bootstrap after
+// an agent registration).
+const unsigned int REFRESH_PROFILE = 0x100u;
+struct RefreshRequest {
+  unsigned int serial;
+  unsigned int parts;
+};
+// Game thread. Moves up to max current-load requests into out and discards
+// ones from earlier loads. Returns the count.
+size_t TakeRefreshRequests(RefreshRequest *out, size_t max);
+
 } // namespace Addon
 } // namespace Stobe

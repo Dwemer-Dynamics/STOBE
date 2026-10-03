@@ -8255,6 +8255,8 @@ static void RunNpcWorldEventSweep(GameWorld *world, Character *selection) {
   }
 }
 
+Character *ResolveLiveCharacterBySerial(GameWorld *world, unsigned int serial);
+
 static void RunInventorySyncSweep(GameWorld *world, Character *selection) {
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
     return;
@@ -8265,6 +8267,25 @@ static void RunInventorySyncSweep(GameWorld *world, Character *selection) {
     return;
   }
   g_lastInventorySweepTick = nowTick;
+
+  // Addon refresh requests ride the same sweep, a few actors per pass.
+  Stobe::Addon::RefreshRequest refresh[4];
+  const size_t refreshCount = Stobe::Addon::TakeRefreshRequests(refresh, 4);
+  for (size_t i = 0; i < refreshCount; ++i) {
+    Character *npc = ResolveLiveCharacterBySerial(world, refresh[i].serial);
+    if (!npc || (uintptr_t)npc < 0x1000) {
+      continue;
+    }
+    if (refresh[i].parts & Stobe::Addon::REFRESH_PROFILE) {
+      QueueIdentityRenameCandidate(npc, "addon_register");
+    }
+    if (refresh[i].parts & STOBE_REFRESH_CONTEXT) {
+      PushImmediateContextSnapshot(npc, "addon_refresh", false);
+    }
+    if (refresh[i].parts & STOBE_REFRESH_INVENTORY) {
+      SyncInventoryForCharacter(npc, true, "addon_refresh");
+    }
+  }
 
   Character *player = world->player->playerCharacters[0];
   if (!player || (uintptr_t)player < 0x1000) {
@@ -9292,6 +9313,16 @@ void ProcessMessageQueue(GameWorld *thisptr) {
               TrimCopy(actStr.substr(0, actStr.find('@')));
           // A busy actor performs no built-in action. ExtCmd continues so
           // dispatch can run the busy owner's own action or report a failure.
+          // A speaker matched only by name is never an addon-unregistered
+          // agent unless it is the player's chat target.
+          if (speakerResolvedFromHeader && headerSpeakerSerial == 0 &&
+              targetHand.serial != g_talkTargetHand.serial &&
+              Stobe::Addon::IsAgentExcluded(targetHand.serial)) {
+            Log("HOOK_MSG_PROC: action " + actionCommand +
+                " dropped for unregistered agent serial=" +
+                ToString((unsigned int)targetHand.serial));
+            continue;
+          }
           if (Stobe::Addon::IsActorBusy(targetHand.serial) &&
               !Stobe::AddonProtocol::IsExtCommand(actionCommand)) {
             Log("HOOK_MSG_PROC: action " + actionCommand +
@@ -11573,6 +11604,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
             Stobe::Addon::DialogueGate(targetHand.serial) != STOBE_OK) {
           if (!utteranceId.empty()) PostSpeechDeliveryState(utteranceId, "cancelled");
           Log("HOOK_MSG_PROC: line dropped for addon-locked/busy actor serial=" +
+              ToString((unsigned int)targetHand.serial));
+          continue;
+        }
+        if (!bubbleContent.empty() && isNPCSay && speakerResolvedFromHeader &&
+            headerSpeakerSerial == 0 &&
+            targetHand.serial != g_talkTargetHand.serial &&
+            Stobe::Addon::IsAgentExcluded(targetHand.serial)) {
+          if (!utteranceId.empty()) PostSpeechDeliveryState(utteranceId, "cancelled");
+          Log("HOOK_MSG_PROC: name-only line dropped for unregistered agent serial=" +
               ToString((unsigned int)targetHand.serial));
           continue;
         }
