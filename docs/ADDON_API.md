@@ -31,7 +31,7 @@ Addon callbacks (action handlers and `QueueGameThreadCallback`) always run on th
 
 ## Actor identity and stale work
 
-Actors are addressed by `StobeActorRef { serial, generation }`. `serial` is the Kenshi hand serial Stobe already uses for NPC identity and server snapshots. `MakeActorRef(serial)` stamps the current Stobe load generation, which changes on every save load or new game. Queued work, action requests and result reports from an earlier generation are discarded (`STOBE_E_STALE`). There is no name-based routing.
+Actors are addressed by `StobeActorRef { serial, generation }`. `serial` is the Kenshi hand serial Stobe already uses for NPC identity and server snapshots. `MakeActorRef(serial)` stamps the current Stobe load generation, which changes on every save load or new game. `SendPlayerInput`, `RequestContextualResponse`, `SendEvent` and `ReportActionResult` return `STOBE_E_STALE` immediately for a reference or request from an earlier generation. Work that was queued before a load is discarded at dispatch with a log line only, because the addon already received `STOBE_QUEUED`. There is no name-based routing: a provided speaker or listener serial is authoritative even when another loaded NPC has the same name.
 
 ## Operations
 
@@ -55,16 +55,16 @@ StobeServer builds that include the plugin runtime acknowledge `addon_state` and
 
 When StobeServer returns an action `ExtCmd<Bridge>_<Action>@<parameter>` for an NPC, Stobe:
 
-1. Parses it in the existing NPC action path, after speaker resolution, duplicate suppression and the existing `action command received` `infoaction` event. The actor must resolve by serial and be alive and conscious, like other speaker-bound actions; otherwise it is skipped and logged.
+1. Parses it in the existing NPC action path, after speaker resolution, duplicate suppression and the existing `action command received` `infoaction` event. Unlike built-in actions, an `ExtCmd` action never uses the name, prefix or talk-target fallbacks: the action header must carry the speaker serial and that exact NPC must be loaded. Otherwise Stobe reports `failed: speaker unresolved` without calling the addon. Streamed responses currently carry a serial only for the conversation's primary NPC, so `ExtCmd` actions selected for other speakers in a group response fail this way. A resolved actor that is dead or unconscious is skipped and logged, like other speaker-bound actions.
 2. Queues dispatch to the game-thread tick and calls the bridge handler with `StobeActionRequest` (request id, actor reference and display name, full command in its original case, bridge, action and raw parameter).
 3. Treats a handler return of `STOBE_ACTION_ACCEPTED` as pending until `ReportActionResult`. Nothing is reported for a request that is merely accepted.
 
-An outcome is sent only when it is known: the addon reports success/failure, the handler rejects or faults, no bridge is registered, the command is malformed or the parameter exceeds 1000 bytes. Each outcome produces:
+An outcome is sent only when it is known: the addon reports success/failure, the handler rejects or faults, no bridge is registered, the speaker is unresolved, the command is malformed or the parameter exceeds 1000 bytes. Each outcome produces:
 
 - `funcret` stream event with CHIM's data shape `command@<Command>@<parameter>@<completed|failed[: detail]>` (`@` and newlines in fields become spaces), for server extensions that observe completions.
 - `infoaction` event `external action <Command> completed|failed[: detail]` for the NPC's event history.
 
-A pending request with no report expires after 10 minutes or on load with a local log line only; Stobe does not invent a result. Built-in Stobe actions keep their existing paths unchanged.
+A pending request with no report expires after 10 minutes or on load with a local log line only; Stobe does not invent a result. An action whose resolved NPC unloads, dies or is knocked out before dispatch is also dropped with a log line and no outcome. Dialectic differs: it reports `speaker_not_in_current_scene` and times out unreported requests as failed after 30 seconds, so a shared server extension can see no `funcret` from Stobe where Dialectic sends a failure. Built-in Stobe actions keep their existing paths unchanged.
 
 The autonomy catalog adapter only recognizes built-in queued actions. If an autonomy decision selects an `ExtCmd` action, the adapter reports that decision as failed (`catalog_adapter_no_queued_action`) after the action is dispatched; addon bridges are intended for dialogue-selected actions.
 

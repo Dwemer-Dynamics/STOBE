@@ -37,7 +37,9 @@ and place it at:
 <Kenshi>/mods/ParityProbe/Stobe/server-plugins/parity_probe/1.0.0.dwpkg
 ```
 
-The folder name must be `parity_probe`, the manifest `name`; the server rejects an upload whose name differs. The client bridge stays `ParityProbe`. On the next game start with interaction On, `stobe.log` shows `SERVER_PLUGIN_SYNC: found parity_probe 1.0.0 in mod ParityProbe`, then `installed` or `already current`. Remove the archive to stop future uploads; uninstall on the server separately.
+The folder name must be `parity_probe`, the manifest `name`; the server rejects an upload whose name differs. The client bridge stays `ParityProbe`. On the next game start with interaction On, `stobe.log` shows `SERVER_PLUGIN_SYNC: found parity_probe 1.0.0 in mod ParityProbe`, then `installed` or `already current`.
+
+To uninstall, disable the ParityProbe mod (or delete the archive) first; otherwise Stobe uploads the package again on the next game start. Then open StobeServer's **Server Plugins** page and choose **Remove** on `parity_probe`. Removal moves the plugin folder into package storage and keeps its database tables, declared settings and data; installing the same plugin again restores them. Nothing is deleted.
 
 Use a bridge name that starts with a letter. Stobe accepts bridges that begin with a digit, but StobeServer only registers `ExtCmd<Bridge>_<Action>` codes whose bridge and action start with a letter.
 
