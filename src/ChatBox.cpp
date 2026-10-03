@@ -5141,7 +5141,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        LONG generationOverride,
                        const std::string &preferredListenerName,
                        const std::string &preferredListenerSerial,
-                       const std::string &direction) {
+                       const std::string &direction, bool exactActors) {
   if (!Stobe::Interaction::Allowed()) return false;
   if (!forceDirectorMode && IsDirectorSceneActive()) return false;
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
@@ -5175,6 +5175,23 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (!preferredCharacter || (uintptr_t)preferredCharacter <= 0x1000) {
       Log("BORED_EVENT: preferred target unresolved name=" + preferredName +
           " serial=" + preferredSerial);
+    }
+  }
+  // Exact callers (addons) name both actors by serial; never substitute.
+  if (exactActors) {
+    bool speakerExact = false;
+    if (forceDirectorMode && !preferredSerial.empty() && preferredCharacter &&
+        (uintptr_t)preferredCharacter > 0x1000) {
+      try {
+        speakerExact =
+            ToString(preferredCharacter->getHandle().serial) == preferredSerial;
+      } catch (...) {
+        speakerExact = false;
+      }
+    }
+    if (!speakerExact) {
+      Log("BORED_EVENT: exact speaker unresolved serial=" + preferredSerial);
+      return false;
     }
   }
 
@@ -5211,9 +5228,13 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     try {
       otherName = other->getName();
       serial = ToString(other->getHandle().serial);
-      preferredMatch =
-          (!preferredSerial.empty() && serial == preferredSerial) ||
-          (!preferredName.empty() && EqualsIgnoreCase(otherName, preferredName));
+      // A provided serial is authoritative so a same-named NPC cannot speak.
+      if (!preferredSerial.empty()) {
+        preferredMatch = serial == preferredSerial;
+      } else {
+        preferredMatch =
+            !preferredName.empty() && EqualsIgnoreCase(otherName, preferredName);
+      }
     } catch (...) {
       continue;
     }
@@ -5394,6 +5415,12 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
             break;
           }
         }
+      }
+      if (exactActors && listener.empty() &&
+          !preferredListenerSerialTrim.empty()) {
+        Log("BORED_EVENT: exact listener not eligible speaker_serial=" +
+            speaker.serial + " listener_serial=" + preferredListenerSerialTrim);
+        return false;
       }
     }
 

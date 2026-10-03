@@ -65,7 +65,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        LONG generationOverride = 0,
                        const std::string &preferredListenerName = "",
                        const std::string &preferredListenerSerial = "",
-                       const std::string &direction = "");
+                       const std::string &direction = "",
+                       bool exactActors = false);
 bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);

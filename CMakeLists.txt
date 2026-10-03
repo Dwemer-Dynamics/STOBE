@@ -65,6 +65,8 @@ if(NOT OGRE_MAIN_LIBRARY)
 endif()
 
 add_library(Stobe SHARED
+  src/AddonProtocol.cpp
+  src/AddonRuntime.cpp
   src/AudioPlayback.cpp
   src/AutonomyController.cpp
   src/AutonomyExecutor.cpp
@@ -105,6 +107,7 @@ add_library(Stobe SHARED
 
 target_include_directories(Stobe PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${KENSHI_LIB_INCLUDE_DIR}"
   "${KENSHI_LIB_INCLUDE_DIR}/ogre"
   "${KENSHI_LIB_INCLUDE_DIR}/mygui"
