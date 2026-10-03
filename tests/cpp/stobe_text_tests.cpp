@@ -1,3 +1,4 @@
+#include "AddonProtocol.h"
 #include "AutonomySafetyProbePolicy.h"
 #include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
@@ -972,6 +973,66 @@ int main() {
            "injection");
   ExpectEq("Standard chat uses input event", EventTypeForRequest("talk"),
            "inputtext");
+
+  {
+    namespace AP = Stobe::AddonProtocol;
+    AP::ExtCommand ext;
+    ExpectBool("ExtCmd parses bridge and action",
+               AP::ParseExtCommand("ExtCmdParityProbe_Ping", ext), true);
+    ExpectEq("ExtCmd keeps bridge case", ext.bridge, "ParityProbe");
+    ExpectEq("ExtCmd action may contain underscores",
+             AP::ParseExtCommand("EXTCMDBridge_Do_Thing", ext) ? ext.action : "",
+             "Do_Thing");
+    ExpectBool("ExtCmd rejects missing bridge",
+               AP::ParseExtCommand("ExtCmd_Ping", ext), false);
+    ExpectBool("ExtCmd rejects missing action",
+               AP::ParseExtCommand("ExtCmdBridge_", ext), false);
+    ExpectBool("ExtCmd rejects unsafe bridge",
+               AP::ParseExtCommand("ExtCmdBad-Name_Ping", ext), false);
+    ExpectBool("Built-in action is not ExtCmd", AP::IsExtCommand("ATTACK"),
+               false);
+    unsigned int serial = 7;
+    ExpectBool("Strict serial accepts max uint32",
+               AP::ParseStrictSerial("4294967295", serial), true);
+    ExpectUInt32("Strict serial keeps max uint32 value", serial, 4294967295u);
+    ExpectBool("Strict serial rejects uint32 overflow",
+               AP::ParseStrictSerial("4294967296", serial), false);
+    ExpectUInt32("Strict serial clears output on failure", serial, 0u);
+    ExpectBool("Strict serial rejects long overflow",
+               AP::ParseStrictSerial("99999999999999999999", serial), false);
+    ExpectBool("Strict serial rejects digit prefix with junk",
+               AP::ParseStrictSerial("123junk", serial), false);
+    ExpectBool("Strict serial rejects trailing space",
+               AP::ParseStrictSerial("123 ", serial), false);
+    ExpectBool("Strict serial rejects sign",
+               AP::ParseStrictSerial("+123", serial), false);
+    ExpectBool("Strict serial rejects zero", AP::ParseStrictSerial("0", serial),
+               false);
+    ExpectBool("Strict serial rejects empty", AP::ParseStrictSerial("", serial),
+               false);
+    ExpectBool("Strict serial accepts plain decimal",
+               AP::ParseStrictSerial("123", serial) && serial == 123u, true);
+    std::string stem;
+    ExpectBool("Package archive accepts dwpkg",
+               AP::SplitPackageArchiveName("1.2.0.DWPKG", stem), true);
+    ExpectEq("Package archive stem is version", stem, "1.2.0");
+    ExpectBool("Package archive rejects other files",
+               AP::SplitPackageArchiveName("readme.txt", stem), false);
+    ExpectBool("Package name rejects traversal",
+               AP::IsSafePackageName("../evil"), false);
+    ExpectBool("Package name rejects trailing dot",
+               AP::IsSafePackageName("Parity."), false);
+    ExpectBool("Package version accepts semver build",
+               AP::IsSafePackageVersion("1.0.0+build-2"), true);
+    const std::string body =
+        "{\"ok\":true,\"upload\":{\"complete\":true,\"job\":"
+        "{\"id\":\"j1\",\"status\":\"completed\"}}}";
+    ExpectBool("Package API nested boolean", AP::JsonBooleanValue(body, "complete", false),
+               true);
+    ExpectEq("Package API job id", AP::JsonStringValue(body, "id"), "j1");
+    ExpectEq("Package request escapes quotes", AP::JsonEscape("a\"b"),
+             "a\\\"b");
+  }
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";
