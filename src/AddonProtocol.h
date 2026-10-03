@@ -24,6 +24,10 @@ bool IsValidBridgeName(const std::string &value);
 bool IsValidToken(const std::string &value);
 std::string LowerAscii(const std::string &value);
 
+// Whole token must be ASCII decimal digits forming a nonzero value that fits
+// in 32 bits. No sign, whitespace, suffix, or overflow wrap is accepted.
+bool ParseStrictSerial(const std::string &value, unsigned int &out);
+
 // Matches the server package manager's plugin-name and version rules.
 bool IsSafePackageName(const std::string &value);
 bool IsSafePackageVersion(const std::string &value);
