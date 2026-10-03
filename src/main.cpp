@@ -10296,7 +10296,8 @@ void ProcessMessageQueue(GameWorld *thisptr) {
                   ToString((unsigned int)targetHand.serial));
               Stobe::Addon::QueueExternalAction(0, rawActionCommand,
                                                 actionArgument);
-            } else if (!shouldSkipSpeakerBoundAction("EXTCMD")) {
+            } else {
+              // Availability is checked, and failures reported, at dispatch.
               Stobe::Addon::QueueExternalAction(targetHand.serial,
                                                 rawActionCommand,
                                                 actionArgument);

@@ -35,6 +35,7 @@ const size_t kMaxQueuedWork = 128;
 const size_t kMaxPendingRequests = 128;
 const size_t kWorkPerTick = 8;
 const DWORD kPendingRequestLifetimeMs = 10 * 60 * 1000;
+const DWORD kExpiryIntervalMs = 1000;
 const DWORD kWorldReadyWindowMs = 2000;
 const DWORD kEventWindowMs = 10000;
 const int kEventsPerWindow = 20;
@@ -44,7 +45,6 @@ enum WorkKind {
   WORK_CONTEXT_REQUEST,
   WORK_EVENT,
   WORK_CANCEL,
-  WORK_ACTION_RESULT,
   WORK_CALLBACK,
   WORK_EXT_ACTION
 };
@@ -94,17 +94,34 @@ struct PendingRequest {
   DWORD createdTick;
 };
 
+// The terminal result of an accepted request, reported on the game thread.
+struct Outcome {
+  StobeU32 requestId;
+  PendingRequest request;
+  bool succeeded;
+  std::string detail;
+  Outcome() : requestId(0), succeeded(false) {}
+};
+
 struct State {
   CRITICAL_SECTION lock;     // Registry and queue. Never held across callbacks.
   CRITICAL_SECTION dispatch; // Held by the game thread while calling an addon.
   std::map<StobeAddonId, AddonEntry> addons;
   std::map<std::string, BridgeEntry> bridges; // Key: lower-case bridge name.
+  // An accepted request lives in exactly one of pending or outcomes; whoever
+  // removes it from pending owns its single outcome. Together they hold at
+  // most kMaxPendingRequests entries.
   std::map<StobeU32, PendingRequest> pending;
+  std::deque<Outcome> outcomes;
   std::deque<WorkItem> work;
   StobeAddonId nextAddonId;
   StobeU32 nextRequestId;
+  DWORD lastExpiryTick;
+  unsigned long expiryGeneration;
   StobeAddonApiV1 api;
-  State() : nextAddonId(1), nextRequestId(1) {
+  State()
+      : nextAddonId(1), nextRequestId(1), lastExpiryTick(0),
+        expiryGeneration(0) {
     InitializeCriticalSection(&lock);
     InitializeCriticalSection(&dispatch);
   }
@@ -182,8 +199,26 @@ int Enqueue(WorkItem &item) {
   return STOBE_QUEUED;
 }
 
-// Removes an addon's registrations. Caller holds state.lock.
-void RemoveAddonLocked(State &state, StobeAddonId id) {
+// Closes a pending request. A request from the current load gets one queued
+// outcome; one from an earlier load is cancelled locally and never reported.
+// Caller holds state.lock.
+void ClosePendingLocked(State &state,
+                        std::map<StobeU32, PendingRequest>::iterator it,
+                        bool succeeded, const std::string &detail) {
+  if (it->second.generation == PlaythroughSession::Generation()) {
+    Outcome outcome;
+    outcome.requestId = it->first;
+    outcome.request = it->second;
+    outcome.succeeded = succeeded;
+    outcome.detail = detail;
+    state.outcomes.push_back(outcome);
+  }
+  state.pending.erase(it);
+}
+
+// Removes an addon's registrations; its accepted requests fail with detail.
+// Caller holds state.lock.
+void RemoveAddonLocked(State &state, StobeAddonId id, const std::string &detail) {
   state.addons.erase(id);
   for (std::map<std::string, BridgeEntry>::iterator it = state.bridges.begin();
        it != state.bridges.end();) {
@@ -196,7 +231,7 @@ void RemoveAddonLocked(State &state, StobeAddonId id) {
   for (std::map<StobeU32, PendingRequest>::iterator it = state.pending.begin();
        it != state.pending.end();) {
     if (it->second.owner == id) {
-      state.pending.erase(it++);
+      ClosePendingLocked(state, it++, false, detail);
     } else {
       ++it;
     }
@@ -217,7 +252,7 @@ void DisableFaultingAddon(StobeAddonId id, const std::string &where) {
   {
     Lock lock(state.lock);
     name = AddonNameLocked(state, id);
-    RemoveAddonLocked(state, id);
+    RemoveAddonLocked(state, id, "addon disabled after a fault");
   }
   Log("ADDON_API: disabled addon '" + name + "' after a fault in " + where);
 }
@@ -461,31 +496,6 @@ void RunEvent(GameWorld *world, const WorkItem &item,
                item.text, item.first.serial, 0);
 }
 
-void RunActionResult(GameWorld *world, const WorkItem &item) {
-  PendingRequest request;
-  {
-    State &state = Get();
-    Lock lock(state.lock);
-    std::map<StobeU32, PendingRequest>::iterator it =
-        state.pending.find(item.number);
-    if (it == state.pending.end() || it->second.owner != item.owner) {
-      Log("ADDON_ACTION: result ignored for unknown request " +
-          ToString(item.number));
-      return;
-    }
-    request = it->second;
-    state.pending.erase(it);
-  }
-  if (request.generation != PlaythroughSession::Generation()) {
-    Log("ADDON_ACTION: result dropped for request " + ToString(item.number) +
-        " from an earlier load");
-    return;
-  }
-  ReportExternalActionOutcome(world, request.actorSerial, request.actorName,
-                              request.command, request.parameter,
-                              item.flag != 0, item.text);
-}
-
 void InvokeCallback(const WorkItem &item) {
   State &state = Get();
   Lock dispatch(state.dispatch);
@@ -525,37 +535,69 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
                                 item.text, false, "speaker unresolved");
     return;
   }
-  if (!IsCharacterUsable(actor)) {
-    Log("ADDON_ACTION: " + parsed.command + " dropped; actor_serial=" +
-        ToString(actorSerial) + " is no longer loaded");
+  bool actorUnavailable = !IsCharacterUsable(actor);
+  if (!actorUnavailable) {
+    try {
+      actorUnavailable = actor->isDead() || actor->isUnconcious();
+    } catch (...) {
+      actorUnavailable = true;
+    }
+  }
+  if (actorUnavailable) {
+    ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
+                                item.text, false,
+                                IsCharacterUsable(actor) ? "actor unavailable"
+                                                         : "actor not loaded");
     return;
   }
 
   State &state = Get();
-  Lock dispatch(state.dispatch);
   BridgeEntry bridge;
   StobeU32 requestId = 0;
   bool bridgeFound = false;
+  int verdict = STOBE_ACTION_REJECTED;
+  bool faulted = false;
   {
-    Lock lock(state.lock);
-    std::map<std::string, BridgeEntry>::const_iterator it =
-        state.bridges.find(LowerAscii(parsed.bridge));
-    bridgeFound = it != state.bridges.end();
-    if (bridgeFound && state.pending.size() < kMaxPendingRequests) {
-      bridge = it->second;
-      requestId = state.nextRequestId++;
-      if (state.nextRequestId == 0) {
-        state.nextRequestId = 1;
+    Lock dispatch(state.dispatch);
+    {
+      Lock lock(state.lock);
+      std::map<std::string, BridgeEntry>::const_iterator it =
+          state.bridges.find(LowerAscii(parsed.bridge));
+      bridgeFound = it != state.bridges.end();
+      if (bridgeFound &&
+          state.pending.size() + state.outcomes.size() < kMaxPendingRequests) {
+        bridge = it->second;
+        requestId = state.nextRequestId++;
+        if (state.nextRequestId == 0) {
+          state.nextRequestId = 1;
+        }
+        PendingRequest request;
+        request.owner = bridge.owner;
+        request.generation = item.generation;
+        request.actorSerial = actorSerial;
+        request.actorName = actorName;
+        request.command = parsed.command;
+        request.parameter = item.text;
+        request.createdTick = GetTickCount();
+        state.pending[requestId] = request;
       }
-      PendingRequest request;
-      request.owner = bridge.owner;
-      request.generation = item.generation;
-      request.actorSerial = actorSerial;
-      request.actorName = actorName;
-      request.command = parsed.command;
-      request.parameter = item.text;
-      request.createdTick = GetTickCount();
-      state.pending[requestId] = request;
+    }
+    if (requestId != 0) {
+      StobeActionRequest request;
+      request.struct_size = sizeof(StobeActionRequest);
+      request.request_id = requestId;
+      request.actor.serial = actorSerial;
+      request.actor.generation = item.generation;
+      request.actor_name = actorName.c_str();
+      request.command = parsed.command.c_str();
+      request.bridge = parsed.bridge.c_str();
+      request.action = parsed.action.c_str();
+      request.parameter = item.text.c_str();
+      try {
+        verdict = bridge.handler(bridge.userData, &request);
+      } catch (...) {
+        faulted = true;
+      }
     }
   }
   if (requestId == 0) {
@@ -566,66 +608,78 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
                                                   parsed.bridge);
     return;
   }
-
-  StobeActionRequest request;
-  request.struct_size = sizeof(StobeActionRequest);
-  request.request_id = requestId;
-  request.actor.serial = actorSerial;
-  request.actor.generation = item.generation;
-  request.actor_name = actorName.c_str();
-  request.command = parsed.command.c_str();
-  request.bridge = parsed.bridge.c_str();
-  request.action = parsed.action.c_str();
-  request.parameter = item.text.c_str();
-
-  int verdict = STOBE_ACTION_REJECTED;
-  bool faulted = false;
-  try {
-    verdict = bridge.handler(bridge.userData, &request);
-  } catch (...) {
-    faulted = true;
-  }
-  if (faulted) {
-    DisableFaultingAddon(bridge.owner, "action handler " + bridge.name);
-  }
   if (verdict == STOBE_ACTION_ACCEPTED && !faulted) {
     Log("ADDON_ACTION: " + parsed.command + " accepted by bridge " + bridge.name +
         " request=" + ToString(requestId) + " actor_serial=" +
         ToString(actorSerial));
     return;
   }
+  // A handler may already have reported, or been unregistered, before it
+  // returned; only a request still pending is failed here.
+  bool closed = false;
   {
     Lock lock(state.lock);
-    state.pending.erase(requestId);
+    closed = state.pending.erase(requestId) != 0;
   }
-  ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
-                              item.text, false,
-                              faulted ? "handler fault" : "rejected by handler");
+  if (faulted) {
+    DisableFaultingAddon(bridge.owner, "action handler " + bridge.name);
+  }
+  if (closed) {
+    ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
+                                item.text, false,
+                                faulted ? "handler fault" : "rejected by handler");
+  }
 }
 
+// Times out accepted requests and cancels those from an earlier load. Runs at
+// most once per second unless the load generation changed.
 void ExpirePendingRequests() {
   State &state = Get();
   const DWORD now = GetTickCount();
   const unsigned long generation = PlaythroughSession::Generation();
-  std::deque<StobeU32> expired;
+  int timedOut = 0;
+  int cancelled = 0;
   {
     Lock lock(state.lock);
+    if (state.expiryGeneration == generation &&
+        now - state.lastExpiryTick < kExpiryIntervalMs) {
+      return;
+    }
+    state.expiryGeneration = generation;
+    state.lastExpiryTick = now;
     for (std::map<StobeU32, PendingRequest>::iterator it = state.pending.begin();
          it != state.pending.end();) {
-      if (it->second.generation != generation ||
-          now - it->second.createdTick > kPendingRequestLifetimeMs) {
-        expired.push_back(it->first);
+      if (it->second.generation != generation) {
+        ++cancelled;
         state.pending.erase(it++);
+      } else if (now - it->second.createdTick > kPendingRequestLifetimeMs) {
+        ++timedOut;
+        ClosePendingLocked(state, it++, false, "timed out");
+      } else {
+        ++it;
+      }
+    }
+    for (std::deque<Outcome>::iterator it = state.outcomes.begin();
+         it != state.outcomes.end();) {
+      if (it->request.generation != generation) {
+        ++cancelled;
+        it = state.outcomes.erase(it);
       } else {
         ++it;
       }
     }
   }
-  // Expiry is local bookkeeping only; no outcome is invented for the server.
-  for (size_t i = 0; i < expired.size(); ++i) {
-    Log("ADDON_ACTION: request " + ToString(expired[i]) +
-        " expired without a reported result");
+  if (timedOut > 0 || cancelled > 0) {
+    Log("ADDON_ACTION: requests timed_out=" + ToString(timedOut) +
+        " cancelled_by_load=" + ToString(cancelled));
   }
+}
+
+void ReportOutcome(GameWorld *world, const Outcome &outcome) {
+  ReportExternalActionOutcome(world, outcome.request.actorSerial,
+                              outcome.request.actorName,
+                              outcome.request.command, outcome.request.parameter,
+                              outcome.succeeded, outcome.detail);
 }
 
 // ---- API entry points -----------------------------------------------------
@@ -676,7 +730,7 @@ int STOBE_CALL ApiUnregisterAddon(StobeAddonId id) {
       return STOBE_E_NOT_REGISTERED;
     }
     name = AddonNameLocked(state, id);
-    RemoveAddonLocked(state, id);
+    RemoveAddonLocked(state, id, "addon unregistered");
   }
   // Wait for an in-flight callback on the game thread (re-entrant there).
   { Lock dispatch(state.dispatch); }
@@ -894,31 +948,29 @@ int STOBE_CALL ApiUnregisterActionBridge(StobeAddonId id, const char *bridge) {
   return STOBE_OK;
 }
 
+// Moves the request straight to its outcome, so a result cannot be lost to a
+// full work queue or race the timeout. A second report finds nothing pending.
 int STOBE_CALL ApiReportActionResult(StobeAddonId id, StobeU32 requestId,
                                      int succeeded, const char *message) {
-  WorkItem item;
+  std::string text;
   if (requestId == 0 ||
-      !CopyBoundedText(message, STOBE_MAX_TEXT_BYTES, true, item.text)) {
+      !CopyBoundedText(message, STOBE_MAX_TEXT_BYTES, true, text)) {
     return STOBE_E_INVALID_ARGUMENT;
   }
   State &state = Get();
-  {
-    Lock lock(state.lock);
-    std::map<StobeU32, PendingRequest>::const_iterator it =
-        state.pending.find(requestId);
-    if (it == state.pending.end() || it->second.owner != id) {
-      return STOBE_E_NOT_FOUND;
-    }
-    if (it->second.generation != PlaythroughSession::Generation()) {
-      return STOBE_E_STALE;
-    }
+  Lock lock(state.lock);
+  if (!IsRegisteredLocked(state, id)) {
+    return STOBE_E_NOT_REGISTERED;
   }
-  item.kind = WORK_ACTION_RESULT;
-  item.owner = id;
-  item.number = requestId;
-  item.flag = succeeded ? 1 : 0;
-  item.generation = PlaythroughSession::Generation();
-  return Enqueue(item);
+  std::map<StobeU32, PendingRequest>::iterator it = state.pending.find(requestId);
+  if (it == state.pending.end() || it->second.owner != id) {
+    return STOBE_E_NOT_FOUND;
+  }
+  if (it->second.generation != PlaythroughSession::Generation()) {
+    return STOBE_E_STALE;
+  }
+  ClosePendingLocked(state, it, succeeded != 0, text);
+  return STOBE_QUEUED;
 }
 
 int STOBE_CALL ApiQueueGameThreadCallback(StobeAddonId id,
@@ -976,27 +1028,43 @@ void GameThreadTick(GameWorld *world) {
   State &state = Get();
   {
     Lock lock(state.lock);
-    if (state.work.empty() && state.pending.empty()) {
+    if (state.work.empty() && state.pending.empty() &&
+        state.outcomes.empty()) {
       return;
     }
   }
   InterlockedExchange(&g_inGameTick, 1);
   ExpirePendingRequests();
   const unsigned long generation = PlaythroughSession::Generation();
+  // Outcomes and work share the per-frame budget; outcomes go first.
   for (size_t processed = 0; processed < kWorkPerTick; ++processed) {
     WorkItem item;
+    Outcome outcome;
+    bool haveOutcome = false;
     std::string addonName;
     {
       Lock lock(state.lock);
-      if (state.work.empty()) {
+      if (!state.outcomes.empty()) {
+        outcome = state.outcomes.front();
+        state.outcomes.pop_front();
+        haveOutcome = true;
+      } else if (state.work.empty()) {
         break;
+      } else {
+        item = state.work.front();
+        state.work.pop_front();
+        if (item.owner != 0 && !IsRegisteredLocked(state, item.owner)) {
+          continue;
+        }
+        addonName = AddonNameLocked(state, item.owner);
       }
-      item = state.work.front();
-      state.work.pop_front();
-      if (item.owner != 0 && !IsRegisteredLocked(state, item.owner)) {
-        continue;
+    }
+    if (haveOutcome) {
+      // Never send a result into a later load.
+      if (outcome.request.generation == generation) {
+        ReportOutcome(world, outcome);
       }
-      addonName = AddonNameLocked(state, item.owner);
+      continue;
     }
     if (item.generation != generation) {
       Log("ADDON_API: dropped queued work from an earlier load kind=" +
@@ -1016,9 +1084,6 @@ void GameThreadTick(GameWorld *world) {
     case WORK_CANCEL:
       BeginChatInterruptGeneration(true);
       Log("ADDON_API: addon '" + addonName + "' cancelled Stobe dialogue");
-      break;
-    case WORK_ACTION_RESULT:
-      RunActionResult(world, item);
       break;
     case WORK_CALLBACK:
       InvokeCallback(item);

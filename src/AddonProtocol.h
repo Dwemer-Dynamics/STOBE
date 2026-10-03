@@ -28,6 +28,14 @@ std::string LowerAscii(const std::string &value);
 // in 32 bits. No sign, whitespace, suffix, or overflow wrap is accepted.
 bool ParseStrictSerial(const std::string &value, unsigned int &out);
 
+// Speaker serial for a streamed ExtCmd action, or 0 when it is not exact.
+// sidToken is the server's "sid=" value ("" from older servers). primarySerial
+// is the request's own NPC serial when the line's actor is that NPC, else 0.
+// sidListed says "<actor>|<sid>" is one of this request's people identities.
+// A sid that conflicts with the primary serial or was not listed yields 0.
+unsigned int SelectExtActionSerial(const std::string &sidToken,
+                                   unsigned int primarySerial, bool sidListed);
+
 // Matches the server package manager's plugin-name and version rules.
 bool IsSafePackageName(const std::string &value);
 bool IsSafePackageVersion(const std::string &value);
