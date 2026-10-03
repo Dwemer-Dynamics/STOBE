@@ -50,6 +50,8 @@ void OnChatTargetChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatActionChange(MyGUI::ComboBox *sender, size_t index);
 void OnAutoChatToggleClick(MyGUI::Widget *sender);
 bool IsAiRequestActive();
+// Counts chat requests whose stream worker started; never decreases.
+LONG ChatRequestStartCount();
 bool IsDirectorSceneActive();
 void RefreshChatModeControls();
 void OnBoredEventClick(MyGUI::Widget *sender);

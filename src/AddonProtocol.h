@@ -1,9 +1,11 @@
 #pragma once
 
+#include <map>
 #include <string>
 
-// Game-independent parsing shared by the addon runtime and server package
-// sync. Kept free of Windows and KenshiLib types for portable tests.
+// Game-independent parsing and control state shared by the addon runtime and
+// server package sync. Kept free of Windows and KenshiLib types for portable
+// tests.
 namespace Stobe {
 namespace AddonProtocol {
 
@@ -48,6 +50,50 @@ std::string JsonStringValue(const std::string &body, const std::string &key);
 bool JsonBooleanValue(const std::string &body, const std::string &key,
                       bool fallback);
 std::string JsonEscape(const std::string &value);
+
+// Per-actor addon flags (dialogue locks or animation-busy flags) keyed by
+// serial within one load generation. Entries from another generation count as
+// absent. Not synchronized; the runtime guards it. Set returns STOBE_OK,
+// STOBE_E_CONFLICT (another owner) or STOBE_E_LIMIT (capacity reached).
+class ActorLockTable {
+public:
+  explicit ActorLockTable(size_t capacity) : capacity_(capacity) {}
+  int Set(unsigned int owner, unsigned int serial, unsigned long generation,
+          bool locked);
+  unsigned int Owner(unsigned int serial, unsigned long generation) const;
+  size_t RemoveOwner(unsigned int owner);
+  size_t RemoveOtherGenerations(unsigned long generation);
+  size_t Size() const { return entries_.size(); }
+
+private:
+  struct Entry {
+    unsigned int owner;
+    unsigned long generation;
+  };
+  std::map<unsigned int, Entry> entries_;
+  size_t capacity_;
+};
+
+// Work Stobe performs for an actor, as gated by addon locks and busy flags.
+enum ActorWork {
+  ACTOR_DIALOGUE,       // selection, request starts and spoken lines
+  ACTOR_BUILTIN_ACTION, // Stobe's own actions, follow/travel/move, autonomy
+  ACTOR_ADDON_ACTION    // ExtCmd dispatched to the bridge owned by addon
+};
+
+// STOBE_OK when the work may run, else STOBE_E_LOCKED or STOBE_E_ACTOR_BUSY.
+// The dialogue lock gates only dialogue; the busy flag gates dialogue and
+// actions, except the busy owner's own ExtCmd actions. Owners are 0 when unset.
+int ActorGate(ActorWork work, unsigned int lockOwner, unsigned int busyOwner,
+              unsigned int addon);
+
+// State of an interaction-change ticket for request sequence ticketSeq, given
+// the newest requested sequence, the newest settled sequence and the status
+// recorded when it settled (0 Off, 1 On, 3 failed). Returns a STOBE_CONTROL_*
+// state and sets reason to a STOBE_E_* code or 0.
+unsigned int ResolveInteractionTicket(long ticketSeq, long requestedSeq,
+                                      long settledSeq, int settledStatus,
+                                      int &reason);
 
 } // namespace AddonProtocol
 } // namespace Stobe

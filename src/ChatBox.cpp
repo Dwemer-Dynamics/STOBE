@@ -7,6 +7,7 @@
 #include "Functions.h"
 #include "Globals.h"
 #include "AddonProtocol.h"
+#include "AddonRuntime.h"
 #include "StobeChatMode.h"
 #include "StobeTiming.h"
 #include "Utils.h"
@@ -82,6 +83,7 @@ bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
 LONG g_activeChatStreamCount = 0;
+LONG g_chatRequestStartCount = 0;
 LONG g_activeDirectorGeneration = 0;
 LONG g_profileModelSlot = 1;
 LONG g_profileModelRevision = 0;
@@ -1151,6 +1153,18 @@ bool IsCharacterUnavailableForConversation(Character *character) {
   return false;
 }
 
+// An addon lock or busy flag keeps the character out of Stobe's automatic dialogue.
+bool IsAddonLockedCharacter(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    return Stobe::Addon::DialogueGate(character->getHandle().serial) != STOBE_OK;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool IsDigitsOnlyToken(const std::string &value) {
   if (value.empty()) {
     return false;
@@ -1701,7 +1715,8 @@ bool TrySelectRechatResponder(GameWorld *world, Character *player,
     if (player && candidate == player) {
       return false;
     }
-    if (IsCharacterUnavailableForConversation(candidate)) {
+    if (IsCharacterUnavailableForConversation(candidate) ||
+        IsAddonLockedCharacter(candidate)) {
       return false;
     }
     if (!ShouldIncludeAnimalForTalk(candidate)) {
@@ -1853,6 +1868,12 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   if (target == player) {
     failReason = "Cannot talk to yourself.";
     Log("CHAT_VALIDATE: fail self-target");
+    return false;
+  }
+
+  if (IsAddonLockedCharacter(target)) {
+    failReason = "That character is busy.";
+    Log("CHAT_VALIDATE: fail target locked by addon");
     return false;
   }
 
@@ -3878,6 +3899,10 @@ bool IsAiRequestActive() {
   return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
 }
 
+LONG ChatRequestStartCount() {
+  return InterlockedCompareExchange(&g_chatRequestStartCount, 0, 0);
+}
+
 bool IsDirectorSceneActive() {
   LONG generation = InterlockedCompareExchange(&g_activeDirectorGeneration, 0, 0);
   return generation != 0 && IsChatInterruptGenerationCurrent(generation);
@@ -4691,6 +4716,7 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   HANDLE chatThread =
       PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
   if (chatThread) {
+    InterlockedIncrement(&g_chatRequestStartCount);
     if (mode == "hypnosis") {
       g_chatMode = "chat";
       g_lastChatModeIndex = 0;
@@ -5216,6 +5242,10 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (!preferredCharacter || (uintptr_t)preferredCharacter <= 0x1000) {
       Log("BORED_EVENT: preferred target unresolved name=" + preferredName +
           " serial=" + preferredSerial);
+    } else if (IsAddonLockedCharacter(preferredCharacter)) {
+      Log("BORED_EVENT: preferred speaker locked by addon serial=" +
+          preferredSerial);
+      return false;
     }
   }
   // Exact callers (addons) name both actors by serial; never substitute.
@@ -5286,7 +5316,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (other == searchAnchor && !preferredMatch) {
       continue;
     }
-    if (!ShouldIncludeAnimalForTalk(other)) {
+    if (!ShouldIncludeAnimalForTalk(other) || IsAddonLockedCharacter(other)) {
       continue;
     }
 

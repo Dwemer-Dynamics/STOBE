@@ -51,6 +51,12 @@ typedef StobeU32 StobeAddonId; /* 0 is never a valid id */
 #define STOBE_E_CONFLICT (-7)     /* bridge already owned by another addon */
 #define STOBE_E_WRONG_THREAD (-8) /* call is only valid on the game thread */
 #define STOBE_E_DISABLED (-9)     /* Stobe interaction is switched off */
+/* Added with version 2; a version 1 caller never receives them. */
+#define STOBE_E_LOCKED (-10)      /* actor is locked by an addon */
+#define STOBE_E_INELIGIBLE (-11)  /* Stobe's request path declined to start it */
+#define STOBE_E_UNCONFIRMED (-12) /* StobeServer did not confirm the change */
+#define STOBE_E_SUPERSEDED (-13)  /* a later interaction change replaced it */
+#define STOBE_E_ACTOR_BUSY (-14)  /* actor is animation-busy for an addon */
 
 /* Bounds. Longer strings are rejected, not truncated. */
 #define STOBE_MAX_NAME_BYTES 48u  /* addon and bridge names */
@@ -157,6 +163,109 @@ typedef struct StobeAddonApiV1 {
 } StobeAddonApiV1;
 
 typedef const StobeAddonApiV1 *(STOBE_CALL *StobeGetApiFn)(StobeU32 version);
+
+/* ---- Version 2: control ---------------------------------------------------
+ * Stobe_GetApi(STOBE_ADDON_API_VERSION_2) returns a StobeAddonApiV2 whose
+ * first member is a complete V1 table, or NULL from a Stobe without it. Cast
+ * only after checking api_version >= 2 and struct_size >= sizeof(V2):
+ *   const StobeAddonApiV1 *base = get(STOBE_ADDON_API_VERSION_2);
+ *   const StobeAddonApiV2 *v2 = (base && base->api_version >= 2 &&
+ *       base->struct_size >= sizeof(StobeAddonApiV2))
+ *       ? (const StobeAddonApiV2 *)base : 0;
+ * Stobe_GetApi(1) keeps returning the unchanged V1 table. Test the
+ * capabilities bit for each feature before calling it.
+ */
+#define STOBE_ADDON_API_VERSION_2 2u
+
+#define STOBE_CAP_INTERACTION_CONTROL 0x1u /* Get/SetInteraction* */
+#define STOBE_CAP_ACTOR_LOCKS 0x2u         /* SetActorLock, GetActorLockOwner */
+#define STOBE_CAP_CONTROL_STATUS 0x4u      /* tickets, callback, GetControlStatus */
+#define STOBE_CAP_ACTOR_BUSY 0x8u          /* SetActorBusy, GetActorBusyOwner */
+
+/* GetInteractionState values. Only ON lets Stobe start AI work. */
+#define STOBE_INTERACTION_OFF 0u
+#define STOBE_INTERACTION_ON 1u
+#define STOBE_INTERACTION_UPDATING 2u /* change being synchronized with the server */
+#define STOBE_INTERACTION_FAILED 3u   /* sync failed; locally off, retried */
+
+/* Ticket kinds. */
+#define STOBE_CONTROL_KIND_PLAYER_INPUT 1u
+#define STOBE_CONTROL_KIND_CONTEXT_REQUEST 2u
+#define STOBE_CONTROL_KIND_INTERACTION 3u
+
+/* Ticket states. Every ticket leaves PENDING exactly once.
+ * ACCEPTED: Stobe started the dialogue request on its network worker. It is
+ *   final for dialogue kinds: Stobe has no acknowledgement that text was
+ *   generated, applied or spoken, and does not claim one.
+ * COMPLETED: StobeServer confirmed the requested interaction state.
+ * REJECTED, FAILED, CANCELLED: reason holds a STOBE_E_* code. */
+#define STOBE_CONTROL_PENDING 1u   /* queued, not yet acted on */
+#define STOBE_CONTROL_ACCEPTED 2u
+#define STOBE_CONTROL_REJECTED 3u  /* refused at dispatch (busy, locked, ...) */
+#define STOBE_CONTROL_COMPLETED 4u
+#define STOBE_CONTROL_FAILED 5u    /* attempted, not confirmed */
+#define STOBE_CONTROL_CANCELLED 6u /* load, superseded */
+
+typedef struct StobeControlStatus {
+  StobeU32 struct_size; /* sizeof(StobeControlStatus); caller sets for Get */
+  StobeU32 ticket;
+  StobeU32 kind;        /* STOBE_CONTROL_KIND_* */
+  StobeU32 state;       /* STOBE_CONTROL_* */
+  int reason;           /* STOBE_E_* for REJECTED/FAILED/CANCELLED, else 0 */
+  StobeU32 reserved;
+} StobeControlStatus;   /* 24 bytes */
+
+/* Game thread, once per ticket when it leaves PENDING. */
+typedef void(STOBE_CALL *StobeControlCallback)(void *user_data,
+                                               const StobeControlStatus *status);
+
+typedef struct StobeAddonApiV2 {
+  StobeAddonApiV1 v1; /* struct_size = sizeof(StobeAddonApiV2), api_version 2 */
+  StobeU32 capabilities; /* STOBE_CAP_* */
+  StobeU32 reserved;
+
+  /* STOBE_INTERACTION_*. Any thread. */
+  StobeU32(STOBE_CALL *GetInteractionState)(void);
+  /* Requests interaction On (enabled != 0) or Off, like the player's toggle.
+   * The last request wins; the player may change it again. Requesting the
+   * confirmed current state completes without contacting the server. */
+  int(STOBE_CALL *SetInteractionEnabled)(StobeAddonId id, int enabled,
+                                         StobeU32 *out_ticket);
+  /* Dialogue lock. Excludes the actor from Stobe's automatic speaker and
+   * listener selection, rechat, autonomy, dialogue request starts and spoken
+   * lines until the owner clears it, unregisters or faults, or a load occurs.
+   * Physical actions are not gated; see SetActorBusy. Another addon's lock is
+   * STOBE_E_CONFLICT. Repeating a set or clearing an unlocked actor is OK. */
+  int(STOBE_CALL *SetActorLock)(StobeAddonId id, StobeActorRef actor,
+                                int locked);
+  /* *out_owner is the locking addon or 0. Any thread. */
+  int(STOBE_CALL *GetActorLockOwner)(StobeActorRef actor,
+                                     StobeAddonId *out_owner);
+  /* As in V1, plus an optional ticket (out_ticket may be NULL). */
+  int(STOBE_CALL *SendPlayerInputTracked)(StobeAddonId id, StobeActorRef target,
+                                          const char *text,
+                                          StobeU32 *out_ticket);
+  int(STOBE_CALL *RequestContextualResponseTracked)(
+      StobeAddonId id, StobeActorRef speaker, StobeActorRef listener,
+      const char *direction, StobeU32 *out_ticket);
+  /* One callback per addon; NULL removes it (waits for an in-flight call). */
+  int(STOBE_CALL *SetControlCallback)(StobeAddonId id, StobeControlCallback fn,
+                                      void *user_data);
+  /* The newest 128 tickets are retained. Any thread. */
+  int(STOBE_CALL *GetControlStatus)(StobeAddonId id, StobeU32 ticket,
+                                    StobeControlStatus *out_status);
+  /* Animation-busy flag, independent of the dialogue lock. While set, Stobe
+   * drops the actor's built-in actions, follow/travel/move orders and
+   * autonomy, and refuses other addons' ExtCmd actions for it with a failed
+   * outcome; the owner's own ExtCmd still runs. Dialogue is gated as for a
+   * lock, with STOBE_E_ACTOR_BUSY.
+   * Ownership, conflict and cleanup are as for SetActorLock. */
+  int(STOBE_CALL *SetActorBusy)(StobeAddonId id, StobeActorRef actor,
+                                int busy);
+  /* *out_owner is the busy-flag owner or 0. Any thread. */
+  int(STOBE_CALL *GetActorBusyOwner)(StobeActorRef actor,
+                                     StobeAddonId *out_owner);
+} StobeAddonApiV2;
 
 #ifdef __cplusplus
 }

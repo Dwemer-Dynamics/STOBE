@@ -1,4 +1,5 @@
 #include "Interaction.h"
+#include "AddonRuntime.h"
 #include "PlaythroughNotices.h"
 #include "Functions.h"
 #include "AudioPlayback.h"
@@ -6465,9 +6466,10 @@ void UpdateMoveToActions(GameWorld *world) {
             state.point = target->getPositionForWaypoint(actor->getPosition());
           }
         }
-        if (result.empty() && actor->isInCombatMode(true, true)) {
+        if (result.empty() && (actor->isInCombatMode(true, true) ||
+                               Stobe::Addon::IsActorBusy(state.actor.serial))) {
           result = "stopped moving to";
-          halt = false;
+          halt = false; // Leave the orders of a combatant or addon animation.
         } else if (result.empty() && movement && MoveToOwnsOrder(orders, state) &&
                    movement->getDestination().distance(state.issuedPosition) > 2.0f) {
           result = "stopped moving to";
@@ -6649,6 +6651,32 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           && (nextAction.type != ACT_NOTIFY || nextAction.narratorNotification)) {
         if (!nextAction.utteranceId.empty()) PostSpeechDeliveryState(nextAction.utteranceId, "cancelled");
         g_uiActionQueue.pop_front();
+        continue;
+      }
+      // Work queued before an addon flagged the actor: a dialogue lock drops
+      // its lines (never the player's own bubble), a busy flag both.
+      const bool queuedLine =
+          (nextAction.type == ACT_SAY && nextAction.taskValue >= 0) ||
+          nextAction.type == ACT_PLAY_TTS;
+      const bool queuedBuiltin = nextAction.type != ACT_NOTIFY &&
+                                 nextAction.type != ACT_SAY &&
+                                 nextAction.type != ACT_PLAY_TTS;
+      if (nextAction.actor.isValid() &&
+          ((queuedLine && Stobe::Addon::DialogueGate(nextAction.actor.serial) != STOBE_OK) ||
+           (queuedBuiltin && Stobe::Addon::IsActorBusy(nextAction.actor.serial)))) {
+        if (!nextAction.utteranceId.empty()) PostSpeechDeliveryState(nextAction.utteranceId, "cancelled");
+        Log(std::string("ACTION_TIMING: dropped ") +
+            (queuedLine ? "line for addon-locked/busy" : "action for addon-busy") +
+            " actor serial=" + ToString((unsigned int)nextAction.actor.serial) +
+            " action_type=" + ToString((int)nextAction.type));
+        const std::string decisionId = nextAction.autonomyDecisionId;
+        g_uiActionQueue.pop_front();
+        if (!decisionId.empty()) {
+          LeaveCriticalSection(&g_uiMutex);
+          ReportAutonomyActionExecutionResult(
+              decisionId, false, queuedLine ? "actor_locked" : "actor_busy");
+          EnterCriticalSection(&g_uiMutex);
+        }
         continue;
       }
       bool nextActionIsSpeech =
