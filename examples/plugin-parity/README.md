@@ -6,6 +6,14 @@ It asks for API version 2 and falls back to version 1. With version 2 it registe
 
 With version 3 (`STOBE_CAP_AGENTS`) it then only reads agents: `ListAgents` (up to 8), `FindClosestAgent` from the player and `GetAgentRegistration` for the actor. It never registers, unregisters or refreshes an actor.
 
+Version 4 is exercised only when `STOBE_PARITY_PROBE_V4_DEMO=1` is set in Kenshi's environment before launch (PowerShell: `$env:STOBE_PARITY_PROBE_V4_DEMO = "1"`, then start Kenshi from that shell). Off by default, because it can write NPC context or start a reply. With it set, `ExtCmdParityProbe_Ping@<op>` runs exactly one operation for that actor 10 seconds later, which leaves time for the Ping's own reply to settle. `<op>` must be one of `normal`, `whisper`, `shout`, `context` (`SendAddonMessage` in that mode), `reactexplicit`, `reacteligible` (`RequestAddonReaction` with no listener) or `state` (an `addon_state` record `probe.status={"v":1,...}`, no model call). Any other parameter leaves Ping read-only. `Report` never runs a demo.
+
+`ParityProbe.log` shows `v4 demo <op> scheduled in 10 s`, then `v4 demo queue=1` and `v4 demo <op> serial=<s> code=<c> ticket=<t>`, followed by a `control ticket=<t> ...` line once Stobe settles the ticket. Wait about 11 seconds before you check. Limits:
+
+- One demo at a time per addon. A Ping that arrives while one is pending logs `refused: one is already pending`.
+- One attempt, no retries. If dialogue is still busy, or the world is not ready, the log shows the refusal (`code=-5` or a `REJECTED` ticket with reason `-5`).
+- A load in the meantime drops the queued callback, and a stale actor reference gives `-3`. Missing capability bits give `-1`. If the callback has not run within 60 seconds, the slot is released and `did not run` is logged.
+
 Nothing here is built or loaded by Stobe's own build or package. Test it in a separate Kenshi/mod setup, never with real saves you care about.
 
 ## Build

@@ -362,6 +362,47 @@ size_t FirstIncludedIndex(const std::vector<bool> &excluded) {
   return excluded.size();
 }
 
+bool AddonMessageModes(unsigned int mode, std::string &selectedOut,
+                       std::string &requestOut) {
+  switch (mode) {
+  case STOBE_MESSAGE_NORMAL:
+    selectedOut = "chat";
+    requestOut = "talk";
+    return true;
+  case STOBE_MESSAGE_WHISPER:
+    selectedOut = requestOut = "whisper";
+    return true;
+  case STOBE_MESSAGE_SHOUT:
+    selectedOut = requestOut = "shout";
+    return true;
+  case STOBE_MESSAGE_CONTEXT:
+    selectedOut = requestOut = "inject";
+    return true;
+  default:
+    return false;
+  }
+}
+
+int ReactionEligibility(unsigned int eligibility, bool boredEventsEnabled,
+                        const ReactionActor &speaker,
+                        const ReactionActor &listener) {
+  if (eligibility == STOBE_REACTION_EXPLICIT) {
+    return STOBE_OK;
+  }
+  if (eligibility != STOBE_REACTION_ELIGIBLE) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  const ReactionActor *actors[2] = {&speaker, &listener};
+  for (int i = 0; i < 2; ++i) {
+    const ReactionActor &actor = *actors[i];
+    if (actor.named &&
+        (actor.excluded || !(actor.autoAgent || actor.registered))) {
+      return STOBE_E_INELIGIBLE;
+    }
+  }
+  return boredEventsEnabled ? STOBE_OK : STOBE_E_INELIGIBLE;
+}
+
 int MatchAgentName(const std::vector<std::pair<std::string, unsigned int> > &agents,
                    const std::string &name, bool complete,
                    unsigned int &serialOut) {

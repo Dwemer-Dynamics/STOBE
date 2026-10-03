@@ -35,14 +35,18 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam);
 void OnChatInputChange(MyGUI::EditBox *sender);
 void OnChatInputAccept(MyGUI::EditBox *sender);
 void OnChatSendClick(MyGUI::Widget *sender);
+// requestModeOverride, when set, is the request mode sent instead of the one
+// resolved from the selected mode and the autochat toggle.
 void SubmitChatTextForCurrentContext(const std::string &submittedText,
-                                     bool fromVoice = false);
+                                     bool fromVoice = false,
+                                     const std::string &requestModeOverride = "");
 void SubmitVoiceChatText(const std::string &submittedText,
                          const std::string &speakerName,
                          const std::string &speakerSerial,
                          const std::string &targetName,
                          const std::string &targetSerial,
-                         const std::string &mode);
+                         const std::string &mode,
+                         const std::string &requestModeOverride = "");
 void OnChatCancelClick(MyGUI::Widget *sender);
 void OnChatModeChange(MyGUI::ComboBox *sender, size_t index);
 void OnChatProfileModelChange(MyGUI::ComboBox *sender, size_t index);
@@ -63,6 +67,9 @@ bool StartAddonFollowupStream(const std::wstring &endpoint,
 // speaker); distanceOut is the chat interaction distance.
 bool IsAutoAgentCandidate(GameWorld *world, Character *candidate,
                           float &distanceOut);
+// Game thread. True when other is alive, conscious, not down and in the
+// conversation area and bored-event search range of anchor.
+bool IsInConversationReach(Character *anchor, Character *other);
 // Counts chat requests whose stream worker started; never decreases.
 LONG ChatRequestStartCount();
 bool IsDirectorSceneActive();
@@ -81,7 +88,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        const std::string &preferredListenerName = "",
                        const std::string &preferredListenerSerial = "",
                        const std::string &direction = "",
-                       bool exactActors = false);
+                       bool exactActors = false,
+                       bool reserveStreamSlot = false);
 bool TriggerNarratorWelcomeOnLoad(GameWorld *world,
                                   Character *preferredSpeaker = nullptr,
                                   LONG generationOverride = 0);

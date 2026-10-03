@@ -59,7 +59,9 @@ enum WorkKind {
   WORK_CANCEL,
   WORK_CALLBACK,
   WORK_EXT_ACTION,
-  WORK_SET_INTERACTION
+  WORK_SET_INTERACTION,
+  WORK_ADDON_MESSAGE, // number: STOBE_MESSAGE_*
+  WORK_ADDON_REACTION // number: STOBE_REACTION_*
 };
 
 struct WorkItem {
@@ -169,6 +171,7 @@ struct State {
   StobeAddonApiV1 api;
   StobeAddonApiV2 apiV2;
   StobeAddonApiV3 apiV3;
+  StobeAddonApiV4 apiV4;
   State()
       : seqTickets(0), seenRequested(-2), seenSettled(-2),
         locks(kMaxActorLocks), busy(kMaxActorLocks),
@@ -645,6 +648,10 @@ void ReportExternalActionOutcome(GameWorld *world, unsigned int actorSerial,
                message, actorSerial, 0);
 }
 
+int SubmitPlayerLine(const WorkItem &item, Character *speaker, Character *target,
+                     const std::string &selectedMode,
+                     const std::string &requestMode);
+
 // Returns STOBE_OK when Stobe started the chat request.
 int RunPlayerInput(GameWorld *world, const WorkItem &item) {
   Character *target = NULL;
@@ -662,7 +669,16 @@ int RunPlayerInput(GameWorld *world, const WorkItem &item) {
         ToString(item.first.serial) + " reason=" + ResultLabel(code));
     return code;
   }
+  return SubmitPlayerLine(item, speaker, target, "chat", "");
+}
 
+// Says item.text from speaker to target through the chat submission path.
+// requestMode empty lets the selected mode and autochat toggle decide it, as
+// for V1 player input. Returns STOBE_OK when a chat request started.
+int SubmitPlayerLine(const WorkItem &item, Character *speaker, Character *target,
+                     const std::string &selectedMode,
+                     const std::string &requestMode) {
+  int code = STOBE_OK;
   // The voice submission path changes the chat UI's remembered target/mode.
   const std::string savedPlayer = Stobe::UI::g_chatPlayerNameStr;
   const std::string savedTargetName = Stobe::UI::g_chatTargetNameStr;
@@ -673,7 +689,7 @@ int RunPlayerInput(GameWorld *world, const WorkItem &item) {
   Stobe::UI::SubmitVoiceChatText(item.text, SafeName(speaker),
                                  ToString(speaker->getHandle().serial),
                                  SafeName(target), ToString(item.first.serial),
-                                 "chat");
+                                 selectedMode, requestMode);
   Stobe::UI::g_chatPlayerNameStr = savedPlayer;
   Stobe::UI::g_chatTargetNameStr = savedTargetName;
   Stobe::UI::g_chatTargetHandleStr = savedTargetHandle;
@@ -684,7 +700,9 @@ int RunPlayerInput(GameWorld *world, const WorkItem &item) {
     code = STOBE_E_INELIGIBLE;
   }
   Log("ADDON_API: player input submitted target_serial=" +
-      ToString(item.first.serial) + " text_len=" +
+      ToString(item.first.serial) + " mode=" +
+      (requestMode.empty() ? std::string("selected") : requestMode) +
+      " text_len=" +
       ToString(static_cast<int>(item.text.size())) + " result=" +
       (code == STOBE_OK ? std::string("started") : ResultLabel(code)));
   return code;
@@ -1837,6 +1855,200 @@ int STOBE_CALL ApiRequestContextRefresh(StobeAddonId id, StobeActorRef actor,
              : STOBE_E_LIMIT;
 }
 
+// ---- Version 4 ----
+
+// True while Stobe dialogue is in flight or the player is in a menu: a
+// streamed reply, a director scene, TTS playback or a queued Stobe line, the
+// chat box open, or the game paused. A contended queue counts as busy.
+bool IsDialogueBusy(GameWorld *world) {
+  if (Stobe::UI::IsAiRequestActive() || Stobe::UI::IsDirectorSceneActive() ||
+      IsTtsPlaybackActive() || Stobe::UI::g_chatWindow) {
+    return true;
+  }
+  try {
+    if (world->isPaused()) {
+      return true;
+    }
+  } catch (...) {
+    return true;
+  }
+  // Streamed lines wait in g_messageQueue before they become UI actions.
+  if (!TryEnterCriticalSection(&g_msgMutex)) {
+    return true;
+  }
+  bool queued = false;
+  for (std::deque<std::string>::const_iterator it = g_messageQueue.begin();
+       it != g_messageQueue.end() && !queued; ++it) {
+    queued = it->find("NPC_SAY: ") == 0 || it->find("PLAYER_TTS: ") == 0;
+  }
+  LeaveCriticalSection(&g_msgMutex);
+  if (queued || !TryEnterCriticalSection(&g_uiMutex)) {
+    return true;
+  }
+  for (std::deque<QueuedAction>::const_iterator it = g_uiActionQueue.begin();
+       it != g_uiActionQueue.end() && !queued; ++it) {
+    queued = it->type == ACT_SAY || it->type == ACT_PLAY_TTS;
+  }
+  LeaveCriticalSection(&g_uiMutex);
+  return queued;
+}
+
+// Shared hard gates, checked before anything changes.
+int AddonSpeechGate(GameWorld *world) {
+  if (!Stobe::Interaction::Allowed()) {
+    return STOBE_E_DISABLED;
+  }
+  return IsDialogueBusy(world) ? STOBE_E_BUSY : STOBE_OK;
+}
+
+bool IsAliveAndConscious(Character *character, unsigned int serial) {
+  const StobeU32 need = STOBE_ACTOR_ALIVE | STOBE_ACTOR_CONSCIOUS;
+  return (ActorFlags(character, serial) & need) == need;
+}
+
+int RunAddonMessage(GameWorld *world, const WorkItem &item) {
+  std::string selectedMode;
+  std::string requestMode;
+  Stobe::AddonProtocol::AddonMessageModes(item.number, selectedMode,
+                                          requestMode);
+  Character *target = NULL;
+  Character *speaker = ResolvePlayerSpeaker(world);
+  int code = ResolveActor(world, item.first, target);
+  if (code == STOBE_OK) {
+    code = AddonSpeechGate(world);
+  }
+  if (code == STOBE_OK && !speaker) {
+    code = STOBE_E_BUSY;
+  }
+  if (code == STOBE_OK) {
+    code = DialogueGate(item.first.serial);
+  }
+  if (code == STOBE_OK && !IsAliveAndConscious(target, item.first.serial)) {
+    code = STOBE_E_INELIGIBLE;
+  }
+  float distance = -1.0f;
+  // The chat path skips range and area checks for injection; apply chat's.
+  if (code == STOBE_OK && item.number == STOBE_MESSAGE_CONTEXT &&
+      !Stobe::UI::IsAutoAgentCandidate(world, target, distance)) {
+    code = STOBE_E_INELIGIBLE;
+  }
+  if (code != STOBE_OK) {
+    Log("ADDON_API: addon message dropped target_serial=" +
+        ToString(item.first.serial) + " mode=" + requestMode +
+        " reason=" + ResultLabel(code));
+    return code;
+  }
+  return SubmitPlayerLine(item, speaker, target, selectedMode, requestMode);
+}
+
+Stobe::AddonProtocol::ReactionActor DescribeReactionActor(GameWorld *world,
+                                                          Character *character,
+                                                          unsigned int serial) {
+  Stobe::AddonProtocol::ReactionActor actor;
+  actor.named = character != NULL;
+  const StobeU32 mode =
+      actor.named ? AgentMode(serial, PlaythroughSession::Generation(), NULL)
+                  : STOBE_AGENT_AUTO;
+  actor.registered = mode == STOBE_AGENT_REGISTERED;
+  actor.excluded = mode == STOBE_AGENT_UNREGISTERED;
+  float distance = -1.0f;
+  actor.autoAgent = actor.named &&
+                    Stobe::UI::IsAutoAgentCandidate(world, character, distance);
+  return actor;
+}
+
+int RunAddonReaction(GameWorld *world, const WorkItem &item) {
+  Character *speaker = NULL;
+  Character *listener = NULL;
+  int code = ResolveActor(world, item.first, speaker);
+  if (code == STOBE_OK && item.second.serial != 0) {
+    code = ResolveActor(world, item.second, listener);
+  }
+  if (code == STOBE_OK) {
+    code = AddonSpeechGate(world);
+  }
+  if (code == STOBE_OK) {
+    code = DialogueGate(item.first.serial);
+    if (code == STOBE_OK) code = DialogueGate(item.second.serial);
+  }
+  // The exact bored-event path relaxes alive and area checks for its named
+  // speaker and searches around it, so check reach from the player here.
+  Character *player = ResolvePlayerSpeaker(world);
+  if (code == STOBE_OK &&
+      (!player || !Stobe::UI::IsInConversationReach(player, speaker) ||
+       (listener && !Stobe::UI::IsInConversationReach(speaker, listener)))) {
+    code = STOBE_E_INELIGIBLE;
+  }
+  if (code == STOBE_OK) {
+    code = Stobe::AddonProtocol::ReactionEligibility(
+        item.number, g_enableBoredEvents,
+        DescribeReactionActor(world, speaker, item.first.serial),
+        DescribeReactionActor(world, listener, item.second.serial));
+  }
+  if (code == STOBE_OK &&
+      !Stobe::UI::TriggerBoredEvent(
+          world, true, SafeName(speaker), ToString(item.first.serial), 0,
+          listener ? SafeName(listener) : std::string(),
+          listener ? ToString(item.second.serial) : std::string(), item.text,
+          true, true)) {
+    code = STOBE_E_INELIGIBLE;
+  }
+  Log("ADDON_API: addon reaction speaker_serial=" +
+      ToString(item.first.serial) + " listener_serial=" +
+      ToString(item.second.serial) + " eligibility=" +
+      (item.number == STOBE_REACTION_EXPLICIT ? "explicit" : "eligible") +
+      " result=" +
+      (code != STOBE_OK ? ResultLabel(code) : std::string("dispatched")));
+  return code;
+}
+
+int STOBE_CALL ApiSendAddonMessage(StobeAddonId id, StobeActorRef actor,
+                                   StobeU32 mode, const char *text,
+                                   StobeU32 *outTicket) {
+  WorkItem item;
+  std::string selectedMode;
+  std::string requestMode;
+  if (actor.serial == 0 ||
+      !Stobe::AddonProtocol::AddonMessageModes(mode, selectedMode,
+                                               requestMode) ||
+      !CopyBoundedText(text, STOBE_MAX_TEXT_BYTES, false, item.text)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  item.kind = WORK_ADDON_MESSAGE;
+  item.owner = id;
+  item.generation = actor.generation;
+  item.first = actor;
+  item.number = mode;
+  return Enqueue(item, STOBE_CONTROL_KIND_PLAYER_INPUT, outTicket);
+}
+
+int STOBE_CALL ApiRequestAddonReaction(StobeAddonId id, StobeActorRef speaker,
+                                       StobeActorRef listener,
+                                       StobeU32 eligibility,
+                                       const char *direction,
+                                       StobeU32 *outTicket) {
+  WorkItem item;
+  if (speaker.serial == 0 || listener.serial == speaker.serial ||
+      (eligibility != STOBE_REACTION_EXPLICIT &&
+       eligibility != STOBE_REACTION_ELIGIBLE) ||
+      !CopyBoundedText(direction, STOBE_MAX_TEXT_BYTES, true, item.text)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(speaker) || (listener.serial != 0 && IsStaleRef(listener))) {
+    return STOBE_E_STALE;
+  }
+  item.kind = WORK_ADDON_REACTION;
+  item.owner = id;
+  item.generation = speaker.generation;
+  item.first = speaker;
+  item.second = listener;
+  item.number = eligibility;
+  return Enqueue(item, STOBE_CONTROL_KIND_CONTEXT_REQUEST, outTicket);
+}
+
 BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   StobeAddonApiV1 &api = Get().api;
   api.struct_size = sizeof(StobeAddonApiV1);
@@ -1885,6 +2097,14 @@ BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   v3.SetAgentRegistration = ApiSetAgentRegistration;
   v3.GetAgentRegistration = ApiGetAgentRegistration;
   v3.RequestContextRefresh = ApiRequestContextRefresh;
+
+  StobeAddonApiV4 &v4 = Get().apiV4;
+  v4.v3 = v3;
+  v4.v3.v2.v1.struct_size = sizeof(StobeAddonApiV4);
+  v4.v3.v2.v1.api_version = STOBE_ADDON_API_VERSION_4;
+  v4.v3.v2.capabilities |= STOBE_CAP_ADDON_MESSAGE | STOBE_CAP_ADDON_REACTION;
+  v4.SendAddonMessage = ApiSendAddonMessage;
+  v4.RequestAddonReaction = ApiRequestAddonReaction;
   return TRUE;
 }
 
@@ -1907,6 +2127,12 @@ static_assert(offsetof(StobeAddonApiV3, ListAgents) == sizeof(StobeAddonApiV2),
 static_assert(sizeof(StobeAddonApiV3) ==
                   sizeof(StobeAddonApiV2) + 6 * sizeof(void *),
               "StobeAddonApiV3 ABI");
+static_assert(offsetof(StobeAddonApiV4, SendAddonMessage) ==
+                  sizeof(StobeAddonApiV3),
+              "StobeAddonApiV4 embeds V3 first");
+static_assert(sizeof(StobeAddonApiV4) ==
+                  sizeof(StobeAddonApiV3) + 2 * sizeof(void *),
+              "StobeAddonApiV4 ABI");
 
 } // namespace
 
@@ -1996,10 +2222,14 @@ void GameThreadTick(GameWorld *world) {
     }
     switch (item.kind) {
     case WORK_PLAYER_INPUT:
-    case WORK_CONTEXT_REQUEST: {
-      const int code = item.kind == WORK_PLAYER_INPUT
-                           ? RunPlayerInput(world, item)
-                           : RunContextRequest(world, item);
+    case WORK_CONTEXT_REQUEST:
+    case WORK_ADDON_MESSAGE:
+    case WORK_ADDON_REACTION: {
+      const int code =
+          item.kind == WORK_PLAYER_INPUT     ? RunPlayerInput(world, item)
+          : item.kind == WORK_CONTEXT_REQUEST ? RunContextRequest(world, item)
+          : item.kind == WORK_ADDON_MESSAGE   ? RunAddonMessage(world, item)
+                                              : RunAddonReaction(world, item);
       FinishTicket(item.ticket,
                    code == STOBE_OK ? STOBE_CONTROL_ACCEPTED
                                     : STOBE_CONTROL_REJECTED,
@@ -2090,12 +2320,16 @@ extern "C" __declspec(dllexport) const StobeAddonApiV1 *STOBE_CALL
 Stobe_GetApi(StobeU32 version) {
   if (version != STOBE_ADDON_API_VERSION &&
       version != STOBE_ADDON_API_VERSION_2 &&
-      version != STOBE_ADDON_API_VERSION_3) {
+      version != STOBE_ADDON_API_VERSION_3 &&
+      version != STOBE_ADDON_API_VERSION_4) {
     return NULL;
   }
   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
   InitOnceExecuteOnce(&once, Stobe::Addon::InitApiTable, NULL, NULL);
   // Version 1 keeps its own unchanged table; version 2 embeds a copy of it.
+  if (version == STOBE_ADDON_API_VERSION_4) {
+    return &Stobe::Addon::Get().apiV4.v3.v2.v1;
+  }
   if (version == STOBE_ADDON_API_VERSION_3) {
     return &Stobe::Addon::Get().apiV3.v2.v1;
   }

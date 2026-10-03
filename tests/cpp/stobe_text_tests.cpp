@@ -73,6 +73,9 @@ static_assert(offsetof(StobeAddonApiV3, v2) == 0, "V3 starts with V2");
 static_assert(offsetof(StobeAddonApiV3, ListAgents) == 208, "V3 appends");
 static_assert(sizeof(StobeAddonApiV3) == 256, "V3 table size");
 static_assert(sizeof(StobeAgentInfo) == 72, "StobeAgentInfo size");
+static_assert(offsetof(StobeAddonApiV4, v3) == 0, "V4 starts with V3");
+static_assert(offsetof(StobeAddonApiV4, SendAddonMessage) == 256, "V4 appends");
+static_assert(sizeof(StobeAddonApiV4) == 272, "V4 table size");
 static_assert(sizeof(StobeControlStatus) == 24, "control status size");
 
 } // namespace
@@ -1199,6 +1202,62 @@ int main() {
                AP::FirstIncludedIndex(excludedOptions) == 1u &&
                    AP::FirstIncludedIndex(std::vector<bool>(2, true)) == 2u &&
                    AP::FirstIncludedIndex(std::vector<bool>()) == 0u,
+               true);
+
+    // V4 message modes are fixed per request; autochat never replaces them.
+    std::string selectedMode;
+    std::string requestMode;
+    ExpectBool("Addon message: normal is talk, not the selected mode",
+               AP::AddonMessageModes(STOBE_MESSAGE_NORMAL, selectedMode,
+                                     requestMode) &&
+                   selectedMode == "chat" && requestMode == "talk",
+               true);
+    ExpectBool("Addon message: whisper, shout and context keep their mode",
+               AP::AddonMessageModes(STOBE_MESSAGE_WHISPER, selectedMode,
+                                     requestMode) &&
+                   requestMode == "whisper" &&
+                   AP::AddonMessageModes(STOBE_MESSAGE_SHOUT, selectedMode,
+                                         requestMode) &&
+                   requestMode == "shout" &&
+                   AP::AddonMessageModes(STOBE_MESSAGE_CONTEXT, selectedMode,
+                                         requestMode) &&
+                   selectedMode == "inject" && requestMode == "inject",
+               true);
+    ExpectBool("Addon message: unknown mode rejected",
+               AP::AddonMessageModes(4u, selectedMode, requestMode), false);
+
+    AP::ReactionActor agent = {true, true, false, false};
+    AP::ReactionActor outOfRange = {true, false, false, false};
+    AP::ReactionActor registered = {true, false, true, false};
+    AP::ReactionActor excluded = {true, true, false, true};
+    AP::ReactionActor unset = {false, false, false, false};
+    ExpectBool("Reaction: explicit allows unregistered named actors",
+               AP::ReactionEligibility(STOBE_REACTION_EXPLICIT, false, excluded,
+                                       excluded) == STOBE_OK,
+               true);
+    ExpectBool("Reaction: eligible takes auto and registered agents",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true, agent,
+                                       registered) == STOBE_OK &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                           agent, unset) == STOBE_OK,
+               true);
+    ExpectBool("Reaction: eligible excludes unregistered speaker or listener",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true, excluded,
+                                       unset) == STOBE_E_INELIGIBLE &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                           agent, excluded) ==
+                       STOBE_E_INELIGIBLE,
+               true);
+    ExpectBool("Reaction: eligible needs an agent and bored events on",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                       outOfRange, unset) ==
+                       STOBE_E_INELIGIBLE &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, false,
+                                           agent, unset) == STOBE_E_INELIGIBLE,
+               true);
+    ExpectBool("Reaction: unknown eligibility rejected",
+               AP::ReactionEligibility(2u, true, agent, unset) ==
+                   STOBE_E_INVALID_ARGUMENT,
                true);
 
     std::vector<std::pair<std::string, unsigned int> > agents;

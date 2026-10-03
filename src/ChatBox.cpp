@@ -2130,6 +2130,25 @@ bool IsAutoAgentCandidate(GameWorld *world, Character *candidate,
                                   distanceOut);
 }
 
+bool IsInConversationReach(Character *anchor, Character *other) {
+  if (!anchor || !other || (uintptr_t)anchor <= 0x1000 ||
+      (uintptr_t)other <= 0x1000 || IsCharacterUnavailableForConversation(other) ||
+      !IsConversationAreaCompatible(anchor, other)) {
+    return false;
+  }
+  try {
+    // The radius TriggerBoredEvent searches around its speaker.
+    float radius = IsIndoorsHandleValid(anchor->isIndoors()) ? g_boredEventRange
+                                                             : g_proximityRadius;
+    if (radius < 10.0f) {
+      radius = 10.0f;
+    }
+    return anchor->getPosition().distance(other->getPosition()) <= radius;
+  } catch (...) {
+    return false;
+  }
+}
+
 void RefreshChatHeaderLabel() {
   if (!g_chatLabel) {
     return;
@@ -4139,7 +4158,8 @@ void OnChatInputChange(MyGUI::EditBox *sender) {
 void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
 void SubmitChatTextForCurrentContext(const std::string &submittedText,
-                                     bool fromVoice) {
+                                     bool fromVoice,
+                                     const std::string &requestModeOverride) {
   if (!Stobe::Interaction::ManualInputAllowed()) return;
   std::string text = submittedText;
   if (text.empty())
@@ -4201,8 +4221,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
     npcName = kNarratorName;
     handleStr = "";
   }
+  // An addon message fixes its request mode; autochat does not replace it.
   std::string mode =
-      Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
+      !requestModeOverride.empty()
+          ? requestModeOverride
+          : Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
 
   // Delivery cue for the player's own line. It travels in its own fields and
   // never changes the literal speech text or the player TTS request.
@@ -4252,9 +4275,16 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
 
   // New player input preempts current dialogue flow: stop active TTS and
   // invalidate any queued rechat/follow-up work before further processing.
-  LONG chatGeneration = BeginChatInterruptGeneration();
-  Log("CHAT_INTERRUPT: new player send preempted active dialogue gen=" +
-      ToString((int)chatGeneration));
+  // An addon message (fixed request mode) is only sent while dialogue is idle
+  // and joins the current generation, leaving follow/travel and queued
+  // actions alone; a later player send still invalidates its reply.
+  const bool addonRequest = !requestModeOverride.empty();
+  LONG chatGeneration = addonRequest ? GetChatInterruptGeneration()
+                                     : BeginChatInterruptGeneration();
+  if (!addonRequest) {
+    Log("CHAT_INTERRUPT: new player send preempted active dialogue gen=" +
+        ToString((int)chatGeneration));
+  }
 
   Log("CHAT_SEND_STAGE: begin mode=" + selectedMode + " request_mode=" + mode +
       " autochat=" + std::string(g_autoChatEnabled ? "1" : "0") +
@@ -4895,8 +4925,13 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   streamTask->rechatDepth = 0;
   streamTask->allowUnavailableTargetSpeech =
       manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
+  // An addon request holds its stream slot before the thread exists, so a
+  // second addon call in the same tick already sees IsAiRequestActive.
+  streamTask->streamSlotReserved = addonRequest;
+  if (addonRequest) InterlockedIncrement(&g_activeChatStreamCount);
   HANDLE chatThread =
       PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
+  if (!chatThread && addonRequest) InterlockedDecrement(&g_activeChatStreamCount);
   if (chatThread) {
     InterlockedIncrement(&g_chatRequestStartCount);
     if (mode == "hypnosis") {
@@ -4918,14 +4953,15 @@ void SubmitVoiceChatText(const std::string &submittedText,
                          const std::string &speakerSerial,
                          const std::string &targetName,
                          const std::string &targetSerial,
-                         const std::string &mode) {
+                         const std::string &mode,
+                         const std::string &requestModeOverride) {
   g_chatPlayerNameStr = speakerName;
   g_chatSpeakerHandleOverride = speakerSerial;
   g_chatTargetNameStr = targetName;
   g_chatTargetHandleStr = targetSerial;
   g_chatMode = Stobe::ChatMode::Normalize(mode);
   g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
-  SubmitChatTextForCurrentContext(submittedText, true);
+  SubmitChatTextForCurrentContext(submittedText, true, requestModeOverride);
   g_chatSpeakerHandleOverride.clear();
 }
 
@@ -5390,7 +5426,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        LONG generationOverride,
                        const std::string &preferredListenerName,
                        const std::string &preferredListenerSerial,
-                       const std::string &direction, bool exactActors) {
+                       const std::string &direction, bool exactActors,
+                       bool reserveStreamSlot) {
   if (!Stobe::Interaction::Allowed()) return false;
   if (!forceDirectorMode && IsDirectorSceneActive()) return false;
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
@@ -5799,8 +5836,11 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   const LONG directorGeneration = task->generation;
   const std::string dispatchedListenerHandle = task->previousSpeakerHandle;
   if (forceDirectorMode) InterlockedExchange(&g_activeDirectorGeneration, directorGeneration);
+  task->streamSlotReserved = reserveStreamSlot;
+  if (reserveStreamSlot) InterlockedIncrement(&g_activeChatStreamCount);
   HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
+    if (reserveStreamSlot) InterlockedDecrement(&g_activeChatStreamCount);
     if (forceDirectorMode) InterlockedCompareExchange(&g_activeDirectorGeneration, 0, directorGeneration);
     delete task;
     Log("BORED_EVENT: failed to start stream thread");

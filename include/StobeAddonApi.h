@@ -352,6 +352,60 @@ typedef struct StobeAddonApiV3 {
                                          StobeU32 parts);
 } StobeAddonApiV3;
 
+/* ---- Version 4: addon messages and reactions -------------------------------
+ * Stobe_GetApi(STOBE_ADDON_API_VERSION_4) returns a StobeAddonApiV4 whose
+ * first member is a complete V3 table (struct_size = sizeof(V4), api_version
+ * 4), or NULL from an older Stobe. Check api_version >= 4 and struct_size >=
+ * sizeof(StobeAddonApiV4) before casting, then the capabilities bit.
+ * Versions 1-3 keep their unchanged tables and capability bits.
+ *
+ * Both calls are refused, before Stobe changes any state, while dialogue is
+ * busy: a reply streaming, a director scene, TTS playing or a Stobe line
+ * queued, the chat box open, or the game paused (STOBE_E_BUSY). Neither one
+ * interrupts or cancels dialogue. Interaction off is STOBE_E_DISABLED; dialogue
+ * locks and busy flags apply as for V1. Tickets use the V2 ticket kinds
+ * (PLAYER_INPUT for messages, CONTEXT_REQUEST for reactions); out_ticket may
+ * be NULL. Structured addon state stays on SendEvent(STOBE_EVENT_PLUGIN_STATE).
+ */
+#define STOBE_ADDON_API_VERSION_4 4u
+
+#define STOBE_CAP_ADDON_MESSAGE 0x40u  /* SendAddonMessage */
+#define STOBE_CAP_ADDON_REACTION 0x80u /* RequestAddonReaction */
+
+/* SendAddonMessage modes. The mode is fixed for the one request; the player's
+ * selected chat mode and autochat toggle neither change it nor are changed. */
+#define STOBE_MESSAGE_NORMAL 0u  /* spoken line, normal reply ("talk") */
+#define STOBE_MESSAGE_WHISPER 1u /* private line and reply, no rechat */
+#define STOBE_MESSAGE_SHOUT 2u   /* loud line, shout range */
+#define STOBE_MESSAGE_CONTEXT 3u /* stored as injected context; no line, no reply */
+
+/* RequestAddonReaction eligibility. */
+#define STOBE_REACTION_EXPLICIT 0u /* the named actors, even if UNREGISTERED */
+#define STOBE_REACTION_ELIGIBLE 1u /* only automatic agents, bored events on */
+
+typedef struct StobeAddonApiV4 {
+  StobeAddonApiV3 v3;
+  /* The player speaker says text to actor in mode (STOBE_MESSAGE_*) through
+   * Stobe's chat request. The actor must be alive and conscious; NORMAL,
+   * WHISPER and SHOUT use the chat box's range and area checks for that mode,
+   * CONTEXT the normal chat range. ACCEPTED means the request started. */
+  int(STOBE_CALL *SendAddonMessage)(StobeAddonId id, StobeActorRef actor,
+                                    StobeU32 mode, const char *text,
+                                    StobeU32 *out_ticket);
+  /* Speaker-locked reaction like RequestContextualResponse. speaker, and
+   * listener when non-zero, must be alive, conscious and in conversation area
+   * and range (speaker of the player speaker, listener of the speaker).
+   * EXPLICIT skips only agent eligibility; ELIGIBLE also requires each named
+   * actor to be an agent (auto or REGISTERED, never UNREGISTERED) and Stobe's
+   * bored events to be enabled, else STOBE_E_INELIGIBLE. direction may be
+   * NULL or "". */
+  int(STOBE_CALL *RequestAddonReaction)(StobeAddonId id, StobeActorRef speaker,
+                                        StobeActorRef listener,
+                                        StobeU32 eligibility,
+                                        const char *direction,
+                                        StobeU32 *out_ticket);
+} StobeAddonApiV4;
+
 #ifdef __cplusplus
 }
 #endif
