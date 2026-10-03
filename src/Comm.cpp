@@ -1643,6 +1643,13 @@ std::string GetStobeServerHomeUrl() {
   return "http://" + host + ":" + ToString((int)g_stobePort) + "/StobeServer/";
 }
 
+bool ResolveStobeServerTarget(std::wstring &host, unsigned short &port) {
+  EnsureDiscovered();
+  host = g_stobeHost.empty() ? std::wstring(kDefaultServerHost) : g_stobeHost;
+  port = g_stobePort;
+  return port != 0;
+}
+
 std::string PlaythroughSession::Transport(const std::string& body, unsigned long& status) {
   EnsureDiscovered();
   RequestPlan request=ResolveRequest(L"/StobeServer/playthrough_session.php",body,true);

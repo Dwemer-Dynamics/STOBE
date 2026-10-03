@@ -98,6 +98,7 @@ add_library(Stobe SHARED
   src/StobeText.cpp
   src/StobeTiming.cpp
   src/main.cpp
+  src/ServerPluginSync.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
   src/VoiceCapture.cpp
