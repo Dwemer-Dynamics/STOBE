@@ -1,3 +1,4 @@
+#include "AddonProtocol.h"
 #include "AutonomySafetyProbePolicy.h"
 #include "AutonomyMonitor.h"
 #include "AutonomyProtocol.h"
@@ -5,7 +6,9 @@
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
 #include "StobeTiming.h"
+#include "StobeAddonApi.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -51,6 +54,29 @@ void ExpectBool(const std::string &name, bool actual, bool expected) {
             << "  expected: " << (expected ? "true" : "false") << "\n"
             << "  actual:   " << (actual ? "true" : "false") << "\n";
 }
+
+// The V1 table is a published ABI; V2 only appends after a full V1 copy.
+static_assert(STOBE_ADDON_API_VERSION == 1u, "V1 version number");
+static_assert(sizeof(StobeAddonApiV1) == 120, "V1 table size");
+static_assert(offsetof(StobeAddonApiV1, RegisterAddon) == 16, "V1 first call");
+static_assert(offsetof(StobeAddonApiV1, QueueGameThreadCallback) == 112,
+              "V1 last call");
+static_assert(sizeof(StobeActionRequest) == 56, "V1 action request");
+static_assert(offsetof(StobeAddonApiV2, v1) == 0, "V2 starts with V1");
+static_assert(offsetof(StobeAddonApiV2, capabilities) == 120, "V2 appends");
+static_assert(offsetof(StobeAddonApiV2, GetControlStatus) == 184,
+              "V2 control status call");
+static_assert(offsetof(StobeAddonApiV2, GetActorBusyOwner) == 200,
+              "V2 last call");
+static_assert(sizeof(StobeAddonApiV2) == 208, "V2 table size");
+static_assert(offsetof(StobeAddonApiV3, v2) == 0, "V3 starts with V2");
+static_assert(offsetof(StobeAddonApiV3, ListAgents) == 208, "V3 appends");
+static_assert(sizeof(StobeAddonApiV3) == 256, "V3 table size");
+static_assert(sizeof(StobeAgentInfo) == 72, "StobeAgentInfo size");
+static_assert(offsetof(StobeAddonApiV4, v3) == 0, "V4 starts with V3");
+static_assert(offsetof(StobeAddonApiV4, SendAddonMessage) == 256, "V4 appends");
+static_assert(sizeof(StobeAddonApiV4) == 272, "V4 table size");
+static_assert(sizeof(StobeControlStatus) == 24, "control status size");
 
 } // namespace
 
@@ -941,6 +967,13 @@ int main() {
                5);
   ExpectUInt32("Inject and chat mode index",
                static_cast<unsigned int>(ToIndex("inject_chat")), 6);
+  ExpectEq("Hypnosis normalizes", Normalize("HYPNOSIS"), "hypnosis");
+  ExpectUInt32("Hypnosis mode index", static_cast<unsigned int>(ToIndex("hypnosis")), 7);
+  ExpectEq("Hypnosis display label", DisplayLabel("hypnosis"), "Hypnosis");
+  ExpectEq("Hypnosis overrides autochat", ResolveRequestMode("hypnosis", true), "hypnosis");
+  ExpectBool("Hypnosis blocks manual actions", AllowsManualActions("hypnosis"), false);
+  ExpectBool("Hypnosis suppresses speech", ShouldQueueLocalPlayerSpeech("hypnosis"), false);
+  ExpectBool("Hypnosis suppresses rechat", AllowsAutomaticRechat("hypnosis"), false);
   ExpectEq("Chat display label", DisplayLabel("chat"), "Chat");
   ExpectEq("Whisper display label", DisplayLabel("whisper"), "Whisper");
   ExpectEq("Inject and chat display label", DisplayLabel("inject_chat"),
@@ -965,6 +998,437 @@ int main() {
            "injection");
   ExpectEq("Standard chat uses input event", EventTypeForRequest("talk"),
            "inputtext");
+
+  {
+    namespace AP = Stobe::AddonProtocol;
+    AP::ExtCommand ext;
+    ExpectBool("ExtCmd parses bridge and action",
+               AP::ParseExtCommand("ExtCmdParityProbe_Ping", ext), true);
+    ExpectEq("ExtCmd keeps bridge case", ext.bridge, "ParityProbe");
+    ExpectEq("ExtCmd action may contain underscores",
+             AP::ParseExtCommand("EXTCMDBridge_Do_Thing", ext) ? ext.action : "",
+             "Do_Thing");
+    ExpectBool("ExtCmd rejects missing bridge",
+               AP::ParseExtCommand("ExtCmd_Ping", ext), false);
+    ExpectBool("ExtCmd rejects missing action",
+               AP::ParseExtCommand("ExtCmdBridge_", ext), false);
+    ExpectBool("ExtCmd rejects unsafe bridge",
+               AP::ParseExtCommand("ExtCmdBad-Name_Ping", ext), false);
+    ExpectBool("Built-in action is not ExtCmd", AP::IsExtCommand("ATTACK"),
+               false);
+    unsigned int serial = 7;
+    ExpectBool("Strict serial accepts max uint32",
+               AP::ParseStrictSerial("4294967295", serial), true);
+    ExpectUInt32("Strict serial keeps max uint32 value", serial, 4294967295u);
+    ExpectBool("Strict serial rejects uint32 overflow",
+               AP::ParseStrictSerial("4294967296", serial), false);
+    ExpectUInt32("Strict serial clears output on failure", serial, 0u);
+    ExpectBool("Strict serial rejects long overflow",
+               AP::ParseStrictSerial("99999999999999999999", serial), false);
+    ExpectBool("Strict serial rejects digit prefix with junk",
+               AP::ParseStrictSerial("123junk", serial), false);
+    ExpectBool("Strict serial rejects trailing space",
+               AP::ParseStrictSerial("123 ", serial), false);
+    ExpectBool("Strict serial rejects sign",
+               AP::ParseStrictSerial("+123", serial), false);
+    ExpectBool("Strict serial rejects zero", AP::ParseStrictSerial("0", serial),
+               false);
+    ExpectBool("Strict serial rejects empty", AP::ParseStrictSerial("", serial),
+               false);
+    ExpectBool("Strict serial accepts plain decimal",
+               AP::ParseStrictSerial("123", serial) && serial == 123u, true);
+    ExpectUInt32("ExtCmd serial: legacy server keeps primary",
+                 AP::SelectExtActionSerial("", 42u, false), 42u);
+    ExpectUInt32("ExtCmd serial: legacy secondary fails closed",
+                 AP::SelectExtActionSerial("", 0u, false), 0u);
+    ExpectUInt32("ExtCmd serial: listed group speaker",
+                 AP::SelectExtActionSerial("77", 0u, true), 77u);
+    ExpectUInt32("ExtCmd serial: unlisted sid rejected",
+                 AP::SelectExtActionSerial("77", 0u, false), 0u);
+    ExpectUInt32("ExtCmd serial: sid conflicting with primary rejected",
+                 AP::SelectExtActionSerial("77", 42u, true), 0u);
+    ExpectUInt32("ExtCmd serial: sid matching primary",
+                 AP::SelectExtActionSerial("42", 42u, false), 42u);
+    ExpectUInt32("ExtCmd serial: malformed sid rejected",
+                 AP::SelectExtActionSerial("77x", 0u, true), 0u);
+    std::string stem;
+    ExpectBool("Package archive accepts dwpkg",
+               AP::SplitPackageArchiveName("1.2.0.DWPKG", stem), true);
+    ExpectEq("Package archive stem is version", stem, "1.2.0");
+    ExpectBool("Package archive rejects other files",
+               AP::SplitPackageArchiveName("readme.txt", stem), false);
+    ExpectBool("Package name rejects traversal",
+               AP::IsSafePackageName("../evil"), false);
+    ExpectBool("Package name rejects trailing dot",
+               AP::IsSafePackageName("Parity."), false);
+    ExpectBool("Package version accepts semver build",
+               AP::IsSafePackageVersion("1.0.0+build-2"), true);
+    const std::string body =
+        "{\"ok\":true,\"upload\":{\"complete\":true,\"job\":"
+        "{\"id\":\"j1\",\"status\":\"completed\"}}}";
+    ExpectBool("Package API nested boolean", AP::JsonBooleanValue(body, "complete", false),
+               true);
+    ExpectEq("Package API job id", AP::JsonStringValue(body, "id"), "j1");
+    ExpectEq("Package request escapes quotes", AP::JsonEscape("a\"b"),
+             "a\\\"b");
+  }
+
+  {
+    namespace AP = Stobe::AddonProtocol;
+    AP::ActorLockTable locks(2);
+    ExpectBool("Lock: owner locks actor", locks.Set(1, 10, 5, true) == STOBE_OK,
+               true);
+    ExpectBool("Lock: repeat by owner is OK", locks.Set(1, 10, 5, true) == STOBE_OK,
+               true);
+    ExpectUInt32("Lock: owner reported", locks.Owner(10, 5), 1u);
+    ExpectBool("Lock: other addon cannot take it",
+               locks.Set(2, 10, 5, true) == STOBE_E_CONFLICT, true);
+    ExpectBool("Lock: other addon cannot clear it",
+               locks.Set(2, 10, 5, false) == STOBE_E_CONFLICT, true);
+    ExpectUInt32("Lock: still held after foreign clear", locks.Owner(10, 5), 1u);
+    ExpectBool("Lock: clearing an unlocked actor is OK",
+               locks.Set(2, 11, 5, false) == STOBE_OK, true);
+    ExpectBool("Lock: second actor", locks.Set(2, 11, 5, true) == STOBE_OK, true);
+    ExpectBool("Lock: table is bounded", locks.Set(2, 12, 5, true) == STOBE_E_LIMIT,
+               true);
+    ExpectUInt32("Lock: absent after a load", locks.Owner(10, 6), 0u);
+    ExpectBool("Lock: earlier load does not conflict",
+               locks.Set(2, 10, 6, true) == STOBE_OK, true);
+    ExpectUInt32("Lock: new load owner", locks.Owner(10, 6), 2u);
+    ExpectUInt32("Lock: load purge removes earlier entries",
+                 static_cast<unsigned int>(locks.RemoveOtherGenerations(6)), 1u);
+    ExpectUInt32("Lock: owner removal releases only its locks",
+                 static_cast<unsigned int>(locks.RemoveOwner(2)), 1u);
+    ExpectUInt32("Lock: empty after removal",
+                 static_cast<unsigned int>(locks.Size()), 0u);
+    ExpectBool("Lock: owner clears its lock",
+               locks.Set(1, 10, 6, true) == STOBE_OK &&
+                   locks.Set(1, 10, 6, false) == STOBE_OK && locks.Owner(10, 6) == 0,
+               true);
+
+    // A dialogue lock and a busy flag are separate tables with the same
+    // rules; the runtime removes an unregistered or faulted owner from both.
+    AP::ActorLockTable talk(4);
+    AP::ActorLockTable busy(4);
+    ExpectBool("Busy: lock and busy held by different owners",
+               talk.Set(1, 20, 6, true) == STOBE_OK &&
+                   busy.Set(2, 20, 6, true) == STOBE_OK,
+               true);
+    ExpectBool("Busy: other addon cannot clear it",
+               busy.Set(1, 20, 6, false) == STOBE_E_CONFLICT &&
+                   busy.Owner(20, 6) == 2u,
+               true);
+    ExpectBool("Busy: clearing the lock leaves busy set",
+               talk.Set(1, 20, 6, false) == STOBE_OK && talk.Owner(20, 6) == 0 &&
+                   busy.Owner(20, 6) == 2u,
+               true);
+    ExpectBool("Busy: owner cleanup clears both tables",
+               talk.Set(2, 21, 6, true) == STOBE_OK && talk.RemoveOwner(2) == 1 &&
+                   busy.RemoveOwner(2) == 1 && talk.Size() == 0 &&
+                   busy.Size() == 0,
+               true);
+
+    const unsigned int none = 0;
+    ExpectBool("Gate: lock refuses dialogue",
+               AP::ActorGate(AP::ACTOR_DIALOGUE, 1, none, 0) == STOBE_E_LOCKED,
+               true);
+    ExpectBool("Gate: busy refuses dialogue",
+               AP::ActorGate(AP::ACTOR_DIALOGUE, none, 2, 0) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+    ExpectBool("Gate: lock does not refuse built-in actions",
+               AP::ActorGate(AP::ACTOR_BUILTIN_ACTION, 1, none, 0) == STOBE_OK,
+               true);
+    ExpectBool("Gate: busy refuses built-in actions",
+               AP::ActorGate(AP::ACTOR_BUILTIN_ACTION, none, 2, 0) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+    ExpectBool("Gate: lock does not refuse addon actions",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, 1, none, 3) == STOBE_OK,
+               true);
+    ExpectBool("Gate: busy owner's own addon action runs",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, 1, 2, 2) == STOBE_OK, true);
+    ExpectBool("Gate: busy refuses another addon's action",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, none, 2, 3) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+
+    int reason = 1;
+    ExpectUInt32("Interaction ticket: pending while syncing",
+                 AP::ResolveInteractionTicket(4, 4, 3, 1, reason),
+                 STOBE_CONTROL_PENDING);
+    ExpectUInt32("Interaction ticket: confirmed state completes",
+                 AP::ResolveInteractionTicket(4, 4, 4, 0, reason),
+                 STOBE_CONTROL_COMPLETED);
+    ExpectBool("Interaction ticket: completed has no reason", reason == 0, true);
+    ExpectUInt32("Interaction ticket: failed sync",
+                 AP::ResolveInteractionTicket(4, 4, 4, 3, reason),
+                 STOBE_CONTROL_FAILED);
+    ExpectBool("Interaction ticket: failed reason", reason == STOBE_E_UNCONFIRMED,
+               true);
+    ExpectUInt32("Interaction ticket: later request supersedes",
+                 AP::ResolveInteractionTicket(4, 5, 3, 1, reason),
+                 STOBE_CONTROL_CANCELLED);
+    ExpectBool("Interaction ticket: superseded reason",
+               reason == STOBE_E_SUPERSEDED, true);
+    ExpectUInt32("Interaction ticket: settled result survives a later request",
+                 AP::ResolveInteractionTicket(4, 5, 4, 1, reason),
+                 STOBE_CONTROL_COMPLETED);
+
+    AP::ActorLockTable in(4);
+    AP::ActorLockTable out(4);
+    ExpectBool("Agent: registration moves between modes for its owner",
+               AP::SetAgentMode(in, out, 1, 30, 6, STOBE_AGENT_REGISTERED) ==
+                       STOBE_OK &&
+                   AP::SetAgentMode(in, out, 1, 30, 6,
+                                    STOBE_AGENT_UNREGISTERED) == STOBE_OK &&
+                   in.Owner(30, 6) == 0 && out.Owner(30, 6) == 1u,
+               true);
+    ExpectBool("Agent: another addon conflicts without changes",
+               AP::SetAgentMode(in, out, 2, 30, 6, STOBE_AGENT_REGISTERED) ==
+                       STOBE_E_CONFLICT &&
+                   AP::SetAgentMode(in, out, 2, 30, 6, STOBE_AGENT_AUTO) ==
+                       STOBE_E_CONFLICT &&
+                   out.Owner(30, 6) == 1u && in.Size() == 0,
+               true);
+    ExpectBool("Agent: auto clears the owner's override",
+               AP::SetAgentMode(in, out, 1, 30, 6, STOBE_AGENT_AUTO) == STOBE_OK &&
+                   in.Size() == 0 && out.Size() == 0,
+               true);
+
+    std::vector<bool> excludedOptions(3, false);
+    excludedOptions[0] = true;
+    ExpectBool("Agent default: nearest registered option, else none",
+               AP::FirstIncludedIndex(excludedOptions) == 1u &&
+                   AP::FirstIncludedIndex(std::vector<bool>(2, true)) == 2u &&
+                   AP::FirstIncludedIndex(std::vector<bool>()) == 0u,
+               true);
+
+    // V4 message modes are fixed per request; autochat never replaces them.
+    std::string selectedMode;
+    std::string requestMode;
+    ExpectBool("Addon message: normal is talk, not the selected mode",
+               AP::AddonMessageModes(STOBE_MESSAGE_NORMAL, selectedMode,
+                                     requestMode) &&
+                   selectedMode == "chat" && requestMode == "talk",
+               true);
+    ExpectBool("Addon message: whisper, shout and context keep their mode",
+               AP::AddonMessageModes(STOBE_MESSAGE_WHISPER, selectedMode,
+                                     requestMode) &&
+                   requestMode == "whisper" &&
+                   AP::AddonMessageModes(STOBE_MESSAGE_SHOUT, selectedMode,
+                                         requestMode) &&
+                   requestMode == "shout" &&
+                   AP::AddonMessageModes(STOBE_MESSAGE_CONTEXT, selectedMode,
+                                         requestMode) &&
+                   selectedMode == "inject" && requestMode == "inject",
+               true);
+    ExpectBool("Addon message: unknown mode rejected",
+               AP::AddonMessageModes(4u, selectedMode, requestMode), false);
+
+    AP::ReactionActor agent = {true, true, false, false};
+    AP::ReactionActor outOfRange = {true, false, false, false};
+    AP::ReactionActor registered = {true, false, true, false};
+    AP::ReactionActor excluded = {true, true, false, true};
+    AP::ReactionActor unset = {false, false, false, false};
+    ExpectBool("Reaction: explicit allows unregistered named actors",
+               AP::ReactionEligibility(STOBE_REACTION_EXPLICIT, false, excluded,
+                                       excluded) == STOBE_OK,
+               true);
+    ExpectBool("Reaction: eligible takes auto and registered agents",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true, agent,
+                                       registered) == STOBE_OK &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                           agent, unset) == STOBE_OK,
+               true);
+    ExpectBool("Reaction: eligible excludes unregistered speaker or listener",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true, excluded,
+                                       unset) == STOBE_E_INELIGIBLE &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                           agent, excluded) ==
+                       STOBE_E_INELIGIBLE,
+               true);
+    ExpectBool("Reaction: eligible needs an agent and bored events on",
+               AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, true,
+                                       outOfRange, unset) ==
+                       STOBE_E_INELIGIBLE &&
+                   AP::ReactionEligibility(STOBE_REACTION_ELIGIBLE, false,
+                                           agent, unset) == STOBE_E_INELIGIBLE,
+               true);
+    ExpectBool("Reaction: unknown eligibility rejected",
+               AP::ReactionEligibility(2u, true, agent, unset) ==
+                   STOBE_E_INVALID_ARGUMENT,
+               true);
+
+    std::vector<std::pair<std::string, unsigned int> > agents;
+    agents.push_back(std::make_pair(std::string("Beep"), 40u));
+    agents.push_back(std::make_pair(std::string("Guard"), 41u));
+    agents.push_back(std::make_pair(std::string("guard"), 42u));
+    unsigned int found = 0;
+    ExpectBool("Agent name: exact case-insensitive match",
+               AP::MatchAgentName(agents, "BEEP", true, found) == STOBE_OK &&
+                   found == 40u,
+               true);
+    ExpectBool("Agent name: shared name fails closed",
+               AP::MatchAgentName(agents, "Guard", true, found) == STOBE_E_AMBIGUOUS &&
+                   found == 0u,
+               true);
+    ExpectBool("Agent name: no prefix match",
+               AP::MatchAgentName(agents, "Bee", true, found) == STOBE_E_NOT_FOUND,
+               true);
+    ExpectBool("Agent name: truncated scan never claims unique or absent",
+               AP::MatchAgentName(agents, "Beep", false, found) ==
+                       STOBE_E_LIMIT &&
+                   found == 0u &&
+                   AP::MatchAgentName(agents, "Bee", false, found) ==
+                       STOBE_E_LIMIT &&
+                   AP::MatchAgentName(agents, "Guard", false, found) ==
+                       STOBE_E_AMBIGUOUS,
+               true);
+
+    AP::RefreshTable refresh(2);
+    std::vector<std::pair<unsigned int, unsigned int> > taken;
+    ExpectBool("Refresh: per-actor bound reserves before adding",
+               refresh.Add(1, 50, 6, 0x100u | 0x1u) &&
+                   refresh.Add(2, 50, 6, 0x2u) && refresh.Add(2, 51, 6, 0x1u) &&
+                   refresh.CanAdd(50) && !refresh.CanAdd(52) &&
+                   !refresh.Add(1, 52, 6, 0x1u) && refresh.Size() == 2,
+               true);
+    refresh.Cancel(1, 50, 0x100u);
+    refresh.RemoveOwner(2);
+    ExpectBool("Refresh: owner cleanup keeps other owners' parts",
+               refresh.Size() == 1 && refresh.Take(6, 4, taken) == 1 &&
+                   taken[0].first == 50u && taken[0].second == 0x1u &&
+                   refresh.Size() == 0,
+               true);
+    refresh.Add(1, 50, 5, 0x1u);
+    refresh.Add(2, 51, 6, 0x2u);
+    ExpectBool("Refresh: a load drops earlier requests",
+               refresh.RemoveOtherGenerations(6) == 1 &&
+                   refresh.Take(6, 4, taken) == 1 && taken[0].first == 51u,
+               true);
+
+    std::vector<std::string> sids, aids;
+    sids.push_back("9101");
+    sids.push_back("9101");
+    aids.push_back("77");
+    ExpectBool("Followup: aid needs one strict aid bound to the sid",
+               AP::SelectSidToken(sids) == "9101" &&
+                   AP::SelectFollowupAid(aids, "9101", 9101u) == 77u &&
+                   AP::SelectFollowupAid(aids, "9101", 0u) == 0u &&
+                   AP::SelectFollowupAid(aids, "", 9101u) == 0u &&
+                   AP::SelectFollowupAid(std::vector<std::string>(), "9101",
+                                         9101u) == 0u,
+               true);
+    ExpectBool("Followup: absent sid is legacy, one strict sid is usable",
+               !AP::SidTokensRejected(std::vector<std::string>()) &&
+                   !AP::SidTokensRejected(sids),
+               true);
+    sids.push_back("9102");
+    std::vector<std::string> malformedSid(1, std::string("91x"));
+    ExpectBool("Followup: conflicting or malformed sid drops the action",
+               AP::SidTokensRejected(sids) &&
+                   AP::SidTokensRejected(malformedSid),
+               true);
+    {
+      // Queued line as ChatBox writes it; the parameter carries look-alike
+      // markers that must survive byte-exact.
+      const std::string param = "x [ADDON_AID:9]|aid=4";
+      std::string line = "NPC_ACTION: " + AP::AppendHeaderAid("SRP Beep|9101", 77u) +
+                         ": ExtCmdParityProbe_Report@" + param;
+      const size_t end = line.find(':', 12);
+      std::string header = line.substr(12, end - 12);
+      unsigned int aid = 0;
+      const bool ok = AP::TakeHeaderAid(header, aid);
+      line.replace(12, end - 12, header);
+      ExpectBool("Followup: aid rides the header, parameter unchanged",
+                 ok && aid == 77u && header == "SRP Beep|9101" &&
+                     line == "NPC_ACTION: SRP Beep|9101: "
+                             "ExtCmdParityProbe_Report@" + param,
+                 true);
+      std::string legacy = "SRP Beep|9101";
+      std::string noSerial = "SRP Beep|aid=7";
+      std::string zero = "SRP Beep|9101|aid=07";
+      std::string twice = "SRP Beep|9101|aid=7|aid=7";
+      ExpectBool("Followup: header aid absent is legacy, malformed fails",
+                 AP::TakeHeaderAid(legacy, aid) && aid == 0u &&
+                     legacy == "SRP Beep|9101" &&
+                     AP::AppendHeaderAid(legacy, 0u) == legacy &&
+                     !AP::TakeHeaderAid(noSerial, aid) &&
+                     !AP::TakeHeaderAid(zero, aid) &&
+                     !AP::TakeHeaderAid(twice, aid) &&
+                     twice == "SRP Beep|9101|aid=7|aid=7",
+                 true);
+    }
+    std::vector<std::string> badAids;
+    badAids.push_back("077");
+    std::vector<std::string> twoAids(2, std::string("77"));
+    ExpectBool("Followup: conflicting sid, duplicate or malformed aid fail closed",
+               AP::SelectSidToken(sids).empty() &&
+                   AP::SelectFollowupAid(twoAids, "9101", 9101u) == 0u &&
+                   AP::SelectFollowupAid(badAids, "9101", 9101u) == 0u,
+               true);
+    ExpectEq("Followup: query matches the server contract",
+                 AP::BuildFollowupQuery(77u, 9101u, 3u, "[\"SRP Beep|9101\"]",
+                                        false),
+                 "&addon_followup=1&aid=77&sid=9101&arid=3&people=%5B%22SRP%20"
+                 "Beep%7C9101%22%5D&tts_enabled=0");
+    ExpectBool("Followup: query needs every id",
+               AP::BuildFollowupQuery(77u, 9101u, 0u, "[]", true).empty(),
+               true);
+    ExpectBool("Followup: lines bind to the captured actor and serial",
+               AP::FollowupLineAllowed("SRP Beep", "", "SRP Beep", 9101u) &&
+                   AP::FollowupLineAllowed("SRP Beep", "9101", "SRP Beep",
+                                           9101u) &&
+                   !AP::FollowupLineAllowed("SRP Beep", "9102", "SRP Beep",
+                                            9101u) &&
+                   !AP::FollowupLineAllowed("srp beep", "", "SRP Beep", 9101u) &&
+                   !AP::FollowupLineAllowed("SRP Drifter", "9101", "SRP Beep",
+                                            9101u),
+               true);
+
+    AP::FollowupQueue followups(2);
+    AP::FollowupReport report;
+    report.aid = 5;
+    report.sid = 9101;
+    report.arid = 1;
+    report.generation = 3;
+    report.interactionEpoch = 8;
+    report.completed = true;
+    report.owner = 2;
+    AP::FollowupReport failure = report;
+    failure.aid = 6;
+    failure.completed = false;
+    AP::FollowupReport next;
+    ExpectBool("Followup queue: one outcome per aid, bounded",
+               followups.Add(report) && !followups.Add(report) &&
+                   followups.Add(failure) && !followups.Add(report) &&
+                   followups.Size() == 2,
+               true);
+    ExpectBool("Followup queue: completed waits for idle, failure does not",
+               followups.Take(false, next) && next.aid == 6u &&
+                   !followups.Take(false, next) &&
+                   followups.Take(true, next) && next.aid == 5u,
+               true);
+    followups.Add(report);
+    followups.Add(failure);
+    ExpectBool("Followup queue: interaction change drops completed only",
+               followups.Prune(3, 9) == 1 && followups.Size() == 1 &&
+                   followups.Prune(4, 9) == 1 && followups.Size() == 0,
+               true);
+    AP::FollowupReport other = report;
+    other.aid = 7;
+    other.owner = 3;
+    AP::FollowupQueue owned(4);
+    owned.Add(report);
+    owned.Add(failure);
+    owned.Add(other);
+    ExpectBool("Followup queue: removed addon drops its completions only",
+               owned.RemoveCompleted(2) == 1 && owned.Size() == 2 &&
+                   owned.Take(false, next) && next.aid == 6u &&
+                   owned.Take(true, next) && next.aid == 7u,
+               true);
+  }
 
   if (g_failures != 0) {
     std::cerr << g_failures << " portable C++ tests failed.\n";

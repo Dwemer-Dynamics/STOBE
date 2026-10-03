@@ -46,13 +46,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetName>Stobe</TargetName>
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
     <LibraryPath>$(ProjectDir)..\third_party\kenshi\KenshiLib;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\mygui;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\ogre;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>Stobe</TargetName>
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Include;$(ProjectDir)..\third_party\kenshi\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
     <LibraryPath>$(ProjectDir)..\third_party\kenshi\KenshiLib;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\mygui;$(ProjectDir)..\third_party\kenshi\KenshiLib Source\Libraries\ogre;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -86,6 +86,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\AddonProtocol.cpp" />
+    <ClCompile Include="src\AddonRuntime.cpp" />
     <ClCompile Include="src\AiNpcInfoWindow.cpp" />
     <ClCompile Include="src\AudioPlayback.cpp" />
     <ClCompile Include="src\AutonomyController.cpp" />
@@ -109,6 +111,7 @@
     </ClCompile>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\PlayerBaseState.cpp" />
+    <ClCompile Include="src\ServerPluginSync.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
     <ClCompile Include="src\StobeChatMode.cpp" />
     <ClCompile Include="src\StobeIdentityRename.cpp" />
@@ -121,6 +124,9 @@
     <ClCompile Include="src\WorldStateRuntime.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\StobeAddonApi.h" />
+    <ClInclude Include="src\AddonProtocol.h" />
+    <ClInclude Include="src\AddonRuntime.h" />
     <ClInclude Include="src\AiNpcInfoWindow.h" />
     <ClInclude Include="src\AudioPlayback.h" />
     <ClInclude Include="src\AutonomyController.h" />
@@ -141,6 +147,7 @@
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\KenshiTownIdentity.h" />
     <ClInclude Include="src\PlayerBaseState.h" />
+    <ClInclude Include="src\ServerPluginSync.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\StobeChatMode.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />

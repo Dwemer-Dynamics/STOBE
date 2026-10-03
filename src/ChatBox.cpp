@@ -6,6 +6,8 @@
 #include "Context.h"
 #include "Functions.h"
 #include "Globals.h"
+#include "AddonProtocol.h"
+#include "AddonRuntime.h"
 #include "StobeChatMode.h"
 #include "StobeTiming.h"
 #include "Utils.h"
@@ -81,6 +83,7 @@ bool g_chatPausedGame = false;
 bool g_renamePausedGame = false;
 bool g_chatTargetRefreshInProgress = false;
 LONG g_activeChatStreamCount = 0;
+LONG g_chatRequestStartCount = 0;
 LONG g_activeDirectorGeneration = 0;
 LONG g_profileModelSlot = 1;
 LONG g_profileModelRevision = 0;
@@ -101,8 +104,9 @@ const int kPlayerCustomMoodMaxChars = 80;
 
 class ActiveChatStreamScope {
 public:
-  explicit ActiveChatStreamScope(LONG directorGeneration = 0) : directorGeneration_(directorGeneration) {
-    InterlockedIncrement(&g_activeChatStreamCount);
+  // alreadyCounted adopts a slot the starter reserved before the thread ran.
+  explicit ActiveChatStreamScope(LONG directorGeneration = 0, bool alreadyCounted = false) : directorGeneration_(directorGeneration) {
+    if (!alreadyCounted) InterlockedIncrement(&g_activeChatStreamCount);
   }
   ~ActiveChatStreamScope() {
     InterlockedDecrement(&g_activeChatStreamCount);
@@ -1150,6 +1154,31 @@ bool IsCharacterUnavailableForConversation(Character *character) {
   return false;
 }
 
+// An addon lock or busy flag keeps the character out of Stobe's automatic dialogue.
+bool IsAddonLockedCharacter(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    return Stobe::Addon::DialogueGate(character->getHandle().serial) != STOBE_OK;
+  } catch (...) {
+    return false;
+  }
+}
+
+// An addon agent unregistration keeps the character out of automatic selection
+// only; explicit player chat to it still works.
+bool IsAddonExcludedAgent(Character *character) {
+  if (!character || (uintptr_t)character <= 0x1000) {
+    return false;
+  }
+  try {
+    return Stobe::Addon::IsAgentExcluded(character->getHandle().serial);
+  } catch (...) {
+    return false;
+  }
+}
+
 bool IsDigitsOnlyToken(const std::string &value) {
   if (value.empty()) {
     return false;
@@ -1700,7 +1729,8 @@ bool TrySelectRechatResponder(GameWorld *world, Character *player,
     if (player && candidate == player) {
       return false;
     }
-    if (IsCharacterUnavailableForConversation(candidate)) {
+    if (IsCharacterUnavailableForConversation(candidate) ||
+        IsAddonLockedCharacter(candidate) || IsAddonExcludedAgent(candidate)) {
       return false;
     }
     if (!ShouldIncludeAnimalForTalk(candidate)) {
@@ -1852,6 +1882,12 @@ bool ValidatePlayerChatSend(GameWorld *world, Character *player, Character *targ
   if (target == player) {
     failReason = "Cannot talk to yourself.";
     Log("CHAT_VALIDATE: fail self-target");
+    return false;
+  }
+
+  if (IsAddonLockedCharacter(target)) {
+    failReason = "That character is busy.";
+    Log("CHAT_VALIDATE: fail target locked by addon");
     return false;
   }
 
@@ -2078,6 +2114,41 @@ bool TryBuildChatTargetOption(GameWorld *world, Character *candidate,
   return true;
 }
 
+bool IsAutoAgentCandidate(GameWorld *world, Character *candidate,
+                          float &distanceOut) {
+  distanceOut = -1.0f;
+  if (!world || !candidate || (uintptr_t)candidate <= 0x1000 ||
+      IsCharacterUnavailableForConversation(candidate) ||
+      !ShouldIncludeAnimalForTalk(candidate)) {
+    return false;
+  }
+  Character *speaker = ResolveSelectedOrConfiguredPlayerSpeaker(world, candidate);
+  if (!speaker || (uintptr_t)speaker <= 0x1000) {
+    return false;
+  }
+  return IsDropdownTargetEligible(world, speaker, candidate, "chat",
+                                  distanceOut);
+}
+
+bool IsInConversationReach(Character *anchor, Character *other) {
+  if (!anchor || !other || (uintptr_t)anchor <= 0x1000 ||
+      (uintptr_t)other <= 0x1000 || IsCharacterUnavailableForConversation(other) ||
+      !IsConversationAreaCompatible(anchor, other)) {
+    return false;
+  }
+  try {
+    // The radius TriggerBoredEvent searches around its speaker.
+    float radius = IsIndoorsHandleValid(anchor->isIndoors()) ? g_boredEventRange
+                                                             : g_proximityRadius;
+    if (radius < 10.0f) {
+      radius = 10.0f;
+    }
+    return anchor->getPosition().distance(other->getPosition()) <= radius;
+  } catch (...) {
+    return false;
+  }
+}
+
 void RefreshChatHeaderLabel() {
   if (!g_chatLabel) {
     return;
@@ -2230,7 +2301,16 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
         WideFromUtf8(g_chatTargetOptions[i].label).c_str());
   }
 
-  size_t selectedIndex = 0;
+  // The automatic default is the nearest option an addon has not unregistered
+  // as an agent; unregistered actors stay listed for an explicit pick, and
+  // when every option is unregistered nothing is selected by itself.
+  std::vector<bool> excluded(g_chatTargetOptions.size(), false);
+  for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
+    unsigned int serial = 0;
+    excluded[i] = TryParseSerial(g_chatTargetOptions[i].handle, serial) &&
+                  Stobe::Addon::IsAgentExcluded(serial);
+  }
+  size_t selectedIndex = Stobe::AddonProtocol::FirstIncludedIndex(excluded);
   if (preserveSelection) {
     for (size_t i = 0; i < g_chatTargetOptions.size(); ++i) {
       if (DoesChatTargetOptionMatch(g_chatTargetOptions[i], preferredName,
@@ -2239,6 +2319,15 @@ void RefreshAvailableChatTargets(bool preserveSelection) {
         break;
       }
     }
+  }
+
+  if (selectedIndex >= g_chatTargetOptions.size()) {
+    g_chatTargetCombo->setIndexSelected(MyGUI::ITEM_NONE);
+    g_chatTargetNameStr.clear();
+    g_chatTargetHandleStr.clear();
+    g_talkTargetHand = hand();
+    g_chatTargetRefreshInProgress = false;
+    return;
   }
 
   g_chatTargetCombo->setIndexSelected(selectedIndex);
@@ -2418,6 +2507,7 @@ struct StreamChatTask {
   LONG generation;
   int rechatDepth;
   bool allowUnavailableTargetSpeech;
+  bool streamSlotReserved; // g_activeChatStreamCount already holds this task
 };
 
 struct PlayerTtsTask {
@@ -2972,7 +3062,8 @@ void DispatchRechatFollowup(const StreamChatTask &currentTask,
                           ToWide(BuildStreamQueryData("rechat", eventData, gameTs)) +
                           L"&profile=" + ToWide(UrlEncode(selectedResponder)) +
                           L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
-                          L"&rechat_depth=" + ToWide(ToString(nextRechatDepth));
+                          L"&rechat_depth=" + ToWide(ToString(nextRechatDepth)) +
+                          L"&addon_followup=1";
   if (!selectedResponder.empty()) {
     endpoint += L"&rechat_target=" + ToWide(UrlEncode(selectedResponder));
   }
@@ -3343,10 +3434,71 @@ static std::string MaybeInjectGiveItemTarget(const StreamChatParseState *state,
   return rewritten;
 }
 
+// ExtCmd actions are bound to an exact serial, never a name. The request's own
+// NPC keeps its handle; another speaker needs the server's sid= value, and that
+// actor|serial pair must be one of the people identities this request sent.
+// Otherwise the header has no serial and the addon runtime reports the action
+// as unresolved.
+static std::string ExtActionSpeakerHeader(StreamChatParseState *state,
+                                          const std::string &actor,
+                                          const std::string &sidToken) {
+  unsigned int primarySerial = 0;
+  if (actor != state->task->npcName ||
+      !Stobe::AddonProtocol::ParseStrictSerial(state->task->handleStr,
+                                               primarySerial)) {
+    primarySerial = 0;
+  }
+  unsigned int sid = 0;
+  bool sidListed = false;
+  if (Stobe::AddonProtocol::ParseStrictSerial(sidToken, sid)) {
+    const std::string identity =
+        "\"" + EscapeJSON(actor + "|" + ToString(sid)) + "\"";
+    sidListed = Stobe::AddonProtocol::LowerAscii(state->task->peopleJson)
+                    .find(Stobe::AddonProtocol::LowerAscii(identity)) !=
+                std::string::npos;
+  }
+  const unsigned int serial = Stobe::AddonProtocol::SelectExtActionSerial(
+      sidToken, primarySerial, sidListed);
+  if (serial == 0) {
+    Log("CHAT_ACTION: EXTCMD speaker serial unavailable actor=" + actor +
+        " sid=" + sidToken.substr(0, 16));
+    return actor;
+  }
+  return actor + "|" + ToString(serial);
+}
+
+// True when a streamed line or action names a speaker other than the request's
+// own speaker that an addon unregistered as an agent; such a secondary speaker
+// is never applied. resolvedSerial gets the serial behind a name-only header.
+static bool IsUnregisteredSecondarySpeaker(StreamChatParseState *state,
+                                           const std::string &actor,
+                                           const std::string &speakerHeader,
+                                           unsigned int &resolvedSerial) {
+  resolvedSerial = 0;
+  unsigned int serial = 0;
+  const size_t pipe = speakerHeader.find('|');
+  if (pipe != std::string::npos) {
+    TryParseSerial(TrimChatLine(speakerHeader.substr(pipe + 1)), serial);
+  } else {
+    GameWorld *world = GetWorldSafe();
+    Character *resolved =
+        world ? ResolveChatTargetCharacter(world, actor, "") : nullptr;
+    if (resolved && (uintptr_t)resolved > 0x1000) {
+      serial = resolved->getHandle().serial;
+      resolvedSerial = serial;
+    }
+  }
+  unsigned int primarySerial = 0;
+  TryParseSerial(TrimChatLine(state->task->handleStr), primarySerial);
+  return serial != 0 && serial != primarySerial &&
+         Stobe::Addon::IsAgentExcluded(serial);
+}
+
 static bool QueueStreamActionIfNew(StreamChatParseState *state,
                                    const std::string &actor,
                                    const std::string &speakerHeader,
-                                   const std::string &rawAction) {
+                                   const std::string &rawAction,
+                                   unsigned int followupAid = 0) {
   if (!state) {
     return false;
   }
@@ -3367,7 +3519,11 @@ static bool QueueStreamActionIfNew(StreamChatParseState *state,
   state->seenActions.insert(dedupeKey);
   Log("CHAT_TIMING: STREAM_ACTION actor=" + actor + " action=" + actionLine +
       " gen=" + ToString((int)state->generation));
-  QueueChatPipeLine("NPC_ACTION: " + speakerHeader + ": " + actionLine,
+  // The aid rides on the header; the action parameter stays byte-exact.
+  QueueChatPipeLine("NPC_ACTION: " +
+                        Stobe::AddonProtocol::AppendHeaderAid(speakerHeader,
+                                                              followupAid) +
+                        ": " + actionLine,
                     state->generation);
   state->actionCount++;
   state->firstLine = false;
@@ -3383,7 +3539,10 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
   const bool chunked = schema == "stobe.director_scene.v2";
   if ((!chunked && schema != "stobe.director_scene.v1") ||
       id.length() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
-      count < 1 || count > (chunked ? 128 : 5) || !state->speechUtteranceIds.empty()) return false;
+      count < 1 || count > (chunked ? 128 : 5) || !state->speechUtteranceIds.empty()) {
+    Log("DIRECTOR: scene rejected reason=invalid_envelope");
+    return false;
+  }
   std::vector<std::string> turns;
   std::vector<std::string> ids;
   bool valid = true;
@@ -3416,10 +3575,16 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     }
   }
   state->speechUtteranceIds = ids;
-  if (!valid) { PostSpeechDeliveryStates(ids, "cancelled"); return false; }
+  if (!valid) {
+    Log("DIRECTOR: scene rejected reason=invalid_turn scene=" + id);
+    PostSpeechDeliveryStates(ids, "cancelled");
+    return false;
+  }
   for (size_t i = 0; i < ids.size(); ++i) TrackSpeechDeliveryState(ids[i]);
   QueueUiNotifyAction("Director scene started.");
   size_t played = 0;
+  size_t skipped = 0;
+  std::string stopReason = "complete";
   for (; played < turns.size() && IsChatInterruptGenerationCurrent(state->generation); ++played) {
     const std::string &turn = turns[played];
     const std::string actor = JsonReadField(turn, "speaker");
@@ -3430,14 +3595,23 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     const std::string hash = JsonReadField(turn, "tts_hash");
     if (g_ttsEnabled && !hash.empty()) say += " [TTSHASH:" + hash + "]";
     say += " [TTSDUR:" + JsonReadField(turn, "tts_duration_ms") + "]";
-    if (!QueueChatPipeLine(say, state->generation)) break;
+    if (!QueueChatPipeLine(say, state->generation)) { stopReason = "queue_rejected"; break; }
     ++state->lineCount;
     DWORD started = GetTickCount();
     while (IsChatInterruptGenerationCurrent(state->generation) &&
            GetSpeechDeliveryState(ids[played]) == SPEECH_DELIVERY_PENDING &&
            GetTickCount() - started < 600000) SleepIfPaused(50);
-    if (!IsChatInterruptGenerationCurrent(state->generation) ||
-        GetSpeechDeliveryState(ids[played]) != SPEECH_DELIVERY_SPOKEN) break;
+    if (!IsChatInterruptGenerationCurrent(state->generation)) { stopReason = "interrupted"; break; }
+    const SpeechDeliveryState delivery = GetSpeechDeliveryState(ids[played]);
+    if (delivery == SPEECH_DELIVERY_UNAVAILABLE) {
+      Log("DIRECTOR: turn skipped reason=speaker_unavailable utterance=" + ids[played]);
+      ++skipped;
+      continue; // Never run actions for an unspoken turn.
+    }
+    if (delivery != SPEECH_DELIVERY_SPOKEN) {
+      stopReason = delivery == SPEECH_DELIVERY_PENDING ? "delivery_timeout" : "delivery_cancelled";
+      break;
+    }
     int actions = atoi(JsonReadField(turn, "action_count").c_str());
     for (int a = 0; a < actions; ++a) {
       if (QueueChatPipeLine("NPC_ACTION: " + header + ": " +
@@ -3445,9 +3619,12 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     }
   }
   if (played < ids.size()) {
+    if (!IsChatInterruptGenerationCurrent(state->generation)) stopReason = "interrupted";
     std::vector<std::string> cancelled(ids.begin() + played, ids.end());
     PostSpeechDeliveryStates(cancelled, "cancelled");
   }
+  Log("DIRECTOR: scene ended scene=" + id + " reason=" + stopReason +
+      " spoken=" + ToString((int)(played - skipped)) + " skipped=" + ToString((int)skipped));
   QueueUiNotifyAction("Director scene stopped.");
   return played == ids.size();
 }
@@ -3456,6 +3633,13 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
                                    const std::string &rawLine) {
   if (!state || !state->task) {
     return false;
+  }
+
+  const std::string hypnosisPrefix = "rolemaster|HypnosisStatus|";
+  if (rawLine.find(hypnosisPrefix) == 0 && state->task->requestMode == "hypnosis") {
+    if (IsChatInterruptGenerationCurrent(state->generation))
+      QueueUiNotifyAction(TrimChatLine(rawLine.substr(hypnosisPrefix.size())));
+    return true;
   }
 
   const std::string directorPrefix = "rolemaster|DirectorScene|";
@@ -3481,6 +3665,10 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
   std::string ttsHash = "";
   int ttsDurationMs = 0;
   std::string utteranceId = "";
+  std::string actionSerialToken = "";
+  std::vector<std::string> sidTokens;
+  std::vector<std::string> aidTokens;
+  const bool followupStream = state->task->requestMode == "addon_followup";
 
   size_t bar1 = line.find('|');
   size_t bar2 =
@@ -3509,7 +3697,12 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
                                 : metadata.substr(tokenStart,
                                                   tokenEnd - tokenStart);
         std::string parsedHash = ParseTtsHashToken(token);
-        if (!parsedHash.empty()) {
+        const std::string trimmedToken = TrimChatLine(token);
+        if (trimmedToken.find("sid=") == 0) {
+          sidTokens.push_back(trimmedToken.substr(4));
+        } else if (trimmedToken.find("aid=") == 0) {
+          aidTokens.push_back(trimmedToken.substr(4));
+        } else if (!parsedHash.empty()) {
           ttsHash = parsedHash;
         } else {
           std::string parsedUtteranceId = ParseUtteranceIdToken(token);
@@ -3528,6 +3721,7 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
         tokenStart = tokenEnd + 1;
       }
     }
+    actionSerialToken = Stobe::AddonProtocol::SelectSidToken(sidTokens);
     if (!g_ttsEnabled) {
       ttsHash.clear();
       ttsDurationMs = 0;
@@ -3542,20 +3736,88 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     }
   }
 
+  const bool isAction = EqualsIgnoreCase(actionKind, "ActionQueue") ||
+                        EqualsIgnoreCase(actionKind, "Action");
+  if (isAction && Stobe::AddonProtocol::SidTokensRejected(sidTokens)) {
+    // Present but malformed or conflicting sid tokens never fall back to the
+    // request's own actor.
+    Log("CHAT_ACTION: action dropped, invalid sid actor=" + actor);
+    return true;
+  }
+  if (followupStream) {
+    // An addon follow-up turn applies only lines of the captured actor and
+    // serial. Actions appear only when the server opted in
+    // (use_functions_again); the server issues no aid in this turn, so any aid
+    // token is discarded and a follow-up cannot chain another follow-up.
+    unsigned int capturedSerial = 0;
+    Stobe::AddonProtocol::ParseStrictSerial(state->task->handleStr,
+                                            capturedSerial);
+    aidTokens.clear();
+    if ((bar2 != std::string::npos && !isAction &&
+         !EqualsIgnoreCase(actionKind, "ScriptQueue")) ||
+        !Stobe::AddonProtocol::FollowupLineAllowed(
+            actor, sidTokens.empty() ? std::string() : actionSerialToken,
+            state->task->npcName, capturedSerial) ||
+        (sidTokens.size() > 1 && actionSerialToken.empty())) {
+      if (!utteranceId.empty()) {
+        PostSpeechDeliveryState(utteranceId, "cancelled");
+      }
+      Log("ADDON_FOLLOWUP: line dropped actor=" + actor + " kind=" +
+          actionKind);
+      return true;
+    }
+  }
+
   std::string speakerHeader = actor;
   bool narratorSpeaker = IsNarratorName(actor);
   if (!state->task->handleStr.empty() && actor == state->task->npcName) {
     speakerHeader = actor + "|" + state->task->handleStr;
   }
-  if ((EqualsIgnoreCase(actionKind, "ActionQueue") ||
-       EqualsIgnoreCase(actionKind, "Action")) &&
-      !subtitle.empty()) {
+  if (isAction && !subtitle.empty()) {
+    unsigned int followupAid = 0;
+    if (!narratorSpeaker && Stobe::AddonProtocol::IsExtCommand(subtitle)) {
+      speakerHeader = ExtActionSpeakerHeader(state, actor, actionSerialToken);
+      unsigned int boundSerial = 0;
+      const size_t pipe = speakerHeader.find('|');
+      if (pipe != std::string::npos) {
+        Stobe::AddonProtocol::ParseStrictSerial(speakerHeader.substr(pipe + 1),
+                                                boundSerial);
+      }
+      followupAid = Stobe::AddonProtocol::SelectFollowupAid(
+          aidTokens, actionSerialToken, boundSerial);
+    }
+    if (followupAid == 0 && !aidTokens.empty()) {
+      // A present but unusable aid fails closed rather than running legacy.
+      Log("CHAT_ACTION: action dropped, invalid aid actor=" + actor);
+      return true;
+    }
     if (narratorSpeaker) {
       Log("CHAT_TIMING: narrator action ignored actor=" + actor +
           " action=" + subtitle + " gen=" + ToString((int)state->generation));
       return true;
     }
-    QueueStreamActionIfNew(state, actor, speakerHeader, subtitle);
+    unsigned int unusedSerial = 0;
+    if (IsUnregisteredSecondarySpeaker(state, actor, speakerHeader,
+                                       unusedSerial)) {
+      Log("CHAT_ACTION: dropped for unregistered secondary speaker actor=" +
+          actor);
+      return true;
+    }
+    QueueStreamActionIfNew(state, actor, speakerHeader, subtitle,
+                           followupAid);
+    return true;
+  }
+
+  unsigned int resolvedSpeakerSerial = 0;
+  if (!narratorSpeaker &&
+      IsUnregisteredSecondarySpeaker(state, actor, speakerHeader,
+                                     resolvedSpeakerSerial)) {
+    if (!utteranceId.empty()) {
+      PostSpeechDeliveryState(utteranceId, "cancelled");
+    }
+    Log("CHAT_TIMING: STREAM_LINE dropped unregistered secondary speaker actor=" +
+        actor + " gen=" + ToString((int)state->generation));
+    state->firstLine = false;
     return true;
   }
 
@@ -3591,14 +3853,8 @@ bool ProcessStreamChatResponseLine(StreamChatParseState *state,
     } else {
       queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       if (speakerHeader == actor) {
-        GameWorld *worldForSpeaker = GetWorldSafe();
-        if (worldForSpeaker) {
-          Character *resolvedSpeaker =
-              ResolveChatTargetCharacter(worldForSpeaker, actor, "");
-          if (resolvedSpeaker && (uintptr_t)resolvedSpeaker > 0x1000) {
-            speakerHeader =
-                actor + "|" + ToString(resolvedSpeaker->getHandle().serial);
-          }
+        if (resolvedSpeakerSerial != 0) {
+          speakerHeader = actor + "|" + ToString(resolvedSpeakerSerial);
         }
         queueLine = "NPC_SAY: " + speakerHeader + ": " + subtitle;
       }
@@ -3675,7 +3931,8 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   StreamChatTask *task = (StreamChatTask *)lpParam;
   if (!task)
     return 0;
-  ActiveChatStreamScope activeStream(task->requestMode == "director" ? task->generation : 0);
+  ActiveChatStreamScope activeStream(task->requestMode == "director" ? task->generation : 0,
+                                     task->streamSlotReserved);
 
   LONG generation = task->generation;
   StreamChatParseState parseState;
@@ -3694,6 +3951,12 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   bool requestOk =
       PostToStobeWithResponseStream(task->endpoint, "", OnStreamChatHttpLine,
                                     &parseState);
+  if (task->requestMode == "addon_followup") {
+    // One reply per addon outcome; never a rechat chain.
+    ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
+    delete task;
+    return 0;
+  }
   if (task->requestMode == "director") {
     // All replies were authored and played by the scene callback. Never request a rechat.
     ForgetSpeechDeliveryStates(parseState.speechUtteranceIds);
@@ -3738,6 +4001,7 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
         SpeechDeliveryState deliveryState =
             GetSpeechDeliveryState(parseState.speechUtteranceIds[i]);
         if (deliveryState == SPEECH_DELIVERY_CANCELLED ||
+            deliveryState == SPEECH_DELIVERY_UNAVAILABLE ||
             deliveryState == SPEECH_DELIVERY_UNKNOWN) {
           speechDelivered = false;
           break;
@@ -3804,8 +4068,40 @@ DWORD WINAPI StreamChatResponseThread(LPVOID lpParam) {
   return 0;
 }
 
+bool StartAddonFollowupStream(const std::wstring &endpoint,
+                              const std::string &actorName,
+                              unsigned int actorSerial,
+                              const std::string &peopleJson) {
+  StreamChatTask *task = new StreamChatTask();
+  task->endpoint = endpoint;
+  task->npcName = actorName;
+  task->handleStr = ToString(actorSerial);
+  task->peopleJson = peopleJson;
+  task->requestMode = "addon_followup";
+  task->generation = GetChatInterruptGeneration();
+  task->rechatDepth = 0;
+  task->allowUnavailableTargetSpeech = false;
+  // Reserve the stream slot before the thread exists so IsAiRequestActive
+  // reports busy from now on; the worker's scope releases it.
+  task->streamSlotReserved = true;
+  InterlockedIncrement(&g_activeChatStreamCount);
+  HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread,
+                                                task, 0, NULL);
+  if (!thread) {
+    InterlockedDecrement(&g_activeChatStreamCount);
+    delete task;
+    return false;
+  }
+  CloseHandle(thread);
+  return true;
+}
+
 bool IsAiRequestActive() {
   return InterlockedCompareExchange(&g_activeChatStreamCount, 0, 0) > 0;
+}
+
+LONG ChatRequestStartCount() {
+  return InterlockedCompareExchange(&g_chatRequestStartCount, 0, 0);
 }
 
 bool IsDirectorSceneActive() {
@@ -3862,7 +4158,8 @@ void OnChatInputChange(MyGUI::EditBox *sender) {
 void OnChatInputAccept(MyGUI::EditBox *sender) { OnChatSendClick(sender); }
 
 void SubmitChatTextForCurrentContext(const std::string &submittedText,
-                                     bool fromVoice) {
+                                     bool fromVoice,
+                                     const std::string &requestModeOverride) {
   if (!Stobe::Interaction::ManualInputAllowed()) return;
   std::string text = submittedText;
   if (text.empty())
@@ -3924,8 +4221,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
     npcName = kNarratorName;
     handleStr = "";
   }
+  // An addon message fixes its request mode; autochat does not replace it.
   std::string mode =
-      Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
+      !requestModeOverride.empty()
+          ? requestModeOverride
+          : Stobe::ChatMode::ResolveRequestMode(selectedMode, g_autoChatEnabled);
 
   // Delivery cue for the player's own line. It travels in its own fields and
   // never changes the literal speech text or the player TTS request.
@@ -3975,9 +4275,16 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
 
   // New player input preempts current dialogue flow: stop active TTS and
   // invalidate any queued rechat/follow-up work before further processing.
-  LONG chatGeneration = BeginChatInterruptGeneration();
-  Log("CHAT_INTERRUPT: new player send preempted active dialogue gen=" +
-      ToString((int)chatGeneration));
+  // An addon message (fixed request mode) is only sent while dialogue is idle
+  // and joins the current generation, leaving follow/travel and queued
+  // actions alone; a later player send still invalidates its reply.
+  const bool addonRequest = !requestModeOverride.empty();
+  LONG chatGeneration = addonRequest ? GetChatInterruptGeneration()
+                                     : BeginChatInterruptGeneration();
+  if (!addonRequest) {
+    Log("CHAT_INTERRUPT: new player send preempted active dialogue gen=" +
+        ToString((int)chatGeneration));
+  }
 
   Log("CHAT_SEND_STAGE: begin mode=" + selectedMode + " request_mode=" + mode +
       " autochat=" + std::string(g_autoChatEnabled ? "1" : "0") +
@@ -4027,6 +4334,11 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   Log("CHAT_SEND_STAGE: resolved_target ptr=" +
       ToString((int)((uintptr_t)targetNpc & 0x7fffffff)) + " has_target=" +
       std::string(targetNpc ? "1" : "0"));
+  if (mode == "hypnosis" && (!targetNpc || targetNpc == player ||
+      BuildStorageIdForCharacter(targetNpc) != "hand_" + handleStr)) {
+    if (world) world->showPlayerAMessage_withLog("Hypnosis needs one current NPC target. Select the NPC again.", true);
+    return;
+  }
   if (player && targetNpc) {
     Log("CHAT_SEND_STAGE: resolved_speaker=" + player->getName() +
         " dist_to_target=" +
@@ -4557,7 +4869,10 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
                                   eventData, gameTs)) +
       L"&profile=" + ToWide(UrlEncode(profileName)) +
       L"&mode=" + ToWide(UrlEncode(mode)) +
-      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0");
+      L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") + L"&addon_followup=1";
+  if (mode == "hypnosis") {
+    endpoint += L"&target_storage_id=" + ToWide(UrlEncode(BuildStorageIdForCharacter(targetNpc)));
+  }
   if (manualActionPromptEligible &&
       manualActionChoice.manualActionKey &&
       manualActionChoice.manualActionKey[0] != '\0') {
@@ -4610,9 +4925,20 @@ void SubmitChatTextForCurrentContext(const std::string &submittedText,
   streamTask->rechatDepth = 0;
   streamTask->allowUnavailableTargetSpeech =
       manualActionChoice.type == MANUAL_CHAT_ACTION_REMOVE_LIMB;
+  // An addon request holds its stream slot before the thread exists, so a
+  // second addon call in the same tick already sees IsAiRequestActive.
+  streamTask->streamSlotReserved = addonRequest;
+  if (addonRequest) InterlockedIncrement(&g_activeChatStreamCount);
   HANDLE chatThread =
       PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, streamTask, 0, NULL);
+  if (!chatThread && addonRequest) InterlockedDecrement(&g_activeChatStreamCount);
   if (chatThread) {
+    InterlockedIncrement(&g_chatRequestStartCount);
+    if (mode == "hypnosis") {
+      g_chatMode = "chat";
+      g_lastChatModeIndex = 0;
+      SaveStobeRuntimeConfig();
+    }
     CloseHandle(chatThread);
   } else {
     delete streamTask;
@@ -4627,14 +4953,15 @@ void SubmitVoiceChatText(const std::string &submittedText,
                          const std::string &speakerSerial,
                          const std::string &targetName,
                          const std::string &targetSerial,
-                         const std::string &mode) {
+                         const std::string &mode,
+                         const std::string &requestModeOverride) {
   g_chatPlayerNameStr = speakerName;
   g_chatSpeakerHandleOverride = speakerSerial;
   g_chatTargetNameStr = targetName;
   g_chatTargetHandleStr = targetSerial;
   g_chatMode = Stobe::ChatMode::Normalize(mode);
   g_lastChatModeIndex = Stobe::ChatMode::ToIndex(g_chatMode);
-  SubmitChatTextForCurrentContext(submittedText, true);
+  SubmitChatTextForCurrentContext(submittedText, true, requestModeOverride);
   g_chatSpeakerHandleOverride.clear();
 }
 
@@ -5099,7 +5426,8 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
                        LONG generationOverride,
                        const std::string &preferredListenerName,
                        const std::string &preferredListenerSerial,
-                       const std::string &direction) {
+                       const std::string &direction, bool exactActors,
+                       bool reserveStreamSlot) {
   if (!Stobe::Interaction::Allowed()) return false;
   if (!forceDirectorMode && IsDirectorSceneActive()) return false;
   if (!world || !world->player || world->player->playerCharacters.size() == 0) {
@@ -5126,6 +5454,10 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   std::string preferredSerial = TrimChatLine(preferredSpeakerSerial);
   bool hasPreferred = !preferredName.empty() || !preferredSerial.empty();
   const bool targetLockedSpeaker = forceDirectorMode && hasPreferred;
+  const std::string preferredListenerNameTrim =
+      TrimChatLine(preferredListenerName);
+  const std::string preferredListenerSerialTrim =
+      TrimChatLine(preferredListenerSerial);
   Character *preferredCharacter = nullptr;
   if (hasPreferred) {
     preferredCharacter =
@@ -5133,6 +5465,27 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (!preferredCharacter || (uintptr_t)preferredCharacter <= 0x1000) {
       Log("BORED_EVENT: preferred target unresolved name=" + preferredName +
           " serial=" + preferredSerial);
+    } else if (IsAddonLockedCharacter(preferredCharacter)) {
+      Log("BORED_EVENT: preferred speaker locked by addon serial=" +
+          preferredSerial);
+      return false;
+    }
+  }
+  // Exact callers (addons) name both actors by serial; never substitute.
+  if (exactActors) {
+    bool speakerExact = false;
+    if (forceDirectorMode && !preferredSerial.empty() && preferredCharacter &&
+        (uintptr_t)preferredCharacter > 0x1000) {
+      try {
+        speakerExact =
+            ToString(preferredCharacter->getHandle().serial) == preferredSerial;
+      } catch (...) {
+        speakerExact = false;
+      }
+    }
+    if (!speakerExact) {
+      Log("BORED_EVENT: exact speaker unresolved serial=" + preferredSerial);
+      return false;
     }
   }
 
@@ -5169,9 +5522,13 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     try {
       otherName = other->getName();
       serial = ToString(other->getHandle().serial);
-      preferredMatch =
-          (!preferredSerial.empty() && serial == preferredSerial) ||
-          (!preferredName.empty() && EqualsIgnoreCase(otherName, preferredName));
+      // A provided serial is authoritative so a same-named NPC cannot speak.
+      if (!preferredSerial.empty()) {
+        preferredMatch = serial == preferredSerial;
+      } else {
+        preferredMatch =
+            !preferredName.empty() && EqualsIgnoreCase(otherName, preferredName);
+      }
     } catch (...) {
       continue;
     }
@@ -5182,7 +5539,17 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
     if (other == searchAnchor && !preferredMatch) {
       continue;
     }
-    if (!ShouldIncludeAnimalForTalk(other)) {
+    if (!ShouldIncludeAnimalForTalk(other) || IsAddonLockedCharacter(other)) {
+      continue;
+    }
+    // Unregistered agents are never picked automatically; an explicitly named
+    // speaker or listener still takes part.
+    if (IsAddonExcludedAgent(other) && !preferredMatch &&
+        !(targetLockedSpeaker &&
+          (!preferredListenerSerialTrim.empty()
+               ? serial == preferredListenerSerialTrim
+               : !preferredListenerNameTrim.empty() &&
+                     EqualsIgnoreCase(otherName, preferredListenerNameTrim)))) {
       continue;
     }
 
@@ -5308,9 +5675,6 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   std::string listenerSerial = "";
   std::string playerName = player->getName();
   std::string playerSerial = ToString(player->getHandle().serial);
-  std::string preferredListenerNameTrim = TrimChatLine(preferredListenerName);
-  std::string preferredListenerSerialTrim =
-      TrimChatLine(preferredListenerSerial);
   std::vector<size_t> listenerIndices;
   listenerIndices.reserve(candidates.size());
   for (size_t i = 0; i < candidates.size(); ++i) {
@@ -5352,6 +5716,12 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
             break;
           }
         }
+      }
+      if (exactActors && listener.empty() &&
+          !preferredListenerSerialTrim.empty()) {
+        Log("BORED_EVENT: exact listener not eligible speaker_serial=" +
+            speaker.serial + " listener_serial=" + preferredListenerSerialTrim);
+        return false;
       }
     }
 
@@ -5433,7 +5803,7 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
       L"&mode=" + ToWide(UrlEncode(mode)) +
       L"&tts_enabled=" + (g_ttsEnabled ? L"1" : L"0") +
       L"&people=" + ToWide(UrlEncode(peopleJson)) +
-      L"&direction=" + ToWide(UrlEncode(direction));
+      L"&direction=" + ToWide(UrlEncode(direction)) + L"&addon_followup=1";
   AppendGeoQueryFromPlayer(endpoint, player);
 
   StreamChatTask *task = new StreamChatTask();
@@ -5466,8 +5836,11 @@ bool TriggerBoredEvent(GameWorld *world, bool forceDirectorMode,
   const LONG directorGeneration = task->generation;
   const std::string dispatchedListenerHandle = task->previousSpeakerHandle;
   if (forceDirectorMode) InterlockedExchange(&g_activeDirectorGeneration, directorGeneration);
+  task->streamSlotReserved = reserveStreamSlot;
+  if (reserveStreamSlot) InterlockedIncrement(&g_activeChatStreamCount);
   HANDLE thread = PlaythroughSession::StartTask(NULL, 0, StreamChatResponseThread, task, 0, NULL);
   if (!thread) {
+    if (reserveStreamSlot) InterlockedDecrement(&g_activeChatStreamCount);
     if (forceDirectorMode) InterlockedCompareExchange(&g_activeDirectorGeneration, 0, directorGeneration);
     delete task;
     Log("BORED_EVENT: failed to start stream thread");
@@ -5695,6 +6068,7 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatModeCombo->addItem(WideFromUtf8("narrator").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("inject").c_str());
   g_chatModeCombo->addItem(WideFromUtf8("inject & chat").c_str());
+  g_chatModeCombo->addItem(WideFromUtf8("hypnosis").c_str());
   g_chatModeCombo->eventComboAccept += MyGUI::newDelegate(OnChatModeChange);
   g_chatModeCombo->eventComboChangePosition +=
       MyGUI::newDelegate(OnChatModeChange);
