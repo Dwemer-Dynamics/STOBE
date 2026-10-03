@@ -33,6 +33,7 @@
 #include "Globals.h"
 #include "KenshiTownCompat.h"
 #include "PlayerBaseState.h"
+#include "ServerPluginSync.h"
 #include "StobeIdentityRename.h"
 #include "StobeChatMode.h"
 #include "Utils.h"
@@ -13350,6 +13351,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     static int invTimer = 0;
     ExecuteQueuedActions(world, invTimer);
     Stobe::Addon::GameThreadTick(world);
+    Stobe::ServerPluginSync::OnGameThreadTick(world);
     UpdateMoveToActions(world);
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);

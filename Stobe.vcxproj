@@ -111,6 +111,7 @@
     </ClCompile>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\PlayerBaseState.cpp" />
+    <ClCompile Include="src\ServerPluginSync.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
     <ClCompile Include="src\StobeChatMode.cpp" />
     <ClCompile Include="src\StobeIdentityRename.cpp" />
@@ -146,6 +147,7 @@
     <ClInclude Include="src\KenshiRvaCompat.h" />
     <ClInclude Include="src\KenshiTownIdentity.h" />
     <ClInclude Include="src\PlayerBaseState.h" />
+    <ClInclude Include="src\ServerPluginSync.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\StobeChatMode.h" />
     <ClInclude Include="src\StobeIdentityRename.h" />

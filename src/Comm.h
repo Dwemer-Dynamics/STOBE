@@ -42,5 +42,7 @@ void ForgetSpeechDeliveryStates(const std::vector<std::string> &utteranceIds);
 bool IsDwemerDistroConnected();
 DWORD GetDwemerDistroLastSuccessAgeMs();
 std::string GetStobeServerHomeUrl();
+// Resolved (configured or discovered) StobeServer host and port.
+bool ResolveStobeServerTarget(std::wstring &host, unsigned short &port);
 
 DWORD WINAPI BoredEventPollThread(LPVOID lpParam);
