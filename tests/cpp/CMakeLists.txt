@@ -18,6 +18,7 @@ add_executable(stobe_portable_tests
 )
 
 target_include_directories(stobe_portable_tests PRIVATE
+  ../../include
   ../../src
 )
 

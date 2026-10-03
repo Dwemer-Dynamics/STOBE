@@ -8457,6 +8457,9 @@ static void ApplyFollowTargets(GameWorld *world) {
       ClearFollowTarget(followerSerial);
       continue;
     }
+    if (Stobe::Addon::IsActorBusy(followerSerial)) {
+      continue; // Resumes when the addon clears its busy flag.
+    }
 
     Ogre::Vector3 from = follower->getPosition();
     Ogre::Vector3 to = target->getPosition();
@@ -8570,7 +8573,8 @@ static void ApplyTravelTargets(GameWorld *world) {
     }
 
     Character *actor = FindCharacterBySerial(world, actorSerial);
-    if (!actor || (uintptr_t)actor < 0x1000) {
+    if (!actor || (uintptr_t)actor < 0x1000 ||
+        Stobe::Addon::IsActorBusy(actorSerial)) {
       continue;
     }
 
@@ -9286,6 +9290,15 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           // Addon handlers receive external commands in their original case.
           const std::string rawActionCommand =
               TrimCopy(actStr.substr(0, actStr.find('@')));
+          // A busy actor performs no built-in action. ExtCmd continues so
+          // dispatch can run the busy owner's own action or report a failure.
+          if (Stobe::Addon::IsActorBusy(targetHand.serial) &&
+              !Stobe::AddonProtocol::IsExtCommand(actionCommand)) {
+            Log("HOOK_MSG_PROC: action " + actionCommand +
+                " dropped for addon-busy actor serial=" +
+                ToString((unsigned int)targetHand.serial));
+            continue;
+          }
           if (actionCommand == "RELEASE_PLAYER" ||
               actionCommand == "RELEASE_PRISONER" ||
               actionCommand == "RELEASEPLAYER" ||
@@ -11556,6 +11569,13 @@ void ProcessMessageQueue(GameWorld *thisptr) {
           PostSpeechDeliveryState(utteranceId, "cancelled");
         }
 
+        if (!bubbleContent.empty() && isNPCSay &&
+            Stobe::Addon::DialogueGate(targetHand.serial) != STOBE_OK) {
+          if (!utteranceId.empty()) PostSpeechDeliveryState(utteranceId, "cancelled");
+          Log("HOOK_MSG_PROC: line dropped for addon-locked/busy actor serial=" +
+              ToString((unsigned int)targetHand.serial));
+          continue;
+        }
         if (!bubbleContent.empty()) {
           Character *tc = ResolveCharacterFromHandSafe(thisptr, targetHand);
           // Missing Director actors are skipped, never replaced by the selection or a namesake.

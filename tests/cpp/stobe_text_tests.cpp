@@ -6,7 +6,9 @@
 #include "StobeIdentityRename.h"
 #include "StobeText.h"
 #include "StobeTiming.h"
+#include "StobeAddonApi.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -52,6 +54,22 @@ void ExpectBool(const std::string &name, bool actual, bool expected) {
             << "  expected: " << (expected ? "true" : "false") << "\n"
             << "  actual:   " << (actual ? "true" : "false") << "\n";
 }
+
+// The V1 table is a published ABI; V2 only appends after a full V1 copy.
+static_assert(STOBE_ADDON_API_VERSION == 1u, "V1 version number");
+static_assert(sizeof(StobeAddonApiV1) == 120, "V1 table size");
+static_assert(offsetof(StobeAddonApiV1, RegisterAddon) == 16, "V1 first call");
+static_assert(offsetof(StobeAddonApiV1, QueueGameThreadCallback) == 112,
+              "V1 last call");
+static_assert(sizeof(StobeActionRequest) == 56, "V1 action request");
+static_assert(offsetof(StobeAddonApiV2, v1) == 0, "V2 starts with V1");
+static_assert(offsetof(StobeAddonApiV2, capabilities) == 120, "V2 appends");
+static_assert(offsetof(StobeAddonApiV2, GetControlStatus) == 184,
+              "V2 control status call");
+static_assert(offsetof(StobeAddonApiV2, GetActorBusyOwner) == 200,
+              "V2 last call");
+static_assert(sizeof(StobeAddonApiV2) == 208, "V2 table size");
+static_assert(sizeof(StobeControlStatus) == 24, "control status size");
 
 } // namespace
 
@@ -1046,6 +1064,109 @@ int main() {
     ExpectEq("Package API job id", AP::JsonStringValue(body, "id"), "j1");
     ExpectEq("Package request escapes quotes", AP::JsonEscape("a\"b"),
              "a\\\"b");
+  }
+
+  {
+    namespace AP = Stobe::AddonProtocol;
+    AP::ActorLockTable locks(2);
+    ExpectBool("Lock: owner locks actor", locks.Set(1, 10, 5, true) == STOBE_OK,
+               true);
+    ExpectBool("Lock: repeat by owner is OK", locks.Set(1, 10, 5, true) == STOBE_OK,
+               true);
+    ExpectUInt32("Lock: owner reported", locks.Owner(10, 5), 1u);
+    ExpectBool("Lock: other addon cannot take it",
+               locks.Set(2, 10, 5, true) == STOBE_E_CONFLICT, true);
+    ExpectBool("Lock: other addon cannot clear it",
+               locks.Set(2, 10, 5, false) == STOBE_E_CONFLICT, true);
+    ExpectUInt32("Lock: still held after foreign clear", locks.Owner(10, 5), 1u);
+    ExpectBool("Lock: clearing an unlocked actor is OK",
+               locks.Set(2, 11, 5, false) == STOBE_OK, true);
+    ExpectBool("Lock: second actor", locks.Set(2, 11, 5, true) == STOBE_OK, true);
+    ExpectBool("Lock: table is bounded", locks.Set(2, 12, 5, true) == STOBE_E_LIMIT,
+               true);
+    ExpectUInt32("Lock: absent after a load", locks.Owner(10, 6), 0u);
+    ExpectBool("Lock: earlier load does not conflict",
+               locks.Set(2, 10, 6, true) == STOBE_OK, true);
+    ExpectUInt32("Lock: new load owner", locks.Owner(10, 6), 2u);
+    ExpectUInt32("Lock: load purge removes earlier entries",
+                 static_cast<unsigned int>(locks.RemoveOtherGenerations(6)), 1u);
+    ExpectUInt32("Lock: owner removal releases only its locks",
+                 static_cast<unsigned int>(locks.RemoveOwner(2)), 1u);
+    ExpectUInt32("Lock: empty after removal",
+                 static_cast<unsigned int>(locks.Size()), 0u);
+    ExpectBool("Lock: owner clears its lock",
+               locks.Set(1, 10, 6, true) == STOBE_OK &&
+                   locks.Set(1, 10, 6, false) == STOBE_OK && locks.Owner(10, 6) == 0,
+               true);
+
+    // A dialogue lock and a busy flag are separate tables with the same
+    // rules; the runtime removes an unregistered or faulted owner from both.
+    AP::ActorLockTable talk(4);
+    AP::ActorLockTable busy(4);
+    ExpectBool("Busy: lock and busy held by different owners",
+               talk.Set(1, 20, 6, true) == STOBE_OK &&
+                   busy.Set(2, 20, 6, true) == STOBE_OK,
+               true);
+    ExpectBool("Busy: other addon cannot clear it",
+               busy.Set(1, 20, 6, false) == STOBE_E_CONFLICT &&
+                   busy.Owner(20, 6) == 2u,
+               true);
+    ExpectBool("Busy: clearing the lock leaves busy set",
+               talk.Set(1, 20, 6, false) == STOBE_OK && talk.Owner(20, 6) == 0 &&
+                   busy.Owner(20, 6) == 2u,
+               true);
+    ExpectBool("Busy: owner cleanup clears both tables",
+               talk.Set(2, 21, 6, true) == STOBE_OK && talk.RemoveOwner(2) == 1 &&
+                   busy.RemoveOwner(2) == 1 && talk.Size() == 0 &&
+                   busy.Size() == 0,
+               true);
+
+    const unsigned int none = 0;
+    ExpectBool("Gate: lock refuses dialogue",
+               AP::ActorGate(AP::ACTOR_DIALOGUE, 1, none, 0) == STOBE_E_LOCKED,
+               true);
+    ExpectBool("Gate: busy refuses dialogue",
+               AP::ActorGate(AP::ACTOR_DIALOGUE, none, 2, 0) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+    ExpectBool("Gate: lock does not refuse built-in actions",
+               AP::ActorGate(AP::ACTOR_BUILTIN_ACTION, 1, none, 0) == STOBE_OK,
+               true);
+    ExpectBool("Gate: busy refuses built-in actions",
+               AP::ActorGate(AP::ACTOR_BUILTIN_ACTION, none, 2, 0) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+    ExpectBool("Gate: lock does not refuse addon actions",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, 1, none, 3) == STOBE_OK,
+               true);
+    ExpectBool("Gate: busy owner's own addon action runs",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, 1, 2, 2) == STOBE_OK, true);
+    ExpectBool("Gate: busy refuses another addon's action",
+               AP::ActorGate(AP::ACTOR_ADDON_ACTION, none, 2, 3) ==
+                   STOBE_E_ACTOR_BUSY,
+               true);
+
+    int reason = 1;
+    ExpectUInt32("Interaction ticket: pending while syncing",
+                 AP::ResolveInteractionTicket(4, 4, 3, 1, reason),
+                 STOBE_CONTROL_PENDING);
+    ExpectUInt32("Interaction ticket: confirmed state completes",
+                 AP::ResolveInteractionTicket(4, 4, 4, 0, reason),
+                 STOBE_CONTROL_COMPLETED);
+    ExpectBool("Interaction ticket: completed has no reason", reason == 0, true);
+    ExpectUInt32("Interaction ticket: failed sync",
+                 AP::ResolveInteractionTicket(4, 4, 4, 3, reason),
+                 STOBE_CONTROL_FAILED);
+    ExpectBool("Interaction ticket: failed reason", reason == STOBE_E_UNCONFIRMED,
+               true);
+    ExpectUInt32("Interaction ticket: later request supersedes",
+                 AP::ResolveInteractionTicket(4, 5, 3, 1, reason),
+                 STOBE_CONTROL_CANCELLED);
+    ExpectBool("Interaction ticket: superseded reason",
+               reason == STOBE_E_SUPERSEDED, true);
+    ExpectUInt32("Interaction ticket: settled result survives a later request",
+                 AP::ResolveInteractionTicket(4, 5, 4, 1, reason),
+                 STOBE_CONTROL_COMPLETED);
   }
 
   if (g_failures != 0) {

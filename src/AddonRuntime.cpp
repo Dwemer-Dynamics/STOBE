@@ -15,6 +15,7 @@
 #include "StobeAddonApi.h"
 #include "Utils.h"
 
+#include <cstddef>
 #include <deque>
 #include <map>
 #include <string>
@@ -25,6 +26,7 @@ namespace Stobe {
 namespace Addon {
 namespace {
 
+using Stobe::AddonProtocol::ActorLockTable;
 using Stobe::AddonProtocol::ExtCommand;
 using Stobe::AddonProtocol::IsValidToken;
 using Stobe::AddonProtocol::LowerAscii;
@@ -33,6 +35,8 @@ const size_t kMaxAddons = 16;
 const size_t kMaxBridges = 64;
 const size_t kMaxQueuedWork = 128;
 const size_t kMaxPendingRequests = 128;
+const size_t kMaxTickets = 128;
+const size_t kMaxActorLocks = 64;
 const size_t kWorkPerTick = 8;
 const DWORD kPendingRequestLifetimeMs = 10 * 60 * 1000;
 const DWORD kExpiryIntervalMs = 1000;
@@ -46,7 +50,8 @@ enum WorkKind {
   WORK_EVENT,
   WORK_CANCEL,
   WORK_CALLBACK,
-  WORK_EXT_ACTION
+  WORK_EXT_ACTION,
+  WORK_SET_INTERACTION
 };
 
 struct WorkItem {
@@ -61,10 +66,11 @@ struct WorkItem {
   std::string key;
   StobeGameThreadCallback callback;
   void *userData;
+  StobeU32 ticket; // 0 when the caller did not ask for one.
 
   WorkItem()
       : kind(WORK_EVENT), owner(0), generation(0), number(0), flag(0),
-        callback(NULL), userData(NULL) {
+        callback(NULL), userData(NULL), ticket(0) {
     first.serial = first.generation = 0;
     second.serial = second.generation = 0;
   }
@@ -75,6 +81,20 @@ struct AddonEntry {
   std::string version;
   DWORD eventWindowStart;
   int eventCount;
+  StobeControlCallback controlCallback;
+  void *controlUserData;
+};
+
+// A control request's feedback record. Interaction tickets resolve from the
+// Interaction request sequence once dispatched (hasSeq).
+struct Ticket {
+  StobeAddonId owner;
+  StobeU32 kind;
+  StobeU32 state;
+  int reason;
+  bool hasSeq;
+  LONG seq;
+  bool noticeQueued;
 };
 
 struct BridgeEntry {
@@ -114,19 +134,39 @@ struct State {
   std::map<StobeU32, PendingRequest> pending;
   std::deque<Outcome> outcomes;
   std::deque<WorkItem> work;
+  // At most kMaxTickets; each ticket has at most one queued notice.
+  std::map<StobeU32, Ticket> tickets;
+  std::deque<StobeU32> notices;
+  size_t seqTickets; // Pending tickets waiting on an interaction sequence.
+  LONG seenRequested, seenSettled; // Progress at the last ticket scan.
+  // Leaf lock below state.lock guarding dialogue locks and busy flags;
+  // readers on any thread take it shared.
+  SRWLOCK locksLock;
+  ActorLockTable locks;
+  ActorLockTable busy;
+  unsigned long lockGeneration; // Game thread only.
   StobeAddonId nextAddonId;
   StobeU32 nextRequestId;
+  StobeU32 nextTicket;
   DWORD lastExpiryTick;
   unsigned long expiryGeneration;
   StobeAddonApiV1 api;
+  StobeAddonApiV2 apiV2;
   State()
-      : nextAddonId(1), nextRequestId(1), lastExpiryTick(0),
+      : seqTickets(0), seenRequested(-2), seenSettled(-2),
+        locks(kMaxActorLocks), busy(kMaxActorLocks), lockGeneration(0),
+        nextAddonId(1),
+        nextRequestId(1), nextTicket(1), lastExpiryTick(0),
         expiryGeneration(0) {
     InitializeCriticalSection(&lock);
     InitializeCriticalSection(&dispatch);
+    InitializeSRWLock(&locksLock);
   }
 };
 
+// Let IsActorLocked and IsActorBusy skip the lock while none exist.
+volatile LONG g_actorLockCount = 0;
+volatile LONG g_actorBusyCount = 0;
 volatile LONG g_gameThreadId = 0;
 volatile LONG g_lastTickTime = 0;
 volatile LONG g_inGameTick = 0;
@@ -186,7 +226,69 @@ std::string AddonNameLocked(State &state, StobeAddonId id) {
   return it == state.addons.end() ? std::string("addon") : it->second.name;
 }
 
-int Enqueue(WorkItem &item) {
+// Caller holds state.lock. Returns 0 when every retained ticket is pending
+// or awaiting its callback; otherwise the oldest finished one is evicted.
+StobeU32 CreateTicketLocked(State &state, StobeAddonId owner, StobeU32 kind) {
+  if (state.tickets.size() >= kMaxTickets) {
+    std::map<StobeU32, Ticket>::iterator it = state.tickets.begin();
+    while (it != state.tickets.end() &&
+           (it->second.state == STOBE_CONTROL_PENDING || it->second.noticeQueued)) {
+      ++it;
+    }
+    if (it == state.tickets.end()) {
+      return 0;
+    }
+    state.tickets.erase(it);
+  }
+  const StobeU32 id = state.nextTicket++;
+  if (state.nextTicket == 0) {
+    state.nextTicket = 1;
+  }
+  Ticket ticket;
+  ticket.owner = owner;
+  ticket.kind = kind;
+  ticket.state = STOBE_CONTROL_PENDING;
+  ticket.reason = 0;
+  ticket.hasSeq = false;
+  ticket.seq = 0;
+  ticket.noticeQueued = false;
+  state.tickets[id] = ticket;
+  return id;
+}
+
+// Caller holds state.lock. A ticket leaves PENDING once; later calls are
+// ignored. The owner's callback, if any, is queued for the game thread.
+void FinishTicketLocked(State &state, StobeU32 id, StobeU32 result, int reason) {
+  std::map<StobeU32, Ticket>::iterator it = state.tickets.find(id);
+  if (id == 0 || it == state.tickets.end() ||
+      it->second.state != STOBE_CONTROL_PENDING) {
+    return;
+  }
+  if (it->second.hasSeq) {
+    --state.seqTickets;
+  }
+  it->second.state = result;
+  it->second.reason = reason;
+  std::map<StobeAddonId, AddonEntry>::const_iterator addon =
+      state.addons.find(it->second.owner);
+  if (addon != state.addons.end() && addon->second.controlCallback) {
+    it->second.noticeQueued = true;
+    state.notices.push_back(id);
+  }
+}
+
+void FinishTicket(StobeU32 id, StobeU32 result, int reason) {
+  if (id == 0) {
+    return;
+  }
+  State &state = Get();
+  Lock lock(state.lock);
+  FinishTicketLocked(state, id, result, reason);
+}
+
+// outTicket non-NULL asks for a feedback ticket of ticketKind.
+int Enqueue(WorkItem &item, StobeU32 ticketKind = 0,
+            StobeU32 *outTicket = NULL) {
   State &state = Get();
   Lock lock(state.lock);
   if (item.owner != 0 && !IsRegisteredLocked(state, item.owner)) {
@@ -195,8 +297,39 @@ int Enqueue(WorkItem &item) {
   if (state.work.size() >= kMaxQueuedWork) {
     return STOBE_E_LIMIT;
   }
+  if (outTicket) {
+    item.ticket = CreateTicketLocked(state, item.owner, ticketKind);
+    if (item.ticket == 0) {
+      return STOBE_E_LIMIT;
+    }
+    *outTicket = item.ticket;
+  }
   state.work.push_back(item);
   return STOBE_QUEUED;
+}
+
+// Caller holds state.locksLock exclusively.
+void PublishLockCountLocked(State &state) {
+  InterlockedExchange(&g_actorLockCount,
+                      static_cast<LONG>(state.locks.Size()));
+  InterlockedExchange(&g_actorBusyCount, static_cast<LONG>(state.busy.Size()));
+}
+
+// Owner of the actor's busy flag (busy) or dialogue lock in the given
+// generation, or 0. Any thread.
+StobeAddonId ActorFlagOwner(bool busy, unsigned int serial,
+                            unsigned long generation) {
+  if (serial == 0 ||
+      InterlockedCompareExchange(busy ? &g_actorBusyCount : &g_actorLockCount,
+                                 0, 0) == 0) {
+    return 0;
+  }
+  State &state = Get();
+  AcquireSRWLockShared(&state.locksLock);
+  const StobeAddonId owner =
+      (busy ? state.busy : state.locks).Owner(serial, generation);
+  ReleaseSRWLockShared(&state.locksLock);
+  return owner;
 }
 
 // Closes a pending request. A request from the current load gets one queued
@@ -244,6 +377,23 @@ void RemoveAddonLocked(State &state, StobeAddonId id, const std::string &detail)
       ++it;
     }
   }
+  // Its tickets go with it; queued notices for them are skipped.
+  for (std::map<StobeU32, Ticket>::iterator it = state.tickets.begin();
+       it != state.tickets.end();) {
+    if (it->second.owner == id) {
+      if (it->second.hasSeq && it->second.state == STOBE_CONTROL_PENDING) {
+        --state.seqTickets;
+      }
+      state.tickets.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+  AcquireSRWLockExclusive(&state.locksLock);
+  state.locks.RemoveOwner(id);
+  state.busy.RemoveOwner(id);
+  PublishLockCountLocked(state);
+  ReleaseSRWLockExclusive(&state.locksLock);
 }
 
 void DisableFaultingAddon(StobeAddonId id, const std::string &where) {
@@ -360,6 +510,12 @@ std::string ResultLabel(int code) {
     return "interaction_off";
   case STOBE_E_INVALID_ARGUMENT:
     return "invalid";
+  case STOBE_E_LOCKED:
+    return "actor_locked";
+  case STOBE_E_INELIGIBLE:
+    return "not_eligible";
+  case STOBE_E_ACTOR_BUSY:
+    return "actor_busy";
   default:
     return ToString(code);
   }
@@ -413,7 +569,8 @@ void ReportExternalActionOutcome(GameWorld *world, unsigned int actorSerial,
                message, actorSerial, 0);
 }
 
-void RunPlayerInput(GameWorld *world, const WorkItem &item) {
+// Returns STOBE_OK when Stobe started the chat request.
+int RunPlayerInput(GameWorld *world, const WorkItem &item) {
   Character *target = NULL;
   int code = ResolveActor(world, item.first, target);
   Character *speaker = ResolvePlayerSpeaker(world);
@@ -421,11 +578,13 @@ void RunPlayerInput(GameWorld *world, const WorkItem &item) {
     code = STOBE_E_DISABLED;
   } else if (code == STOBE_OK && (Stobe::UI::g_chatWindow || !speaker)) {
     code = STOBE_E_BUSY; // Never overwrite the player's open chat state.
+  } else if (code == STOBE_OK) {
+    code = DialogueGate(item.first.serial);
   }
   if (code != STOBE_OK) {
     Log("ADDON_API: player input dropped target_serial=" +
         ToString(item.first.serial) + " reason=" + ResultLabel(code));
-    return;
+    return code;
   }
 
   // The voice submission path changes the chat UI's remembered target/mode.
@@ -434,6 +593,7 @@ void RunPlayerInput(GameWorld *world, const WorkItem &item) {
   const std::string savedTargetHandle = Stobe::UI::g_chatTargetHandleStr;
   const std::string savedMode = g_chatMode;
   const size_t savedModeIndex = Stobe::UI::g_lastChatModeIndex;
+  const LONG startsBefore = Stobe::UI::ChatRequestStartCount();
   Stobe::UI::SubmitVoiceChatText(item.text, SafeName(speaker),
                                  ToString(speaker->getHandle().serial),
                                  SafeName(target), ToString(item.first.serial),
@@ -443,12 +603,19 @@ void RunPlayerInput(GameWorld *world, const WorkItem &item) {
   Stobe::UI::g_chatTargetHandleStr = savedTargetHandle;
   g_chatMode = savedMode;
   Stobe::UI::g_lastChatModeIndex = savedModeIndex;
+  // The chat path may still refuse (range, area); only a started request counts.
+  if (Stobe::UI::ChatRequestStartCount() == startsBefore) {
+    code = STOBE_E_INELIGIBLE;
+  }
   Log("ADDON_API: player input submitted target_serial=" +
       ToString(item.first.serial) + " text_len=" +
-      ToString(static_cast<int>(item.text.size())));
+      ToString(static_cast<int>(item.text.size())) + " result=" +
+      (code == STOBE_OK ? std::string("started") : ResultLabel(code)));
+  return code;
 }
 
-void RunContextRequest(GameWorld *world, const WorkItem &item) {
+// Returns STOBE_OK when Stobe started the contextual request.
+int RunContextRequest(GameWorld *world, const WorkItem &item) {
   Character *speaker = NULL;
   Character *listener = NULL;
   int code = ResolveActor(world, item.first, speaker);
@@ -460,6 +627,9 @@ void RunContextRequest(GameWorld *world, const WorkItem &item) {
   } else if (code == STOBE_OK && (Stobe::UI::IsAiRequestActive() ||
                                   Stobe::UI::IsDirectorSceneActive())) {
     code = STOBE_E_BUSY; // Addon requests do not interrupt active dialogue.
+  } else if (code == STOBE_OK) {
+    code = DialogueGate(item.first.serial);
+    if (code == STOBE_OK) code = DialogueGate(item.second.serial);
   }
   bool dispatched = false;
   if (code == STOBE_OK) {
@@ -468,11 +638,14 @@ void RunContextRequest(GameWorld *world, const WorkItem &item) {
         listener ? SafeName(listener) : std::string(),
         listener ? ToString(item.second.serial) : std::string(), item.text,
         true);
+    if (!dispatched) {
+      code = STOBE_E_INELIGIBLE;
+    }
   }
   Log("ADDON_API: contextual request speaker_serial=" +
       ToString(item.first.serial) + " result=" +
-      (code != STOBE_OK ? ResultLabel(code)
-                        : std::string(dispatched ? "dispatched" : "not_eligible")));
+      (code != STOBE_OK ? ResultLabel(code) : std::string("dispatched")));
+  return code;
 }
 
 void RunEvent(GameWorld *world, const WorkItem &item,
@@ -550,11 +723,15 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
                                                          : "actor not loaded");
     return;
   }
-
+  // The dialogue lock does not gate actions; a busy flag refuses every
+  // bridge except its owner's, so the owner can coordinate its animation.
+  const StobeAddonId busyOwner =
+      ActorFlagOwner(true, actorSerial, item.generation);
   State &state = Get();
   BridgeEntry bridge;
   StobeU32 requestId = 0;
   bool bridgeFound = false;
+  int gate = STOBE_OK;
   int verdict = STOBE_ACTION_REJECTED;
   bool faulted = false;
   {
@@ -564,7 +741,12 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
       std::map<std::string, BridgeEntry>::const_iterator it =
           state.bridges.find(LowerAscii(parsed.bridge));
       bridgeFound = it != state.bridges.end();
-      if (bridgeFound &&
+      if (bridgeFound) {
+        gate = Stobe::AddonProtocol::ActorGate(
+            Stobe::AddonProtocol::ACTOR_ADDON_ACTION, 0, busyOwner,
+            it->second.owner);
+      }
+      if (bridgeFound && gate == STOBE_OK &&
           state.pending.size() + state.outcomes.size() < kMaxPendingRequests) {
         bridge = it->second;
         requestId = state.nextRequestId++;
@@ -603,9 +785,10 @@ void RunExternalAction(GameWorld *world, const WorkItem &item) {
   if (requestId == 0) {
     ReportExternalActionOutcome(world, actorSerial, actorName, parsed.command,
                                 item.text, false,
-                                bridgeFound ? std::string("too many pending requests")
-                                            : "no registered handler for bridge " +
-                                                  parsed.bridge);
+                                !bridgeFound ? "no registered handler for bridge " +
+                                                   parsed.bridge
+                                : gate != STOBE_OK ? std::string("actor busy")
+                                                   : std::string("too many pending requests"));
     return;
   }
   if (verdict == STOBE_ACTION_ACCEPTED && !faulted) {
@@ -682,6 +865,94 @@ void ReportOutcome(GameWorld *world, const Outcome &outcome) {
                               outcome.succeeded, outcome.detail);
 }
 
+// Settles interaction tickets. Scans only while some are pending and the
+// Interaction progress changed since the last scan.
+void ResolveInteractionTickets() {
+  State &state = Get();
+  Lock lock(state.lock);
+  if (state.seqTickets == 0) {
+    return;
+  }
+  LONG requested = 0;
+  LONG settled = 0;
+  int settledStatus = 0;
+  Stobe::Interaction::Progress(requested, settled, settledStatus);
+  if (requested == state.seenRequested && settled == state.seenSettled) {
+    return;
+  }
+  state.seenRequested = requested;
+  state.seenSettled = settled;
+  for (std::map<StobeU32, Ticket>::iterator it = state.tickets.begin();
+       it != state.tickets.end(); ++it) {
+    if (it->second.state != STOBE_CONTROL_PENDING || !it->second.hasSeq) {
+      continue;
+    }
+    int reason = 0;
+    const StobeU32 result = Stobe::AddonProtocol::ResolveInteractionTicket(
+        it->second.seq, requested, settled, settledStatus, reason);
+    if (result != STOBE_CONTROL_PENDING) {
+      FinishTicketLocked(state, it->first, result, reason);
+    }
+  }
+}
+
+void RunSetInteraction(const WorkItem &item, const std::string &addonName) {
+  const LONG seq = Stobe::Interaction::Request(item.flag != 0);
+  State &state = Get();
+  {
+    Lock lock(state.lock);
+    std::map<StobeU32, Ticket>::iterator it = state.tickets.find(item.ticket);
+    if (it != state.tickets.end() && it->second.state == STOBE_CONTROL_PENDING) {
+      it->second.hasSeq = true;
+      it->second.seq = seq;
+      ++state.seqTickets;
+      state.seenRequested = -2; // Force a scan; the request may be settled.
+    }
+  }
+  Log("ADDON_API: addon '" + addonName + "' requested interaction " +
+      (item.flag != 0 ? "on" : "off") + " seq=" + ToString(static_cast<int>(seq)));
+}
+
+void DeliverNotice(StobeU32 id) {
+  State &state = Get();
+  Lock dispatch(state.dispatch);
+  StobeControlStatus status;
+  StobeControlCallback callback = NULL;
+  void *userData = NULL;
+  StobeAddonId owner = 0;
+  {
+    Lock lock(state.lock);
+    std::map<StobeU32, Ticket>::iterator it = state.tickets.find(id);
+    if (it == state.tickets.end()) {
+      return; // Owner unregistered.
+    }
+    it->second.noticeQueued = false;
+    std::map<StobeAddonId, AddonEntry>::const_iterator addon =
+        state.addons.find(it->second.owner);
+    if (addon == state.addons.end() || !addon->second.controlCallback) {
+      return;
+    }
+    owner = it->second.owner;
+    callback = addon->second.controlCallback;
+    userData = addon->second.controlUserData;
+    status.struct_size = sizeof(StobeControlStatus);
+    status.ticket = id;
+    status.kind = it->second.kind;
+    status.state = it->second.state;
+    status.reason = it->second.reason;
+    status.reserved = 0;
+  }
+  bool faulted = false;
+  try {
+    callback(userData, &status);
+  } catch (...) {
+    faulted = true;
+  }
+  if (faulted) {
+    DisableFaultingAddon(owner, "control callback");
+  }
+}
+
 // ---- API entry points -----------------------------------------------------
 
 int STOBE_CALL ApiRegisterAddon(const StobeAddonInfo *info, StobeAddonId *outId) {
@@ -698,6 +969,8 @@ int STOBE_CALL ApiRegisterAddon(const StobeAddonInfo *info, StobeAddonId *outId)
   }
   entry.eventWindowStart = GetTickCount();
   entry.eventCount = 0;
+  entry.controlCallback = NULL;
+  entry.controlUserData = NULL;
   State &state = Get();
   StobeAddonId id = 0;
   {
@@ -800,8 +1073,10 @@ int STOBE_CALL ApiGetActorState(StobeActorRef actor, StobeActorState *outState) 
   return STOBE_OK;
 }
 
-int STOBE_CALL ApiSendPlayerInput(StobeAddonId id, StobeActorRef target,
-                                  const char *text) {
+int STOBE_CALL ApiSendPlayerInputTracked(StobeAddonId id,
+                                         StobeActorRef target,
+                                         const char *text,
+                                         StobeU32 *outTicket) {
   WorkItem item;
   if (target.serial == 0 ||
       !CopyBoundedText(text, STOBE_MAX_TEXT_BYTES, false, item.text)) {
@@ -814,13 +1089,19 @@ int STOBE_CALL ApiSendPlayerInput(StobeAddonId id, StobeActorRef target,
   item.owner = id;
   item.generation = target.generation;
   item.first = target;
-  return Enqueue(item);
+  return Enqueue(item, STOBE_CONTROL_KIND_PLAYER_INPUT, outTicket);
 }
 
-int STOBE_CALL ApiRequestContextualResponse(StobeAddonId id,
-                                            StobeActorRef speaker,
-                                            StobeActorRef listener,
-                                            const char *direction) {
+int STOBE_CALL ApiSendPlayerInput(StobeAddonId id, StobeActorRef target,
+                                  const char *text) {
+  return ApiSendPlayerInputTracked(id, target, text, NULL);
+}
+
+int STOBE_CALL ApiRequestContextualResponseTracked(StobeAddonId id,
+                                                   StobeActorRef speaker,
+                                                   StobeActorRef listener,
+                                                   const char *direction,
+                                                   StobeU32 *outTicket) {
   WorkItem item;
   if (speaker.serial == 0 || listener.serial == speaker.serial ||
       !CopyBoundedText(direction, STOBE_MAX_TEXT_BYTES, true, item.text)) {
@@ -834,7 +1115,15 @@ int STOBE_CALL ApiRequestContextualResponse(StobeAddonId id,
   item.generation = speaker.generation;
   item.first = speaker;
   item.second = listener;
-  return Enqueue(item);
+  return Enqueue(item, STOBE_CONTROL_KIND_CONTEXT_REQUEST, outTicket);
+}
+
+int STOBE_CALL ApiRequestContextualResponse(StobeAddonId id,
+                                            StobeActorRef speaker,
+                                            StobeActorRef listener,
+                                            const char *direction) {
+  return ApiRequestContextualResponseTracked(id, speaker, listener, direction,
+                                             NULL);
 }
 
 int STOBE_CALL ApiSendEvent(StobeAddonId id, StobeU32 kind, StobeActorRef actor,
@@ -988,6 +1277,127 @@ int STOBE_CALL ApiQueueGameThreadCallback(StobeAddonId id,
   return Enqueue(item);
 }
 
+// ---- Version 2 entry points ------------------------------------------------
+
+StobeU32 STOBE_CALL ApiGetInteractionState() {
+  return static_cast<StobeU32>(Stobe::Interaction::Status());
+}
+
+int STOBE_CALL ApiSetInteractionEnabled(StobeAddonId id, int enabled,
+                                        StobeU32 *outTicket) {
+  WorkItem item;
+  item.kind = WORK_SET_INTERACTION;
+  item.owner = id;
+  item.generation = PlaythroughSession::Generation();
+  item.flag = enabled != 0 ? 1 : 0;
+  return Enqueue(item, STOBE_CONTROL_KIND_INTERACTION, outTicket);
+}
+
+// Dialogue locks and busy flags share ownership, conflict and cleanup rules.
+int SetActorFlag(bool busy, StobeAddonId id, StobeActorRef actor, bool on) {
+  if (actor.serial == 0) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  State &state = Get();
+  int code = STOBE_OK;
+  bool changed = false;
+  std::string name;
+  {
+    Lock lock(state.lock);
+    if (!IsRegisteredLocked(state, id)) {
+      return STOBE_E_NOT_REGISTERED;
+    }
+    name = AddonNameLocked(state, id);
+    ActorLockTable &table = busy ? state.busy : state.locks;
+    AcquireSRWLockExclusive(&state.locksLock);
+    const bool before = table.Owner(actor.serial, actor.generation) != 0;
+    code = table.Set(id, actor.serial, actor.generation, on);
+    changed = before != (table.Owner(actor.serial, actor.generation) != 0);
+    PublishLockCountLocked(state);
+    ReleaseSRWLockExclusive(&state.locksLock);
+  }
+  if (changed) {
+    Log("ADDON_API: addon '" + name + "' " +
+        (busy ? (on ? "set busy" : "cleared busy") : (on ? "locked" : "unlocked")) +
+        " actor_serial=" + ToString(actor.serial));
+  }
+  return code;
+}
+
+int GetActorFlagOwner(bool busy, StobeActorRef actor, StobeAddonId *outOwner) {
+  if (actor.serial == 0 || !outOwner) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  *outOwner = 0;
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  *outOwner = ActorFlagOwner(busy, actor.serial, actor.generation);
+  return STOBE_OK;
+}
+
+int STOBE_CALL ApiSetActorLock(StobeAddonId id, StobeActorRef actor,
+                               int locked) {
+  return SetActorFlag(false, id, actor, locked != 0);
+}
+
+int STOBE_CALL ApiGetActorLockOwner(StobeActorRef actor, StobeAddonId *outOwner) {
+  return GetActorFlagOwner(false, actor, outOwner);
+}
+
+int STOBE_CALL ApiSetActorBusy(StobeAddonId id, StobeActorRef actor, int busy) {
+  return SetActorFlag(true, id, actor, busy != 0);
+}
+
+int STOBE_CALL ApiGetActorBusyOwner(StobeActorRef actor, StobeAddonId *outOwner) {
+  return GetActorFlagOwner(true, actor, outOwner);
+}
+
+int STOBE_CALL ApiSetControlCallback(StobeAddonId id, StobeControlCallback fn,
+                                     void *userData) {
+  State &state = Get();
+  {
+    Lock lock(state.lock);
+    std::map<StobeAddonId, AddonEntry>::iterator it = state.addons.find(id);
+    if (id == 0 || it == state.addons.end()) {
+      return STOBE_E_NOT_REGISTERED;
+    }
+    it->second.controlCallback = fn;
+    it->second.controlUserData = userData;
+  }
+  if (!fn) {
+    Lock dispatch(state.dispatch); // Wait for an in-flight callback.
+  }
+  return STOBE_OK;
+}
+
+int STOBE_CALL ApiGetControlStatus(StobeAddonId id, StobeU32 ticket,
+                                   StobeControlStatus *outStatus) {
+  if (ticket == 0 || !outStatus ||
+      outStatus->struct_size < sizeof(StobeControlStatus)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  State &state = Get();
+  Lock lock(state.lock);
+  if (!IsRegisteredLocked(state, id)) {
+    return STOBE_E_NOT_REGISTERED;
+  }
+  std::map<StobeU32, Ticket>::const_iterator it = state.tickets.find(ticket);
+  if (it == state.tickets.end() || it->second.owner != id) {
+    return STOBE_E_NOT_FOUND;
+  }
+  outStatus->struct_size = sizeof(StobeControlStatus);
+  outStatus->ticket = ticket;
+  outStatus->kind = it->second.kind;
+  outStatus->state = it->second.state;
+  outStatus->reason = it->second.reason;
+  outStatus->reserved = 0;
+  return STOBE_OK;
+}
+
 BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   StobeAddonApiV1 &api = Get().api;
   api.struct_size = sizeof(StobeAddonApiV1);
@@ -1006,6 +1416,24 @@ BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   api.UnregisterActionBridge = ApiUnregisterActionBridge;
   api.ReportActionResult = ApiReportActionResult;
   api.QueueGameThreadCallback = ApiQueueGameThreadCallback;
+
+  StobeAddonApiV2 &v2 = Get().apiV2;
+  v2.v1 = api;
+  v2.v1.struct_size = sizeof(StobeAddonApiV2);
+  v2.v1.api_version = STOBE_ADDON_API_VERSION_2;
+  v2.capabilities = STOBE_CAP_INTERACTION_CONTROL | STOBE_CAP_ACTOR_LOCKS |
+                    STOBE_CAP_CONTROL_STATUS | STOBE_CAP_ACTOR_BUSY;
+  v2.reserved = 0;
+  v2.GetInteractionState = ApiGetInteractionState;
+  v2.SetInteractionEnabled = ApiSetInteractionEnabled;
+  v2.SetActorLock = ApiSetActorLock;
+  v2.GetActorLockOwner = ApiGetActorLockOwner;
+  v2.SendPlayerInputTracked = ApiSendPlayerInputTracked;
+  v2.RequestContextualResponseTracked = ApiRequestContextualResponseTracked;
+  v2.SetControlCallback = ApiSetControlCallback;
+  v2.GetControlStatus = ApiGetControlStatus;
+  v2.SetActorBusy = ApiSetActorBusy;
+  v2.GetActorBusyOwner = ApiGetActorBusyOwner;
   return TRUE;
 }
 
@@ -1016,6 +1444,12 @@ static_assert(sizeof(StobeActorState) == 8, "StobeActorState ABI");
 static_assert(sizeof(StobeActionRequest) == 56, "StobeActionRequest ABI");
 static_assert(sizeof(StobeAddonApiV1) == 16 + 13 * sizeof(void *),
               "StobeAddonApiV1 ABI");
+static_assert(sizeof(StobeControlStatus) == 24, "StobeControlStatus ABI");
+static_assert(offsetof(StobeAddonApiV2, capabilities) == sizeof(StobeAddonApiV1),
+              "StobeAddonApiV2 embeds V1 first");
+static_assert(sizeof(StobeAddonApiV2) ==
+                  sizeof(StobeAddonApiV1) + 8 + 10 * sizeof(void *),
+              "StobeAddonApiV2 ABI");
 
 } // namespace
 
@@ -1026,21 +1460,41 @@ void GameThreadTick(GameWorld *world) {
   InterlockedExchange(&g_gameThreadId, static_cast<LONG>(GetCurrentThreadId()));
   InterlockedExchange(&g_lastTickTime, static_cast<LONG>(GetTickCount()));
   State &state = Get();
+  const unsigned long generation = PlaythroughSession::Generation();
+  if (state.lockGeneration != generation) {
+    // A load clears every actor lock and busy flag.
+    size_t cleared = 0;
+    {
+      Lock lock(state.lock);
+      AcquireSRWLockExclusive(&state.locksLock);
+      cleared = state.locks.RemoveOtherGenerations(generation) +
+                state.busy.RemoveOtherGenerations(generation);
+      PublishLockCountLocked(state);
+      ReleaseSRWLockExclusive(&state.locksLock);
+    }
+    state.lockGeneration = generation;
+    if (cleared > 0) {
+      Log("ADDON_API: load cleared " + ToString(static_cast<int>(cleared)) +
+          " actor lock(s)/busy flag(s)");
+    }
+  }
   {
     Lock lock(state.lock);
     if (state.work.empty() && state.pending.empty() &&
-        state.outcomes.empty()) {
+        state.outcomes.empty() && state.notices.empty() &&
+        state.seqTickets == 0) {
       return;
     }
   }
   InterlockedExchange(&g_inGameTick, 1);
   ExpirePendingRequests();
-  const unsigned long generation = PlaythroughSession::Generation();
-  // Outcomes and work share the per-frame budget; outcomes go first.
+  ResolveInteractionTickets();
+  // Outcomes, notices and work share the per-frame budget in that order.
   for (size_t processed = 0; processed < kWorkPerTick; ++processed) {
     WorkItem item;
     Outcome outcome;
     bool haveOutcome = false;
+    StobeU32 notice = 0;
     std::string addonName;
     {
       Lock lock(state.lock);
@@ -1048,6 +1502,9 @@ void GameThreadTick(GameWorld *world) {
         outcome = state.outcomes.front();
         state.outcomes.pop_front();
         haveOutcome = true;
+      } else if (!state.notices.empty()) {
+        notice = state.notices.front();
+        state.notices.pop_front();
       } else if (state.work.empty()) {
         break;
       } else {
@@ -1066,17 +1523,30 @@ void GameThreadTick(GameWorld *world) {
       }
       continue;
     }
+    if (notice != 0) {
+      DeliverNotice(notice);
+      continue;
+    }
     if (item.generation != generation) {
+      FinishTicket(item.ticket, STOBE_CONTROL_CANCELLED, STOBE_E_STALE);
       Log("ADDON_API: dropped queued work from an earlier load kind=" +
           ToString(static_cast<int>(item.kind)));
       continue;
     }
     switch (item.kind) {
     case WORK_PLAYER_INPUT:
-      RunPlayerInput(world, item);
+    case WORK_CONTEXT_REQUEST: {
+      const int code = item.kind == WORK_PLAYER_INPUT
+                           ? RunPlayerInput(world, item)
+                           : RunContextRequest(world, item);
+      FinishTicket(item.ticket,
+                   code == STOBE_OK ? STOBE_CONTROL_ACCEPTED
+                                    : STOBE_CONTROL_REJECTED,
+                   code);
       break;
-    case WORK_CONTEXT_REQUEST:
-      RunContextRequest(world, item);
+    }
+    case WORK_SET_INTERACTION:
+      RunSetInteraction(item, addonName);
       break;
     case WORK_EVENT:
       RunEvent(world, item, addonName);
@@ -1094,6 +1564,22 @@ void GameThreadTick(GameWorld *world) {
     }
   }
   InterlockedExchange(&g_inGameTick, 0);
+}
+
+bool IsActorLocked(unsigned int serial) {
+  return ActorFlagOwner(false, serial, PlaythroughSession::Generation()) != 0;
+}
+
+bool IsActorBusy(unsigned int serial) {
+  return ActorFlagOwner(true, serial, PlaythroughSession::Generation()) != 0;
+}
+
+int DialogueGate(unsigned int serial) {
+  const unsigned long generation = PlaythroughSession::Generation();
+  return Stobe::AddonProtocol::ActorGate(
+      Stobe::AddonProtocol::ACTOR_DIALOGUE,
+      ActorFlagOwner(false, serial, generation),
+      ActorFlagOwner(true, serial, generation), 0);
 }
 
 void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand,
@@ -1120,10 +1606,13 @@ void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand
 
 extern "C" __declspec(dllexport) const StobeAddonApiV1 *STOBE_CALL
 Stobe_GetApi(StobeU32 version) {
-  if (version != STOBE_ADDON_API_VERSION) {
+  if (version != STOBE_ADDON_API_VERSION &&
+      version != STOBE_ADDON_API_VERSION_2) {
     return NULL;
   }
   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
   InitOnceExecuteOnce(&once, Stobe::Addon::InitApiTable, NULL, NULL);
-  return &Stobe::Addon::Get().api;
+  // Version 1 keeps its own unchanged table; version 2 embeds a copy of it.
+  return version == STOBE_ADDON_API_VERSION ? &Stobe::Addon::Get().api
+                                            : &Stobe::Addon::Get().apiV2.v1;
 }

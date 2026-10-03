@@ -1,5 +1,7 @@
 #include "AddonProtocol.h"
 
+#include "StobeAddonApi.h"
+
 #include <cstdio>
 
 namespace Stobe {
@@ -247,6 +249,101 @@ std::string JsonEscape(const std::string &value) {
     }
   }
   return out;
+}
+
+int ActorLockTable::Set(unsigned int owner, unsigned int serial,
+                        unsigned long generation, bool locked) {
+  std::map<unsigned int, Entry>::iterator it = entries_.find(serial);
+  if (it != entries_.end() && it->second.generation != generation) {
+    entries_.erase(it); // A lock never survives a load.
+    it = entries_.end();
+  }
+  if (it != entries_.end() && it->second.owner != owner) {
+    return STOBE_E_CONFLICT;
+  }
+  if (!locked) {
+    if (it != entries_.end()) {
+      entries_.erase(it);
+    }
+    return STOBE_OK;
+  }
+  if (it == entries_.end()) {
+    if (entries_.size() >= capacity_) {
+      return STOBE_E_LIMIT;
+    }
+    Entry entry;
+    entry.owner = owner;
+    entry.generation = generation;
+    entries_[serial] = entry;
+  }
+  return STOBE_OK;
+}
+
+unsigned int ActorLockTable::Owner(unsigned int serial,
+                                   unsigned long generation) const {
+  std::map<unsigned int, Entry>::const_iterator it = entries_.find(serial);
+  return it != entries_.end() && it->second.generation == generation
+             ? it->second.owner
+             : 0;
+}
+
+size_t ActorLockTable::RemoveOwner(unsigned int owner) {
+  size_t removed = 0;
+  for (std::map<unsigned int, Entry>::iterator it = entries_.begin();
+       it != entries_.end();) {
+    if (it->second.owner == owner) {
+      entries_.erase(it++);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+  return removed;
+}
+
+size_t ActorLockTable::RemoveOtherGenerations(unsigned long generation) {
+  size_t removed = 0;
+  for (std::map<unsigned int, Entry>::iterator it = entries_.begin();
+       it != entries_.end();) {
+    if (it->second.generation != generation) {
+      entries_.erase(it++);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+  return removed;
+}
+
+int ActorGate(ActorWork work, unsigned int lockOwner, unsigned int busyOwner,
+              unsigned int addon) {
+  if (work == ACTOR_DIALOGUE) {
+    return lockOwner != 0   ? STOBE_E_LOCKED
+           : busyOwner != 0 ? STOBE_E_ACTOR_BUSY
+                            : STOBE_OK;
+  }
+  if (busyOwner == 0 || (work == ACTOR_ADDON_ACTION && busyOwner == addon)) {
+    return STOBE_OK;
+  }
+  return STOBE_E_ACTOR_BUSY;
+}
+
+unsigned int ResolveInteractionTicket(long ticketSeq, long requestedSeq,
+                                      long settledSeq, int settledStatus,
+                                      int &reason) {
+  reason = 0;
+  if (settledSeq == ticketSeq) {
+    if (settledStatus == 0 || settledStatus == 1) {
+      return STOBE_CONTROL_COMPLETED;
+    }
+    reason = STOBE_E_UNCONFIRMED;
+    return STOBE_CONTROL_FAILED;
+  }
+  if (requestedSeq != ticketSeq) {
+    reason = STOBE_E_SUPERSEDED;
+    return STOBE_CONTROL_CANCELLED;
+  }
+  return STOBE_CONTROL_PENDING;
 }
 
 } // namespace AddonProtocol

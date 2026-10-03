@@ -16,10 +16,21 @@ const StobeAddonApiV1 *api = get ? get(STOBE_ADDON_API_VERSION) : NULL;
 
 Check `api->struct_size >= sizeof(StobeAddonApiV1)` before use. Later versions only append fields; a breaking change gets a new version number.
 
+To use [version 2](#version-2-control), ask for it first and fall back:
+
+```c
+const StobeAddonApiV1 *base = get ? get(STOBE_ADDON_API_VERSION_2) : NULL;
+const StobeAddonApiV2 *v2 = (base && base->api_version >= 2 &&
+    base->struct_size >= sizeof(StobeAddonApiV2)) ? (const StobeAddonApiV2 *)base : NULL;
+if (!v2) base = get ? get(STOBE_ADDON_API_VERSION) : NULL;  /* older Stobe */
+```
+
+A Stobe without version 2 returns `NULL` for it. `Stobe_GetApi(1)` keeps returning the unchanged version 1 table. The version 2 table starts with a complete version 1 table, so `&v2->v1` can be used wherever a `StobeAddonApiV1` is expected. Test the `capabilities` bit for a feature before calling it.
+
 ## ABI rules
 
 - Plain C, x64, MSVC calling convention (`__cdecl`, the single x64 convention). The addon may use any MSVC toolset; Stobe itself stays on v100.
-- No C++ or STL objects cross the boundary. Struct sizes are fixed and checked by `static_assert` in Stobe: `StobeActorRef` 8, `StobeAddonInfo` 24, `StobeActorState` 8, `StobeActionRequest` 56, `StobeAddonApiV1` 120 bytes.
+- No C++ or STL objects cross the boundary. Struct sizes are fixed and checked by `static_assert` in Stobe: `StobeActorRef` 8, `StobeAddonInfo` 24, `StobeActorState` 8, `StobeActionRequest` 56, `StobeAddonApiV1` 120 bytes; version 2 adds `StobeControlStatus` 24 and `StobeAddonApiV2` 208 bytes (`capabilities` at offset 120).
 - Strings are UTF-8/ANSI, NUL-terminated. Names are at most 48 bytes and text at most 1000 bytes; longer values are rejected, never truncated.
 - Stobe copies every input before returning. Strings in callbacks belong to Stobe and are valid only during the callback. Nothing is freed across modules.
 
@@ -27,7 +38,7 @@ Check `api->struct_size >= sizeof(StobeAddonApiV1)` before use. Later versions o
 
 Every function may be called from any thread except `GetActorState`, which is valid only inside a Stobe callback. Game-affecting calls are copied into a bounded queue (128 items, 8 processed per frame) and executed during Stobe's `PlayerInterface::update` hook while the world is stable. `STOBE_QUEUED` means accepted, not delivered: a queued request can still be dropped (see the Stobe log, prefix `ADDON_API:`). Network work stays on Stobe's existing background HTTP workers.
 
-Addon callbacks (action handlers and `QueueGameThreadCallback`) always run on the game thread with no Stobe lock held. A callback that faults is caught and its addon is unregistered. `UnregisterAddon` and `UnregisterActionBridge` wait for an in-flight callback when called from another thread, so a DLL can unload after they return. Do not block the game thread inside a callback.
+Addon callbacks (action handlers, `QueueGameThreadCallback` and the version 2 control callback) always run on the game thread with no Stobe lock held. A callback that faults is caught and its addon is unregistered. `UnregisterAddon` and `UnregisterActionBridge` wait for an in-flight callback when called from another thread, so a DLL can unload after they return. Do not block the game thread inside a callback.
 
 ## Actor identity and stale work
 
@@ -50,6 +61,61 @@ Actors are addressed by `StobeActorRef { serial, generation }`. `serial` is the 
 | `QueueGameThreadCallback` | Runs a function once on the game thread unless the load generation changes first. |
 
 StobeServer builds that include the plugin runtime acknowledge `addon_state` and `funcret` with `ok`. They do not store them as unhandled events or call the model; a server extension's `prerequest.php` observes them (see the paired `parity_probe` example). Older servers store `addon_state` through the unhandled-event path with a warning per event. Keep plugin-state events infrequent.
+
+## Version 2: control
+
+Version 2 adds interaction control, per-actor dialogue locks and animation-busy flags, and feedback tickets. Its version 1 functions behave as before.
+
+| Function | Behavior |
+| --- | --- |
+| `GetInteractionState` | `STOBE_INTERACTION_OFF` 0, `ON` 1, `UPDATING` 2 (change being synchronized with StobeServer), `FAILED` 3 (sync failed; Stobe is locally off and retries every 5 s). Only On lets Stobe start AI work. Any thread. |
+| `SetInteractionEnabled` | Requests On or Off exactly like the player's toggle (same server sync, interrupt and epoch change). Queued for the game thread; returns `STOBE_QUEUED`. |
+| `SetActorLock` / `GetActorLockOwner` | Takes or releases a dialogue lock owned by the calling addon. Immediate, any thread. `STOBE_CAP_ACTOR_LOCKS`. |
+| `SetActorBusy` / `GetActorBusyOwner` | Sets or clears an animation-busy flag owned by the calling addon. Immediate, any thread. `STOBE_CAP_ACTOR_BUSY`. |
+| `SendPlayerInputTracked`, `RequestContextualResponseTracked` | The version 1 operations with an optional ticket. |
+| `SetControlCallback` / `GetControlStatus` | Ticket feedback by callback, by polling, or both. |
+
+### Interaction state
+
+The player's toggle and every addon request set one desired state; the newest request wins. Each change of the desired state gets a new request sequence. A sync result is applied only if no newer request arrived while it was in flight; otherwise the same background sync immediately runs again for the newest state (up to four passes, then the normal 5 s retry), so a request made during `UPDATING` is never lost or overwritten by an older reply. Repeating the desired state, or requesting the state StobeServer already confirmed, does not start another sync. A request from a `FAILED` state retries. The player can change the state again at any time, and the toggle UI still ignores clicks while syncing. Interaction requests are carried out during a loaded world's update; one queued before a load is cancelled.
+
+Turning interaction off gates AI dialogue, actions and speech exactly as the player's toggle does: queued lines and actions are discarded (utterances reported cancelled), in-flight replies stop delivering lines, and the line already playing finishes. It never stops microphone recording, speech-to-text upload or transcription, and does not discard a pending transcript; a transcript that arrives while interaction is not On is refused at chat submission with "Stobe is off.", as for the player's toggle.
+
+### Dialogue locks and busy flags
+
+An actor can carry a dialogue lock and an animation-busy flag, independently and possibly from different addons. Each lasts until its owner clears it, the owner unregisters or is disabled after a fault, or a save load or new game starts.
+
+`SetActorLock(id, actor, 1)` keeps the actor out of Stobe's AI dialogue. While locked:
+
+- Bored-event/director speaker and listener selection and rechat responder selection skip the actor; a requested preferred speaker that is locked cancels the event.
+- Autonomy bound to the actor cancels its current action and reports `OBSERVING` with reason `actor_locked`, as for a pause; it resumes when the lock is released.
+- Player chat to the actor is refused with "That character is busy."; addon `SendPlayerInput` and `RequestContextualResponse` naming it as target, speaker or listener are rejected with `STOBE_E_LOCKED`.
+- Response lines for the actor are dropped (utterances are reported as cancelled), including ones already queued. Physical actions, built-in or `ExtCmd`, are not gated by the lock.
+
+`SetActorBusy(id, actor, 1)` stops Stobe from moving or acting with the actor while the addon plays an animation. While busy:
+
+- Built-in actions for the actor from the server are dropped before they are queued, and queued ones are dropped before they run; each is logged (`HOOK_MSG_PROC`/`ACTION_TIMING`), and an autonomy action is reported to autonomy as failed with `actor_busy`. Actions naming the actor only as target are not affected.
+- Follow and travel orders are not reissued until the flag is cleared; a bounded move-to ends as "stopped moving to" without halting the actor.
+- Autonomy pauses with reason `actor_busy`, as for a lock.
+- An `ExtCmd` action for the actor runs only if its bridge belongs to the busy owner, so the owner can coordinate and complete its own animation. Other bridges are not called and the action is reported failed with `actor busy`. An action a bridge already accepted is unaffected; its `ReportActionResult` is delivered as usual.
+- AI dialogue is excluded as for a lock: selection, rechat, request starts and response lines (queued ones included) skip the actor; addon `SendPlayerInput` and `RequestContextualResponse` naming it are rejected with `STOBE_E_ACTOR_BUSY` (with `STOBE_E_LOCKED` if also locked).
+
+Only the owner can clear a lock or busy flag; another addon gets `STOBE_E_CONFLICT` for both set and clear. Repeating a set, or clearing an unset actor, returns `STOBE_OK`. At most 64 actors are locked and 64 busy at a time (`STOBE_E_LIMIT`). Neither ever redirects work to another actor or bypasses Stobe's own checks for dead, unconscious, unloaded or stale actors, loads or menus. Group requests can still list a locked actor as nearby context; the server may write a line for it, which is then dropped. A line or action already running finishes.
+
+Lookups are lock-free when none exist and otherwise a shared-lock map lookup; there is no per-frame scan.
+
+### Tickets and feedback
+
+Pass a non-NULL `out_ticket` to get a ticket. Each ticket leaves `STOBE_CONTROL_PENDING` exactly once:
+
+| Kind | Final states |
+| --- | --- |
+| Player input, contextual request | `ACCEPTED`: Stobe started the request on its network worker. `REJECTED` with `STOBE_E_DISABLED`, `BUSY`, `LOCKED`, `ACTOR_BUSY`, `NOT_FOUND`, `STALE` or `INELIGIBLE` (Stobe's chat path declined it, for example out of range). `CANCELLED` with `STOBE_E_STALE` when a load discarded it before dispatch. |
+| Interaction | `COMPLETED` when StobeServer confirmed the requested state (or it was already confirmed). `FAILED` with `STOBE_E_UNCONFIRMED` when the sync failed. `CANCELLED` with `STOBE_E_SUPERSEDED` when a newer request (from any addon or the player) replaced it first, or `STOBE_E_STALE` for a load before dispatch. |
+
+`ACCEPTED` is final: Stobe has no acknowledgement that a reply was generated, applied or spoken, and never reports one.
+
+With a callback set, Stobe calls it on the game thread once per ticket when it leaves `PENDING`, together with other addon work (8 items per frame). A callback can arrive before a call made on another thread has returned. `GetControlStatus` reads a ticket from any thread. Stobe keeps the newest 128 tickets: a full table evicts the oldest finished ticket whose callback has run, and returns `STOBE_E_LIMIT` when every retained ticket is still pending. Unregistering removes the addon's tickets without callbacks.
 
 ## ExtCmd actions
 
@@ -90,14 +156,15 @@ CHIM's public extension surface is its Papyrus natives in `AIAgentFunctions.psc`
 | `commandEnded`, `commandEndedForActor` | `ReportActionResult` per request id |
 | `isActorTalking(name)` | `GetActorState` → `STOBE_ACTOR_IN_STOBE_SPEECH` by actor reference |
 | `stopAllDialogue` | `CancelDialogue` |
-| `getChimInteractionState` | `GetRuntimeFlags` → `STOBE_RUNTIME_INTERACTION_ENABLED` (read only) |
+| `getChimInteractionState` | `GetRuntimeFlags` → `STOBE_RUNTIME_INTERACTION_ENABLED`; v2 `GetInteractionState` |
+| `setChimInteractionEnabled` | v2 `SetInteractionEnabled` |
+| `setLocked` | v2 `SetActorLock` |
+| `setAnimationBusy` | v2 `SetActorBusy` |
 | `Data/CHIM/server-plugins/<pkg>/<ver>.dwpkg` | `mods/<Addon>/Stobe/server-plugins/<pkg>/<ver>.dwpkg` (below) |
 
 Not exposed:
 
 - `sendMessage`, `requestMessage` and other untargeted or name-addressed calls (`getAgentByName`, `removeAgentByName`, name strings in the `…ForActor` variants): Stobe routes by actor reference only.
-- `setAnimationBusy`, `setLocked`: Stobe has no per-actor lock honored by speaker selection, autonomy and rechat. Adding one requires changes to those selectors; a flag the runtime ignored would be misleading. Use `GetActorState` and `GetRuntimeFlags` to avoid requesting dialogue for busy actors.
-- `setChimInteractionEnabled`: the interaction toggle remains player-owned.
 - CHIM agent management and Skyrim engine helpers (`setDrivenByAI`, `addBasicProfile`, nearby-agent queries, location markers, `SayTo`, furniture/container checks, music scenes, bounty/arrest/item-transfer confirmations, screenshots/Soul Gaze, `IntCmd`, `WebCmd`, JSON form helpers).
 - CHIM UI and configuration plumbing (MCM snapshots, Prisma/history/overlay panels, `setConf`/`get_conf_i`, microphone recording/open mic, `sendLocationFast`/`sendFactionFast`/`sendNPCFast`). Stobe owns its UI, settings and context capture.
 
@@ -126,4 +193,4 @@ Limitations: changing the server target during a session needs a game restart to
 
 ## Validation status
 
-Portable tests cover `ExtCmd` parsing, strict serials, the `ExtCmd` speaker-serial decision, package name/version/archive rules and the package API field readers. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events and package upload against a live server require in-game testing.
+Portable tests cover `ExtCmd` parsing, strict serials, the `ExtCmd` speaker-serial decision, package name/version/archive rules, the package API field readers, the version 1 and 2 table layouts, lock and busy-flag ownership, the lock/busy gate for dialogue, built-in and `ExtCmd` actions, and interaction ticket resolution. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events, package upload, interaction sync against a live server and lock and busy enforcement in game require in-game testing.
