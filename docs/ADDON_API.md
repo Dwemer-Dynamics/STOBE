@@ -25,12 +25,12 @@ const StobeAddonApiV2 *v2 = (base && base->api_version >= 2 &&
 if (!v2) base = get ? get(STOBE_ADDON_API_VERSION) : NULL;  /* older Stobe */
 ```
 
-[Version 3](#version-3-agents-and-context) is requested the same way with `STOBE_ADDON_API_VERSION_3`, checking `api_version >= 3` and `struct_size >= sizeof(StobeAddonApiV3)`, and falling back to 2 then 1. A Stobe without version 2 returns `NULL` for it. `Stobe_GetApi(1)` keeps returning the unchanged version 1 table. The version 2 table starts with a complete version 1 table, so `&v2->v1` can be used wherever a `StobeAddonApiV1` is expected. Test the `capabilities` bit for a feature before calling it.
+[Version 3](#version-3-agents-and-context) is requested the same way with `STOBE_ADDON_API_VERSION_3`, checking `api_version >= 3` and `struct_size >= sizeof(StobeAddonApiV3)`, and falling back to 2 then 1. [Version 4](#version-4-addon-messages-and-reactions) is requested with `STOBE_ADDON_API_VERSION_4`, checking `api_version >= 4` and `struct_size >= sizeof(StobeAddonApiV4)`, then falling back to 3. A Stobe without version 2 returns `NULL` for it. `Stobe_GetApi(1)` keeps returning the unchanged version 1 table. The version 2 table starts with a complete version 1 table, so `&v2->v1` can be used wherever a `StobeAddonApiV1` is expected. Test the `capabilities` bit for a feature before calling it.
 
 ## ABI rules
 
 - Plain C, x64, MSVC calling convention (`__cdecl`, the single x64 convention). The addon may use any MSVC toolset; Stobe itself stays on v100.
-- No C++ or STL objects cross the boundary. Struct sizes are fixed and checked by `static_assert` in Stobe: `StobeActorRef` 8, `StobeAddonInfo` 24, `StobeActorState` 8, `StobeActionRequest` 56, `StobeAddonApiV1` 120 bytes; version 2 adds `StobeControlStatus` 24 and `StobeAddonApiV2` 208 bytes (`capabilities` at offset 120); version 3 adds `StobeAgentInfo` 72 and `StobeAddonApiV3` 256 bytes (first new call at offset 208). The version 1 and 2 tables are unchanged.
+- No C++ or STL objects cross the boundary. Struct sizes are fixed and checked by `static_assert` in Stobe: `StobeActorRef` 8, `StobeAddonInfo` 24, `StobeActorState` 8, `StobeActionRequest` 56, `StobeAddonApiV1` 120 bytes; version 2 adds `StobeControlStatus` 24 and `StobeAddonApiV2` 208 bytes (`capabilities` at offset 120); version 3 adds `StobeAgentInfo` 72 and `StobeAddonApiV3` 256 bytes (first new call at offset 208); version 4 adds `StobeAddonApiV4` 272 bytes (first new call at offset 256). The version 1, 2 and 3 tables and their capability bits are unchanged.
 - Strings are UTF-8/ANSI, NUL-terminated. Names are at most 48 bytes and text at most 1000 bytes; longer values are rejected, never truncated.
 - Stobe copies every input before returning. Strings in callbacks belong to Stobe and are valid only during the callback. Nothing is freed across modules.
 
@@ -145,9 +145,62 @@ Stobe's automatic eligibility never overrides a registration: a registered actor
 
 `RequestContextRefresh(id, actor, parts)` with `STOBE_REFRESH_CONTEXT` and/or `STOBE_REFRESH_INVENTORY` returns `STOBE_QUEUED` once the request is recorded. Requests for one actor merge into one entry (at most 32 actors pending; `STOBE_E_LIMIT` beyond that), which remembers each addon's parts: when an addon unregisters or faults, only its parts are withdrawn, and setting `AUTO` or `UNREGISTERED` withdraws only that addon's pending registration profile upload. Profiles already uploaded are never deleted. They run during Stobe's existing inventory sweep (about every 6 s, up to 4 actors per sweep) on the game thread, if the actor is still loaded: a context snapshot is uploaded and the inventory goes through the existing hash-checked inventory sync, which skips an unchanged inventory sent in the last few seconds. Uploads use Stobe's existing background HTTP worker; the API call never touches the network or the engine. Pending requests are dropped on load. `STOBE_QUEUED` is not a server confirmation and no ticket is issued.
 
-### Not in this version
+## Version 4: addon messages and reactions
 
-`sendMessageToActor` whisper/shout types and separate explicit versus automatic contextual-request entry points are deferred to a later version; `SendPlayerInput` stays normal chat.
+Version 4 (`STOBE_CAP_ADDON_MESSAGE`, `STOBE_CAP_ADDON_REACTION`) adds two calls. The table starts with a complete version 3 table whose `capabilities` add the new bits. `SendPlayerInput` and `RequestContextualResponse` keep their version 1 behavior.
+
+`SendAddonMessage(id, actor, mode, text, &ticket)`: the player speaker says `text` to `actor` through Stobe's chat request and existing stream pipeline. The mode is fixed for that request; the player's selected chat mode and autochat toggle neither change it nor are changed:
+
+| `STOBE_MESSAGE_*` | Request mode | Effect |
+| --- | --- | --- |
+| `NORMAL` | `talk` | Spoken player line and normal reply, even while the player has whisper, director or autochat selected. |
+| `WHISPER` | `whisper` | Private line and reply; no automatic rechat, as for the chat box. |
+| `SHOUT` | `shout` | Loud line, chat box shout range. |
+| `CONTEXT` | `inject` | Stored by StobeServer as injected context: no player line, no model reply. |
+
+No new audio effects are added. The target must be alive and conscious; `NORMAL`, `WHISPER` and `SHOUT` then pass the chat box's own range, area and target checks for that mode, and `CONTEXT` the normal chat range and area (the chat path itself skips them for injection). A refusal there is `STOBE_E_INELIGIBLE`.
+
+`RequestAddonReaction(id, speaker, listener, eligibility, direction, &ticket)`: a speaker-locked reaction on the existing bored/director endpoint, as `RequestContextualResponse`. `listener.serial` 0 lets Stobe pick the player (if in range) or the nearest automatic agent; it never picks an unregistered actor. Before the request starts, Stobe checks that the speaker is alive, conscious and within conversation area and bored-event range of the player speaker, and a named listener the same relative to the speaker. Then:
+
+- `STOBE_REACTION_EXPLICIT` skips only agent eligibility: the named actors may be `UNREGISTERED` or outside chat range of the player (but inside the reach above).
+- `STOBE_REACTION_ELIGIBLE` also requires each named actor to be an agent (automatic or `REGISTERED`, never `UNREGISTERED`) and Stobe's bored events to be enabled. Stobe has no other per-actor activity policy. The server's bored-event chance does not apply to either kind, since both use the deterministic director mode.
+
+### Gates
+
+Both calls are refused, before Stobe changes any state, with:
+
+- `STOBE_E_STALE`/`STOBE_E_NOT_FOUND`: reference from an earlier load, or the serial is not a loaded character.
+- `STOBE_E_DISABLED`: interaction is off.
+- `STOBE_E_BUSY`: a reply is streaming (including an addon follow-up), a director scene runs, TTS is playing or a Stobe line is queued, the chat box is open, or the game is paused.
+- `STOBE_E_LOCKED`/`STOBE_E_ACTOR_BUSY`: a dialogue lock or busy flag on any named actor.
+- `STOBE_E_INELIGIBLE`: the checks above, or Stobe's request path declined to start.
+
+Neither call interrupts or cancels dialogue: unlike a player send, an addon message keeps the current interrupt generation and leaves follow/travel orders and queued non-speech actions alone, and the player's next send still cancels its reply. Each call holds Stobe's stream slot from the moment its request starts, so a second call in the same tick is `STOBE_E_BUSY`. None of them is queued for later: a busy refusal is final, and the addon decides whether to retry. Stobe has no combat-specific dialogue gate; the alive/conscious/down checks apply. The call returns `STOBE_QUEUED`; the ticket (V2 kind `PLAYER_INPUT` for messages, `CONTEXT_REQUEST` for reactions) ends `ACCEPTED` when the stream request started or `REJECTED` with the code. As in version 2, `ACCEPTED` does not mean a line was generated or spoken.
+
+### Structured state
+
+There is no new event kind or command. Send structured addon state with the existing `SendEvent(STOBE_EVENT_PLUGIN_STATE, actor, key, json)`: Stobe sends an `addon_state` event whose text is `<Addon>: <key>=<json>`, namespaced by the registered addon name, at most 48 key bytes and 1000 text bytes, within the 20-events-per-10-seconds limit. The value is a plain text field: Stobe does not parse or validate it, so keeping it one valid, bounded JSON object (with a version field) is the addon author's convention. StobeServer's `addon_state` case only answers `ok`; its `prerequest.php` observers can parse it (see the ParityProbe extension). It starts no model request. Use `CONTEXT` messages or `SendEvent(STOBE_EVENT_INFO)` for text the model should see. No call writes arbitrary events, URLs or database rows.
+
+### Example
+
+```c
+const StobeAddonApiV1 *base = get(STOBE_ADDON_API_VERSION_4);
+const StobeAddonApiV4 *v4 = (base && base->api_version >= 4 &&
+    base->struct_size >= sizeof(StobeAddonApiV4)) ? (const StobeAddonApiV4 *)base : 0;
+/* Game thread, e.g. inside a QueueGameThreadCallback callback. */
+StobeAgentInfo agent; agent.struct_size = sizeof(agent);
+StobeU32 count = 0, ticket = 0;
+if (v4 && (v4->v3.v2.capabilities & STOBE_CAP_ADDON_MESSAGE) &&
+    v4->v3.ListAgents(id, &agent, 1, &count) == STOBE_OK && count == 1) {
+  v4->SendAddonMessage(id, agent.actor, STOBE_MESSAGE_WHISPER,
+                       "Meet me behind the bar.", &ticket);
+  /* SetControlCallback receives ACCEPTED, or REJECTED with STOBE_E_BUSY etc. */
+  base->SendEvent(id, STOBE_EVENT_PLUGIN_STATE, agent.actor, "quest.stage",
+                  "{\"v\":1,\"type\":\"stage\",\"name\":\"meet\",\"text\":\"asked\"}");
+}
+```
+
+If you call either function from inside an action handler, it is refused while that action's own reply holds the stream. The opt-in ParityProbe demo instead runs one operation 10 seconds later (see its [README](../examples/plugin-parity/README.md)).
 
 ## ExtCmd actions
 
@@ -190,10 +243,10 @@ CHIM's public extension surface is its Papyrus natives in `AIAgentFunctions.psc`
 
 | CHIM | Stobe v1 |
 | --- | --- |
-| `sendMessageToActor(msg, type, actor)` | `SendPlayerInput` (normal chat only; whisper/shout/injection types are not exposed) |
-| `requestMessageForActor`, `requestMessageForEligibleActor` | `RequestContextualResponse` (speaker-locked; rejected while busy instead of queued) |
+| `sendMessageToActor(msg, type, actor)` | v4 `SendAddonMessage` (`NORMAL`, `WHISPER`, `SHOUT`, `CONTEXT`); `SendPlayerInput` stays normal chat |
+| `requestMessageForActor`, `requestMessageForEligibleActor` | v4 `RequestAddonReaction` with `EXPLICIT` or `ELIGIBLE`; `RequestContextualResponse` (speaker-locked; rejected while busy instead of queued) |
 | `logMessage`, `logMessageForActor` | `SendEvent(STOBE_EVENT_INFO)` |
-| `PostGameData(json)` | Partial: `SendEvent(STOBE_EVENT_PLUGIN_STATE)` bounded key/value records |
+| `PostGameData(json)` | Partial: `SendEvent(STOBE_EVENT_PLUGIN_STATE)` bounded key/JSON records for server observers |
 | `ExtCmd` → `<Bridge>.DispatchExternalCommand(npc, command, parameter)` | `RegisterActionBridge`; receives the actor reference instead of the NPC name |
 | `commandEnded`, `commandEndedForActor` | `ReportActionResult` per request id |
 | `isActorTalking(name)` | `GetActorState` → `STOBE_ACTOR_IN_STOBE_SPEECH` by actor reference |
@@ -238,4 +291,4 @@ Limitations: changing the server target during a session needs a game restart to
 
 ## Validation status
 
-Portable tests cover `ExtCmd` parsing, strict serials, the `ExtCmd` speaker-serial decision, package name/version/archive rules, the package API field readers, the version 1, 2 and 3 table layouts, lock and busy-flag ownership, agent registration ownership, ambiguous agent names, the lock/busy gate for dialogue, built-in and `ExtCmd` actions, and interaction ticket resolution. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events, package upload, interaction sync against a live server, lock and busy enforcement, agent queries, registration effects on selection and refresh uploads in game require in-game testing.
+Portable tests cover `ExtCmd` parsing, strict serials, the `ExtCmd` speaker-serial decision, package name/version/archive rules, the package API field readers, the version 1 to 4 table layouts, version 4 message request modes and reaction eligibility decisions, lock and busy-flag ownership, agent registration ownership, ambiguous agent names, the lock/busy gate for dialogue, built-in and `ExtCmd` actions, and interaction ticket resolution. The v100 x64 build checks compilation, ABI sizes and the export. Loading, hook timing, chat/continue dispatch, `ExtCmd` round trips, result events, package upload, interaction sync against a live server, lock and busy enforcement, agent queries, registration effects on selection, refresh uploads, and version 4 message delivery, whisper privacy, injection storage, reaction gates and listener choice in game require in-game testing.

@@ -7,7 +7,12 @@
 // interaction state only when it is already On, and releases a lock and a
 // busy flag in the same callback that set them. With API version 3 it only
 // reads agents (list, closest, registration); it never registers, unregisters
-// or refreshes anyone. Without Stobe it stays inert.
+// or refreshes anyone. With API version 4 and the environment variable
+// STOBE_PARITY_PROBE_V4_DEMO=1 set before Kenshi starts, Ping@<op> (normal,
+// whisper, shout, context, reactexplicit, reacteligible or state) runs that one
+// operation 10 seconds later and logs its code and ticket; it may write NPC
+// context or start dialogue, so it is off by default. Report never does.
+// Without Stobe it stays inert.
 #include <windows.h>
 
 #include <stdio.h>
@@ -20,6 +25,8 @@ namespace {
 const StobeAddonApiV1 *g_api = NULL;
 const StobeAddonApiV2 *g_v2 = NULL; // NULL with a version 1 Stobe.
 const StobeAddonApiV3 *g_v3 = NULL; // NULL before version 3.
+const StobeAddonApiV4 *g_v4 = NULL; // NULL before version 4.
+bool g_v4Demo = false;              // STOBE_PARITY_PROBE_V4_DEMO=1
 StobeAddonId g_addon = 0;
 char g_logPath[MAX_PATH] = {0};
 
@@ -127,6 +134,113 @@ void ExerciseAgents(StobeActorRef actor) {
   LogLine(line);
 }
 
+// Opt-in version 4 demo: Ping@<op> runs one operation 10 seconds later, when
+// the Ping's own reply has usually settled. At most one is pending.
+const char *const kDemoOps[] = {"normal",       "whisper",      "shout",
+                                "context",      "reactexplicit", "reacteligible",
+                                "state"};
+const int kDemoOpCount = sizeof(kDemoOps) / sizeof(kDemoOps[0]);
+volatile LONG g_demoToken = 0; // nonzero while a demo is pending
+LONG g_demoNext = 0;
+int g_demoOp = 0;              // written before g_demoToken is published
+StobeActorRef g_demoActor = {0, 0};
+
+// Game thread. Claims the token, so a dropped or timed-out run never fires.
+void STOBE_CALL RunDemo(void *token) {
+  const LONG mine = static_cast<LONG>(reinterpret_cast<LONG_PTR>(token));
+  if (InterlockedCompareExchange(&g_demoToken, 0, mine) != mine) {
+    return;
+  }
+  const StobeU32 caps = g_v4->v3.v2.capabilities;
+  const StobeActorRef anyone = {0, 0};
+  StobeU32 ticket = 0;
+  int code = STOBE_E_BUSY; // world not ready: log the refusal, never retry
+  if (!(g_api->GetRuntimeFlags() & STOBE_RUNTIME_WORLD_READY)) {
+    code = STOBE_E_BUSY;
+  } else if (g_demoOp <= 3) { // STOBE_MESSAGE_NORMAL..CONTEXT
+    code = (caps & STOBE_CAP_ADDON_MESSAGE)
+               ? g_v4->SendAddonMessage(g_addon, g_demoActor,
+                                        static_cast<StobeU32>(g_demoOp),
+                                        "ParityProbe checked in with you.",
+                                        &ticket)
+               : STOBE_E_INVALID_ARGUMENT;
+  } else if (g_demoOp <= 5) {
+    code = (caps & STOBE_CAP_ADDON_REACTION)
+               ? g_v4->RequestAddonReaction(
+                     g_addon, g_demoActor, anyone,
+                     g_demoOp == 4 ? STOBE_REACTION_EXPLICIT
+                                   : STOBE_REACTION_ELIGIBLE,
+                     "React briefly to the probe.", &ticket)
+               : STOBE_E_INVALID_ARGUMENT;
+  } else {
+    // Structured state rides the existing addon_state route; no model call.
+    code = g_api->SendEvent(
+        g_addon, STOBE_EVENT_PLUGIN_STATE, g_demoActor, "probe.status",
+        "{\"v\":1,\"type\":\"status\",\"name\":\"probe\",\"text\":\"ok\"}");
+  }
+  char line[160];
+  sprintf_s(line, sizeof(line), "v4 demo %s serial=%u code=%d ticket=%u",
+            kDemoOps[g_demoOp], g_demoActor.serial, code, ticket);
+  LogLine(line);
+}
+
+// Background thread: sleeps, then only queues RunDemo. No engine access.
+DWORD WINAPI DemoDelayThread(LPVOID token) {
+  Sleep(10000);
+  const int queued = g_api->QueueGameThreadCallback(g_addon, RunDemo, token);
+  const LONG mine = static_cast<LONG>(reinterpret_cast<LONG_PTR>(token));
+  char line[64];
+  sprintf_s(line, sizeof(line), "v4 demo queue=%d", queued);
+  LogLine(line);
+  // Stobe drops the callback on a load change; release the slot after 60 s.
+  Sleep(queued >= 0 ? 60000 : 0);
+  if (InterlockedCompareExchange(&g_demoToken, 0, mine) == mine) {
+    LogLine("v4 demo did not run (queue failed or load changed)");
+  }
+  return 0;
+}
+
+// Game thread, from Ping. Unknown parameters leave Ping read-only.
+void ScheduleDemo(const StobeActionRequest *request) {
+  if (!g_v4Demo || !g_v4) {
+    return;
+  }
+  int op = 0;
+  while (op < kDemoOpCount && _stricmp(request->parameter, kDemoOps[op]) != 0) {
+    ++op;
+  }
+  if (op == kDemoOpCount) {
+    LogLine("v4 demo: parameter is not a demo operation; read-only Ping");
+    return;
+  }
+  LONG token = InterlockedIncrement(&g_demoNext);
+  if (token == 0) {
+    token = InterlockedIncrement(&g_demoNext);
+  }
+  if (g_demoToken != 0) {
+    LogLine("v4 demo refused: one is already pending");
+    return;
+  }
+  g_demoOp = op;
+  g_demoActor = request->actor; // serial + generation; Stobe rejects stale refs
+  if (InterlockedCompareExchange(&g_demoToken, token, 0) != 0) {
+    LogLine("v4 demo refused: one is already pending");
+    return;
+  }
+  HANDLE thread = CreateThread(NULL, 0, DemoDelayThread,
+                               reinterpret_cast<LPVOID>(LONG_PTR(token)), 0, NULL);
+  if (!thread) {
+    g_demoToken = 0;
+    LogLine("v4 demo refused: no delay thread");
+    return;
+  }
+  CloseHandle(thread);
+  char line[96];
+  sprintf_s(line, sizeof(line), "v4 demo %s scheduled in 10 s serial=%u",
+            kDemoOps[op], request->actor.serial);
+  LogLine(line);
+}
+
 // Runs on Kenshi's game thread. Reads state only, then reports the result.
 int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
   if (!request || request->struct_size < sizeof(StobeActionRequest) ||
@@ -163,13 +277,23 @@ int STOBE_CALL OnParityAction(void *, const StobeActionRequest *request) {
   if (!report) {
     ExerciseControl(request->actor);
     ExerciseAgents(request->actor);
+    ScheduleDemo(request);
   }
   return reported >= 0 ? STOBE_ACTION_ACCEPTED : STOBE_ACTION_REJECTED;
 }
 
-// Prefers version 3, then 2; an older Stobe returns NULL for newer versions.
+// Prefers version 4, then 3 and 2; an older Stobe returns NULL for newer
+// versions.
 const StobeAddonApiV1 *GetStobeApi(StobeGetApiFn getApi) {
-  const StobeAddonApiV1 *api = getApi(STOBE_ADDON_API_VERSION_3);
+  const StobeAddonApiV1 *api = getApi(STOBE_ADDON_API_VERSION_4);
+  if (api && api->api_version >= STOBE_ADDON_API_VERSION_4 &&
+      api->struct_size >= sizeof(StobeAddonApiV4)) {
+    g_v4 = reinterpret_cast<const StobeAddonApiV4 *>(api);
+    g_v3 = &g_v4->v3;
+    g_v2 = &g_v3->v2;
+    return api;
+  }
+  api = getApi(STOBE_ADDON_API_VERSION_3);
   if (api && api->api_version >= STOBE_ADDON_API_VERSION_3 &&
       api->struct_size >= sizeof(StobeAddonApiV3)) {
     g_v3 = reinterpret_cast<const StobeAddonApiV3 *>(api);
@@ -237,6 +361,10 @@ DWORD WINAPI ConnectThread(LPVOID) {
 // RE_Kenshi plugin entry point (same C++ signature as Stobe's).
 __declspec(dllexport) void startPlugin() {
   InitLogPath();
+  char demo[4] = {0};
+  g_v4Demo = GetEnvironmentVariableA("STOBE_PARITY_PROBE_V4_DEMO", demo,
+                                     sizeof(demo)) == 1 &&
+             demo[0] == '1';
   HANDLE thread = CreateThread(NULL, 0, ConnectThread, NULL, 0, NULL);
   if (thread) {
     CloseHandle(thread);

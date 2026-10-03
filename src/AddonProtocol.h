@@ -172,6 +172,25 @@ int MatchAgentName(const std::vector<std::pair<std::string, unsigned int> > &age
                    const std::string &name, bool complete,
                    unsigned int &serialOut);
 
+// Chat-box mode and fixed request mode for a STOBE_MESSAGE_* addon message,
+// independent of the player's selected mode and autochat toggle. False for
+// an unknown mode.
+bool AddonMessageModes(unsigned int mode, std::string &selectedOut,
+                       std::string &requestOut);
+
+// Agent eligibility of a reaction whose hard gates (load, alive, range, area,
+// busy, locks) already passed. EXPLICIT is always STOBE_OK; ELIGIBLE needs
+// bored events on and every named actor an agent and not unregistered.
+struct ReactionActor {
+  bool named;      // false for an unset listener
+  bool autoAgent;  // in chat range of the player speaker
+  bool registered; // STOBE_AGENT_REGISTERED
+  bool excluded;   // STOBE_AGENT_UNREGISTERED
+};
+int ReactionEligibility(unsigned int eligibility, bool boredEventsEnabled,
+                        const ReactionActor &speaker,
+                        const ReactionActor &listener);
+
 // Index of the first option not excluded: the option the chat target dropdown
 // selects by itself (options are nearest first). Returns excluded.size() when
 // every option is excluded, so nothing is selected until the player picks.
