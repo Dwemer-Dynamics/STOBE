@@ -991,6 +991,27 @@ int main() {
                AP::ParseExtCommand("ExtCmdBad-Name_Ping", ext), false);
     ExpectBool("Built-in action is not ExtCmd", AP::IsExtCommand("ATTACK"),
                false);
+    unsigned int serial = 7;
+    ExpectBool("Strict serial accepts max uint32",
+               AP::ParseStrictSerial("4294967295", serial), true);
+    ExpectUInt32("Strict serial keeps max uint32 value", serial, 4294967295u);
+    ExpectBool("Strict serial rejects uint32 overflow",
+               AP::ParseStrictSerial("4294967296", serial), false);
+    ExpectUInt32("Strict serial clears output on failure", serial, 0u);
+    ExpectBool("Strict serial rejects long overflow",
+               AP::ParseStrictSerial("99999999999999999999", serial), false);
+    ExpectBool("Strict serial rejects digit prefix with junk",
+               AP::ParseStrictSerial("123junk", serial), false);
+    ExpectBool("Strict serial rejects trailing space",
+               AP::ParseStrictSerial("123 ", serial), false);
+    ExpectBool("Strict serial rejects sign",
+               AP::ParseStrictSerial("+123", serial), false);
+    ExpectBool("Strict serial rejects zero", AP::ParseStrictSerial("0", serial),
+               false);
+    ExpectBool("Strict serial rejects empty", AP::ParseStrictSerial("", serial),
+               false);
+    ExpectBool("Strict serial accepts plain decimal",
+               AP::ParseStrictSerial("123", serial) && serial == 123u, true);
     std::string stem;
     ExpectBool("Package archive accepts dwpkg",
                AP::SplitPackageArchiveName("1.2.0.DWPKG", stem), true);

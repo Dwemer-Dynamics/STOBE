@@ -22,7 +22,8 @@
  *
  * Identity: actors are addressed by Kenshi handle serial plus the Stobe load
  * generation in which the serial was observed. References from an earlier
- * save/load are rejected as STOBE_E_STALE. There is no name-based routing.
+ * save/load are rejected as STOBE_E_STALE when the call is made; work queued
+ * before a load is discarded at dispatch. There is no name-based routing.
  */
 #ifndef STOBE_ADDON_API_H
 #define STOBE_ADDON_API_H
