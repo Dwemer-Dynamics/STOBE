@@ -4,6 +4,8 @@ A minimal native addon for testing Stobe's [addon API](../../docs/ADDON_API.md).
 
 It asks for API version 2 and falls back to version 1. With version 2 it registers a control callback and, after each Ping, makes control calls with no lasting effect: it requests interaction On only when it is already On (never Off), locks the actor, reads the owner and unlocks it, and sets, reads and clears the actor's busy flag (when `STOBE_CAP_ACTOR_BUSY` is reported), all within the same callback.
 
+With version 3 (`STOBE_CAP_AGENTS`) it then only reads agents: `ListAgents` (up to 8), `FindClosestAgent` from the player and `GetAgentRegistration` for the actor. It never registers, unregisters or refreshes an actor.
+
 Nothing here is built or loaded by Stobe's own build or package. Test it in a separate Kenshi/mod setup, never with real saves you care about.
 
 ## Build
@@ -50,7 +52,7 @@ Use a bridge name that starts with a letter. Stobe accepts bridges that begin wi
 When the model selects the action for an NPC:
 
 - `stobe.log`: `ADDON_ACTION: ExtCmdParityProbe_Ping accepted by bridge ParityProbe request=<n> actor_serial=<serial>`, then `external action ExtCmdParityProbe_Ping completed: pong serial=… state=0 flags=0x07 target=<parameter>`.
-- `ParityProbe.log`: the same request and report code `1` (`STOBE_QUEUED`). With version 2, `v2 interaction=1 request=1 ticket=<t> lock=0 owner_is_self=1 unlock=0 busy=0 busy_owner_is_self=1 clear=0`, then on a later frame `control ticket=<t> kind=3 state=4 reason=0` (completed without a server call). With interaction not On, no interaction request is made.
+- `ParityProbe.log`: the same request and report code `1` (`STOBE_QUEUED`). With version 2, `v2 interaction=1 request=1 ticket=<t> lock=0 owner_is_self=1 unlock=0 busy=0 busy_owner_is_self=1 clear=0`, then on a later frame `control ticket=<t> kind=3 state=4 reason=0` (completed without a server call). With version 3, `v3 agents=0 count=<n> first=<name> closest=0 serial=<s> registration=0 mode=0 owner=0`. With interaction not On, no interaction request is made.
 - The server receives `funcret` data `command@ExtCmdParityProbe_Ping@<parameter>@completed: pong …` and an `infoaction` line for the NPC.
 
 An unknown action such as `ExtCmdParityProbe_Explode` is rejected by the handler and reported as failed. If the addon is not installed, Stobe reports `failed: no registered handler for bridge ParityProbe`.

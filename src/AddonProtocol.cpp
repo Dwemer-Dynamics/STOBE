@@ -328,6 +328,142 @@ int ActorGate(ActorWork work, unsigned int lockOwner, unsigned int busyOwner,
   return STOBE_E_ACTOR_BUSY;
 }
 
+int SetAgentMode(ActorLockTable &registered, ActorLockTable &unregistered,
+                 unsigned int owner, unsigned int serial,
+                 unsigned long generation, unsigned int mode) {
+  const unsigned int inOwner = registered.Owner(serial, generation);
+  const unsigned int outOwner = unregistered.Owner(serial, generation);
+  if ((inOwner != 0 && inOwner != owner) ||
+      (outOwner != 0 && outOwner != owner)) {
+    return STOBE_E_CONFLICT;
+  }
+  ActorLockTable &keep = mode == STOBE_AGENT_UNREGISTERED ? unregistered
+                                                         : registered;
+  ActorLockTable &drop = mode == STOBE_AGENT_UNREGISTERED ? registered
+                                                         : unregistered;
+  if (mode == STOBE_AGENT_AUTO) {
+    registered.Set(owner, serial, generation, false);
+    unregistered.Set(owner, serial, generation, false);
+    return STOBE_OK;
+  }
+  const int code = keep.Set(owner, serial, generation, true);
+  if (code == STOBE_OK) {
+    drop.Set(owner, serial, generation, false);
+  }
+  return code;
+}
+
+size_t FirstIncludedIndex(const std::vector<bool> &excluded) {
+  for (size_t i = 0; i < excluded.size(); ++i) {
+    if (!excluded[i]) {
+      return i;
+    }
+  }
+  return excluded.size();
+}
+
+int MatchAgentName(const std::vector<std::pair<std::string, unsigned int> > &agents,
+                   const std::string &name, bool complete,
+                   unsigned int &serialOut) {
+  serialOut = 0;
+  const std::string wanted = LowerAscii(name);
+  for (size_t i = 0; i < agents.size(); ++i) {
+    if (agents[i].second == 0 || LowerAscii(agents[i].first) != wanted) {
+      continue;
+    }
+    if (serialOut != 0 && serialOut != agents[i].second) {
+      serialOut = 0;
+      return STOBE_E_AMBIGUOUS;
+    }
+    serialOut = agents[i].second;
+  }
+  if (!complete) {
+    serialOut = 0;
+    return STOBE_E_LIMIT;
+  }
+  return serialOut != 0 ? STOBE_OK : STOBE_E_NOT_FOUND;
+}
+
+bool RefreshTable::CanAdd(unsigned int serial) const {
+  return entries_.count(serial) != 0 || entries_.size() < capacity_;
+}
+
+bool RefreshTable::Add(unsigned int owner, unsigned int serial,
+                       unsigned long generation, unsigned int parts) {
+  if (!CanAdd(serial)) {
+    return false;
+  }
+  Entry &entry = entries_[serial];
+  if (entry.parts.empty() || entry.generation != generation) {
+    entry.parts.clear();
+    entry.generation = generation;
+  }
+  entry.parts[owner] |= parts;
+  return true;
+}
+
+void RefreshTable::Cancel(unsigned int owner, unsigned int serial,
+                          unsigned int parts) {
+  std::map<unsigned int, Entry>::iterator it = entries_.find(serial);
+  if (it == entries_.end()) {
+    return;
+  }
+  std::map<unsigned int, unsigned int>::iterator share =
+      it->second.parts.find(owner);
+  if (share != it->second.parts.end() && (share->second &= ~parts) == 0) {
+    it->second.parts.erase(share);
+  }
+  if (it->second.parts.empty()) {
+    entries_.erase(it);
+  }
+}
+
+void RefreshTable::RemoveOwner(unsigned int owner) {
+  for (std::map<unsigned int, Entry>::iterator it = entries_.begin();
+       it != entries_.end();) {
+    it->second.parts.erase(owner);
+    if (it->second.parts.empty()) {
+      entries_.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+}
+
+size_t RefreshTable::RemoveOtherGenerations(unsigned long generation) {
+  size_t removed = 0;
+  for (std::map<unsigned int, Entry>::iterator it = entries_.begin();
+       it != entries_.end();) {
+    if (it->second.generation != generation) {
+      entries_.erase(it++);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+  return removed;
+}
+
+size_t RefreshTable::Take(
+    unsigned long generation, size_t max,
+    std::vector<std::pair<unsigned int, unsigned int> > &out) {
+  out.clear();
+  for (std::map<unsigned int, Entry>::iterator it = entries_.begin();
+       it != entries_.end() && out.size() < max;) {
+    if (it->second.generation == generation) {
+      unsigned int parts = 0;
+      for (std::map<unsigned int, unsigned int>::const_iterator share =
+               it->second.parts.begin();
+           share != it->second.parts.end(); ++share) {
+        parts |= share->second;
+      }
+      out.push_back(std::make_pair(it->first, parts));
+    }
+    entries_.erase(it++);
+  }
+  return out.size();
+}
+
 unsigned int ResolveInteractionTicket(long ticketSeq, long requestedSeq,
                                       long settledSeq, int settledStatus,
                                       int &reason) {

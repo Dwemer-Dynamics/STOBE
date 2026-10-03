@@ -69,6 +69,10 @@ static_assert(offsetof(StobeAddonApiV2, GetControlStatus) == 184,
 static_assert(offsetof(StobeAddonApiV2, GetActorBusyOwner) == 200,
               "V2 last call");
 static_assert(sizeof(StobeAddonApiV2) == 208, "V2 table size");
+static_assert(offsetof(StobeAddonApiV3, v2) == 0, "V3 starts with V2");
+static_assert(offsetof(StobeAddonApiV3, ListAgents) == 208, "V3 appends");
+static_assert(sizeof(StobeAddonApiV3) == 256, "V3 table size");
+static_assert(sizeof(StobeAgentInfo) == 72, "StobeAgentInfo size");
 static_assert(sizeof(StobeControlStatus) == 24, "control status size");
 
 } // namespace
@@ -1167,6 +1171,83 @@ int main() {
     ExpectUInt32("Interaction ticket: settled result survives a later request",
                  AP::ResolveInteractionTicket(4, 5, 4, 1, reason),
                  STOBE_CONTROL_COMPLETED);
+
+    AP::ActorLockTable in(4);
+    AP::ActorLockTable out(4);
+    ExpectBool("Agent: registration moves between modes for its owner",
+               AP::SetAgentMode(in, out, 1, 30, 6, STOBE_AGENT_REGISTERED) ==
+                       STOBE_OK &&
+                   AP::SetAgentMode(in, out, 1, 30, 6,
+                                    STOBE_AGENT_UNREGISTERED) == STOBE_OK &&
+                   in.Owner(30, 6) == 0 && out.Owner(30, 6) == 1u,
+               true);
+    ExpectBool("Agent: another addon conflicts without changes",
+               AP::SetAgentMode(in, out, 2, 30, 6, STOBE_AGENT_REGISTERED) ==
+                       STOBE_E_CONFLICT &&
+                   AP::SetAgentMode(in, out, 2, 30, 6, STOBE_AGENT_AUTO) ==
+                       STOBE_E_CONFLICT &&
+                   out.Owner(30, 6) == 1u && in.Size() == 0,
+               true);
+    ExpectBool("Agent: auto clears the owner's override",
+               AP::SetAgentMode(in, out, 1, 30, 6, STOBE_AGENT_AUTO) == STOBE_OK &&
+                   in.Size() == 0 && out.Size() == 0,
+               true);
+
+    std::vector<bool> excludedOptions(3, false);
+    excludedOptions[0] = true;
+    ExpectBool("Agent default: nearest registered option, else none",
+               AP::FirstIncludedIndex(excludedOptions) == 1u &&
+                   AP::FirstIncludedIndex(std::vector<bool>(2, true)) == 2u &&
+                   AP::FirstIncludedIndex(std::vector<bool>()) == 0u,
+               true);
+
+    std::vector<std::pair<std::string, unsigned int> > agents;
+    agents.push_back(std::make_pair(std::string("Beep"), 40u));
+    agents.push_back(std::make_pair(std::string("Guard"), 41u));
+    agents.push_back(std::make_pair(std::string("guard"), 42u));
+    unsigned int found = 0;
+    ExpectBool("Agent name: exact case-insensitive match",
+               AP::MatchAgentName(agents, "BEEP", true, found) == STOBE_OK &&
+                   found == 40u,
+               true);
+    ExpectBool("Agent name: shared name fails closed",
+               AP::MatchAgentName(agents, "Guard", true, found) == STOBE_E_AMBIGUOUS &&
+                   found == 0u,
+               true);
+    ExpectBool("Agent name: no prefix match",
+               AP::MatchAgentName(agents, "Bee", true, found) == STOBE_E_NOT_FOUND,
+               true);
+    ExpectBool("Agent name: truncated scan never claims unique or absent",
+               AP::MatchAgentName(agents, "Beep", false, found) ==
+                       STOBE_E_LIMIT &&
+                   found == 0u &&
+                   AP::MatchAgentName(agents, "Bee", false, found) ==
+                       STOBE_E_LIMIT &&
+                   AP::MatchAgentName(agents, "Guard", false, found) ==
+                       STOBE_E_AMBIGUOUS,
+               true);
+
+    AP::RefreshTable refresh(2);
+    std::vector<std::pair<unsigned int, unsigned int> > taken;
+    ExpectBool("Refresh: per-actor bound reserves before adding",
+               refresh.Add(1, 50, 6, 0x100u | 0x1u) &&
+                   refresh.Add(2, 50, 6, 0x2u) && refresh.Add(2, 51, 6, 0x1u) &&
+                   refresh.CanAdd(50) && !refresh.CanAdd(52) &&
+                   !refresh.Add(1, 52, 6, 0x1u) && refresh.Size() == 2,
+               true);
+    refresh.Cancel(1, 50, 0x100u);
+    refresh.RemoveOwner(2);
+    ExpectBool("Refresh: owner cleanup keeps other owners' parts",
+               refresh.Size() == 1 && refresh.Take(6, 4, taken) == 1 &&
+                   taken[0].first == 50u && taken[0].second == 0x1u &&
+                   refresh.Size() == 0,
+               true);
+    refresh.Add(1, 50, 5, 0x1u);
+    refresh.Add(2, 51, 6, 0x2u);
+    ExpectBool("Refresh: a load drops earlier requests",
+               refresh.RemoveOtherGenerations(6) == 1 &&
+                   refresh.Take(6, 4, taken) == 1 && taken[0].first == 51u,
+               true);
   }
 
   if (g_failures != 0) {

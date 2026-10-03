@@ -15,10 +15,13 @@
 #include "StobeAddonApi.h"
 #include "Utils.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <string>
+#include <vector>
 
 Character *ResolveLiveCharacterBySerial(GameWorld *world, unsigned int serial);
 
@@ -37,6 +40,9 @@ const size_t kMaxQueuedWork = 128;
 const size_t kMaxPendingRequests = 128;
 const size_t kMaxTickets = 128;
 const size_t kMaxActorLocks = 64;
+const size_t kMaxAgentRegistrations = 64;
+const size_t kMaxRefreshRequests = 32;
+const size_t kMaxAgentScan = 512; // loaded characters examined per query
 const size_t kWorkPerTick = 8;
 const DWORD kPendingRequestLifetimeMs = 10 * 60 * 1000;
 const DWORD kExpiryIntervalMs = 1000;
@@ -144,7 +150,12 @@ struct State {
   SRWLOCK locksLock;
   ActorLockTable locks;
   ActorLockTable busy;
+  // Agent registration overrides; an actor is in at most one of them.
+  ActorLockTable agentIn;
+  ActorLockTable agentOut;
   unsigned long lockGeneration; // Game thread only.
+  // Pending refresh parts by actor and requesting addon.
+  Stobe::AddonProtocol::RefreshTable refresh;
   StobeAddonId nextAddonId;
   StobeU32 nextRequestId;
   StobeU32 nextTicket;
@@ -152,9 +163,12 @@ struct State {
   unsigned long expiryGeneration;
   StobeAddonApiV1 api;
   StobeAddonApiV2 apiV2;
+  StobeAddonApiV3 apiV3;
   State()
       : seqTickets(0), seenRequested(-2), seenSettled(-2),
-        locks(kMaxActorLocks), busy(kMaxActorLocks), lockGeneration(0),
+        locks(kMaxActorLocks), busy(kMaxActorLocks),
+        agentIn(kMaxAgentRegistrations), agentOut(kMaxAgentRegistrations),
+        lockGeneration(0), refresh(kMaxRefreshRequests),
         nextAddonId(1),
         nextRequestId(1), nextTicket(1), lastExpiryTick(0),
         expiryGeneration(0) {
@@ -167,6 +181,7 @@ struct State {
 // Let IsActorLocked and IsActorBusy skip the lock while none exist.
 volatile LONG g_actorLockCount = 0;
 volatile LONG g_actorBusyCount = 0;
+volatile LONG g_agentRegistrationCount = 0;
 volatile LONG g_gameThreadId = 0;
 volatile LONG g_lastTickTime = 0;
 volatile LONG g_inGameTick = 0;
@@ -313,6 +328,9 @@ void PublishLockCountLocked(State &state) {
   InterlockedExchange(&g_actorLockCount,
                       static_cast<LONG>(state.locks.Size()));
   InterlockedExchange(&g_actorBusyCount, static_cast<LONG>(state.busy.Size()));
+  InterlockedExchange(&g_agentRegistrationCount,
+                      static_cast<LONG>(state.agentIn.Size() +
+                                        state.agentOut.Size()));
 }
 
 // Owner of the actor's busy flag (busy) or dialogue lock in the given
@@ -392,8 +410,11 @@ void RemoveAddonLocked(State &state, StobeAddonId id, const std::string &detail)
   AcquireSRWLockExclusive(&state.locksLock);
   state.locks.RemoveOwner(id);
   state.busy.RemoveOwner(id);
+  state.agentIn.RemoveOwner(id);
+  state.agentOut.RemoveOwner(id);
   PublishLockCountLocked(state);
   ReleaseSRWLockExclusive(&state.locksLock);
+  state.refresh.RemoveOwner(id);
 }
 
 void DisableFaultingAddon(StobeAddonId id, const std::string &where) {
@@ -1039,19 +1060,7 @@ StobeU32 STOBE_CALL ApiGetRuntimeFlags() {
   return flags;
 }
 
-int STOBE_CALL ApiGetActorState(StobeActorRef actor, StobeActorState *outState) {
-  if (!outState || outState->struct_size < sizeof(StobeActorState)) {
-    return STOBE_E_INVALID_ARGUMENT;
-  }
-  if (!IsGameThreadInTick()) {
-    return STOBE_E_WRONG_THREAD;
-  }
-  outState->flags = 0;
-  Character *character = NULL;
-  const int code = ResolveActor(GetWorldSafe(), actor, character);
-  if (code != STOBE_OK) {
-    return code;
-  }
+StobeU32 ActorFlags(Character *character, unsigned int serial) {
   StobeU32 flags = STOBE_ACTOR_LOADED;
   try {
     if (!character->isDead()) {
@@ -1066,10 +1075,26 @@ int STOBE_CALL ApiGetActorState(StobeActorRef actor, StobeActorState *outState) 
     }
   } catch (...) {
   }
-  if (IsSerialInStobeSpeech(actor.serial)) {
+  if (IsSerialInStobeSpeech(serial)) {
     flags |= STOBE_ACTOR_IN_STOBE_SPEECH;
   }
-  outState->flags = flags;
+  return flags;
+}
+
+int STOBE_CALL ApiGetActorState(StobeActorRef actor, StobeActorState *outState) {
+  if (!outState || outState->struct_size < sizeof(StobeActorState)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (!IsGameThreadInTick()) {
+    return STOBE_E_WRONG_THREAD;
+  }
+  outState->flags = 0;
+  Character *character = NULL;
+  const int code = ResolveActor(GetWorldSafe(), actor, character);
+  if (code != STOBE_OK) {
+    return code;
+  }
+  outState->flags = ActorFlags(character, actor.serial);
   return STOBE_OK;
 }
 
@@ -1398,6 +1423,307 @@ int STOBE_CALL ApiGetControlStatus(StobeAddonId id, StobeU32 ticket,
   return STOBE_OK;
 }
 
+// STOBE_AGENT_* override for serial in the given load, with its owner.
+StobeU32 AgentMode(unsigned int serial, unsigned long generation,
+                   StobeAddonId *outOwner) {
+  if (outOwner) {
+    *outOwner = 0;
+  }
+  if (InterlockedCompareExchange(&g_agentRegistrationCount, 0, 0) == 0) {
+    return STOBE_AGENT_AUTO;
+  }
+  State &state = Get();
+  AcquireSRWLockShared(&state.locksLock);
+  StobeAddonId owner = state.agentIn.Owner(serial, generation);
+  StobeU32 mode = owner != 0 ? STOBE_AGENT_REGISTERED : STOBE_AGENT_AUTO;
+  if (owner == 0) {
+    owner = state.agentOut.Owner(serial, generation);
+    mode = owner != 0 ? STOBE_AGENT_UNREGISTERED : STOBE_AGENT_AUTO;
+  }
+  ReleaseSRWLockShared(&state.locksLock);
+  if (outOwner) {
+    *outOwner = owner;
+  }
+  return mode;
+}
+
+struct Agent {
+  Character *character;
+  unsigned int serial;
+  float distance;
+  StobeU32 mode;
+  bool autoAgent;
+  std::string name;
+};
+
+bool AgentNearer(const Agent &lhs, const Agent &rhs) {
+  const bool lhsKnown = lhs.distance >= 0.0f;
+  if (lhsKnown != (rhs.distance >= 0.0f)) {
+    return lhsKnown;
+  }
+  if (lhs.distance != rhs.distance) {
+    return lhs.distance < rhs.distance;
+  }
+  return lhs.serial < rhs.serial;
+}
+
+// Game thread. Agents among Kenshi's loaded characters, nearest first, using
+// the chat target rules. Examines at most kMaxAgentScan characters per call;
+// returns false when the scan stopped there with characters left unexamined.
+bool CollectAgents(GameWorld *world, std::vector<Agent> &out) {
+  out.clear();
+  bool complete = true;
+  if (!world) {
+    return complete;
+  }
+  const unsigned long generation = PlaythroughSession::Generation();
+  try {
+    const ogre_unordered_set<Character *>::type &chars =
+        world->getCharacterUpdateList();
+    size_t scanned = 0;
+    ogre_unordered_set<Character *>::type::const_iterator it = chars.begin();
+    for (; it != chars.end() && scanned < kMaxAgentScan; ++it, ++scanned) {
+      Character *character = *it;
+      if (!IsCharacterUsable(character)) {
+        continue;
+      }
+      Agent agent;
+      agent.character = character;
+      agent.serial = character->getHandle().serial;
+      if (agent.serial == 0) {
+        continue;
+      }
+      agent.mode = AgentMode(agent.serial, generation, NULL);
+      if (agent.mode == STOBE_AGENT_UNREGISTERED) {
+        continue;
+      }
+      agent.autoAgent =
+          Stobe::UI::IsAutoAgentCandidate(world, character, agent.distance);
+      if (!agent.autoAgent) {
+        if (agent.mode != STOBE_AGENT_REGISTERED || character->isDead() ||
+            character->isUnconcious()) {
+          continue;
+        }
+        agent.distance = -1.0f;
+      }
+      agent.name = SafeName(character);
+      out.push_back(agent);
+    }
+    complete = it == chars.end();
+  } catch (...) {
+    complete = false;
+  }
+  std::sort(out.begin(), out.end(), AgentNearer);
+  return complete;
+}
+
+int CheckAgentQuery(StobeAddonId id) {
+  if (!IsGameThreadInTick()) {
+    return STOBE_E_WRONG_THREAD;
+  }
+  State &state = Get();
+  Lock lock(state.lock);
+  return IsRegisteredLocked(state, id) ? STOBE_OK : STOBE_E_NOT_REGISTERED;
+}
+
+StobeActorRef CurrentRef(unsigned int serial) {
+  StobeActorRef ref;
+  ref.serial = serial;
+  ref.generation = static_cast<StobeU32>(PlaythroughSession::Generation());
+  return ref;
+}
+
+int STOBE_CALL ApiListAgents(StobeAddonId id, StobeAgentInfo *out,
+                             StobeU32 capacity, StobeU32 *outCount) {
+  if (!out || !outCount || capacity == 0 ||
+      out[0].struct_size < sizeof(StobeAgentInfo)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  *outCount = 0;
+  const int check = CheckAgentQuery(id);
+  if (check != STOBE_OK) {
+    return check;
+  }
+  std::vector<Agent> agents;
+  CollectAgents(GetWorldSafe(), agents);
+  const size_t limit = std::min<size_t>(
+      std::min<size_t>(capacity, STOBE_MAX_AGENTS), agents.size());
+  for (size_t i = 0; i < limit; ++i) {
+    StobeAgentInfo &info = out[i];
+    std::memset(&info, 0, sizeof(info));
+    info.struct_size = sizeof(StobeAgentInfo);
+    info.actor = CurrentRef(agents[i].serial);
+    info.flags = ActorFlags(agents[i].character, agents[i].serial) |
+                 (agents[i].autoAgent ? STOBE_ACTOR_AUTO_AGENT : 0u);
+    info.distance = agents[i].distance;
+    info.registration = agents[i].mode;
+    const size_t length =
+        std::min<size_t>(agents[i].name.size(), sizeof(info.name) - 1);
+    std::memcpy(info.name, agents[i].name.data(), length);
+  }
+  *outCount = static_cast<StobeU32>(limit);
+  return STOBE_OK;
+}
+
+int STOBE_CALL ApiFindAgentByName(StobeAddonId id, const char *name,
+                                  StobeActorRef *outActor) {
+  std::string wanted;
+  if (!outActor || !CopyBoundedText(name, STOBE_MAX_NAME_BYTES, false, wanted)) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  outActor->serial = outActor->generation = 0;
+  const int check = CheckAgentQuery(id);
+  if (check != STOBE_OK) {
+    return check;
+  }
+  std::vector<Agent> agents;
+  const bool complete = CollectAgents(GetWorldSafe(), agents);
+  std::vector<std::pair<std::string, unsigned int> > named;
+  for (size_t i = 0; i < agents.size(); ++i) {
+    named.push_back(std::make_pair(agents[i].name, agents[i].serial));
+  }
+  unsigned int serial = 0;
+  const int code =
+      Stobe::AddonProtocol::MatchAgentName(named, wanted, complete, serial);
+  if (code == STOBE_OK) {
+    *outActor = CurrentRef(serial);
+  }
+  return code;
+}
+
+int STOBE_CALL ApiFindClosestAgent(StobeAddonId id, StobeActorRef origin,
+                                   StobeActorRef *outActor) {
+  if (!outActor) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  outActor->serial = outActor->generation = 0;
+  const int check = CheckAgentQuery(id);
+  if (check != STOBE_OK) {
+    return check;
+  }
+  GameWorld *world = GetWorldSafe();
+  Character *anchor = NULL;
+  if (origin.serial != 0) {
+    const int code = ResolveActor(world, origin, anchor);
+    if (code != STOBE_OK) {
+      return code;
+    }
+  }
+  std::vector<Agent> agents;
+  CollectAgents(world, agents);
+  unsigned int best = 0;
+  float bestDistance = 0.0f;
+  for (size_t i = 0; i < agents.size(); ++i) {
+    if (agents[i].serial == origin.serial) {
+      continue;
+    }
+    float distance = agents[i].distance;
+    if (anchor) {
+      try {
+        distance = anchor->getPosition().distance(
+            agents[i].character->getPosition());
+      } catch (...) {
+        continue;
+      }
+    }
+    if (distance < 0.0f) {
+      continue;
+    }
+    if (best == 0 || distance < bestDistance) {
+      best = agents[i].serial;
+      bestDistance = distance;
+    }
+  }
+  if (best == 0) {
+    return STOBE_E_NOT_FOUND;
+  }
+  *outActor = CurrentRef(best);
+  return STOBE_OK;
+}
+
+int STOBE_CALL ApiSetAgentRegistration(StobeAddonId id, StobeActorRef actor,
+                                       StobeU32 mode) {
+  if (actor.serial == 0 || mode > STOBE_AGENT_UNREGISTERED) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  State &state = Get();
+  int code = STOBE_OK;
+  std::string name;
+  {
+    Lock lock(state.lock);
+    if (!IsRegisteredLocked(state, id)) {
+      return STOBE_E_NOT_REGISTERED;
+    }
+    name = AddonNameLocked(state, id);
+    AcquireSRWLockExclusive(&state.locksLock);
+    const unsigned int inOwner =
+        state.agentIn.Owner(actor.serial, actor.generation);
+    const unsigned int outOwner =
+        state.agentOut.Owner(actor.serial, actor.generation);
+    if ((inOwner != 0 && inOwner != id) || (outOwner != 0 && outOwner != id)) {
+      code = STOBE_E_CONFLICT;
+    } else if (mode == STOBE_AGENT_REGISTERED &&
+               !state.refresh.CanAdd(actor.serial)) {
+      code = STOBE_E_LIMIT; // The profile upload is reserved before commit.
+    } else {
+      code = Stobe::AddonProtocol::SetAgentMode(state.agentIn, state.agentOut,
+                                                id, actor.serial,
+                                                actor.generation, mode);
+    }
+    PublishLockCountLocked(state);
+    ReleaseSRWLockExclusive(&state.locksLock);
+    if (code == STOBE_OK && mode == STOBE_AGENT_REGISTERED) {
+      state.refresh.Add(id, actor.serial, actor.generation,
+                        REFRESH_PROFILE | STOBE_REFRESH_CONTEXT);
+    } else if (code == STOBE_OK) {
+      state.refresh.Cancel(id, actor.serial, REFRESH_PROFILE);
+    }
+  }
+  if (code == STOBE_OK) {
+    Log("ADDON_API: addon '" + name + "' set agent mode=" +
+        ToString(static_cast<int>(mode)) +
+        " actor_serial=" + ToString(actor.serial));
+  }
+  return code == STOBE_OK && mode == STOBE_AGENT_REGISTERED ? STOBE_QUEUED
+                                                            : code;
+}
+
+int STOBE_CALL ApiGetAgentRegistration(StobeActorRef actor, StobeU32 *outMode,
+                                       StobeAddonId *outOwner) {
+  if (actor.serial == 0 || !outMode || !outOwner) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  *outMode = STOBE_AGENT_AUTO;
+  *outOwner = 0;
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  *outMode = AgentMode(actor.serial, actor.generation, outOwner);
+  return STOBE_OK;
+}
+
+int STOBE_CALL ApiRequestContextRefresh(StobeAddonId id, StobeActorRef actor,
+                                        StobeU32 parts) {
+  const StobeU32 known = STOBE_REFRESH_CONTEXT | STOBE_REFRESH_INVENTORY;
+  if (actor.serial == 0 || parts == 0 || (parts & ~known) != 0) {
+    return STOBE_E_INVALID_ARGUMENT;
+  }
+  if (IsStaleRef(actor)) {
+    return STOBE_E_STALE;
+  }
+  State &state = Get();
+  Lock lock(state.lock);
+  if (!IsRegisteredLocked(state, id)) {
+    return STOBE_E_NOT_REGISTERED;
+  }
+  return state.refresh.Add(id, actor.serial, actor.generation, parts)
+             ? STOBE_QUEUED
+             : STOBE_E_LIMIT;
+}
+
 BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   StobeAddonApiV1 &api = Get().api;
   api.struct_size = sizeof(StobeAddonApiV1);
@@ -1434,6 +1760,18 @@ BOOL CALLBACK InitApiTable(PINIT_ONCE, PVOID, PVOID *) {
   v2.GetControlStatus = ApiGetControlStatus;
   v2.SetActorBusy = ApiSetActorBusy;
   v2.GetActorBusyOwner = ApiGetActorBusyOwner;
+
+  StobeAddonApiV3 &v3 = Get().apiV3;
+  v3.v2 = v2;
+  v3.v2.v1.struct_size = sizeof(StobeAddonApiV3);
+  v3.v2.v1.api_version = STOBE_ADDON_API_VERSION_3;
+  v3.v2.capabilities |= STOBE_CAP_AGENTS | STOBE_CAP_CONTEXT_REFRESH;
+  v3.ListAgents = ApiListAgents;
+  v3.FindAgentByName = ApiFindAgentByName;
+  v3.FindClosestAgent = ApiFindClosestAgent;
+  v3.SetAgentRegistration = ApiSetAgentRegistration;
+  v3.GetAgentRegistration = ApiGetAgentRegistration;
+  v3.RequestContextRefresh = ApiRequestContextRefresh;
   return TRUE;
 }
 
@@ -1450,6 +1788,12 @@ static_assert(offsetof(StobeAddonApiV2, capabilities) == sizeof(StobeAddonApiV1)
 static_assert(sizeof(StobeAddonApiV2) ==
                   sizeof(StobeAddonApiV1) + 8 + 10 * sizeof(void *),
               "StobeAddonApiV2 ABI");
+static_assert(sizeof(StobeAgentInfo) == 72, "StobeAgentInfo ABI");
+static_assert(offsetof(StobeAddonApiV3, ListAgents) == sizeof(StobeAddonApiV2),
+              "StobeAddonApiV3 embeds V2 first");
+static_assert(sizeof(StobeAddonApiV3) ==
+                  sizeof(StobeAddonApiV2) + 6 * sizeof(void *),
+              "StobeAddonApiV3 ABI");
 
 } // namespace
 
@@ -1468,14 +1812,17 @@ void GameThreadTick(GameWorld *world) {
       Lock lock(state.lock);
       AcquireSRWLockExclusive(&state.locksLock);
       cleared = state.locks.RemoveOtherGenerations(generation) +
-                state.busy.RemoveOtherGenerations(generation);
+                state.busy.RemoveOtherGenerations(generation) +
+                state.agentIn.RemoveOtherGenerations(generation) +
+                state.agentOut.RemoveOtherGenerations(generation);
       PublishLockCountLocked(state);
       ReleaseSRWLockExclusive(&state.locksLock);
+      state.refresh.RemoveOtherGenerations(generation);
     }
     state.lockGeneration = generation;
     if (cleared > 0) {
       Log("ADDON_API: load cleared " + ToString(static_cast<int>(cleared)) +
-          " actor lock(s)/busy flag(s)");
+          " actor lock(s)/busy flag(s)/agent registration(s)");
     }
   }
   {
@@ -1582,6 +1929,25 @@ int DialogueGate(unsigned int serial) {
       ActorFlagOwner(true, serial, generation), 0);
 }
 
+bool IsAgentExcluded(unsigned int serial) {
+  return AgentMode(serial, PlaythroughSession::Generation(), NULL) ==
+         STOBE_AGENT_UNREGISTERED;
+}
+
+size_t TakeRefreshRequests(RefreshRequest *out, size_t max) {
+  State &state = Get();
+  std::vector<std::pair<unsigned int, unsigned int> > taken;
+  {
+    Lock lock(state.lock);
+    state.refresh.Take(PlaythroughSession::Generation(), max, taken);
+  }
+  for (size_t i = 0; i < taken.size(); ++i) {
+    out[i].serial = taken[i].first;
+    out[i].parts = taken[i].second;
+  }
+  return taken.size();
+}
+
 void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand,
                          const std::string &parameter) {
   WorkItem item;
@@ -1607,12 +1973,16 @@ void QueueExternalAction(unsigned int actorSerial, const std::string &rawCommand
 extern "C" __declspec(dllexport) const StobeAddonApiV1 *STOBE_CALL
 Stobe_GetApi(StobeU32 version) {
   if (version != STOBE_ADDON_API_VERSION &&
-      version != STOBE_ADDON_API_VERSION_2) {
+      version != STOBE_ADDON_API_VERSION_2 &&
+      version != STOBE_ADDON_API_VERSION_3) {
     return NULL;
   }
   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
   InitOnceExecuteOnce(&once, Stobe::Addon::InitApiTable, NULL, NULL);
   // Version 1 keeps its own unchanged table; version 2 embeds a copy of it.
+  if (version == STOBE_ADDON_API_VERSION_3) {
+    return &Stobe::Addon::Get().apiV3.v2.v1;
+  }
   return version == STOBE_ADDON_API_VERSION ? &Stobe::Addon::Get().api
                                             : &Stobe::Addon::Get().apiV2.v1;
 }
