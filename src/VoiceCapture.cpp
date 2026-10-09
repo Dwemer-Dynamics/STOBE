@@ -1,5 +1,4 @@
 #include "PlaythroughSession.h"
-#include "Interaction.h"
 #include "VoiceCapture.h"
 
 #include "Comm.h"
@@ -31,7 +30,7 @@ const DWORD kAutoConvertPcmFlag = 0x80000000;
 const DWORD kSrcDefaultQualityFlag = 0x08000000;
 
 struct Result {
-  LONG interactionEpoch;
+  unsigned long playthroughEpoch;
   Context context;
   std::string text;
   std::string error;
@@ -69,7 +68,7 @@ HANDLE g_captureReadyEvent = NULL;
 CRITICAL_SECTION g_mutex;
 std::map<int, Result> g_results;
 Context g_pendingContext;
-LONG g_captureInteractionEpoch = 0;
+unsigned long g_capturePlaythroughEpoch = 0;
 
 void EnsureInitialized() {
   if (InterlockedCompareExchange(&g_initialized, 1, 0) == 0)
@@ -153,7 +152,7 @@ void QueueResult(const Context &context, const std::string &text,
   int id = (int)InterlockedIncrement(&g_nextResultId);
   EnterCriticalSection(&g_mutex);
   Result result;
-  result.interactionEpoch = g_captureInteractionEpoch;
+  result.playthroughEpoch = PlaythroughSession::Context();
   result.context = context;
   result.text = text;
   result.error = error;
@@ -414,9 +413,13 @@ DWORD WINAPI CaptureWorkerThread(LPVOID) {
       break;
 
     Context context;
+    unsigned long playthroughEpoch;
     EnterCriticalSection(&g_mutex);
     context = g_pendingContext;
+    playthroughEpoch = g_capturePlaythroughEpoch;
     LeaveCriticalSection(&g_mutex);
+    // The persistent worker must use this recording's save, not its startup save.
+    const PlaythroughSession::Scope scope(playthroughEpoch);
 
     bool usedWasapi = false;
     if (SUCCEEDED(initResult) || initResult == RPC_E_CHANGED_MODE)
@@ -505,7 +508,6 @@ bool EnsureCaptureWorker(bool waitUntilReady) {
 } // namespace
 
 bool Start(const Context &context) {
-  if (!Stobe::Interaction::ManualInputAllowed()) return false;
   EnsureInitialized();
   if (!EnsureCaptureWorker(true)) {
     Log("STT_CAPTURE: microphone warmup did not complete");
@@ -518,7 +520,7 @@ bool Start(const Context &context) {
   g_startedAt = GetTickCount();
   EnterCriticalSection(&g_mutex);
   g_pendingContext = context;
-  g_captureInteractionEpoch = Stobe::Interaction::Epoch();
+  g_capturePlaythroughEpoch = PlaythroughSession::Generation();
   LeaveCriticalSection(&g_mutex);
   if (!SetEvent(g_captureStartEvent)) {
     InterlockedExchange(&g_recording, 0);
@@ -562,7 +564,12 @@ bool ConsumeResult(int resultId, Context &contextOut, std::string &textOut,
     LeaveCriticalSection(&g_mutex);
     return false;
   }
-  if (!Stobe::Interaction::IsCurrent(found->second.interactionEpoch)) { g_results.erase(found); LeaveCriticalSection(&g_mutex); return false; }
+  // Switching AI interaction does not invalidate transcripts; loading a save does.
+  if (found->second.playthroughEpoch != PlaythroughSession::Generation()) {
+    g_results.erase(found);
+    LeaveCriticalSection(&g_mutex);
+    return false;
+  }
   contextOut = found->second.context;
   textOut = found->second.text;
   errorOut = found->second.error;

@@ -1147,6 +1147,8 @@ void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
   std::string normalizedState = Trim(deliveryState);
   std::transform(normalizedState.begin(), normalizedState.end(),
                  normalizedState.begin(), ::tolower);
+  const bool unavailable = normalizedState == "unavailable";
+  if (unavailable) normalizedState = "cancelled";
   if (normalizedState != "spoken" && normalizedState != "cancelled") {
     return;
   }
@@ -1163,7 +1165,8 @@ void PostSpeechDeliveryStates(const std::vector<std::string> &utteranceIds,
   }
 
   UpdateTrackedSpeechDeliveryStates(
-      uniqueIds, normalizedState == "spoken" ? SPEECH_DELIVERY_SPOKEN
+      uniqueIds, unavailable ? SPEECH_DELIVERY_UNAVAILABLE
+                            : normalizedState == "spoken" ? SPEECH_DELIVERY_SPOKEN
                                                : SPEECH_DELIVERY_CANCELLED);
 
   std::string payload = "{\"updates\":[";
@@ -1638,6 +1641,13 @@ std::string GetStobeServerHomeUrl() {
     host = "127.0.0.1";
   }
   return "http://" + host + ":" + ToString((int)g_stobePort) + "/StobeServer/";
+}
+
+bool ResolveStobeServerTarget(std::wstring &host, unsigned short &port) {
+  EnsureDiscovered();
+  host = g_stobeHost.empty() ? std::wstring(kDefaultServerHost) : g_stobeHost;
+  port = g_stobePort;
+  return port != 0;
 }
 
 std::string PlaythroughSession::Transport(const std::string& body, unsigned long& status) {
