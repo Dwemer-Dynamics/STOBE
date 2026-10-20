@@ -3590,11 +3590,13 @@ static bool PlayDirectorScene(StreamChatParseState *state, const std::string &sc
     const std::string actor = JsonReadField(turn, "speaker");
     const std::string header = actor + "|" + JsonReadField(turn, "actor_id");
     std::string say = "NPC_SAY: " + header + ": " + JsonReadField(turn, "text") +
-        " [TALKTARGET:" + BuildTalkTargetMetadataToken(JsonReadField(turn, "listener"), "") + "]" +
-        " [UTTERANCEID:" + ids[played] + "]";
+        " [TALKTARGET:" + BuildTalkTargetMetadataToken(JsonReadField(turn, "listener"), "") + "]";
+    // Suffixes are stripped last-first (UTTERANCEID, TTSDUR, TTSHASH), so keep normal chat order.
     const std::string hash = JsonReadField(turn, "tts_hash");
     if (g_ttsEnabled && !hash.empty()) say += " [TTSHASH:" + hash + "]";
-    say += " [TTSDUR:" + JsonReadField(turn, "tts_duration_ms") + "]";
+    const int ttsDurationMs = atoi(JsonReadField(turn, "tts_duration_ms").c_str());
+    if (g_ttsEnabled && ttsDurationMs > 0) say += " [TTSDUR:" + ToString(ttsDurationMs) + "]";
+    say += " [UTTERANCEID:" + ids[played] + "]";
     if (!QueueChatPipeLine(say, state->generation)) { stopReason = "queue_rejected"; break; }
     ++state->lineCount;
     DWORD started = GetTickCount();
