@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Stobe VERSION 1.3.1 LANGUAGES CXX)
+project(Stobe VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,8 @@ if(NOT OGRE_MAIN_LIBRARY)
 endif()
 
 add_library(Stobe SHARED
+  src/AddonProtocol.cpp
+  src/AddonRuntime.cpp
   src/AudioPlayback.cpp
   src/AutonomyController.cpp
   src/AutonomyExecutor.cpp
@@ -96,6 +98,7 @@ add_library(Stobe SHARED
   src/StobeText.cpp
   src/StobeTiming.cpp
   src/main.cpp
+  src/ServerPluginSync.cpp
   src/SettingsWindow.cpp
   src/Utils.cpp
   src/VoiceCapture.cpp
@@ -105,6 +108,7 @@ add_library(Stobe SHARED
 
 target_include_directories(Stobe PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${KENSHI_LIB_INCLUDE_DIR}"
   "${KENSHI_LIB_INCLUDE_DIR}/ogre"
   "${KENSHI_LIB_INCLUDE_DIR}/mygui"

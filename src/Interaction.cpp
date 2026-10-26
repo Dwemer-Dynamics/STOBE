@@ -2,42 +2,77 @@
 #include "Comm.h"
 #include "Globals.h"
 #include "Utils.h"
-#include "VoiceCapture.h"
 #include <kenshi/GameWorld.h>
 #include <cstdlib>
 
 namespace Stobe { namespace Interaction {
 namespace {
 volatile LONG status = 2, desired = -1, generation = 0, epoch = 1, busy = 0;
+// Every change of desired bumps requestSeq; a sync result is committed only
+// for the sequence it was started with, under requestLock.
+LONG requestSeq = 0, settledSeq = -1, settledStatus = 2;
+SRWLOCK requestLock = SRWLOCK_INIT;
 DWORD nextAttempt = 0;
+const int kSyncPasses = 4;
 
 // Run on the existing event-driven update path; never touch game/UI objects here.
 DWORD WINAPI Synchronize(LPVOID) {
-  std::string response = PostToStobeWithResponse(L"/StobeServer/interaction.php", "{}");
-  std::string enabled = JsonReadField(response, "enabled");
-  std::string version = JsonReadField(response, "generation");
-  const LONG requested = InterlockedCompareExchange(&desired, 0, 0);
-  bool valid = (enabled == "true" || enabled == "false") && !version.empty()
-      && version.find_first_not_of("0123456789") == std::string::npos;
-  if (valid && requested >= 0 && (enabled == "true") != (requested == 1)) {
-    response = PostToStobeWithResponse(L"/StobeServer/interaction.php",
-        std::string("{\"enabled\":") + (requested ? "true" : "false") +
-        ",\"generation\":" + version + "}");
-    enabled = JsonReadField(response, "enabled");
-    version = JsonReadField(response, "generation");
-    valid = (enabled == "true" || enabled == "false") && !version.empty()
-        && version.find_first_not_of("0123456789") == std::string::npos
-        && (enabled == "true") == (requested == 1);
+  for (int pass = 0; pass < kSyncPasses; ++pass) {
+    AcquireSRWLockShared(&requestLock);
+    const LONG seq = requestSeq;
+    const LONG requested = desired;
+    ReleaseSRWLockShared(&requestLock);
+    std::string response = PostToStobeWithResponse(L"/StobeServer/interaction.php", "{}");
+    std::string enabled = JsonReadField(response, "enabled");
+    std::string version = JsonReadField(response, "generation");
+    bool valid = (enabled == "true" || enabled == "false") && !version.empty()
+        && version.find_first_not_of("0123456789") == std::string::npos;
+    if (valid && requested >= 0 && (enabled == "true") != (requested == 1)) {
+      response = PostToStobeWithResponse(L"/StobeServer/interaction.php",
+          std::string("{\"enabled\":") + (requested ? "true" : "false") +
+          ",\"generation\":" + version + "}");
+      enabled = JsonReadField(response, "enabled");
+      version = JsonReadField(response, "generation");
+      valid = (enabled == "true" || enabled == "false") && !version.empty()
+          && version.find_first_not_of("0123456789") == std::string::npos
+          && (enabled == "true") == (requested == 1);
+    }
+    AcquireSRWLockExclusive(&requestLock);
+    if (requestSeq != seq) {
+      // A newer request arrived while this one was in flight; sync it instead.
+      ReleaseSRWLockExclusive(&requestLock);
+      continue;
+    }
+    if (valid) {
+      InterlockedExchange(&generation, std::strtol(version.c_str(), NULL, 10));
+      InterlockedExchange(&desired, enabled == "true" ? 1 : 0);
+      InterlockedExchange(&status, enabled == "true" ? 1 : 0);
+    } else {
+      InterlockedExchange(&status, 3);
+    }
+    settledSeq = seq;
+    settledStatus = Status();
+    InterlockedExchange(&busy, 0);
+    ReleaseSRWLockExclusive(&requestLock);
+    return 0;
   }
-  if (valid) {
-    InterlockedExchange(&generation, std::strtol(version.c_str(), NULL, 10));
-    InterlockedExchange(&desired, enabled == "true" ? 1 : 0);
-    InterlockedExchange(&status, enabled == "true" ? 1 : 0);
-  } else {
-    InterlockedExchange(&status, 3);
-  }
+  // Still changing; stay syncing and let Update retry after its backoff.
   InterlockedExchange(&busy, 0);
   return 0;
+}
+
+// Game thread. Records a new desired state and starts synchronizing it.
+void Begin(LONG value) {
+  AcquireSRWLockExclusive(&requestLock);
+  InterlockedExchange(&desired, value);
+  ++requestSeq;
+  InterlockedExchange(&status, 2);
+  ReleaseSRWLockExclusive(&requestLock);
+  InterlockedIncrement(&epoch);
+  // Invalidate requests and pending actions, preserving the line already playing.
+  BeginChatInterruptGeneration(false);
+  nextAttempt = 0;
+  Update();
 }
 }
 
@@ -55,14 +90,27 @@ bool ManualInputAllowed() {
 
 void Toggle() {
   if (InterlockedCompareExchange(&busy, 0, 0) || Status() == 2) return;
-  if (Status() != 3) InterlockedExchange(&desired, Allowed() ? 0 : 1);
-  InterlockedExchange(&status, 2);
-  InterlockedIncrement(&epoch);
-  Stobe::Voice::Cancel();
-  // Invalidate requests and pending actions, preserving the line already playing.
-  BeginChatInterruptGeneration(false);
-  nextAttempt = 0;
-  Update();
+  Begin(Status() != 3 ? (Allowed() ? 0 : 1)
+                      : InterlockedCompareExchange(&desired, 0, 0));
+}
+
+LONG Request(bool enabled) {
+  const LONG value = enabled ? 1 : 0;
+  AcquireSRWLockShared(&requestLock);
+  const bool unchanged = desired == value && status != 3;
+  const LONG seq = requestSeq;
+  ReleaseSRWLockShared(&requestLock);
+  if (unchanged) return seq; // Only the game thread changes requestSeq.
+  Begin(value);
+  return seq + 1;
+}
+
+void Progress(LONG &requested, LONG &settled, int &statusAtSettle) {
+  AcquireSRWLockShared(&requestLock);
+  requested = requestSeq;
+  settled = settledSeq;
+  statusAtSettle = settledStatus;
+  ReleaseSRWLockShared(&requestLock);
 }
 
 void Update() {
