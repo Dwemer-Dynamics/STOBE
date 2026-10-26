@@ -1,0 +1,5 @@
+name=ParityProbe
+version=1.0.0
+author=Dwemer Dynamics
+category=Test
+description=Stobe addon API test plugin. Answers ExtCmdParityProbe_Ping without changing the game. Requires RE_Kenshi and Stobe.

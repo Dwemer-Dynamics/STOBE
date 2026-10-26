@@ -20,7 +20,7 @@ std::string Normalize(const std::string &mode) {
   const std::string normalized = LowerAscii(mode);
   if (normalized == "whisper" || normalized == "shout" ||
       normalized == "cheat" || normalized == "narrator" ||
-      normalized == "inject") {
+      normalized == "inject" || normalized == "hypnosis") {
     return normalized;
   }
   if (normalized == "event inject" || normalized == "injection_log") {
@@ -47,6 +47,8 @@ std::size_t ToIndex(const std::string &mode) {
     return 5;
   if (normalized == "inject_chat")
     return 6;
+  if (normalized == "hypnosis")
+    return 7;
   return 0;
 }
 
@@ -64,6 +66,8 @@ std::string DisplayLabel(const std::string &mode) {
     return "Narrator";
   if (normalized == "inject")
     return "Inject";
+  if (normalized == "hypnosis")
+    return "Hypnosis";
   return "Chat";
 }
 
@@ -71,7 +75,7 @@ std::string ResolveRequestMode(const std::string &selectedMode,
                                bool autoChatEnabled) {
   const std::string normalized = Normalize(selectedMode);
   if (normalized == "cheat" || normalized == "narrator" ||
-      IsInjectionMode(normalized)) {
+      normalized == "hypnosis" || IsInjectionMode(normalized)) {
     return normalized;
   }
   if (autoChatEnabled) {
@@ -90,7 +94,7 @@ bool IsInjectionMode(const std::string &mode) {
 
 bool AllowsManualActions(const std::string &mode) {
   const std::string normalized = Normalize(mode);
-  return normalized != "narrator" && !IsInjectionMode(normalized);
+  return normalized != "hypnosis" && normalized != "narrator" && !IsInjectionMode(normalized);
 }
 
 bool ShouldQueueLocalPlayerSpeech(const std::string &requestMode) {
@@ -99,7 +103,7 @@ bool ShouldQueueLocalPlayerSpeech(const std::string &requestMode) {
 }
 
 bool AllowsAutomaticRechat(const std::string &requestMode) {
-  return requestMode != "whisper" && requestMode != "narrator" &&
+  return requestMode != "hypnosis" && requestMode != "whisper" && requestMode != "narrator" &&
          requestMode != "inject" && requestMode != "inject_chat";
 }
 

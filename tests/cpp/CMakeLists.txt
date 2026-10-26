@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(stobe_portable_tests
   stobe_text_tests.cpp
+  ../../src/AddonProtocol.cpp
   ../../src/AutonomyMonitor.cpp
   ../../src/AutonomyProtocol.cpp
   ../../src/AutonomySafetyProbePolicy.cpp
@@ -17,6 +18,7 @@ add_executable(stobe_portable_tests
 )
 
 target_include_directories(stobe_portable_tests PRIVATE
+  ../../include
   ../../src
 )
 

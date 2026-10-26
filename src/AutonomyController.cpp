@@ -1,4 +1,5 @@
 #include "AutonomyController.h"
+#include "AddonRuntime.h"
 
 #include "AutonomyExecutor.h"
 #include "AutonomyMonitor.h"
@@ -1041,6 +1042,17 @@ void UpdateAutonomyController(GameWorld *world) {
     PublishRuntimeState(control, character.runtimeSerial, "OBSERVING",
                         "game_paused", character.name, gameTs,
                         revisionChanged);
+    return;
+  }
+  // An addon dialogue lock (no planner requests) or busy flag (no actions)
+  // stops autonomy for the actor like a user pause, without requiring an
+  // explicit resume once it is cleared.
+  const bool addonBusy = Stobe::Addon::IsActorBusy(character.runtimeSerial);
+  if (addonBusy || Stobe::Addon::IsActorLocked(character.runtimeSerial)) {
+    const char *reason = addonBusy ? "actor_busy" : "actor_locked";
+    ClearActiveAction(world, true, reason);
+    PublishRuntimeState(control, character.runtimeSerial, "OBSERVING", reason,
+                        character.name, gameTs, revisionChanged);
     return;
   }
 
