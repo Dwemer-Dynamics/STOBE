@@ -52,3 +52,11 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer);
 // One-time movement lifecycle on the game thread.
 void UpdateMoveToActions(GameWorld *world);
 void ResetMoveToActions();
+
+// Stop all character actions. Request is thread-safe; processing and reset run
+// on the game thread. Only native goals, jobs and orders Stobe created are released.
+void RequestStopAllStobeActions();
+void ProcessPendingStopAllStobeActions(GameWorld *world);
+void ResetStobeActionOwnership();
+// Adds the follow goal and records it for Stop only if this call created it.
+void AddStobeFollowGoal(Character *follower, Character *target);

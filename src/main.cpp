@@ -8509,7 +8509,7 @@ static void ApplyFollowTargets(GameWorld *world) {
         } catch (...) {
         }
         try {
-          follower->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
+          AddStobeFollowGoal(follower, target);
         } catch (...) {
         }
         try {
@@ -13035,6 +13035,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     Stobe::UI::ResetNpcContextRenameAction(false);
     ResetMoveToActions();
+    ResetStobeActionOwnership();
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -13052,6 +13053,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!worldStable) {
     Stobe::UI::ResetNpcContextRenameAction();
     ResetMoveToActions();
+    ResetStobeActionOwnership();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -13382,6 +13384,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
+    // Before autonomy, message conversion and the paused/TTS-gated action queue.
+    ProcessPendingStopAllStobeActions(world);
     Stobe::WorldStateRuntime::Update(world, worldBecameStableTick);
     UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);

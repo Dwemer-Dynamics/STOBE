@@ -959,6 +959,43 @@ void ResetAutonomyController(const char *reason) {
   }
 }
 
+void PauseAutonomyControllerForStop(GameWorld *world) {
+  if (!Stobe::AutonomyReleaseGate::kEnabled) {
+    return;
+  }
+  EnsureInitialized();
+  Stobe::Autonomy::ControlSnapshot control;
+  EnterCriticalSection(&g_controlMutex);
+  control = g_control;
+  LeaveCriticalSection(&g_controlMutex);
+  const std::string reason = "stop_all_actions";
+  if (g_catalogActive.active) {
+    CancelPendingAutonomyCatalogDecision(g_catalogActive.decision.decisionId);
+    if (control.valid) {
+      QueueActionReport(control, g_catalogActive.decision, "INTERRUPTED",
+                        reason,
+                        static_cast<int>(GetTickCount() -
+                                         g_catalogActive.startedTick),
+                        0, true);
+    }
+  }
+  g_catalogActive = ActiveCatalogAction();
+  if (g_active.active && control.valid) {
+    QueueActionReport(control, g_active.decision, "INTERRUPTED", reason,
+                      g_active.activeElapsedMs, 0, true);
+  }
+  ClearActiveAction(world, true, reason);
+  ClearTickState();
+  g_requiresExplicitResume = true;
+  if (control.valid && control.enabled) {
+    PublishRuntimeState(control, 0, "PAUSED_USER", reason, "", 0, true);
+  } else {
+    g_runtimeState = "PAUSED_USER";
+    g_runtimeReason = reason;
+  }
+  Log("AUTONOMY: paused by stop all actions");
+}
+
 void UpdateAutonomyController(GameWorld *world) {
   if (!Stobe::AutonomyReleaseGate::kEnabled) {
     return;

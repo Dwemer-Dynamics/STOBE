@@ -37,6 +37,7 @@
 #include <kenshi/RootObjectBase.h>
 #include <kenshi/RootObjectFactory.h>
 #include <kenshi/SensoryData.h>
+#include <kenshi/Tasker.h>
 #include <kenshi/util/YesNoMaybe.h>
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Colour.h>
@@ -3587,6 +3588,350 @@ static std::string DescribeCloseActionRangeReasonForUser(
   return "too far away";
 }
 
+namespace {
+// Native task collections an owned entry can live in.
+enum NativeTaskList { NATIVE_GOALS = 0, NATIVE_JOBS = 1, NATIVE_PERMAJOBS = 2 };
+
+// Native goals/jobs/permajobs created by one Stobe dispatch. Main-thread only.
+// A token identifies a Tasker by address and is never dereferenced until it is
+// found again in the actor's current collection of the same kind.
+struct OwnedNativeTask {
+  hand actor;
+  hand subject;
+  TaskType type;
+  int job; // NativeTaskList
+  const Tasker *token;
+  bool hasDestination; // Stobe also moved the actor to this point.
+  Ogre::Vector3 destination;
+};
+std::vector<OwnedNativeTask> s_ownedNativeTasks;
+
+bool SameHand(const hand &first, const hand &second) {
+  return first.type == second.type && first.container == second.container &&
+         first.containerSerial == second.containerSerial &&
+         first.index == second.index && first.serial == second.serial;
+}
+
+// Returns the live character only when its full handle matches the saved one.
+Character *ResolveOwnedActor(GameWorld *world, const hand &actor) {
+  Character *live = ResolveLiveCharacter(world, actor);
+  try {
+    return live && SameHand(live->getHandle(), actor) ? live : NULL;
+  } catch (...) {
+    return NULL;
+  }
+}
+
+// Observed identity of one queued native order.
+struct NativeOrderKey {
+  const Tasker *task;
+  TaskType type;
+  hand subject;
+  Ogre::Vector3 location;
+};
+
+// A subject order's destination is its subject, whose position moves; only a
+// location order (null subject) is also compared by location.
+bool SameNativeOrder(const NativeOrderKey &first, const NativeOrderKey &second) {
+  return first.task == second.task && first.type == second.type &&
+         SameHand(first.subject, second.subject) &&
+         (first.subject.serial != 0 || first.location == second.location);
+}
+
+bool CaptureNativeOrders(OrdersReceiver *orders, std::vector<NativeOrderKey> &out) {
+  out.clear();
+  if (!orders || (uintptr_t)orders <= 0x1000) {
+    return false;
+  }
+  try {
+    for (std::deque<Tasker *>::const_iterator it = orders->orders.list.begin();
+         it != orders->orders.list.end(); ++it) {
+      Tasker *task = *it;
+      if (!task || (uintptr_t)task <= 0x1000) {
+        out.clear();
+        return false;
+      }
+      NativeOrderKey key;
+      key.task = task;
+      key.type = task->key();
+      key.subject = task->subject;
+      key.location = task->location;
+      out.push_back(key);
+    }
+  } catch (...) {
+    out.clear();
+    return false;
+  }
+  return true;
+}
+
+bool ContainsNativeOrder(const std::vector<NativeOrderKey> &orders,
+                         const NativeOrderKey &order) {
+  for (size_t i = 0; i < orders.size(); ++i) {
+    if (SameNativeOrder(orders[i], order)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A replaced, appended or modified order is anything not unchanged from baseline.
+bool HasNewerNativeOrder(const std::vector<NativeOrderKey> &live,
+                         const std::vector<NativeOrderKey> &baseline) {
+  for (size_t i = 0; i < live.size(); ++i) {
+    if (!ContainsNativeOrder(baseline, live[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void CollectLiveNativeTasks(OrdersReceiver *orders, int kind, TaskType type,
+                            std::vector<Tasker *> &out) {
+  out.clear();
+  if (!orders || (uintptr_t)orders <= 0x1000) {
+    return;
+  }
+  const int lists = kind == NATIVE_GOALS ? 5 : 1;
+  for (int list = 0; list < lists; ++list) {
+    lektor<Tasker *> *tasks = &orders->goals[list];
+    if (kind == NATIVE_JOBS) {
+      tasks = &orders->jobs;
+    } else if (kind == NATIVE_PERMAJOBS) {
+      tasks = &orders->permajobs;
+    }
+    for (uint32_t i = 0; i < tasks->size(); ++i) {
+      Tasker *task = tasks->stuff[i];
+      if (task && (uintptr_t)task > 0x1000 && task->key() == type) {
+        out.push_back(task);
+      }
+    }
+  }
+}
+
+bool ContainsNativeTask(const std::vector<Tasker *> &tasks, const Tasker *task) {
+  return std::find(tasks.begin(), tasks.end(), task) != tasks.end();
+}
+
+// Matches a live task to the exact entry recorded for this actor.
+const OwnedNativeTask *FindOwnedNativeTask(const hand &actor, int job,
+                                           const Tasker *task) {
+  for (size_t i = 0; i < s_ownedNativeTasks.size(); ++i) {
+    const OwnedNativeTask &owned = s_ownedNativeTasks[i];
+    if (owned.token == task && owned.job == job && SameHand(owned.actor, actor) &&
+        owned.type == task->key() && SameHand(task->subject, owned.subject)) {
+      return &owned;
+    }
+  }
+  return NULL;
+}
+
+struct NativeTaskSnapshot {
+  TaskType type;
+  std::vector<Tasker *> goals;
+  std::vector<Tasker *> jobs;
+  std::vector<Tasker *> permajobs;
+  bool valid;
+};
+
+// Drops records whose task is no longer live so a reused address is not
+// mistaken for a task Stobe created earlier.
+void PruneOwnedNativeTasks(Character *actor) {
+  hand actorHandle;
+  OrdersReceiver *orders = NULL;
+  try {
+    actorHandle = actor->getHandle();
+    orders = actor->getOrdersReciever();
+  } catch (...) {
+    return;
+  }
+  std::vector<Tasker *> live;
+  for (size_t i = 0; i < s_ownedNativeTasks.size();) {
+    const OwnedNativeTask &owned = s_ownedNativeTasks[i];
+    bool keep = !SameHand(owned.actor, actorHandle);
+    if (!keep) {
+      try {
+        CollectLiveNativeTasks(orders, owned.job, owned.type, live);
+        keep = ContainsNativeTask(live, owned.token) &&
+               SameHand(((Tasker *)owned.token)->subject, owned.subject);
+      } catch (...) {
+        keep = false;
+      }
+    }
+    if (keep) {
+      ++i;
+    } else {
+      s_ownedNativeTasks.erase(s_ownedNativeTasks.begin() + i);
+    }
+  }
+}
+
+NativeTaskSnapshot SnapshotNativeTasks(Character *actor, TaskType type) {
+  NativeTaskSnapshot snapshot;
+  snapshot.type = type;
+  snapshot.valid = false;
+  try {
+    PruneOwnedNativeTasks(actor);
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    CollectLiveNativeTasks(orders, NATIVE_GOALS, type, snapshot.goals);
+    CollectLiveNativeTasks(orders, NATIVE_JOBS, type, snapshot.jobs);
+    CollectLiveNativeTasks(orders, NATIVE_PERMAJOBS, type, snapshot.permajobs);
+    snapshot.valid = orders && (uintptr_t)orders > 0x1000;
+  } catch (...) {
+    snapshot.valid = false;
+  }
+  return snapshot;
+}
+
+// Records only entries that appeared during this dispatch with the expected
+// subject; a pre-existing matching goal, job or permajob is never adopted.
+int RecordDispatchedNativeTasks(Character *actor,
+                                const NativeTaskSnapshot &before,
+                                const hand &subject,
+                                const Ogre::Vector3 *destination) {
+  if (!before.valid) {
+    return 0;
+  }
+  int recorded = 0;
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    const hand actorHandle = actor->getHandle();
+    std::vector<Tasker *> after;
+    for (int job = NATIVE_GOALS; job <= NATIVE_PERMAJOBS; ++job) {
+      CollectLiveNativeTasks(orders, job, before.type, after);
+      const std::vector<Tasker *> *existing = &before.goals;
+      if (job == NATIVE_JOBS) {
+        existing = &before.jobs;
+      } else if (job == NATIVE_PERMAJOBS) {
+        existing = &before.permajobs;
+      }
+      for (size_t i = 0; i < after.size(); ++i) {
+        Tasker *task = after[i];
+        if (ContainsNativeTask(*existing, task) ||
+            !SameHand(task->subject, subject)) {
+          continue;
+        }
+        OwnedNativeTask owned;
+        owned.actor = actorHandle;
+        owned.subject = task->subject;
+        owned.type = before.type;
+        owned.job = job;
+        owned.token = task;
+        owned.hasDestination = destination != NULL;
+        owned.destination = destination ? *destination : Ogre::Vector3::ZERO;
+        s_ownedNativeTasks.push_back(owned);
+        ++recorded;
+      }
+    }
+  } catch (...) {
+    Log("STOBE_OWNERSHIP: capture failed type=" + ToString((int)before.type));
+  }
+  return recorded;
+}
+
+bool HasLiveOwnedNativeTask(Character *actor, int job, TaskType type) {
+  const hand actorHandle = actor->getHandle();
+  std::vector<Tasker *> live;
+  CollectLiveNativeTasks(actor->getOrdersReciever(), job, type, live);
+  for (size_t i = 0; i < live.size(); ++i) {
+    if (FindOwnedNativeTask(actorHandle, job, live[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ForgetOwnedNativeTasks(const hand &actor, int job, TaskType type) {
+  for (size_t i = 0; i < s_ownedNativeTasks.size();) {
+    const OwnedNativeTask &owned = s_ownedNativeTasks[i];
+    if (SameHand(owned.actor, actor) && owned.job == job && owned.type == type) {
+      s_ownedNativeTasks.erase(s_ownedNativeTasks.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+}
+
+enum NativeReleaseResult {
+  NATIVE_RELEASE_NONE,
+  NATIVE_RELEASE_DONE,
+  NATIVE_RELEASE_KEPT
+};
+
+// Permajobs are removed one slot at a time, backwards, and only where the slot
+// still holds an exact owned token; every other permajob is preserved.
+NativeReleaseResult ReleaseOwnedPermajobs(Character *actor, TaskType type) {
+  try {
+    const hand actorHandle = actor->getHandle();
+    bool removed = false;
+    for (int i = actor->getPermajobCount() - 1; i >= 0; --i) {
+      const Tasker *task = actor->getPermajobData(i);
+      if (task && (uintptr_t)task > 0x1000 && actor->getPermajob(i) == type &&
+          FindOwnedNativeTask(actorHandle, NATIVE_PERMAJOBS, task)) {
+        actor->removePermajob(i);
+        removed = true;
+      }
+    }
+    std::vector<Tasker *> live;
+    CollectLiveNativeTasks(actor->getOrdersReciever(), NATIVE_PERMAJOBS, type,
+                           live);
+    for (size_t i = 0; i < live.size(); ++i) {
+      if (FindOwnedNativeTask(actorHandle, NATIVE_PERMAJOBS, live[i])) {
+        return NATIVE_RELEASE_KEPT;
+      }
+    }
+    ForgetOwnedNativeTasks(actorHandle, NATIVE_PERMAJOBS, type);
+    return removed ? NATIVE_RELEASE_DONE : NATIVE_RELEASE_NONE;
+  } catch (...) {
+    return NATIVE_RELEASE_KEPT;
+  }
+}
+
+// OrdersReceiver removes goals/jobs by task type, so remove only when every
+// live entry of that type is an exact Stobe-owned record.
+NativeReleaseResult ReleaseOwnedNativeTaskType(Character *actor, int job,
+                                               TaskType type) {
+  if (job == NATIVE_PERMAJOBS) {
+    return ReleaseOwnedPermajobs(actor, type);
+  }
+  NativeReleaseResult result = NATIVE_RELEASE_NONE;
+  try {
+    const hand actorHandle = actor->getHandle();
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    std::vector<Tasker *> live;
+    CollectLiveNativeTasks(orders, job, type, live);
+    for (size_t i = 0; i < live.size(); ++i) {
+      if (!FindOwnedNativeTask(actorHandle, job, live[i])) {
+        return NATIVE_RELEASE_KEPT;
+      }
+    }
+    if (!live.empty()) {
+      if (job == NATIVE_JOBS) {
+        orders->removeJob(type);
+      } else {
+        orders->removeGoal(type);
+      }
+      CollectLiveNativeTasks(orders, job, type, live);
+      result = live.empty() ? NATIVE_RELEASE_DONE : NATIVE_RELEASE_KEPT;
+    }
+    if (result != NATIVE_RELEASE_KEPT) {
+      ForgetOwnedNativeTasks(actorHandle, job, type);
+    }
+  } catch (...) {
+    result = NATIVE_RELEASE_KEPT;
+  }
+  return result;
+}
+} // namespace
+
+// Main thread. Adds the follow goal and records it only if this call created it.
+void AddStobeFollowGoal(Character *follower, Character *target) {
+  const NativeTaskSnapshot before =
+      SnapshotNativeTasks(follower, STAY_CLOSE_TO_TARGET);
+  follower->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
+  RecordDispatchedNativeTasks(follower, before, target->getHandle(), NULL);
+}
+
 static void ResetCloseActionApproachState(Character *actor, QueuedAction &act) {
   if (actor && (uintptr_t)actor > 0x1000) {
     unsigned int actorSerial = 0;
@@ -3686,6 +4031,8 @@ static CloseActionApproachResult TryDeferCloseActionUntilInRange(
   }
 
   if (!act.proximityMoveIssued) {
+    const NativeTaskSnapshot approachBefore =
+        SnapshotNativeTasks(actor, STAY_CLOSE_TO_TARGET);
     try {
       actor->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
       goalQueued = true;
@@ -3699,6 +4046,7 @@ static CloseActionApproachResult TryDeferCloseActionUntilInRange(
     } catch (...) {
       jobQueued = false;
     }
+    RecordDispatchedNativeTasks(actor, approachBefore, targetHandle, NULL);
   }
 
   try {
@@ -6269,40 +6617,68 @@ struct MoveToState {
   Ogre::Vector3 issuedPosition;
   Ogre::Vector3 progressPosition;
   std::string label;
-  Tasker *order;
+  NativeOrderKey order; // Observed right after dispatch.
   DWORD elapsed;
   DWORD stalled;
+  // Stop could not confirm the order gone: observed only, never re-enforced.
+  bool dormant;
   MoveToState() : point(Ogre::Vector3::ZERO),
       issuedPosition(Ogre::Vector3::ZERO), progressPosition(Ogre::Vector3::ZERO),
-      order(NULL), elapsed(0), stalled(0) {}
+      elapsed(0), stalled(0), dormant(false) {
+    order.task = NULL;
+  }
 };
 // Main-thread only; handles are resolved afresh rather than retaining world pointers.
 std::map<unsigned int, MoveToState> s_moveToStates;
 DWORD s_moveToTick = 0;
 
 bool MoveToOwnsOrder(OrdersReceiver *orders, const MoveToState &state) {
-  return orders && orders->orders.list.size() == 1 &&
-         orders->getFirstOrder() == state.order &&
+  std::vector<NativeOrderKey> live;
+  return state.order.task && CaptureNativeOrders(orders, live) &&
+         live.size() == 1 && SameNativeOrder(live[0], state.order) &&
          orders->hasPlayerOrder(MOVE_CUS_ORDERED);
 }
 
 // Release only our movement order; never clear a newer player order or change job settings.
+bool ReleaseMoveToOrder(Character *actor, const MoveToState &state, bool halt) {
+  bool released = false;
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    CharMovement *movement = actor->getMovement();
+    if (MoveToOwnsOrder(orders, state) && movement &&
+        movement->getDestination().distance(state.issuedPosition) <= 2.0f) {
+      orders->clearOrders();
+      if (halt) {
+        movement->halt();
+      }
+      actor->reThinkCurrentAIAction();
+      released = true;
+    }
+  } catch (...) {
+    Log("MOVE_TO: could not release movement order");
+  }
+  return released;
+}
+
+// True only when the recorded order is verifiably absent from the queue.
+bool MoveToOrderGone(Character *actor, const MoveToState &state) {
+  std::vector<NativeOrderKey> live;
+  try {
+    return CaptureNativeOrders(actor->getOrdersReciever(), live) &&
+           !ContainsNativeOrder(live, state.order);
+  } catch (...) {
+    return false;
+  }
+}
+
 void FinishMoveTo(GameWorld *world, Character *actor, const MoveToState &state,
                   const std::string &result, bool halt) {
   if (actor) {
-    try {
-      OrdersReceiver *orders = actor->getOrdersReciever();
-      CharMovement *movement = actor->getMovement();
-      if (MoveToOwnsOrder(orders, state) && movement &&
-          movement->getDestination().distance(state.issuedPosition) <= 2.0f) {
-        orders->clearOrders();
-        if (halt) {
-          movement->halt();
-        }
+    if (!ReleaseMoveToOrder(actor, state, halt)) {
+      try {
+        actor->reThinkCurrentAIAction();
+      } catch (...) {
       }
-      actor->reThinkCurrentAIAction();
-    } catch (...) {
-      Log("MOVE_TO: could not release movement order");
     }
   }
   const std::string name = actor ? SafeCharacterName(actor) : "NPC";
@@ -6332,6 +6708,16 @@ bool StartMoveTo(GameWorld *world, Character *actor, const std::string &payload)
   }
   MoveToState state;
   state.actor = actor->getHandle();
+  std::map<unsigned int, MoveToState>::const_iterator previous =
+      s_moveToStates.find(state.actor.serial);
+  if (previous != s_moveToStates.end() && previous->second.dormant) {
+    // Replacing it would lose the only identity of the still-queued order.
+    world->showPlayerAMessage_withLog(actor->getName() +
+        " cannot start a new move while an earlier STOBE movement order is still queued.", true);
+    Log("MOVE_TO: rejected, cancel-pending order queued actor_serial=" +
+        ToString(state.actor.serial));
+    return true;
+  }
   RootObjectBase *reference = NULL;
   if (fields.size() == 3 && fields[0] == "ref") {
     char *end = NULL;
@@ -6407,8 +6793,11 @@ bool StartMoveTo(GameWorld *world, Character *actor, const std::string &payload)
       actor->dialogue->setInDialog(false);
     }
     orders->addOrder(MOVE_CUS_ORDERED, hand(), state.point, true, false);
-    active.order = orders->getFirstOrder();
-    if (!active.order) {
+    std::vector<NativeOrderKey> issued;
+    if (CaptureNativeOrders(orders, issued) && !issued.empty()) {
+      active.order = issued.front();
+    }
+    if (!active.order.task) {
       throw std::runtime_error("movement order rejected");
     }
     actor->reThinkCurrentAIAction();
@@ -6424,12 +6813,581 @@ bool StartMoveTo(GameWorld *world, Character *actor, const std::string &payload)
   }
   return true;
 }
+
+// One tracked Stobe ATTACK per actor. Order tokens are identities only.
+struct OwnedAttackState {
+  hand actor;
+  hand target;
+  bool baselineValid;
+  std::vector<NativeOrderKey> baseline; // Order queue observed after dispatch.
+  bool hasOwnedOrder;
+  NativeOrderKey ownedOrder;            // Attack order that appeared during dispatch.
+  bool superseded; // A newer order arrived while the owned order stayed queued.
+  bool releasePending; // Monitor release left owned work; only Stop retries.
+  bool pendingCheckFailed; // A pending check threw; logged once.
+};
+std::map<unsigned int, OwnedAttackState> s_ownedAttacks;
+volatile LONG s_stopAllActionsRequested = 0;
+
+bool IsAttackOrderType(TaskType type) {
+  return type == UNPROVOKED_FOCUSED_MELEE_ATTACK ||
+         type == FOCUSED_MELEE_ATTACK ||
+         type == RANGED_ATTACK_FOCUSED_UNPROVOKED ||
+         type == RANGED_ATTACK_FOCUSED;
+}
+
+// True unless the owned attack order is verifiably absent from the queue.
+bool OwnedAttackOrderLive(OrdersReceiver *orders, const OwnedAttackState &state) {
+  if (!state.hasOwnedOrder) {
+    return false;
+  }
+  std::vector<NativeOrderKey> live;
+  return !CaptureNativeOrders(orders, live) ||
+         ContainsNativeOrder(live, state.ownedOrder);
+}
+
+// Removes the owned MELEE_ATTACK goal. The recorded attack order is cleared,
+// and combat ended, only while the order queue is unchanged since dispatch.
+// KEPT while the owned order is still queued, so its record is not dropped.
+NativeReleaseResult ReleaseOwnedAttack(Character *actor,
+                                       const OwnedAttackState &state,
+                                       bool clearOrder, bool releaseCombat) {
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    if (!orders || (uintptr_t)orders <= 0x1000) {
+      return NATIVE_RELEASE_KEPT;
+    }
+    std::vector<NativeOrderKey> live;
+    const bool newerOrder = !state.baselineValid ||
+                            !CaptureNativeOrders(orders, live) ||
+                            HasNewerNativeOrder(live, state.baseline);
+    const TaskMatch &current = orders->getCurrentGoal();
+    const bool goalMatches = current.key() == MELEE_ATTACK &&
+                             SameHand(current.subject, state.target);
+    const NativeReleaseResult goals =
+        ReleaseOwnedNativeTaskType(actor, NATIVE_GOALS, MELEE_ATTACK);
+    if (newerOrder) {
+      // The newer order, and any owned order queued with it, is left undisturbed.
+      return OwnedAttackOrderLive(orders, state) ? NATIVE_RELEASE_KEPT : goals;
+    }
+    bool changed = goals == NATIVE_RELEASE_DONE;
+    if (clearOrder && state.hasOwnedOrder && live.size() == 1 &&
+        SameNativeOrder(live[0], state.ownedOrder)) {
+      orders->clearOrders();
+      changed = true;
+    }
+    const bool orderKept = OwnedAttackOrderLive(orders, state);
+    if (releaseCombat && goals != NATIVE_RELEASE_KEPT && !orderKept) {
+      if (goalMatches) {
+        static_cast<AITaskSytem *>(orders)->taskImpossible();
+        orders->setNeedGOAP();
+        changed = true;
+      }
+      if (goalMatches || SameHand(actor->getAttackTarget(), state.target)) {
+        actor->endCombatMode();
+        changed = true;
+      }
+    }
+    if (changed) {
+      actor->reThinkCurrentAIAction();
+    }
+    if (goals == NATIVE_RELEASE_KEPT || orderKept) {
+      return NATIVE_RELEASE_KEPT;
+    }
+    return changed ? NATIVE_RELEASE_DONE : NATIVE_RELEASE_NONE;
+  } catch (...) {
+    Log("ATTACK_OWNERSHIP: release failed actor_serial=" +
+        ToString(state.actor.serial));
+    return NATIVE_RELEASE_KEPT;
+  }
+}
+
+void LogAttackRelease(const OwnedAttackState &state, const std::string &reason,
+                      NativeReleaseResult result) {
+  std::string text = "none";
+  switch (result) {
+  case NATIVE_RELEASE_DONE:
+    text = "released";
+    break;
+  case NATIVE_RELEASE_KEPT:
+    text = "kept";
+    break;
+  default:
+    break;
+  }
+  Log("ATTACK_OWNERSHIP: release actor_serial=" + ToString(state.actor.serial) +
+      " target_serial=" + ToString(state.target.serial) + " reason=" + reason +
+      " result=" + text);
+}
+
+// The goal is added and captured first so a capture failure never issues the
+// native attack. `before` must show no live MELEE_ATTACK goal. Returns an empty
+// string once the attack is tracked, otherwise the failure reason.
+std::string StartOwnedAttack(Character *actor, Character *target,
+                             const NativeTaskSnapshot &before) {
+  OwnedAttackState state;
+  state.baselineValid = false;
+  state.hasOwnedOrder = false;
+  state.superseded = false;
+  state.releasePending = false;
+  state.pendingCheckFailed = false;
+  OrdersReceiver *orders = NULL;
+  try {
+    state.actor = actor->getHandle();
+    state.target = target->getHandle();
+    orders = actor->getOrdersReciever();
+    actor->addGoal(MELEE_ATTACK, (RootObjectBase *)target);
+  } catch (...) {
+    return "goal_failed";
+  }
+  if (RecordDispatchedNativeTasks(actor, before, state.target, NULL) == 0) {
+    try {
+      // Any live MELEE_ATTACK goal appeared during this dispatch.
+      std::vector<Tasker *> live;
+      CollectLiveNativeTasks(orders, NATIVE_GOALS, MELEE_ATTACK, live);
+      if (!live.empty() && before.goals.empty()) {
+        orders->removeGoal(MELEE_ATTACK);
+      }
+    } catch (...) {
+    }
+    return "goal_not_captured";
+  }
+  std::vector<NativeOrderKey> ordersBefore;
+  const bool ordersBeforeValid = CaptureNativeOrders(orders, ordersBefore);
+  try {
+    actor->attackTarget(target);
+  } catch (...) {
+    ReleaseOwnedNativeTaskType(actor, NATIVE_GOALS, MELEE_ATTACK);
+    return "attack_failed";
+  }
+  state.baselineValid = CaptureNativeOrders(orders, state.baseline);
+  for (size_t i = 0; ordersBeforeValid && i < state.baseline.size(); ++i) {
+    const NativeOrderKey &order = state.baseline[i];
+    if (!ContainsNativeOrder(ordersBefore, order) &&
+        IsAttackOrderType(order.type) && SameHand(order.subject, state.target)) {
+      state.ownedOrder = order;
+      state.hasOwnedOrder = true;
+      break;
+    }
+  }
+  bool goalLive = false;
+  try {
+    goalLive = HasLiveOwnedNativeTask(actor, NATIVE_GOALS, MELEE_ATTACK);
+  } catch (...) {
+  }
+  if (!goalLive && !state.hasOwnedOrder) {
+    // Nothing would remain for Stop to release; undo rather than run untracked.
+    ReleaseOwnedAttack(actor, state, true, true);
+    return "attack_not_captured";
+  }
+  try {
+    actor->reThinkCurrentAIAction();
+  } catch (...) {
+  }
+  s_ownedAttacks[state.actor.serial] = state;
+  Log("ATTACK_OWNERSHIP: tracking actor_serial=" +
+      ToString(state.actor.serial) + " target_serial=" +
+      ToString(state.target.serial) + " goal=" + (goalLive ? "1" : "0") +
+      " owned_order=" + (state.hasOwnedOrder ? "1" : "0") +
+      " baseline=" + (state.baselineValid ? "1" : "0"));
+  return "";
+}
+
+// Ends tracking when the target is down/gone, the actor is down, or no owned
+// goal, owned order or combat intent on the target remains. A newer order is
+// never disturbed; an owned order still queued with it stays recorded until it
+// leaves the queue. A release that leaves owned work, or a failed check, stays
+// tracked without retrying until that work leaves or Stop retries it. A downed
+// actor may lose its exact owned order but keeps combat. An unloaded actor
+// stays tracked for Stop to report. No distance or time limits.
+void UpdateOwnedAttacks(GameWorld *world) {
+  for (std::map<unsigned int, OwnedAttackState>::iterator it =
+           s_ownedAttacks.begin();
+       it != s_ownedAttacks.end();) {
+    OwnedAttackState &state = it->second;
+    Character *actor = ResolveOwnedActor(world, state.actor);
+    if (!actor) {
+      ++it;
+      continue;
+    }
+    if (state.releasePending) {
+      // A release already left owned work in place; wait quietly until the
+      // owned order, goal and native combat intent on the target are all gone.
+      bool pending = true;
+      try {
+        OrdersReceiver *orders = actor->getOrdersReciever();
+        if (!orders || (uintptr_t)orders <= 0x1000) {
+          throw std::runtime_error("orders unavailable");
+        }
+        const TaskMatch &current = orders->getCurrentGoal();
+        pending = OwnedAttackOrderLive(orders, state) ||
+                  HasLiveOwnedNativeTask(actor, NATIVE_GOALS, MELEE_ATTACK) ||
+                  SameHand(actor->getAttackTarget(), state.target) ||
+                  (current.key() == MELEE_ATTACK &&
+                   SameHand(current.subject, state.target));
+      } catch (...) {
+        if (!state.pendingCheckFailed) {
+          state.pendingCheckFailed = true;
+          LogAttackRelease(state, "pending_check_exception", NATIVE_RELEASE_KEPT);
+        }
+      }
+      if (pending) {
+        ++it;
+      } else {
+        LogAttackRelease(state, "pending_gone", NATIVE_RELEASE_NONE);
+        s_ownedAttacks.erase(it++);
+      }
+      continue;
+    }
+    std::string reason;
+    bool clearOrder = true;
+    bool releaseCombat = true;
+    bool retain = false;
+    try {
+      OrdersReceiver *orders = actor->getOrdersReciever();
+      std::vector<NativeOrderKey> live;
+      const bool ordersKnown = CaptureNativeOrders(orders, live);
+      const bool orderLive =
+          state.hasOwnedOrder &&
+          (!ordersKnown || ContainsNativeOrder(live, state.ownedOrder));
+      Character *target = ResolveOwnedActor(world, state.target);
+      if (actor->isDead() || actor->isUnconcious()) {
+        reason = "actor_down";
+        releaseCombat = false;
+      } else if (!state.baselineValid || !ordersKnown ||
+                 HasNewerNativeOrder(live, state.baseline)) {
+        if (!state.superseded) {
+          reason = "newer_order";
+          clearOrder = false;
+          releaseCombat = false;
+          retain = orderLive;
+        } else if (!orderLive) {
+          reason = "superseded_order_gone";
+        }
+      } else if (!target) {
+        reason = "target_unavailable";
+      } else if (target->isDead()) {
+        reason = "target_dead";
+      } else if (target->isUnconcious()) {
+        reason = "target_down";
+      } else if (!orderLive &&
+                 !HasLiveOwnedNativeTask(actor, NATIVE_GOALS, MELEE_ATTACK)) {
+        // Combat intent can outlive the goal, e.g. when a newer action cleared
+        // goals; it stays owned until the actor turns to another target.
+        const TaskMatch &current = orders->getCurrentGoal();
+        if (!SameHand(actor->getAttackTarget(), state.target) &&
+            !(current.key() == MELEE_ATTACK &&
+              SameHand(current.subject, state.target))) {
+          reason = "finished";
+        }
+      }
+    } catch (...) {
+      reason = "monitor_exception";
+    }
+    if (reason.empty()) {
+      ++it;
+      continue;
+    }
+    NativeReleaseResult result = NATIVE_RELEASE_NONE;
+    if (reason != "finished" && reason != "monitor_exception" &&
+        reason != "superseded_order_gone") {
+      result = ReleaseOwnedAttack(actor, state, clearOrder, releaseCombat);
+    }
+    LogAttackRelease(state, reason, result);
+    if (retain) {
+      state.superseded = true; // Partial ownership: the queued order only.
+      ++it;
+    } else if (result == NATIVE_RELEASE_KEPT || reason == "monitor_exception") {
+      state.releasePending = true;
+      ++it;
+    } else {
+      s_ownedAttacks.erase(it++);
+    }
+  }
+}
 }
 
 // Called at the existing world-transition boundaries; never dereference a previous world.
 void ResetMoveToActions() {
   s_moveToStates.clear();
   s_moveToTick = 0;
+}
+
+// Discards handles and identity tokens only; the previous world is never touched.
+void ResetStobeActionOwnership() {
+  s_ownedNativeTasks.clear();
+  s_ownedAttacks.clear();
+  if (InterlockedExchange(&s_stopAllActionsRequested, 0) != 0) {
+    Log("STOP_ALL: pending request discarded at world transition");
+  }
+}
+
+void RequestStopAllStobeActions() {
+  if (InterlockedExchange(&s_stopAllActionsRequested, 1) == 0) {
+    Log("STOP_ALL: requested");
+  }
+}
+
+namespace {
+// Only while no player order exists: restores the speed Stobe raised and halts
+// movement still aimed at `destination` (a negative radius restores speed only).
+bool HaltStobeMovement(Character *actor, const Ogre::Vector3 &destination,
+                       float radius) {
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    CharMovement *movement = actor->getMovement();
+    if (!orders || (uintptr_t)orders <= 0x1000 || !movement ||
+        (uintptr_t)movement <= 0x1000 || orders->hasPlayerOrders()) {
+      return false;
+    }
+    movement->restoreDesiredSpeed();
+    if (movement->getDestination().distance(destination) > radius) {
+      return false;
+    }
+    movement->halt();
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Releases one actor's owned goals/jobs/permajobs of one type. The current
+// goal is rejected, and its Stobe movement halted, only while it is an exact
+// owned entry and the actor has no player order.
+NativeReleaseResult ReleaseOwnedTasksForStop(Character *actor, TaskType type) {
+  OrdersReceiver *orders = NULL;
+  bool playerOrders = true;
+  bool rejectCurrent = false;
+  bool hasDestination = false;
+  Ogre::Vector3 destination = Ogre::Vector3::ZERO;
+  try {
+    orders = actor->getOrdersReciever();
+    const hand actorHandle = actor->getHandle();
+    const TaskMatch &current = orders->getCurrentGoal();
+    std::vector<Tasker *> live;
+    CollectLiveNativeTasks(orders, NATIVE_GOALS, type, live);
+    for (size_t i = 0; i < live.size(); ++i) {
+      const OwnedNativeTask *owned =
+          FindOwnedNativeTask(actorHandle, NATIVE_GOALS, live[i]);
+      if (owned && current.key() == type &&
+          SameHand(current.subject, owned->subject)) {
+        rejectCurrent = true;
+      }
+      if (owned && owned->hasDestination) {
+        hasDestination = true;
+        destination = owned->destination;
+      }
+    }
+    playerOrders = orders->hasPlayerOrders();
+  } catch (...) {
+    return NATIVE_RELEASE_KEPT;
+  }
+  const NativeReleaseResult goals =
+      ReleaseOwnedNativeTaskType(actor, NATIVE_GOALS, type);
+  const NativeReleaseResult jobs =
+      ReleaseOwnedNativeTaskType(actor, NATIVE_JOBS, type);
+  const NativeReleaseResult permajobs =
+      ReleaseOwnedNativeTaskType(actor, NATIVE_PERMAJOBS, type);
+  if (goals == NATIVE_RELEASE_KEPT || jobs == NATIVE_RELEASE_KEPT ||
+      permajobs == NATIVE_RELEASE_KEPT) {
+    return NATIVE_RELEASE_KEPT;
+  }
+  if (goals != NATIVE_RELEASE_DONE && jobs != NATIVE_RELEASE_DONE &&
+      permajobs != NATIVE_RELEASE_DONE) {
+    return NATIVE_RELEASE_NONE;
+  }
+  if (playerOrders) {
+    return NATIVE_RELEASE_DONE;
+  }
+  try {
+    if (rejectCurrent && goals == NATIVE_RELEASE_DONE) {
+      static_cast<AITaskSytem *>(orders)->taskImpossible();
+      orders->setNeedGOAP();
+    }
+    if (hasDestination) {
+      HaltStobeMovement(actor, destination, rejectCurrent ? 3.0f : -1.0f);
+    }
+    actor->reThinkCurrentAIAction();
+  } catch (...) {
+  }
+  return NATIVE_RELEASE_DONE;
+}
+
+void CountRelease(NativeReleaseResult result, int &released, int &kept) {
+  if (result == NATIVE_RELEASE_DONE) {
+    ++released;
+  } else if (result == NATIVE_RELEASE_KEPT) {
+    ++kept;
+  }
+}
+} // namespace
+
+// Main thread, before autonomy, message conversion and queued execution.
+void ProcessPendingStopAllStobeActions(GameWorld *world) {
+  if (!world || InterlockedExchange(&s_stopAllActionsRequested, 0) == 0) {
+    return;
+  }
+  // cancelled: queued actions and follow/travel enforcement; released: native
+  // work Stobe removed; kept: left to newer or non-STOBE orders; unconfirmed:
+  // recorded native work on characters that could not be resolved.
+  int cancelled = 0;
+  EnterCriticalSection(&g_msgMutex);
+  for (std::deque<std::string>::const_iterator it = g_messageQueue.begin();
+       it != g_messageQueue.end(); ++it) {
+    if (it->find("NPC_ACTION: ") == 0) {
+      ++cancelled;
+    }
+  }
+  LeaveCriticalSection(&g_msgMutex);
+  EnterCriticalSection(&g_uiMutex);
+  for (std::deque<QueuedAction>::const_iterator it = g_uiActionQueue.begin();
+       it != g_uiActionQueue.end(); ++it) {
+    if (it->type != ACT_SAY && it->type != ACT_PLAY_TTS &&
+        it->type != ACT_NOTIFY) {
+      ++cancelled;
+    }
+  }
+  LeaveCriticalSection(&g_uiMutex);
+
+  PauseAutonomyControllerForStop(world);
+  // Drops queued actions, unspoken lines and late responses; current speech plays on.
+  const LONG generation = BeginChatInterruptGeneration(false);
+  // Enforcement stops first so it cannot re-add goals or movement below.
+  const std::map<unsigned int, hand> follows = SnapshotFollowTargets();
+  const std::map<unsigned int, TravelTarget> travels = SnapshotTravelTargets();
+  ClearAllFollowTargets();
+  ClearAllTravelTargets();
+
+  int released = 0;
+  int kept = 0;
+  int unconfirmed = 0;
+  // An order not confirmed gone stays recorded, dormant, for a later Stop.
+  for (std::map<unsigned int, MoveToState>::iterator it = s_moveToStates.begin();
+       it != s_moveToStates.end();) {
+    MoveToState &state = it->second;
+    Character *actor = ResolveOwnedActor(world, state.actor);
+    std::vector<NativeOrderKey> live;
+    bool retain = false;
+    if (!actor) {
+      ++unconfirmed;
+      retain = true;
+    } else if (ReleaseMoveToOrder(actor, state, true)) {
+      ++released;
+    } else if (!CaptureNativeOrders(actor->getOrdersReciever(), live)) {
+      ++unconfirmed;
+      retain = true;
+    } else if (ContainsNativeOrder(live, state.order)) {
+      ++kept; // Queued with newer orders; those are left undisturbed.
+      retain = true;
+    } else if (!live.empty()) {
+      ++kept;
+    }
+    if (retain) {
+      state.dormant = true;
+      Log("MOVE_TO: stop left order cancel-pending actor_serial=" +
+          ToString(state.actor.serial));
+      ++it;
+    } else {
+      s_moveToStates.erase(it++);
+    }
+  }
+
+  // Unresolved or kept attacks stay recorded for a later Stop until world reset.
+  for (std::map<unsigned int, OwnedAttackState>::iterator it =
+           s_ownedAttacks.begin();
+       it != s_ownedAttacks.end();) {
+    Character *actor = ResolveOwnedActor(world, it->second.actor);
+    if (!actor) {
+      ++unconfirmed;
+      LogAttackRelease(it->second, "stop_all_unresolved", NATIVE_RELEASE_KEPT);
+      ++it;
+      continue;
+    }
+    NativeReleaseResult result = ReleaseOwnedAttack(actor, it->second, true, true);
+    LogAttackRelease(it->second, "stop_all", result);
+    CountRelease(result, released, kept);
+    if (result == NATIVE_RELEASE_KEPT) {
+      ++it;
+    } else {
+      s_ownedAttacks.erase(it++);
+    }
+  }
+
+  // Persistent SET_TASK, USE_OBJECT, follow and close-action approach goals,
+  // jobs and permajobs; kept or unresolved records stay registered.
+  std::vector<OwnedNativeTask> groups;
+  for (size_t i = 0; i < s_ownedNativeTasks.size(); ++i) {
+    bool seen = false;
+    for (size_t j = 0; !seen && j < groups.size(); ++j) {
+      seen = groups[j].type == s_ownedNativeTasks[i].type &&
+             SameHand(groups[j].actor, s_ownedNativeTasks[i].actor);
+    }
+    if (!seen) {
+      groups.push_back(s_ownedNativeTasks[i]);
+    }
+  }
+  for (size_t i = 0; i < groups.size(); ++i) {
+    Character *actor = ResolveOwnedActor(world, groups[i].actor);
+    if (!actor) {
+      ++unconfirmed; // Records stay for a later Stop until world reset.
+      continue;
+    }
+    CountRelease(ReleaseOwnedTasksForStop(actor, groups[i].type), released,
+                 kept);
+  }
+
+  for (std::map<unsigned int, hand>::const_iterator it = follows.begin();
+       it != follows.end(); ++it) {
+    ++cancelled;
+    Character *actor = ResolveLiveCharacterBySerial(world, it->first);
+    Character *target = ResolveOwnedActor(world, it->second);
+    std::vector<Tasker *> remaining;
+    try {
+      if (actor && target) {
+        // A follow goal left after release is not Stobe's; keep its movement.
+        CollectLiveNativeTasks(actor->getOrdersReciever(), NATIVE_GOALS,
+                               STAY_CLOSE_TO_TARGET, remaining);
+        if (remaining.empty()) {
+          HaltStobeMovement(actor, target->getPosition(), 3.0f);
+        }
+      }
+    } catch (...) {
+    }
+  }
+
+  for (std::map<unsigned int, TravelTarget>::const_iterator it = travels.begin();
+       it != travels.end(); ++it) {
+    Character *actor = ResolveLiveCharacterBySerial(world, it->first);
+    if (!actor) {
+      ++unconfirmed;
+    } else if (HaltStobeMovement(
+                   actor, Ogre::Vector3(it->second.x, it->second.y, it->second.z),
+                   8.0f)) {
+      ++released;
+    } else {
+      ++cancelled;
+    }
+  }
+
+  std::string message;
+  if (released == 0 && kept == 0 && unconfirmed == 0 && cancelled == 0) {
+    message = "[STOBE] No active STOBE character actions to stop.";
+  } else {
+    message = "[STOBE] Stop Actions: " + ToString(released) + " released, " +
+              ToString(cancelled) + " cancelled";
+    if (kept > 0) {
+      message += ", " + ToString(kept) + " left to newer or non-STOBE orders";
+    }
+    if (unconfirmed > 0) {
+      message += ", " + ToString(unconfirmed) +
+                 " could not be confirmed (character not loaded)";
+    }
+    message += ".";
+  }
+  Log("STOP_ALL: generation=" + ToString((int)generation) +
+      " released=" + ToString(released) + " cancelled=" + ToString(cancelled) +
+      " kept=" + ToString(kept) + " unconfirmed=" + ToString(unconfirmed));
+  world->showPlayerAMessage_withLog(message, true);
 }
 
 // Advance bounded movement without network requests, world scans, or permanent job deletion.
@@ -6443,10 +7401,23 @@ void UpdateMoveToActions(GameWorld *world) {
   if (!world || world->isPaused()) {
     return;
   }
+  UpdateOwnedAttacks(world);
   elapsed = std::min(elapsed, (DWORD)1000);
   for (std::map<unsigned int, MoveToState>::iterator it = s_moveToStates.begin();
        it != s_moveToStates.end();) {
     MoveToState &state = it->second;
+    if (state.dormant) {
+      // Observe only: no destination update or resume, even once loaded.
+      Character *owner = ResolveOwnedActor(world, state.actor);
+      if (owner && MoveToOrderGone(owner, state)) {
+        Log("MOVE_TO: cancel-pending order gone actor_serial=" +
+            ToString(state.actor.serial));
+        s_moveToStates.erase(it++);
+      } else {
+        ++it;
+      }
+      continue;
+    }
     Character *actor = ResolveLiveCharacter(world, state.actor);
     std::string result;
     bool halt = true;
@@ -6488,6 +7459,12 @@ void UpdateMoveToActions(GameWorld *world) {
             result = "could not reach";
           } else if (state.point.distance(state.issuedPosition) > 1.0f) {
             orders->updateLastOrder(MOVE_CUS_ORDERED, hand(), state.point);
+            std::vector<NativeOrderKey> updated;
+            if (CaptureNativeOrders(orders, updated) && updated.size() == 1 &&
+                updated[0].task == state.order.task &&
+                updated[0].type == state.order.type) {
+              state.order = updated[0]; // Re-observe our own location update.
+            }
             movement->setDestination(state.point, HIGH_PRIORITY, false);
             state.issuedPosition = movement->getDestination();
           }
@@ -6713,7 +7690,16 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
       Character *target = ResolveLiveCharacter(thisptr, act.target);
       if (npc && act.type != ACT_SAY && act.type != ACT_PLAY_TTS && act.type != ACT_NOTIFY) {
         std::map<unsigned int, MoveToState>::iterator previous = s_moveToStates.find(act.actor.serial);
-        if (previous != s_moveToStates.end()) {
+        if (previous != s_moveToStates.end() && previous->second.dormant) {
+          // Retire only if it is the sole order or already gone; otherwise keep it.
+          Character *owner = ResolveOwnedActor(thisptr, previous->second.actor);
+          if (owner && (ReleaseMoveToOrder(owner, previous->second, true) ||
+                        MoveToOrderGone(owner, previous->second))) {
+            Log("MOVE_TO: cancel-pending order retired actor_serial=" +
+                ToString(act.actor.serial));
+            s_moveToStates.erase(previous);
+          }
+        } else if (previous != s_moveToStates.end()) {
           FinishMoveTo(thisptr, npc, previous->second, "stopped moving to", true);
           s_moveToStates.erase(previous);
         }
@@ -7065,10 +8051,59 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           thisptr->showPlayerAMessage_withLog(
               npcName + (killed || alreadyDead ? " died." : " suicide failed."),
               true);
+        } else if (act.type == ACT_ATTACK && target &&
+                   (target == npc || target->isDead() ||
+                    target->isUnconcious())) {
+          Log("ACTION_EXEC: ATTACK rejected actor=" + SafeCharacterName(npc) +
+              " target=" + SafeCharacterName(target) +
+              (target == npc ? " reason=self" : " reason=target_down"));
+          thisptr->showPlayerAMessage_withLog(
+              SafeCharacterName(npc) + " has no valid attack target.", true);
         } else if (act.type == ACT_ATTACK && target) {
-          BreakFactionCeasefireForExplicitAttack(npc, target,
-                                                 "stobe_attack_action");
-          if (npc->getFaction() && npc->getFaction()->isThePlayer()) {
+          // Rejected before any native change unless the new goal can be
+          // tracked; pre-existing attack goals are never adopted.
+          const bool playerSquad =
+              npc->getFaction() && npc->getFaction()->isThePlayer();
+          NativeTaskSnapshot attackBefore = SnapshotNativeTasks(npc, MELEE_ATTACK);
+          std::string attackFailure;
+          if (!attackBefore.valid) {
+            attackFailure = "capture_unavailable";
+          }
+          for (size_t i = 0;
+               attackFailure.empty() && !playerSquad && i < attackBefore.goals.size();
+               ++i) {
+            if (!FindOwnedNativeTask(npc->getHandle(), NATIVE_GOALS,
+                                     attackBefore.goals[i])) {
+              attackFailure = "existing_attack_goal";
+            }
+          }
+          // A repeated or new-target command retires the previous Stobe attack;
+          // it stays tracked if its goal could not be released.
+          std::map<unsigned int, OwnedAttackState>::iterator previousAttack =
+              s_ownedAttacks.find(act.actor.serial);
+          // Its order must be verifiably gone first: a squad member may
+          // proceed past a kept foreign goal, never past a kept owned order.
+          bool previousRetired = false;
+          if (attackFailure.empty() && previousAttack != s_ownedAttacks.end()) {
+            NativeReleaseResult retired =
+                ReleaseOwnedAttack(npc, previousAttack->second, true, false);
+            LogAttackRelease(previousAttack->second, "newer_attack", retired);
+            bool orderLeft = true;
+            try {
+              orderLeft = OwnedAttackOrderLive(npc->getOrdersReciever(),
+                                               previousAttack->second);
+            } catch (...) {
+            }
+            previousRetired = retired != NATIVE_RELEASE_KEPT && !orderLeft;
+            if (!previousRetired && (!playerSquad || orderLeft)) {
+              attackFailure = "previous_attack_kept";
+            }
+          }
+          if (attackFailure.empty()) {
+            BreakFactionCeasefireForExplicitAttack(npc, target,
+                                                   "stobe_attack_action");
+          }
+          if (attackFailure.empty() && playerSquad) {
             bool targetInPlayerFaction = false;
             try {
               targetInPlayerFaction =
@@ -7086,10 +8121,35 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             // Clear existing goals so the attack command can take over.
             npc->clearAllAIGoals();
           }
-          npc->attackTarget(target);
-          npc->addGoal(MELEE_ATTACK, (RootObjectBase *)target);
-          npc->reThinkCurrentAIAction();
-          thisptr->showPlayerAMessage(npc->getName() + " is attacking!", false);
+          if (attackFailure.empty()) {
+            // Fresh snapshot: retired goal addresses must not hide the new goal.
+            attackBefore = SnapshotNativeTasks(npc, MELEE_ATTACK);
+            if (!attackBefore.valid || !attackBefore.goals.empty()) {
+              attackFailure = "existing_attack_goal";
+            } else {
+              attackFailure = StartOwnedAttack(npc, target, attackBefore);
+            }
+          }
+          if (!attackFailure.empty() && previousRetired) {
+            // Finish releasing the retired attack; keep it if anything remains.
+            const NativeReleaseResult cleanup =
+                ReleaseOwnedAttack(npc, previousAttack->second, true, true);
+            LogAttackRelease(previousAttack->second, "replacement_failed",
+                             cleanup);
+            if (cleanup != NATIVE_RELEASE_KEPT) {
+              s_ownedAttacks.erase(previousAttack);
+            }
+          }
+          if (attackFailure.empty()) {
+            thisptr->showPlayerAMessage(npc->getName() + " is attacking!", false);
+          } else {
+            Log("ACTION_EXEC: ATTACK not started actor=" + SafeCharacterName(npc) +
+                " target=" + SafeCharacterName(target) +
+                " reason=" + attackFailure);
+            thisptr->showPlayerAMessage_withLog(
+                SafeCharacterName(npc) + " could not start a trackable attack.",
+                true);
+          }
         } else if (act.type == ACT_STOP_ATTACK) {
           StopFactionAttackResult stopResult =
               StopFactionAttack(thisptr, npc, target);
@@ -7373,7 +8433,7 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             } catch (...) {
             }
             try {
-              npc->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
+              AddStobeFollowGoal(npc, target);
             } catch (...) {
             }
             try {
@@ -7668,9 +8728,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
                 }
               }
               try {
+                const NativeTaskSnapshot taskBefore = SnapshotNativeTasks(npc, tt);
                 npc->addJob(tt, taskTarget, true, false, npc->getPosition());
                 npc->addGoal(tt, (RootObjectBase *)taskTarget);
                 taskApplied = true;
+                RecordDispatchedNativeTasks(
+                    npc, taskBefore,
+                    taskTarget ? ((RootObjectBase *)taskTarget)->getHandle()
+                               : hand(),
+                    NULL);
               } catch (...) {
                 Log("ACTION_EXEC: Task dispatch exception for " + npc->getName() +
                     " task=" + ToString((int)tt));
@@ -9885,6 +10951,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           bool goalQueued = false;
           bool destinationQueued = false;
           bool speedBoosted = false;
+          const NativeTaskSnapshot useBefore =
+              SnapshotNativeTasks(npc, bestUsable->taskType);
           try {
             RootObject *subject = (RootObject *)bestUsable->building;
             npc->addJob(bestUsable->taskType, subject, true, false,
@@ -9899,6 +10967,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             goalQueued = true;
           } catch (...) {
             goalQueued = false;
+          }
+          try {
+            const Ogre::Vector3 useDestination =
+                bestUsable->building->getPosition();
+            RecordDispatchedNativeTasks(
+                npc, useBefore,
+                ((RootObjectBase *)bestUsable->building)->getHandle(),
+                &useDestination);
+          } catch (...) {
           }
           try {
             npc->setDestination(bestUsable->building->getPosition(), false);
@@ -10283,6 +11360,8 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           thisptr->showPlayerAMessage_withLog(
               "Spawn item action is currently disabled.", true);
         }
+        // Forget tokens this action freed (e.g. clearAllAIGoals) before reuse.
+        PruneOwnedNativeTasks(npc);
 
         EnterCriticalSection(&g_uiMutex);
         lockReacquired = true;
