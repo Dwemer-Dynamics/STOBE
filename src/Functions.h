@@ -52,3 +52,10 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer);
 // One-time movement lifecycle on the game thread.
 void UpdateMoveToActions(GameWorld *world);
 void ResetMoveToActions();
+
+// Stobe dialogue ATTACK cleanup. Request is thread-safe; the others run on the
+// game thread. Stop cancels queued chat work and only Stobe-tracked attacks.
+void RequestStopStobeAttacks();
+void ProcessStopStobeAttacks(GameWorld *world);
+void UpdateStobeAttacks(GameWorld *world);
+void ResetStobeAttacks();

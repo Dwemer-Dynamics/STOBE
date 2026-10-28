@@ -143,6 +143,8 @@ void CreateRenameUI(const std::string &targetName,
                     const std::string &speakerName,
                     const std::string &targetHandle);
 void OnRenameClick(MyGUI::Widget *sender);
+void OnStopStobeAttacksClick(MyGUI::Widget *sender);
+bool QueueChatPipeLine(const std::string &line, LONG generation);
 void OnRenameInputChange(MyGUI::EditBox *sender);
 void OnRenameInputAccept(MyGUI::EditBox *sender);
 void OnRenameConfirmClick(MyGUI::Widget *sender);
@@ -2407,6 +2409,12 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam) {
     delete t;
     return 0;
   }
+  if (t->generation <= 0 || !IsChatInterruptGenerationCurrent(t->generation)) {
+    Log("CHAT_THREAD: Dropped stale response gen=" +
+        ToString((int)t->generation));
+    delete t;
+    return 0;
+  }
 
   Log("CHAT_THREAD: Got response: " + response.substr(0, 200));
 
@@ -2472,10 +2480,10 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam) {
       if (!first)
         SleepIfPaused(g_dialogueSpeedSeconds * 1000);
 
-      EnterCriticalSection(&g_msgMutex);
-      g_messageQueue.push_back(pipeLine);
-      g_lastDialogueTick = GetTickCount();
-      LeaveCriticalSection(&g_msgMutex);
+      if (!QueueChatPipeLine(pipeLine, t->generation)) {
+        delete t;
+        return 0;
+      }
       first = false;
     }
   }
@@ -2484,9 +2492,9 @@ DWORD WINAPI DialogResponseWorker(LPVOID lpParam) {
     Sleep(50);
     std::string actLine =
         "NPC_ACTION: " + t->npcName + "|" + t->handleStr + ": " + actions[i];
-    EnterCriticalSection(&g_msgMutex);
-    g_messageQueue.push_back(actLine);
-    LeaveCriticalSection(&g_msgMutex);
+    if (!QueueChatPipeLine(actLine, t->generation)) {
+      break;
+    }
   }
 
   delete t;
@@ -5074,6 +5082,15 @@ void OnRenameClick(MyGUI::Widget *sender) {
   CreateRenameUI(speakerName, speakerName, speakerHandle);
 }
 
+// Available in every mode and while requests are active; the game thread
+// cancels queued chat work and tracked attacks, then reports the result.
+void OnStopStobeAttacksClick(MyGUI::Widget *sender) {
+  RequestStopStobeAttacks();
+  if (g_chatInput) {
+    MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatInput);
+  }
+}
+
 // Opens the existing rename dialog for the exact NPC that owned the native
 // right-click menu when this companion action was created.
 void OnNpcContextRenameClick(MyGUI::Widget *sender) {
@@ -6057,7 +6074,9 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float moodComboX = moodLabelX + moodLabelW + 0.01f;
   const float moodComboW = 0.26f;
   const float moodCustomX = moodComboX + moodComboW + controlRowGap;
-  const float moodCustomW = 0.95f - moodCustomX;
+  const float stopAttacksX = sendX;
+  const float stopAttacksW = sendWidth;
+  const float moodCustomW = stopAttacksX - controlRowGap - moodCustomX;
 
   g_chatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
       "Kenshi_ComboBox", controlRowLeftX, controlRowY, modeWidth, rowH,
@@ -6128,6 +6147,13 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatCustomMoodInput->setMaxTextLength((size_t)kPlayerCustomMoodMaxChars);
   g_chatCustomMoodInput->eventEditTextChange +=
       MyGUI::newDelegate(OnChatCustomMoodChange);
+
+  MyGUI::Button *stopAttacksBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", stopAttacksX, moodRowY, stopAttacksW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatStopAttacksBtn");
+  stopAttacksBtn->setCaption(WideFromUtf8(T("Stop Attacks")).c_str());
+  stopAttacksBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnStopStobeAttacksClick);
 
   RefreshChatMoodControls();
 

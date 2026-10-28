@@ -37,6 +37,7 @@
 #include <kenshi/RootObjectBase.h>
 #include <kenshi/RootObjectFactory.h>
 #include <kenshi/SensoryData.h>
+#include <kenshi/Tasker.h>
 #include <kenshi/util/YesNoMaybe.h>
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Colour.h>
@@ -6424,12 +6425,461 @@ bool StartMoveTo(GameWorld *world, Character *actor, const std::string &payload)
   }
   return true;
 }
+
+// One Stobe dialogue ATTACK per actor. Goal and order pointers are identity
+// tokens, matched only against the actor's live collections.
+struct AttackOrderKey {
+  const Tasker *task;
+  TaskType type;
+  hand subject;
+  Ogre::Vector3 location;
+};
+struct StobeAttackState {
+  hand actor;
+  hand target;
+  const Tasker *goal;
+  bool hasOrder;
+  AttackOrderKey order;                 // Attack order that appeared during dispatch.
+  std::vector<AttackOrderKey> baseline; // Order queue right after dispatch.
+  bool pending; // Cleanup left owned work in place; only Stop retries it.
+  bool combatEnded; // endCombatMode ran; its attack target may read stale.
+};
+std::map<unsigned int, StobeAttackState> s_stobeAttacks;
+DWORD s_stobeAttackTick = 0;
+volatile LONG s_stopAttacksRequested = 0;
+
+bool SameHand(const hand &first, const hand &second) {
+  return first.type == second.type && first.container == second.container &&
+         first.containerSerial == second.containerSerial &&
+         first.index == second.index && first.serial == second.serial;
+}
+
+// Live character only when its full handle matches the recorded one.
+Character *ResolveAttackCharacter(GameWorld *world, const hand &handle) {
+  Character *live = ResolveLiveCharacter(world, handle);
+  try {
+    return live && SameHand(live->getHandle(), handle) ? live : NULL;
+  } catch (...) {
+    return NULL;
+  }
+}
+
+// A subject order follows its moving subject; only location orders compare location.
+bool SameAttackOrder(const AttackOrderKey &first, const AttackOrderKey &second) {
+  return first.task == second.task && first.type == second.type &&
+         SameHand(first.subject, second.subject) &&
+         (first.subject.serial != 0 || first.location == second.location);
+}
+
+bool ContainsAttackOrder(const std::vector<AttackOrderKey> &orders,
+                         const AttackOrderKey &order) {
+  for (size_t i = 0; i < orders.size(); ++i) {
+    if (SameAttackOrder(orders[i], order)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CaptureAttackOrders(OrdersReceiver *orders, std::vector<AttackOrderKey> &out) {
+  out.clear();
+  if (!orders || (uintptr_t)orders <= 0x1000) {
+    return false;
+  }
+  try {
+    for (std::deque<Tasker *>::const_iterator it = orders->orders.list.begin();
+         it != orders->orders.list.end(); ++it) {
+      Tasker *task = *it;
+      if (!task || (uintptr_t)task <= 0x1000) {
+        out.clear();
+        return false;
+      }
+      AttackOrderKey key = {task, task->key(), task->subject, task->location};
+      out.push_back(key);
+    }
+  } catch (...) {
+    out.clear();
+    return false;
+  }
+  return true;
+}
+
+// Any queued order absent from the post-dispatch baseline was replaced,
+// appended or modified by someone else.
+bool HasNewerAttackOrder(OrdersReceiver *orders, const StobeAttackState &state,
+                         std::vector<AttackOrderKey> &live) {
+  if (!CaptureAttackOrders(orders, live)) {
+    return true;
+  }
+  for (size_t i = 0; i < live.size(); ++i) {
+    if (!ContainsAttackOrder(state.baseline, live[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void CollectAttackGoals(OrdersReceiver *orders, std::vector<Tasker *> &out) {
+  out.clear();
+  for (int list = 0; list < 5; ++list) {
+    for (uint32_t i = 0; i < orders->goals[list].size(); ++i) {
+      Tasker *task = orders->goals[list].stuff[i];
+      if (task && (uintptr_t)task > 0x1000 && task->key() == MELEE_ATTACK) {
+        out.push_back(task);
+      }
+    }
+  }
+}
+
+bool AttackGoalLive(OrdersReceiver *orders, const StobeAttackState &state) {
+  std::vector<Tasker *> goals;
+  CollectAttackGoals(orders, goals);
+  for (size_t i = 0; i < goals.size(); ++i) {
+    if (goals[i] == state.goal && SameHand(goals[i]->subject, state.target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AttackOrderLive(OrdersReceiver *orders, const StobeAttackState &state) {
+  std::vector<AttackOrderKey> live;
+  return state.hasOrder && (!CaptureAttackOrders(orders, live) ||
+                            ContainsAttackOrder(live, state.order));
+}
+
+bool CurrentGoalAttacks(OrdersReceiver *orders, const hand &target) {
+  const TaskMatch &current = orders->getCurrentGoal();
+  return current.key() == MELEE_ATTACK && SameHand(current.subject, target);
+}
+
+// Owned goal or order, or native combat intent on the target, remains.
+bool StobeAttackActive(Character *actor, const StobeAttackState &state) {
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    return AttackGoalLive(orders, state) || AttackOrderLive(orders, state) ||
+           (!state.combatEnded &&
+            SameHand(actor->getAttackTarget(), state.target)) ||
+           CurrentGoalAttacks(orders, state.target);
+  } catch (...) {
+    return true;
+  }
+}
+
+// removeGoal is type-wide, so it runs only while our goal is the sole
+// MELEE_ATTACK goal. Anything newer in the queue leaves all other native state
+// alone. Otherwise the queue is cleared only when it is exactly our sole order,
+// and with endCombat a surviving MELEE task or combat on the owned target is
+// ended. True only when no owned work or native intent on the target remains.
+bool ReleaseStobeAttack(Character *actor, StobeAttackState &state,
+                        bool endCombat) {
+  try {
+    OrdersReceiver *orders = actor->getOrdersReciever();
+    if (!orders || (uintptr_t)orders <= 0x1000) {
+      return false;
+    }
+    std::vector<AttackOrderKey> live;
+    const bool newer = HasNewerAttackOrder(orders, state, live);
+    std::vector<Tasker *> goals;
+    CollectAttackGoals(orders, goals);
+    bool changed = false;
+    if (goals.size() == 1 && AttackGoalLive(orders, state)) {
+      orders->removeGoal(MELEE_ATTACK);
+      changed = true;
+    }
+    if (newer) {
+      return !StobeAttackActive(actor, state);
+    }
+    if (state.hasOrder && live.size() == 1 &&
+        SameAttackOrder(live[0], state.order)) {
+      orders->clearOrders();
+      changed = true;
+    }
+    const bool left = AttackGoalLive(orders, state) || AttackOrderLive(orders, state);
+    if (endCombat && !left && CurrentGoalAttacks(orders, state.target)) {
+      static_cast<AITaskSytem *>(orders)->taskImpossible();
+      changed = true;
+    }
+    if (endCombat && !left && SameHand(actor->getAttackTarget(), state.target)) {
+      actor->endCombatMode();
+      state.combatEnded = true;
+      changed = true;
+    }
+    if (changed) {
+      orders->setNeedGOAP();
+      actor->reThinkCurrentAIAction();
+    }
+    return !StobeAttackActive(actor, state);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool IsAttackOrderType(TaskType type) {
+  return type == UNPROVOKED_FOCUSED_MELEE_ATTACK || type == FOCUSED_MELEE_ATTACK ||
+         type == RANGED_ATTACK_FOCUSED_UNPROVOKED || type == RANGED_ATTACK_FOCUSED;
+}
+
+bool HasAttackGoal(Character *actor) {
+  try {
+    std::vector<Tasker *> goals;
+    CollectAttackGoals(actor->getOrdersReciever(), goals);
+    return !goals.empty();
+  } catch (...) {
+    return true;
+  }
+}
+
+// The goal is added and captured before attackTarget, so an attack Stobe
+// cannot track is never issued. A pending record holding the pre-dispatch
+// queue exists during the call, and orders it adds are never adopted. Returns
+// "" once tracked, else the reason; the record stays pending if cleanup of a
+// failed dispatch is unconfirmed.
+std::string StartStobeAttack(Character *actor, Character *target) {
+  StobeAttackState state;
+  state.goal = NULL;
+  state.hasOrder = false;
+  state.pending = true;
+  state.combatEnded = false;
+  OrdersReceiver *orders = NULL;
+  bool goalAdded = false;
+  try {
+    state.actor = actor->getHandle();
+    state.target = target->getHandle();
+    orders = actor->getOrdersReciever();
+    std::vector<Tasker *> goals;
+    CollectAttackGoals(orders, goals);
+    if (!goals.empty()) {
+      return "existing_attack_goal"; // Never adopted.
+    }
+    actor->addGoal(MELEE_ATTACK, (RootObjectBase *)target);
+    goalAdded = true;
+    CollectAttackGoals(orders, goals);
+    if (goals.size() == 1 && SameHand(goals[0]->subject, state.target)) {
+      state.goal = goals[0];
+    }
+  } catch (...) {
+  }
+  std::vector<AttackOrderKey> ordersBefore;
+  if (!state.goal || !CaptureAttackOrders(orders, ordersBefore)) {
+    try {
+      if (goalAdded) {
+        orders->removeGoal(MELEE_ATTACK); // Every live attack goal is new.
+      }
+    } catch (...) {
+    }
+    return "goal_not_captured";
+  }
+  state.baseline = ordersBefore;
+  StobeAttackState &record = s_stobeAttacks[state.actor.serial];
+  record = state;
+  std::vector<AttackOrderKey> ordersAfter;
+  const char *failure = NULL;
+  try {
+    actor->attackTarget(target);
+    if (!CaptureAttackOrders(orders, ordersAfter)) {
+      failure = "attack_not_captured";
+    }
+  } catch (...) {
+    failure = "attack_failed";
+  }
+  if (failure) {
+    const bool released = ReleaseStobeAttack(actor, record, true);
+    Log("ATTACK_CLEANUP: actor_serial=" + ToString(state.actor.serial) +
+        " target_serial=" + ToString(state.target.serial) + " reason=" +
+        failure + (released ? " result=released" : " result=pending"));
+    if (released) {
+      s_stobeAttacks.erase(state.actor.serial);
+    }
+    return failure;
+  }
+  record.baseline = ordersAfter;
+  for (size_t i = 0; i < ordersAfter.size(); ++i) {
+    const AttackOrderKey &order = ordersAfter[i];
+    if (!ContainsAttackOrder(ordersBefore, order) &&
+        IsAttackOrderType(order.type) && SameHand(order.subject, state.target)) {
+      record.order = order;
+      record.hasOrder = true;
+      break;
+    }
+  }
+  record.pending = false;
+  try {
+    actor->reThinkCurrentAIAction();
+  } catch (...) {
+  }
+  Log("ATTACK_CLEANUP: tracking actor_serial=" + ToString(state.actor.serial) +
+      " target_serial=" + ToString(state.target.serial) +
+      " owned_order=" + (record.hasOrder ? "1" : "0"));
+  return "";
+}
+
+// A repeated or new-target command first ends the earlier attack and is
+// rejected while that attack's owned work or native intent remains.
+bool RejectStobeAttack(GameWorld *world, Character *actor, Character *target) {
+  std::string reason;
+  try {
+    if (target == actor || target->isDead() || target->isUnconcious()) {
+      reason = "invalid_target";
+    }
+    std::map<unsigned int, StobeAttackState>::iterator previous =
+        s_stobeAttacks.find(actor->getHandle().serial);
+    if (reason.empty() && previous != s_stobeAttacks.end()) {
+      if (ReleaseStobeAttack(actor, previous->second, true)) {
+        s_stobeAttacks.erase(previous);
+      } else {
+        previous->second.pending = true;
+        reason = "previous_attack_pending";
+      }
+    }
+    if (reason.empty() &&
+        !(actor->getFaction() && actor->getFaction()->isThePlayer()) &&
+        HasAttackGoal(actor)) {
+      reason = "existing_attack_goal"; // Squad members clear goals first.
+    }
+  } catch (...) {
+    reason = "validation_failed";
+  }
+  if (reason.empty()) {
+    return false;
+  }
+  Log("ACTION_EXEC: ATTACK rejected actor=" + SafeCharacterName(actor) +
+      " target=" + SafeCharacterName(target) + " reason=" + reason);
+  world->showPlayerAMessage_withLog(
+      SafeCharacterName(actor) + (reason == "invalid_target"
+                                      ? " has no valid attack target."
+                                      : " could not start a trackable attack."),
+      true);
+  return true;
+}
 }
 
 // Called at the existing world-transition boundaries; never dereference a previous world.
 void ResetMoveToActions() {
   s_moveToStates.clear();
   s_moveToTick = 0;
+}
+
+// Discards handles and tokens only; the previous world is never touched.
+void ResetStobeAttacks() {
+  s_stobeAttacks.clear();
+  s_stobeAttackTick = 0;
+  if (InterlockedExchange(&s_stopAttacksRequested, 0) != 0) {
+    Log("STOP_ATTACKS: pending request discarded at world transition");
+  }
+}
+
+// Ends a tracked attack when the target is down or unavailable, the actor is
+// down, a newer order replaces it, or its goal, order and combat intent end.
+// Cleanup that leaves owned work stays pending quietly until Stop or reset.
+void UpdateStobeAttacks(GameWorld *world) {
+  const DWORD now = GetTickCount();
+  if (s_stobeAttacks.empty() ||
+      (s_stobeAttackTick && now - s_stobeAttackTick < 250)) {
+    return;
+  }
+  s_stobeAttackTick = now;
+  if (!world || world->isPaused()) {
+    return;
+  }
+  for (std::map<unsigned int, StobeAttackState>::iterator it =
+           s_stobeAttacks.begin();
+       it != s_stobeAttacks.end();) {
+    StobeAttackState &state = it->second;
+    Character *actor = ResolveAttackCharacter(world, state.actor);
+    std::string reason;
+    bool endCombat = true;
+    try {
+      std::vector<AttackOrderKey> live;
+      if (!actor) {
+        // Unloaded actor: kept for Stop or world reset.
+      } else if (state.pending) {
+        if (!StobeAttackActive(actor, state)) {
+          reason = "pending_gone";
+        }
+      } else if (actor->isDead() || actor->isUnconcious()) {
+        reason = "actor_down";
+        endCombat = false;
+      } else if (HasNewerAttackOrder(actor->getOrdersReciever(), state, live)) {
+        reason = "newer_order";
+        endCombat = false;
+      } else {
+        Character *target = ResolveAttackCharacter(world, state.target);
+        if (!target) {
+          reason = "target_unavailable";
+        } else if (target->isDead()) {
+          reason = "target_dead";
+        } else if (target->isUnconcious()) {
+          reason = "target_down";
+        } else if (!StobeAttackActive(actor, state)) {
+          reason = "finished";
+        }
+      }
+    } catch (...) {
+      reason = state.pending ? "" : "monitor_exception";
+    }
+    if (reason.empty()) {
+      ++it;
+      continue;
+    }
+    const bool done = reason == "pending_gone" || reason == "finished" ||
+                      (reason != "monitor_exception" &&
+                       ReleaseStobeAttack(actor, state, endCombat));
+    Log("ATTACK_CLEANUP: actor_serial=" + ToString(state.actor.serial) +
+        " target_serial=" + ToString(state.target.serial) + " reason=" +
+        reason + (done ? " result=released" : " result=pending"));
+    if (done) {
+      s_stobeAttacks.erase(it++);
+    } else {
+      state.pending = true;
+      ++it;
+    }
+  }
+}
+
+void RequestStopStobeAttacks() {
+  if (InterlockedExchange(&s_stopAttacksRequested, 1) == 0) {
+    Log("STOP_ATTACKS: requested");
+  }
+}
+
+// Main thread, before message conversion and the paused/TTS-gated action queue.
+void ProcessStopStobeAttacks(GameWorld *world) {
+  if (!world || InterlockedExchange(&s_stopAttacksRequested, 0) == 0) {
+    return;
+  }
+  // Drops queued actions, unspoken lines and late responses; current speech plays on.
+  const LONG generation = BeginChatInterruptGeneration(false);
+  int stopped = 0;
+  int left = 0;
+  for (std::map<unsigned int, StobeAttackState>::iterator it =
+           s_stobeAttacks.begin();
+       it != s_stobeAttacks.end();) {
+    Character *actor = ResolveAttackCharacter(world, it->second.actor);
+    if (actor && ReleaseStobeAttack(actor, it->second, true)) {
+      ++stopped;
+      s_stobeAttacks.erase(it++);
+    } else {
+      it->second.pending = true;
+      ++left;
+      ++it;
+    }
+  }
+  std::string message =
+      "[STOBE] Stop Attacks: pending STOBE replies and actions cancelled";
+  if (stopped > 0) {
+    message += ", " + ToString(stopped) + " tracked attack(s) stopped";
+  }
+  if (left > 0) {
+    message += ", " + ToString(left) +
+               " left pending (newer orders, unloaded characters or unfinished cleanup)";
+  }
+  if (stopped == 0 && left == 0) {
+    message += "; no tracked attacks were active";
+  }
+  Log("STOP_ATTACKS: generation=" + ToString((int)generation) +
+      " stopped=" + ToString(stopped) + " left=" + ToString(left));
+  world->showPlayerAMessage_withLog(message + ".", true);
 }
 
 // Advance bounded movement without network requests, world scans, or permanent job deletion.
@@ -7065,6 +7515,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
           thisptr->showPlayerAMessage_withLog(
               npcName + (killed || alreadyDead ? " died." : " suicide failed."),
               true);
+        } else if (act.type == ACT_ATTACK && target &&
+                   RejectStobeAttack(thisptr, npc, target)) {
+          // Rejected before any faction, squad or order change.
         } else if (act.type == ACT_ATTACK && target) {
           BreakFactionCeasefireForExplicitAttack(npc, target,
                                                  "stobe_attack_action");
@@ -7086,10 +7539,15 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer) {
             // Clear existing goals so the attack command can take over.
             npc->clearAllAIGoals();
           }
-          npc->attackTarget(target);
-          npc->addGoal(MELEE_ATTACK, (RootObjectBase *)target);
-          npc->reThinkCurrentAIAction();
-          thisptr->showPlayerAMessage(npc->getName() + " is attacking!", false);
+          const std::string attackFailure = StartStobeAttack(npc, target);
+          if (attackFailure.empty()) {
+            thisptr->showPlayerAMessage(npc->getName() + " is attacking!", false);
+          } else {
+            Log("ACTION_EXEC: ATTACK not started actor=" + SafeCharacterName(npc) +
+                " reason=" + attackFailure);
+            thisptr->showPlayerAMessage_withLog(
+                SafeCharacterName(npc) + " could not start a trackable attack.", true);
+          }
         } else if (act.type == ACT_STOP_ATTACK) {
           StopFactionAttackResult stopResult =
               StopFactionAttack(thisptr, npc, target);

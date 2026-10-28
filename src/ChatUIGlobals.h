@@ -9,6 +9,8 @@
 #include <vector>
 #include <windows.h>
 
+LONG GetChatInterruptGeneration();
+
 namespace Stobe {
 namespace UI {
 
@@ -16,6 +18,8 @@ struct ChatTask {
   std::string json;
   std::string npcName;
   std::string handleStr;
+  LONG generation; // Captured at creation, before the request is sent.
+  ChatTask() : generation(GetChatInterruptGeneration()) {}
 };
 
 struct AiNpcInfoTask {
