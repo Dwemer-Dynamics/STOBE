@@ -143,7 +143,7 @@ void CreateRenameUI(const std::string &targetName,
                     const std::string &speakerName,
                     const std::string &targetHandle);
 void OnRenameClick(MyGUI::Widget *sender);
-void OnStopStobeActionsClick(MyGUI::Widget *sender);
+void OnStopStobeAttacksClick(MyGUI::Widget *sender);
 bool QueueChatPipeLine(const std::string &line, LONG generation);
 void OnRenameInputChange(MyGUI::EditBox *sender);
 void OnRenameInputAccept(MyGUI::EditBox *sender);
@@ -5083,9 +5083,9 @@ void OnRenameClick(MyGUI::Widget *sender) {
 }
 
 // Available in every mode and while requests are active; the game thread
-// performs the stop and reports what was actually released.
-void OnStopStobeActionsClick(MyGUI::Widget *sender) {
-  RequestStopAllStobeActions();
+// cancels queued chat work and tracked attacks, then reports the result.
+void OnStopStobeAttacksClick(MyGUI::Widget *sender) {
+  RequestStopStobeAttacks();
   if (g_chatInput) {
     MyGUI::InputManager::getInstance().setKeyFocusWidget(g_chatInput);
   }
@@ -6074,9 +6074,9 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   const float moodComboX = moodLabelX + moodLabelW + 0.01f;
   const float moodComboW = 0.26f;
   const float moodCustomX = moodComboX + moodComboW + controlRowGap;
-  const float stopActionsX = sendX;
-  const float stopActionsW = sendWidth;
-  const float moodCustomW = stopActionsX - controlRowGap - moodCustomX;
+  const float stopAttacksX = sendX;
+  const float stopAttacksW = sendWidth;
+  const float moodCustomW = stopAttacksX - controlRowGap - moodCustomX;
 
   g_chatModeCombo = client->createWidgetReal<MyGUI::ComboBox>(
       "Kenshi_ComboBox", controlRowLeftX, controlRowY, modeWidth, rowH,
@@ -6148,12 +6148,12 @@ void CreateChatUI(const std::string &npcName, const std::string &playerName,
   g_chatCustomMoodInput->eventEditTextChange +=
       MyGUI::newDelegate(OnChatCustomMoodChange);
 
-  MyGUI::Button *stopActionsBtn = client->createWidgetReal<MyGUI::Button>(
-      "Kenshi_Button1", stopActionsX, moodRowY, stopActionsW, rowH,
-      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatStopActionsBtn");
-  stopActionsBtn->setCaption(WideFromUtf8(T("Stop Actions")).c_str());
-  stopActionsBtn->eventMouseButtonClick +=
-      MyGUI::newDelegate(OnStopStobeActionsClick);
+  MyGUI::Button *stopAttacksBtn = client->createWidgetReal<MyGUI::Button>(
+      "Kenshi_Button1", stopAttacksX, moodRowY, stopAttacksW, rowH,
+      MyGUI::Align::Top | MyGUI::Align::Left, "Stobe_ChatStopAttacksBtn");
+  stopAttacksBtn->setCaption(WideFromUtf8(T("Stop Attacks")).c_str());
+  stopAttacksBtn->eventMouseButtonClick +=
+      MyGUI::newDelegate(OnStopStobeAttacksClick);
 
   RefreshChatMoodControls();
 

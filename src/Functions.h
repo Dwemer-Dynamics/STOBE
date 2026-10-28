@@ -53,10 +53,9 @@ void ExecuteQueuedActions(GameWorld *thisptr, int &inventoryTimer);
 void UpdateMoveToActions(GameWorld *world);
 void ResetMoveToActions();
 
-// Stop all character actions. Request is thread-safe; processing and reset run
-// on the game thread. Only native goals, jobs and orders Stobe created are released.
-void RequestStopAllStobeActions();
-void ProcessPendingStopAllStobeActions(GameWorld *world);
-void ResetStobeActionOwnership();
-// Adds the follow goal and records it for Stop only if this call created it.
-void AddStobeFollowGoal(Character *follower, Character *target);
+// Stobe dialogue ATTACK cleanup. Request is thread-safe; the others run on the
+// game thread. Stop cancels queued chat work and only Stobe-tracked attacks.
+void RequestStopStobeAttacks();
+void ProcessStopStobeAttacks(GameWorld *world);
+void UpdateStobeAttacks(GameWorld *world);
+void ResetStobeAttacks();

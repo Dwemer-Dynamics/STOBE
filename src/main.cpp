@@ -8509,7 +8509,7 @@ static void ApplyFollowTargets(GameWorld *world) {
         } catch (...) {
         }
         try {
-          AddStobeFollowGoal(follower, target);
+          follower->addGoal(STAY_CLOSE_TO_TARGET, (RootObjectBase *)target);
         } catch (...) {
         }
         try {
@@ -13035,7 +13035,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     // During loads MyGUI can be torn down; clear stale pointers and do nothing.
     Stobe::UI::ResetNpcContextRenameAction(false);
     ResetMoveToActions();
-    ResetStobeActionOwnership();
+    ResetStobeAttacks();
     ResetAutonomyController("gui_unavailable");
     ResetAutonomySafetyProbe("gui_unavailable");
     Stobe::DialogueMenuTts::Reset("gui_unavailable");
@@ -13053,7 +13053,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   if (!worldStable) {
     Stobe::UI::ResetNpcContextRenameAction();
     ResetMoveToActions();
-    ResetStobeActionOwnership();
+    ResetStobeAttacks();
     ResetAutonomyController("world_unstable");
     ResetAutonomySafetyProbe("world_unstable");
     Stobe::DialogueMenuTts::Reset("world_unstable");
@@ -13384,8 +13384,8 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
   GameWorld *world = GetWorldSafe();
   bool worldFrameStable = IsWorldStableForUI(world);
   if (world && worldFrameStable) {
-    // Before autonomy, message conversion and the paused/TTS-gated action queue.
-    ProcessPendingStopAllStobeActions(world);
+    // Before message conversion and the paused/TTS-gated action queue.
+    ProcessStopStobeAttacks(world);
     Stobe::WorldStateRuntime::Update(world, worldBecameStableTick);
     UpdateAutonomyController(world);
     UpdateAutonomySafetyProbe(world, sel);
@@ -13433,6 +13433,7 @@ void Hook_PlayerUpdateTick(PlayerInterface *thisptr) {
     Stobe::Addon::GameThreadTick(world);
     Stobe::ServerPluginSync::OnGameThreadTick(world);
     UpdateMoveToActions(world);
+    UpdateStobeAttacks(world);
     ApplyFollowTargets(world);
     ApplyTravelTargets(world);
     RunQueuedItemImageSync();
